@@ -1,0 +1,28 @@
+{
+  "name": "@jiafuei/opencode-model-glob",
+  "version": "0.0.1",
+  "description": "Search connected OpenCode model IDs and their variants",
+  "type": "module",
+  "exports": {
+    "./server": "./model_glob.ts"
+  },
+  "files": [
+    "model_glob.ts",
+    "README.md"
+  ],
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "models",
+    "search"
+  ],
+  "engines": {
+    "opencode": ">=1.18.9"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "@opencode-ai/plugin": "^1.18.9"
+  }
+}

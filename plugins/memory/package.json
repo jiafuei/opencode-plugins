@@ -1,0 +1,30 @@
+{
+  "name": "@jiafuei/opencode-memory",
+  "version": "0.0.1",
+  "description": "Project-scoped automatic memory for OpenCode",
+  "type": "module",
+  "exports": {
+    "./server": "./memory_server.tsx",
+    "./tui": "./memory_tui.tsx"
+  },
+  "files": [
+    "memory_server.tsx",
+    "memory_tui.tsx",
+    "README.md"
+  ],
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "memory"
+  ],
+  "engines": {
+    "opencode": ">=1.18.9"
+  },
+  "publishConfig": {
+    "access": "restricted"
+  },
+  "dependencies": {
+    "@opencode-ai/plugin": "^1.18.9",
+    "@opentui/solid": "0.4.3"
+  }
+}

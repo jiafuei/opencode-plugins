@@ -1,0 +1,29 @@
+{
+  "name": "@jiafuei/opencode-openai-compaction",
+  "version": "0.0.1",
+  "description": "Replace OpenCode's summary compaction with OpenAI's server-side compact endpoint",
+  "type": "module",
+  "exports": {
+    "./server": "./openai_compaction.ts"
+  },
+  "files": [
+    "openai_compaction.ts",
+    "openai_compaction_shared.ts",
+    "README.md"
+  ],
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "compaction",
+    "openai"
+  ],
+  "engines": {
+    "opencode": ">=1.18.9"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "@opencode-ai/plugin": "^1.18.9"
+  }
+}

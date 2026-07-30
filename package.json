@@ -1,0 +1,16 @@
+{
+  "name": "@jiafuei/opencode-plugins",
+  "type": "module",
+  "private": true,
+  "workspaces": [
+    "plugins/*"
+  ],
+  "scripts": {
+    "test": "bun test plugins",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5"
+  }
+}

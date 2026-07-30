@@ -1,0 +1,28 @@
+{
+  "name": "@jiafuei/opencode-redact-keys",
+  "version": "0.0.1",
+  "description": "Secret redaction for protected files in OpenCode",
+  "type": "module",
+  "exports": {
+    "./server": "./redact_keys.ts"
+  },
+  "files": [
+    "redact_keys.ts",
+    "README.md"
+  ],
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "secrets",
+    "redaction"
+  ],
+  "engines": {
+    "opencode": ">=1.18.9"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "@opencode-ai/plugin": "^1.18.9"
+  }
+}
