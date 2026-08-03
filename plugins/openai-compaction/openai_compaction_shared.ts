@@ -171,3 +171,21 @@ export function compactionDirectory(projectID: string, directory: string): strin
 export function statePath(root: string, sessionID: string): string {
   return join(root, `${sessionID.replace(/[^a-zA-Z0-9._-]/g, "-")}.json`);
 }
+
+export function precedingMessageID(messageID: string): string | undefined {
+  const match = /^msg_([0-9a-fA-F]{12})([0-9a-zA-Z]{14})$/.exec(messageID);
+  if (!match) return undefined;
+  const alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+  const random = match[2]!.split("");
+  for (let index = random.length - 1; index >= 0; index--) {
+    const value = alphabet.indexOf(random[index]!);
+    if (value <= 0) continue;
+    random[index] = alphabet[value - 1]!;
+    random.fill("z", index + 1);
+    return `msg_${match[1]!.toLowerCase()}${random.join("")}`;
+  }
+  const value = BigInt(`0x${match[1]}`);
+  if (value === 0n) return undefined;
+  const time = (value - 1n).toString(16).padStart(12, "0");
+  return `msg_${time}${"z".repeat(14)}`;
+}

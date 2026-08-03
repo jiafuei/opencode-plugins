@@ -7,6 +7,7 @@ import {
   isResponsesEndpoint,
   normalizeEndpoint,
   planRequest,
+  precedingMessageID,
   readCompactedWindow,
   statePath,
   type CompactionState,
@@ -33,6 +34,9 @@ type CompactionOptions = {
 type SessionInfo = {
   contextLimit: number;
   model: string;
+  agent: string;
+  messageID: string;
+  variant?: string;
   failed: boolean;
 };
 
@@ -42,6 +46,23 @@ type LogClient = {
       body: { service: string; level: "debug" | "info" | "warn" | "error"; message: string; extra?: Record<string, unknown> };
       query: { directory: string };
     }): Promise<unknown>;
+  };
+};
+
+type SessionClient = {
+  session: {
+    prompt(input: {
+      path: { id: string };
+      query: { directory: string };
+      body: {
+        messageID: string;
+        model: { providerID: string; modelID: string };
+        agent: string;
+        variant?: string;
+        noReply: true;
+        parts: Array<{ type: "text"; text: string; ignored: true }>;
+      };
+    }): Promise<{ data?: unknown; error?: unknown }>;
   };
 };
 
@@ -60,6 +81,7 @@ const OpenAICompactionPlugin: Plugin = async ({ client, project, directory }, op
   // `Bun.write` creates the parent directory on first save.
   const root = compactionDirectory(project.id, directory);
   const logClient = client as unknown as LogClient;
+  const sessionClient = client as unknown as SessionClient;
   const sessions = new Map<string, SessionInfo>();
   const states = new Map<string, CompactionState | undefined>();
   const originalFetch = globalThis.fetch;
@@ -109,6 +131,30 @@ const OpenAICompactionPlugin: Plugin = async ({ client, project, directory }, op
     return window;
   };
 
+  const showCompactionMessage = async (sessionID: string, info: SessionInfo) => {
+    const messageID = precedingMessageID(info.messageID);
+    if (!messageID) {
+      log("warn", "could not create compaction message before an invalid user message id", {
+        sessionID,
+        messageID: info.messageID,
+      });
+      return;
+    }
+    const result = await sessionClient.session.prompt({
+      path: { id: sessionID },
+      query: { directory },
+      body: {
+        messageID,
+        model: { providerID: "openai", modelID: info.model },
+        agent: info.agent,
+        ...(info.variant ? { variant: info.variant } : {}),
+        noReply: true,
+        parts: [{ type: "text", text: "Compacting context...", ignored: true }],
+      },
+    });
+    if (result.error) throw result.error;
+  };
+
   const rewrite = async (sessionID: string, url: string, body: ResponsesBody, headers: Headers) => {
     const info = sessions.get(sessionID);
     if (!info || info.failed) return undefined;
@@ -131,6 +177,12 @@ const OpenAICompactionPlugin: Plugin = async ({ client, project, directory }, op
       return { body: { ...body, input: plan.input }, fresh: false };
     }
 
+    await showCompactionMessage(sessionID, info).catch((error) => {
+      log("warn", "could not show compaction message", {
+        sessionID,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    });
     const window = await compact(url, headers, {
       model: body.model,
       input: plan.compactInput,
@@ -214,6 +266,9 @@ const OpenAICompactionPlugin: Plugin = async ({ client, project, directory }, op
       sessions.set(input.sessionID, {
         contextLimit: input.model.limit.context,
         model: input.model.id,
+        agent: input.agent,
+        messageID: input.message.id,
+        variant: (input.message.model as typeof input.message.model & { variant?: string }).variant,
         failed: previous?.model === input.model.id ? previous.failed : false,
       });
       output.headers[SESSION_HEADER] = input.sessionID;

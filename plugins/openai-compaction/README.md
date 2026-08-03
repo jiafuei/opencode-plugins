@@ -36,6 +36,7 @@ opencode plugin @jiafuei/opencode-openai-compaction
 ## How it works
 
 - `chat.headers` tags each `openai` turn with the session ID (skipping the `title` and `compaction` agents) and records the model's context limit.
+- Before calling the compact endpoint, the plugin adds a persistent `Compacting context...` message to the transcript. It is a `noReply` user message with an ignored text part, so both the TUI and web UI display it without starting another turn or including it in model input. Its ID sorts immediately before the triggering user message so it cannot become the session's active prompt.
 - The plugin wraps `globalThis.fetch` and intercepts the tagged POSTs to `…/responses`. It runs *inside* OpenCode's built-in codex plugin, so the request is already authenticated and addressed — the same headers are reused for the compact call, and both API-key (`api.openai.com/v1/responses`) and ChatGPT OAuth (`chatgpt.com/backend-api/codex/responses`) sessions work. The session header is always stripped before the request goes out.
 - Compacted windows are stored per session under `${XDG_DATA_HOME:-~/.local/share}/opencode/openai-compaction/<project>/<session>.json` and removed when the session is deleted.
 - Before replaying a window, the plugin fingerprints the history prefix it replaced. The fingerprint ignores text content — so OpenCode's tool-output pruning is harmless — but insertions, reordering, a model switch or OpenCode's own compaction invalidate it, and the plugin falls back to sending the original request.

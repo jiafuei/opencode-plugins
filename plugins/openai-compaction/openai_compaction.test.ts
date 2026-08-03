@@ -5,6 +5,7 @@ import {
   isResponsesEndpoint,
   lastUserTurnIndex,
   planRequest,
+  precedingMessageID,
   readCompactedWindow,
   splitEnvelope,
   type CompactionState,
@@ -15,6 +16,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const ENDPOINT = "https://api.openai.com/v1/responses";
+const USER_MESSAGE_ID = "msg_019000000001ABCDEFGHIJKLMN";
 
 function user(text: string) {
   return { role: "user", content: [{ type: "input_text", text }] };
@@ -69,6 +71,13 @@ describe("endpoints", () => {
     expect(compactUrl("https://chatgpt.com/backend-api/codex/responses")).toBe(
       "https://chatgpt.com/backend-api/codex/responses/compact",
     );
+  });
+
+  test("creates an indicator id before the active user message", () => {
+    const id = precedingMessageID(USER_MESSAGE_ID);
+    expect(id).toMatch(/^msg_[0-9a-f]{12}[0-9a-zA-Z]{14}$/);
+    expect(id! < USER_MESSAGE_ID).toBe(true);
+    expect(precedingMessageID("not-a-message-id")).toBeUndefined();
   });
 });
 
@@ -265,13 +274,31 @@ describe("planRequest", () => {
 
 describe("plugin", () => {
   type Call = { url: string; init: RequestInit };
+  type Indicator = {
+    path: { id: string };
+    query: { directory: string };
+    body: {
+      messageID: string;
+      model: { providerID: string; modelID: string };
+      agent: string;
+      variant?: string;
+      noReply: true;
+      parts: Array<{ type: "text"; text: string; ignored: true }>;
+    };
+  };
 
   async function createHarness(
-    overrides: { compact?: () => Response; main?: () => Response; contextLimit?: number } = {},
+    overrides: {
+      compact?: () => Response;
+      main?: () => Response;
+      indicator?: (input: Indicator) => Promise<{ data?: unknown; error?: unknown }>;
+      contextLimit?: number;
+    } = {},
   ) {
     const dataHome = join(tmpdir(), `openai-compaction-${Bun.hash.wyhash(`${Math.random()}`).toString(16)}`);
     process.env.XDG_DATA_HOME = dataHome;
     const calls: Call[] = [];
+    const indicators: Indicator[] = [];
     const stub = (async (input: string | URL | Request, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
       calls.push({ url, init: init ?? {} });
@@ -289,7 +316,19 @@ describe("plugin", () => {
     const previous = globalThis.fetch;
     globalThis.fetch = stub;
     const hooks = (await plugin.server(
-      { client: { app: { log: async () => {} } }, project: { id: "proj" }, directory: dataHome } as never,
+      {
+        client: {
+          app: { log: async () => {} },
+          session: {
+            prompt: async (input: Indicator) => {
+              indicators.push(input);
+              return overrides.indicator?.(input) ?? { data: {} };
+            },
+          },
+        },
+        project: { id: "proj" },
+        directory: dataHome,
+      } as never,
       { threshold: 0.1 },
     )) as {
       "chat.headers": (input: unknown, output: { headers: Record<string, string> }) => Promise<void>;
@@ -302,6 +341,7 @@ describe("plugin", () => {
       {
         sessionID: "ses_1",
         agent: "build",
+        message: { id: USER_MESSAGE_ID, model: { variant: "high" } },
         model: { providerID: "openai", id: "gpt-5.5", limit: { context: overrides.contextLimit ?? 1_000 } },
       },
       { headers },
@@ -316,6 +356,7 @@ describe("plugin", () => {
 
     return {
       calls,
+      indicators,
       headers,
       send,
       dataHome,
@@ -347,6 +388,18 @@ describe("plugin", () => {
     expect(sent(compactCall).url).toBe(compactUrl(ENDPOINT));
     expect(sentInput(compactCall)).toHaveLength(items.length - 4);
     expect(sentInput(sentCall)).toEqual([{ type: "message", id: "compacted" }, ...items.slice(-4)]);
+    expect(harness.indicators).toHaveLength(1);
+    expect(harness.indicators[0]).toMatchObject({
+      path: { id: "ses_1" },
+      body: {
+        model: { providerID: "openai", modelID: "gpt-5.5" },
+        agent: "build",
+        variant: "high",
+        noReply: true,
+        parts: [{ type: "text", text: "Compacting context...", ignored: true }],
+      },
+    });
+    expect(harness.indicators[0]!.body.messageID < USER_MESSAGE_ID).toBe(true);
     expect(harness.headers["x-opencode-openai-compaction"]).toBe("ses_1");
     expect(new Headers(sent(sentCall).init.headers).get("x-opencode-openai-compaction")).toBeNull();
     expect(await stateFile(harness).exists()).toBe(true);
@@ -355,10 +408,20 @@ describe("plugin", () => {
     harness.calls.length = 0;
     await harness.send(next);
     expect(harness.calls).toHaveLength(1);
+    expect(harness.indicators).toHaveLength(1);
     expect(sentInput(harness.calls[0])).toEqual([
       { type: "message", id: "compacted" },
       ...next.slice(items.length - 4),
     ]);
+    await harness.dispose();
+  });
+
+  test("continues compaction when the indicator message fails", async () => {
+    const harness = await createHarness({ indicator: async () => { throw new Error("indicator failed"); } });
+    await harness.send(history(6));
+    expect(harness.indicators).toHaveLength(1);
+    expect(harness.calls).toHaveLength(2);
+    expect(sent(harness.calls[0]).url).toBe(compactUrl(ENDPOINT));
     await harness.dispose();
   });
 
