@@ -19,7 +19,7 @@ import {
 // {
 //   "plugin": [
 //     ["@jiafuei/opencode-openai-compaction", {
-//       "threshold": 0.7,
+//       "threshold": "70%",
 //       "debug": false
 //     }]
 //   ]
@@ -27,7 +27,7 @@ import {
 
 type CompactionOptions = {
   enabled?: boolean;
-  threshold?: number;
+  threshold?: number | `${number}%`;
   debug?: boolean;
 };
 
@@ -73,9 +73,18 @@ const OpenAICompactionPlugin: Plugin = async ({ client, project, directory }, op
   const config = (options ?? {}) as PluginOptions & CompactionOptions;
   if (config.enabled === false) return {};
 
-  const threshold = config.threshold ?? 0.7;
-  if (typeof threshold !== "number" || threshold <= 0 || threshold > 1) {
-    throw new Error("OpenAI compaction threshold must be a number in (0, 1]");
+  const configuredThreshold = config.threshold ?? 0.7;
+  let threshold: number;
+  if (typeof configuredThreshold === "number") {
+    threshold = configuredThreshold;
+  } else if (typeof configuredThreshold === "string") {
+    const match = /^(\d+(?:\.\d+)?)%$/.exec(configuredThreshold);
+    threshold = match ? Number(match[1]) / 100 : Number.NaN;
+  } else {
+    threshold = Number.NaN;
+  }
+  if (!Number.isFinite(threshold) || threshold <= 0 || (typeof configuredThreshold === "string" && threshold > 1)) {
+    throw new Error("OpenAI compaction threshold must be a positive number or a percentage in (0%, 100%]");
   }
 
   // `Bun.write` creates the parent directory on first save.

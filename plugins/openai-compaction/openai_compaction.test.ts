@@ -270,6 +270,13 @@ describe("planRequest", () => {
         .type,
     ).toBe("passthrough");
   });
+
+  test("uses an absolute token threshold without a known context limit", () => {
+    expect(
+      planRequest({ body: body(history(6)), state: undefined, endpoint: ENDPOINT, contextLimit: 0, threshold: 1_000 })
+        .type,
+    ).toBe("compact");
+  });
 });
 
 describe("plugin", () => {
@@ -293,6 +300,7 @@ describe("plugin", () => {
       main?: () => Response;
       indicator?: (input: Indicator) => Promise<{ data?: unknown; error?: unknown }>;
       contextLimit?: number;
+      threshold?: number | `${number}%`;
     } = {},
   ) {
     const dataHome = join(tmpdir(), `openai-compaction-${Bun.hash.wyhash(`${Math.random()}`).toString(16)}`);
@@ -329,7 +337,7 @@ describe("plugin", () => {
         project: { id: "proj" },
         directory: dataHome,
       } as never,
-      { threshold: 0.1 },
+      { threshold: overrides.threshold ?? 0.1 },
     )) as {
       "chat.headers": (input: unknown, output: { headers: Record<string, string> }) => Promise<void>;
       dispose: () => Promise<void>;
@@ -376,6 +384,22 @@ describe("plugin", () => {
 
   const stateFile = (harness: { dataHome: string }) =>
     Bun.file(join(harness.dataHome, "opencode", "openai-compaction", "proj", "ses_1.json"));
+
+  test("accepts percentage thresholds", async () => {
+    const harness = await createHarness({ threshold: "10%" });
+    await harness.send(history(6));
+    expect(harness.calls).toHaveLength(2);
+    expect(sent(harness.calls[0]).url).toBe(compactUrl(ENDPOINT));
+    await harness.dispose();
+  });
+
+  test("rejects invalid percentage thresholds", async () => {
+    for (const threshold of ["70", "0%", "101%"] as const) {
+      await expect(plugin.server({} as never, { threshold } as never)).rejects.toThrow(
+        "OpenAI compaction threshold must be a positive number or a percentage in (0%, 100%]",
+      );
+    }
+  });
 
   test("compacts an oversized request and replays the window on the next turn", async () => {
     // Sized so the full history is over the threshold but the replayed window plus

@@ -133,8 +133,9 @@ export function planRequest(input: {
   const replayInput = state ? [...envelope, ...base] : undefined;
   const settled: CompactionPlan = replayInput ? { type: "replay", input: replayInput } : { type: "passthrough" };
 
-  if (contextLimit <= 0) return settled;
-  if (estimateTokens([...envelope, ...base]) < contextLimit * threshold) return settled;
+  const tokenThreshold = threshold <= 1 ? contextLimit * threshold : threshold;
+  if (tokenThreshold <= 0) return settled;
+  if (estimateTokens([...envelope, ...base]) < tokenThreshold) return settled;
 
   const tailStart = Math.max(lastUserTurnIndex(base), offset);
   if (tailStart <= offset) return settled;

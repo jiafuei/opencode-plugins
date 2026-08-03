@@ -23,14 +23,14 @@ opencode plugin @jiafuei/opencode-openai-compaction
   "plugin": [
     ["@jiafuei/opencode-openai-compaction", {
       "enabled": true,
-      "threshold": 0.7,
+      "threshold": "70%",
       "debug": false
     }]
   ]
 }
 ```
 
-- `threshold` — fraction of the model's context window at which a request is compacted before being sent (default `0.7`).
+- `threshold` — estimated input size at which a request is compacted before being sent. Use an absolute token count such as `100000`, a percentage such as `"70%"`, or the legacy fractional form `0.7` for 70% of the model's context window (default `0.7`).
 - `debug` — log every replay and mismatch, not just compactions and failures. Logs go to the OpenCode server log under the `openai-compaction` service.
 
 ## How it works
