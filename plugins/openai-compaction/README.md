@@ -24,6 +24,7 @@ opencode plugin @jiafuei/opencode-openai-compaction
     ["@jiafuei/opencode-openai-compaction", {
       "enabled": true,
       "threshold": "70%",
+      "additionalProviders": ["openai-compatible"],
       "debug": false
     }]
   ]
@@ -31,11 +32,12 @@ opencode plugin @jiafuei/opencode-openai-compaction
 ```
 
 - `threshold` — estimated input size at which a request is compacted before being sent. Use an absolute token count such as `100000`, a percentage such as `"70%"`, or the legacy fractional form `0.7` for 70% of the model's context window (default `0.7`).
+- `additionalProviders` — provider IDs to enable in addition to `openai`. Each provider must send OpenAI Responses-shaped requests to a `/responses` endpoint and implement the matching `/responses/compact` contract.
 - `debug` — log every replay and mismatch, not just compactions and failures. Logs go to the OpenCode server log under the `openai-compaction` service.
 
 ## How it works
 
-- `chat.headers` tags each `openai` turn with the session ID (skipping the `title` and `compaction` agents) and records the model's context limit.
+- `chat.headers` tags each enabled provider's turns with the session ID (skipping the `title` and `compaction` agents) and records the provider, model and context limit.
 - Before calling the compact endpoint, the plugin adds a persistent `Compacting context...` message to the transcript. It is a `noReply` user message with an ignored text part, so both the TUI and web UI display it without starting another turn or including it in model input. Its ID sorts immediately before the triggering user message so it cannot become the session's active prompt.
 - The plugin wraps `globalThis.fetch` and intercepts the tagged POSTs to `…/responses`. It runs *inside* OpenCode's built-in codex plugin, so the request is already authenticated and addressed — the same headers are reused for the compact call, and both API-key (`api.openai.com/v1/responses`) and ChatGPT OAuth (`chatgpt.com/backend-api/codex/responses`) sessions work. The session header is always stripped before the request goes out.
 - Compacted windows are stored per session under `${XDG_DATA_HOME:-~/.local/share}/opencode/openai-compaction/<project>/<session>.json` and removed when the session is deleted.
@@ -47,6 +49,7 @@ OpenCode's built-in compaction is deliberately left enabled. Because the wire pa
 ## Limitations
 
 - The compact endpoint contract follows [OpenAI's documented `POST /v1/responses/compact`](https://platform.openai.com/docs/api-reference/responses/compact): the request carries only `model`, `input` and `instructions`, and the response's `output` array is stored verbatim as the window. If the endpoint is unavailable for your account, the plugin logs a warning, marks the session, and every request goes out unmodified.
+- Additional providers are opt-in because supporting an OpenAI-compatible `/responses` endpoint does not guarantee support for `/responses/compact`.
 - The ChatGPT OAuth path (`chatgpt.com/backend-api/codex/responses/compact`) is assumed to mirror that contract, following the pi extension.
 - Only requests with a string body are inspected. The experimental native LLM runtime may issue `Request` objects; those pass through untouched.
 - `globalThis.fetch` is patched process-wide. The filter is narrow (POST + `/responses` + the plugin's own header) and the original is restored on dispose.

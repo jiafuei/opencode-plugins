@@ -20,6 +20,7 @@ import {
 //   "plugin": [
 //     ["@jiafuei/opencode-openai-compaction", {
 //       "threshold": "70%",
+//       "additionalProviders": ["openai-compatible"],
 //       "debug": false
 //     }]
 //   ]
@@ -28,11 +29,13 @@ import {
 type CompactionOptions = {
   enabled?: boolean;
   threshold?: number | `${number}%`;
+  additionalProviders?: string[];
   debug?: boolean;
 };
 
 type SessionInfo = {
   contextLimit: number;
+  providerID: string;
   model: string;
   agent: string;
   messageID: string;
@@ -72,6 +75,7 @@ const SKIPPED_AGENTS = new Set(["title", "compaction"]);
 const OpenAICompactionPlugin: Plugin = async ({ client, project, directory }, options) => {
   const config = (options ?? {}) as PluginOptions & CompactionOptions;
   if (config.enabled === false) return {};
+  const providers = new Set(["openai", ...(config.additionalProviders ?? [])]);
 
   const configuredThreshold = config.threshold ?? 0.7;
   let threshold: number;
@@ -154,7 +158,7 @@ const OpenAICompactionPlugin: Plugin = async ({ client, project, directory }, op
       query: { directory },
       body: {
         messageID,
-        model: { providerID: "openai", modelID: info.model },
+        model: { providerID: info.providerID, modelID: info.model },
         agent: info.agent,
         ...(info.variant ? { variant: info.variant } : {}),
         noReply: true,
@@ -270,15 +274,17 @@ const OpenAICompactionPlugin: Plugin = async ({ client, project, directory }, op
 
   return {
     "chat.headers": async (input, output) => {
-      if (input.model.providerID !== "openai" || SKIPPED_AGENTS.has(input.agent)) return;
+      if (!providers.has(input.model.providerID) || SKIPPED_AGENTS.has(input.agent)) return;
       const previous = sessions.get(input.sessionID);
       sessions.set(input.sessionID, {
         contextLimit: input.model.limit.context,
+        providerID: input.model.providerID,
         model: input.model.id,
         agent: input.agent,
         messageID: input.message.id,
         variant: (input.message.model as typeof input.message.model & { variant?: string }).variant,
-        failed: previous?.model === input.model.id ? previous.failed : false,
+        failed:
+          previous?.providerID === input.model.providerID && previous.model === input.model.id ? previous.failed : false,
       });
       output.headers[SESSION_HEADER] = input.sessionID;
     },

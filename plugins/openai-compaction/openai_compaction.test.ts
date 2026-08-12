@@ -301,6 +301,9 @@ describe("plugin", () => {
       indicator?: (input: Indicator) => Promise<{ data?: unknown; error?: unknown }>;
       contextLimit?: number;
       threshold?: number | `${number}%`;
+      providerID?: string;
+      additionalProviders?: string[];
+      endpoint?: string;
     } = {},
   ) {
     const dataHome = join(tmpdir(), `openai-compaction-${Bun.hash.wyhash(`${Math.random()}`).toString(16)}`);
@@ -337,7 +340,10 @@ describe("plugin", () => {
         project: { id: "proj" },
         directory: dataHome,
       } as never,
-      { threshold: overrides.threshold ?? 0.1 },
+      {
+        threshold: overrides.threshold ?? 0.1,
+        additionalProviders: overrides.additionalProviders,
+      },
     )) as {
       "chat.headers": (input: unknown, output: { headers: Record<string, string> }) => Promise<void>;
       dispose: () => Promise<void>;
@@ -350,13 +356,17 @@ describe("plugin", () => {
         sessionID: "ses_1",
         agent: "build",
         message: { id: USER_MESSAGE_ID, model: { variant: "high" } },
-        model: { providerID: "openai", id: "gpt-5.5", limit: { context: overrides.contextLimit ?? 1_000 } },
+        model: {
+          providerID: overrides.providerID ?? "openai",
+          id: "gpt-5.5",
+          limit: { context: overrides.contextLimit ?? 1_000 },
+        },
       },
       { headers },
     );
 
     const send = (input: unknown[]) =>
-      patched(ENDPOINT, {
+      patched(overrides.endpoint ?? ENDPOINT, {
         method: "POST",
         headers: { ...headers, "content-type": "application/json" },
         body: JSON.stringify(body(input)),
@@ -390,6 +400,37 @@ describe("plugin", () => {
     await harness.send(history(6));
     expect(harness.calls).toHaveLength(2);
     expect(sent(harness.calls[0]).url).toBe(compactUrl(ENDPOINT));
+    await harness.dispose();
+  });
+
+  test("compacts requests from configured additional providers", async () => {
+    const endpoint = "https://openai-compatible.example/v1/responses";
+    const harness = await createHarness({
+      providerID: "openai-compatible",
+      additionalProviders: ["openai-compatible"],
+      endpoint,
+    });
+    await harness.send(history(6));
+
+    expect(harness.calls).toHaveLength(2);
+    expect(sent(harness.calls[0]).url).toBe(compactUrl(endpoint));
+    expect(harness.indicators[0]).toMatchObject({
+      body: { model: { providerID: "openai-compatible", modelID: "gpt-5.5" } },
+    });
+    await harness.dispose();
+  });
+
+  test("leaves unconfigured providers untouched", async () => {
+    const harness = await createHarness({
+      providerID: "openai-compatible",
+      endpoint: "https://openai-compatible.example/v1/responses",
+    });
+    const items = history(6);
+    await harness.send(items);
+
+    expect(harness.calls).toHaveLength(1);
+    expect(sentInput(harness.calls[0])).toEqual(items);
+    expect(harness.indicators).toHaveLength(0);
     await harness.dispose();
   });
 
