@@ -1,0 +1,28 @@
+{
+  "name": "@jiafuei/opencode-anthropic-compaction",
+  "version": "0.0.1",
+  "description": "Enable Anthropic server-side compaction for OpenCode sessions",
+  "type": "module",
+  "exports": {
+    "./server": "./anthropic_compaction.ts"
+  },
+  "files": [
+    "anthropic_compaction.ts",
+    "README.md"
+  ],
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "compaction",
+    "anthropic"
+  ],
+  "engines": {
+    "opencode": ">=1.18.16"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "@opencode-ai/plugin": "^1.18.9"
+  }
+}

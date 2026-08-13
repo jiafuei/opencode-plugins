@@ -4,6 +4,7 @@ Standalone plugins for [OpenCode](https://opencode.ai), maintained as independen
 
 ## Plugins
 
+- [Anthropic compaction](plugins/anthropic-compaction/README.md): compact supported Claude sessions with Anthropic's server-side context management.
 - [Memory](plugins/memory/README.md): project-scoped automatic memory with a `/memory` browser.
 - [Model glob](plugins/model-glob/README.md): search connected model IDs and their available variants.
 - [OpenAI compaction](plugins/openai-compaction/README.md): compact OpenAI sessions with the provider's server-side compact endpoint instead of a summary.
@@ -15,6 +16,7 @@ Standalone plugins for [OpenCode](https://opencode.ai), maintained as independen
 Install a plugin for the current project:
 
 ```sh
+opencode plugin @jiafuei/opencode-anthropic-compaction
 opencode plugin @jiafuei/opencode-memory
 opencode plugin @jiafuei/opencode-model-glob
 opencode plugin @jiafuei/opencode-openai-compaction
