@@ -39,8 +39,6 @@ const SUPPORTED_MODELS = new Set([
 ]);
 const SKIPPED_AGENTS = new Set(["title", "summary", "compaction"]);
 const MINIMUM_TRIGGER = 50_000;
-const DEFAULT_INSTRUCTIONS =
-  "Summarize the transcript inside <summary></summary> tags. Preserve the task state, code, technical decisions, learnings, and next steps needed to continue. Do not call any tools while writing this summary; respond with text only.";
 
 const AnthropicCompactionPlugin: Plugin = async (_input, options) => {
   const config = (options ?? {}) as CompactionOptions;
@@ -85,7 +83,7 @@ const AnthropicCompactionPlugin: Plugin = async (_input, options) => {
           {
             type: "compact_20260112",
             trigger: { type: "input_tokens", value: trigger },
-            instructions: config.instructions ?? DEFAULT_INSTRUCTIONS,
+            ...(config.instructions ? { instructions: config.instructions } : {}),
           },
         ],
       };

@@ -19,8 +19,7 @@ opencode plugin @jiafuei/opencode-anthropic-compaction
       "enabled": true,
       "threshold": "70%",
       "additionalProviders": ["my-anthropic-proxy"],
-      "additionalModels": ["anthropic.claude-sonnet-4-6-v1:0"],
-      "instructions": "Summarize the transcript inside <summary></summary> tags. Preserve the task state, code, technical decisions, learnings, and next steps needed to continue. Do not call any tools while writing this summary; respond with text only."
+      "additionalModels": ["anthropic.claude-sonnet-4-6-v1:0"]
     }]
   ]
 }
@@ -29,7 +28,7 @@ opencode plugin @jiafuei/opencode-anthropic-compaction
 - `threshold` controls the input-token trigger. Use an absolute token count of at least `50000`, a percentage such as `"70%"`, or the fractional form `0.7` for 70% of the model context window. Relative values are clamped to Anthropic's 50,000-token minimum. The default is `"70%"`.
 - `additionalProviders` enables provider IDs in addition to `anthropic`. Their models must still use the `@ai-sdk/anthropic` adapter.
 - `additionalModels` enables upstream or OpenCode model IDs in addition to Anthropic's documented model allowlist. This is useful for proxy and cloud-platform aliases.
-- `instructions` replaces Anthropic's compaction prompt. The default preserves coding-task state and explicitly prevents tool calls during summarization.
+- `instructions` replaces Anthropic's model-specific compaction prompt. When omitted, Anthropic uses its server-side default.
 
 Restart OpenCode after installing the plugin or changing its configuration.
 

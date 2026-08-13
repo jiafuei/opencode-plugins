@@ -45,7 +45,7 @@ describe("configuration", () => {
       type: "compact_20260112",
       trigger: { type: "input_tokens", value: 140_000 },
     });
-    expect(compactionEdit(options).instructions).toContain("Do not call any tools");
+    expect(compactionEdit(options)).not.toHaveProperty("instructions");
   });
 
   test("supports percentages, fractional thresholds, and absolute token counts", async () => {
