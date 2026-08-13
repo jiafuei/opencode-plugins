@@ -39,6 +39,7 @@ const SUPPORTED_MODELS = new Set([
 ]);
 const SKIPPED_AGENTS = new Set(["title", "summary", "compaction"]);
 const MINIMUM_TRIGGER = 50_000;
+const BEDROCK_OPTION = "anthropicCompactionBedrock";
 
 const AnthropicCompactionPlugin: Plugin = async (_input, options) => {
   const config = (options ?? {}) as CompactionOptions;
@@ -64,6 +65,25 @@ const AnthropicCompactionPlugin: Plugin = async (_input, options) => {
   const models = new Set([...SUPPORTED_MODELS, ...(config.additionalModels ?? [])]);
 
   return {
+    config: async (opencodeConfig) => {
+      for (const provider of Object.values(opencodeConfig.provider ?? {})) {
+        const providerOptions = provider.options;
+        if (providerOptions?.[BEDROCK_OPTION] !== true) continue;
+
+        const providerFetch = typeof providerOptions.fetch === "function" ? providerOptions.fetch : undefined;
+        delete providerOptions[BEDROCK_OPTION];
+        providerOptions.fetch = async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+          if (typeof init?.body !== "string") return (providerFetch ?? fetch)(input, init);
+
+          const body = JSON.parse(init.body);
+          if (!body.context_management) return (providerFetch ?? fetch)(input, init);
+
+          body.anthropic_version ??= "bedrock-2023-05-31";
+          body.anthropic_beta = [...new Set([...(body.anthropic_beta ?? []), "compact-2026-01-12"])] as string[];
+          return (providerFetch ?? fetch)(input, { ...init, body: JSON.stringify(body) });
+        };
+      }
+    },
     "chat.params": async (input, output) => {
       if (!providers.has(input.model.providerID) || SKIPPED_AGENTS.has(input.agent)) return;
       if (input.model.api.npm !== "@ai-sdk/anthropic") return;

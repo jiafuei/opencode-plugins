@@ -120,6 +120,63 @@ describe("request gating", () => {
   });
 });
 
+describe("Bedrock proxy requests", () => {
+  test("adds Bedrock fields to compaction requests from marked providers", async () => {
+    const requests: RequestInit[] = [];
+    const providerOptions: Record<string, any> = {
+      anthropicCompactionBedrock: true,
+      fetch: async (_input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+        requests.push(init ?? {});
+        return new Response();
+      },
+    };
+    const hooks = await plugin.server({} as never, {});
+
+    await hooks.config?.({ provider: { "bedrock-proxy": { options: providerOptions } } } as never);
+    await providerOptions.fetch("https://proxy.example/v1/messages", {
+      method: "POST",
+      body: JSON.stringify({
+        model: "claude-sonnet-4-6",
+        anthropic_beta: ["another-beta"],
+        context_management: { edits: [{ type: "compact_20260112" }] },
+      }),
+    });
+
+    expect(providerOptions).not.toHaveProperty("anthropicCompactionBedrock");
+    expect(JSON.parse(requests[0]!.body as string)).toMatchObject({
+      anthropic_version: "bedrock-2023-05-31",
+      anthropic_beta: ["another-beta", "compact-2026-01-12"],
+      context_management: { edits: [{ type: "compact_20260112" }] },
+    });
+  });
+
+  test("leaves unmarked providers and non-compaction bodies unchanged", async () => {
+    const requests: RequestInit[] = [];
+    const markedOptions: Record<string, any> = {
+      anthropicCompactionBedrock: true,
+      fetch: async (_input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+        requests.push(init ?? {});
+        return new Response();
+      },
+    };
+    const unmarkedFetch = async () => new Response();
+    const unmarkedOptions = { fetch: unmarkedFetch };
+    const hooks = await plugin.server({} as never, {});
+
+    await hooks.config?.({
+      provider: {
+        marked: { options: markedOptions },
+        unmarked: { options: unmarkedOptions },
+      },
+    } as never);
+    const body = JSON.stringify({ messages: [] });
+    await markedOptions.fetch("https://proxy.example/v1/messages", { method: "POST", body });
+
+    expect(requests[0]!.body).toBe(body);
+    expect(unmarkedOptions.fetch).toBe(unmarkedFetch);
+  });
+});
+
 describe("context management composition", () => {
   test("preserves other edits and replaces an existing compaction edit", async () => {
     const options = await setup(

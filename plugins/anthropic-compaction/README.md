@@ -21,7 +21,14 @@ opencode plugin @jiafuei/opencode-anthropic-compaction
       "additionalProviders": ["my-anthropic-proxy"],
       "additionalModels": ["anthropic.claude-sonnet-4-6-v1:0"]
     }]
-  ]
+  ],
+  "provider": {
+    "my-anthropic-proxy": {
+      "options": {
+        "anthropicCompactionBedrock": true
+      }
+    }
+  }
 }
 ```
 
@@ -29,6 +36,7 @@ opencode plugin @jiafuei/opencode-anthropic-compaction
 - `additionalProviders` enables provider IDs in addition to `anthropic`. Their models must still use the `@ai-sdk/anthropic` adapter.
 - `additionalModels` enables upstream or OpenCode model IDs in addition to Anthropic's documented model allowlist. This is useful for proxy and cloud-platform aliases.
 - `instructions` replaces Anthropic's model-specific compaction prompt. When omitted, Anthropic uses its server-side default.
+- `provider.<id>.options.anthropicCompactionBedrock` marks a proxy that forwards Bedrock-native request fields. The plugin adds `anthropic_version: "bedrock-2023-05-31"` and `anthropic_beta: ["compact-2026-01-12"]` to request bodies containing `context_management`. This marker does not enable the provider; include its ID in `additionalProviders` as well.
 
 Restart OpenCode after installing the plugin or changing its configuration.
 
@@ -61,12 +69,12 @@ No global fetch patch or separate per-session state is used.
 
 ## Anthropic proxies backed by Bedrock
 
-A Bedrock-backed proxy can work when OpenCode talks to it through `@ai-sdk/anthropic`. Add its OpenCode provider ID to `additionalProviders` and any renamed model ID to `additionalModels`.
+A Bedrock-backed proxy can work when OpenCode talks to it through `@ai-sdk/anthropic`. Add its OpenCode provider ID to `additionalProviders`, set its `anthropicCompactionBedrock` provider option, and add any renamed model ID to `additionalModels`.
 
 The proxy must faithfully implement the Anthropic Messages contract for compaction:
 
 - accept `context_management.edits`
-- forward the `compact-2026-01-12` beta to Bedrock's expected request field
+- accept `anthropic_version` and `anthropic_beta` in the proxy request body and forward them to Bedrock
 - stream `compaction` and `compaction_delta` events
 - accept returned compaction blocks in later assistant messages
 - preserve compaction usage iterations
