@@ -420,8 +420,13 @@ const WorkflowPlugin: Plugin = async ({ client, project, directory }, rawOptions
   const refreshModels = async () => {
     const result = await workerClient.provider.list({ query: { directory } });
     if (!result.data) return;
+    const connected = result.data.connected?.length ? new Set(result.data.connected) : undefined;
     const models = new Set<string>();
-    for (const provider of result.data.all) for (const modelID of Object.keys(provider.models)) models.add(`${provider.id}/${modelID}`);
+    for (const provider of result.data.all) {
+      if (connected && !connected.has(provider.id)) continue;
+      for (const modelID of Object.keys(provider.models)) models.add(`${provider.id}/${modelID}`);
+    }
+    // Falling back to all models when `connected` is missing/empty is deliberate: an empty allowlist would brick every spec that names a modelID, and a parent that is running at all has a working model.
     registeredModels = models.size ? models : undefined;
   };
 

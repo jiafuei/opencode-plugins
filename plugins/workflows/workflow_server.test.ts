@@ -44,6 +44,7 @@ async function createHarness(options: Record<string, unknown> = {}) {
     failChildren: false,
     agents: ["build", "general"],
     models: ["claude"],
+    connected: ["anthropic"],
     agentRefreshes: 0,
     modelRefreshes: 0,
     synthetic: [] as string[],
@@ -54,7 +55,7 @@ async function createHarness(options: Record<string, unknown> = {}) {
   };
   const client = {
     app: { log: async () => ({}), agents: async () => { state.agentRefreshes++; return { data: state.agents.map((name) => ({ name })) }; } },
-    provider: { list: async () => { state.modelRefreshes++; return { data: { all: [{ id: "anthropic", models: Object.fromEntries(state.models.map((id) => [id, {}])) }], default: {}, connected: ["anthropic"] } }; } },
+    provider: { list: async () => { state.modelRefreshes++; return { data: { all: [{ id: "anthropic", models: Object.fromEntries(state.models.map((id) => [id, {}])) }, { id: "offline", models: { ghost: {} } }], default: {}, connected: state.connected } }; } },
     session: {
       create: async (input: { body: { agent?: string; model?: { providerID: string; id: string } } }) => { state.created.push(input.body); return { data: { id: `session-${++state.sessions}` } }; },
       prompt: async (input: { body: { agent: string; format?: unknown; parts: Array<{ text: string }> } }) => {
@@ -161,6 +162,22 @@ describe("workflow server", () => {
     await expect(h.hooks.tool.workflow.execute({ spec: spec([{ id: "p1", title: "Phase", steps: [{ type: "worker", worker: { ...worker("a"), modelID: "anthropic/claude" } }] }]) }, context)).rejects.toThrow("unavailable model");
     expect([h.state.agentRefreshes, h.state.modelRefreshes]).toEqual([2, 2]);
   });
+
+  test("registers only models from connected providers, falling back to all when connected is empty", async () => {
+    const h = await createHarness();
+    const context = { sessionID: "parent-session", messageID: "parent-message", abort: new AbortController().signal, metadata: () => {} };
+    await Bun.write(tuiPresencePath(h.root), JSON.stringify({ heartbeatAt: Date.now() }));
+    const offlineStep = { type: "worker", worker: { ...worker("a"), modelID: "offline/ghost" } };
+
+    await expect(h.hooks.tool.workflow.execute({ spec: spec([{ id: "p1", title: "Phase", steps: [offlineStep] }]) }, context)).rejects.toThrow("unavailable model");
+
+    const { id } = await h.submit(spec([{ id: "p1", title: "Phase", steps: [{ type: "worker", worker: { ...worker("a"), modelID: "anthropic/claude" } }] }]));
+    expect((await h.waitForRun(id, (run) => run.status === "pending")).status).toBe("pending");
+
+    h.state.connected = [];
+    const fallback = await h.submit(spec([{ id: "p1", title: "Phase", steps: [offlineStep] }]));
+    expect((await h.waitForRun(fallback.id, (run) => run.status === "pending")).status).toBe("pending");
+  }, 15_000);
 
   test("approves, renders templates across sequential workers, and completes with a synthetic handoff", async () => {
     const h = await createHarness();
