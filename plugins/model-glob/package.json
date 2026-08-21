@@ -17,12 +17,12 @@
     "search"
   ],
   "engines": {
-    "opencode": ">=1.18.9"
+    "opencode": ">=1.18.21"
   },
   "publishConfig": {
     "access": "public"
   },
   "dependencies": {
-    "@opencode-ai/plugin": "^1.18.9"
+    "@opencode-ai/plugin": "^1.18.21"
   }
 }

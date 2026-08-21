@@ -18,13 +18,13 @@
     "memory"
   ],
   "engines": {
-    "opencode": ">=1.18.9"
+    "opencode": ">=1.18.21"
   },
   "publishConfig": {
     "access": "restricted"
   },
   "dependencies": {
-    "@opencode-ai/plugin": "^1.18.9",
+    "@opencode-ai/plugin": "^1.18.21",
     "@opentui/solid": "0.4.3"
   }
 }
