@@ -47,6 +47,7 @@ async function createHarness(options: Record<string, unknown> = {}) {
     syntheticBody: undefined as { agent?: string; model?: { providerID: string; modelID: string } } | undefined,
     created: [] as Array<{ agent?: string; model?: { providerID: string; id: string } }>,
     onPrompt: undefined as ((agent: string) => void) | undefined,
+    promptDelay: undefined as ((text: string) => number) | undefined,
   };
   const client = {
     app: { log: async () => ({}), agents: async () => { state.agentRefreshes++; return { data: state.agents.map((name) => ({ name })) }; } },
@@ -56,7 +57,7 @@ async function createHarness(options: Record<string, unknown> = {}) {
       prompt: async (input: { body: { agent: string; format?: unknown; parts: Array<{ text: string }> } }) => {
         state.inFlight++;
         state.maxInFlight = Math.max(state.maxInFlight, state.inFlight);
-        await Bun.sleep(50);
+        await Bun.sleep(input.body.format ? 50 : state.promptDelay?.(input.body.parts[0]!.text) ?? 50);
         state.inFlight--;
         state.onPrompt?.(input.body.agent);
         if (input.body.format) {
@@ -261,5 +262,19 @@ describe("workflow server", () => {
     expect(run.limits.maxConcurrency).toBe(3);
     expect(run.workers.c!.status).toBe("completed");
     expect(h.state.maxInFlight).toBe(3);
+  }, 15_000);
+
+  test("frees a concurrency slot as soon as a worker finishes", async () => {
+    const h = await createHarness({ max_concurrency: 2 });
+    h.state.promptDelay = (text) => text.includes("slow") ? 400 : 10;
+    const workers = [worker("slow", "slow"), worker("quick", "quick"), worker("last", "last")];
+    const { id, result } = await h.submit(spec([{ id: "p1", title: "Phase", steps: [{ type: "parallel", id: "group", workers }] }]));
+    await h.control({ runID: id, action: "approve" });
+    await result;
+    const run = await h.waitForRun(id, (item) => item.status === "completed");
+    // Fixed batches would hold "last" until the whole [slow, quick] batch drained; a pool starts it
+    // the moment "quick" releases its slot, so it finishes long before "slow" does.
+    expect(run.workers.last!.endedAt!).toBeLessThan(run.workers.slow!.endedAt!);
+    expect(h.state.maxInFlight).toBe(2);
   }, 15_000);
 });

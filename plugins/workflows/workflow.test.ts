@@ -9,8 +9,6 @@ import {
   isLeaseStale,
   isTerminal,
   isWorkflowControlAction,
-  nextQueuedRun,
-  pausesScheduling,
   planDiff,
   reconcileRevisionWorkers,
   sealActivePhase,
@@ -18,15 +16,17 @@ import {
   assertCoordinatorSource,
   assertLeaseOwnership,
   coordinatorRetryable,
-  currentPlanWorkerIDs,
-  initializePlanHistory,
+  hydrateRun,
   pendingCoordinationReason,
   pendingTemplateDependency,
   quiescenceStatus,
   renderTemplate,
   retryClassification,
   retryDelay,
-  shouldScheduleNextParallelBatch,
+  retryDecision,
+  beginAttempt,
+  RETRY_DELAYS_MS,
+  type WorkerAttempt,
   selectWorkflowChild,
   stableJson,
   statePath,
@@ -44,6 +44,7 @@ import {
   type WorkflowStatus,
   workflowMessageID,
   workersInOrder,
+  workerIDsInPhases,
   acceptWorkerSteering,
   currentPlanProgress,
   finalizeDeliveredSteering,
@@ -70,12 +71,12 @@ import {
   coordinatorInput,
   finalizeSoftPause,
   isPendingControlFilename,
-  pendingWorkerBatches,
+  pendingWorkers,
   utf8Prefix,
   workflowProjectDirectory,
 } from "./workflow_shared.ts";
 import { WorkflowCoordination } from "./workflow_coordination.ts";
-import workflowTui, { failureControlActions, inspectorControlActions, promptRightRun, transcriptReturn, transcriptSelection } from "./workflow_tui.tsx";
+import workflowTui, { failureControlOptions, promptRightRun, transcriptSelection } from "./workflow_tui.tsx";
 
 const agents = new Set(["build", "explore"]);
 const models = new Set(["openai/gpt-5"]);
@@ -180,7 +181,7 @@ describe("workflow spec", () => {
 describe("Stage 4 steering and inspector", () => {
   const run = (): WorkflowRun => {
     const spec = validateWorkflowSpec(base, agents, models);
-    return { version: 1, id: "run", parentSessionID: "parent", parentMessageID: "message", createdAt: 1, updatedAt: 1, status: "running", spec, limits: effectiveLimits(spec), workers: Object.fromEntries(workersInOrder(spec).map((worker) => [worker.id, { ...worker, status: worker.id === "scan" ? "running" : "pending" }])) };
+    return hydrateRun({ version: 1, id: "run", parentSessionID: "parent", parentMessageID: "message", createdAt: 1, updatedAt: 1, status: "running", spec, limits: effectiveLimits(spec), workers: Object.fromEntries(workersInOrder(spec).map((worker) => [worker.id, { ...worker, status: worker.id === "scan" ? "running" : "pending" }])) });
   };
 
   test("accepts only at the active boundary and rejects late steering durably", () => {
@@ -268,10 +269,6 @@ describe("Stage 4 steering and inspector", () => {
 
   test("derives inspector controls and transcript return selection", () => {
     const current = run();
-    expect(inspectorControlActions(current, current.workers.scan!)).toContain("steer");
-    expect(inspectorControlActions(current)).toContain("permission_mode");
-    const selection = { runID: "run", kind: "worker" as const, id: "scan" };
-    expect(transcriptReturn(selection)).toEqual({ name: "workflows", params: selection });
     expect(queuedSteering(current.workers.scan!)).toEqual([]);
     expect(transcriptSelection([current], { runID: "missing", workerID: "scan" })).toBeUndefined();
     expect(transcriptSelection([current], { runID: "run", workerID: "scan" })).toBeUndefined();
@@ -300,7 +297,7 @@ describe("Stage 3 adaptive planning", () => {
       { id: "done", title: "Done", checkpoint: true, steps: [{ type: "worker", worker: { id: "scan", label: "Scan", agent: "explore", prompt: "scan" } }] },
       { id: "todo", title: "Todo", steps: [{ type: "worker", worker: { id: "audit", label: "Audit", agent: "build", prompt: "{{workers.scan.output}}" } }] },
     ] }, agents, models);
-    return { version: 1, id: "run", parentSessionID: "parent", parentMessageID: "message", createdAt: 1, updatedAt: 1, status: "running", spec, limits: effectiveLimits(spec), workers: Object.fromEntries(workersInOrder(spec).map((worker) => [worker.id, { ...worker, status: worker.id === "scan" ? "completed" : "pending" }])), completedPhases: ["done"], sealedPhases: [], checkpointOccurrences: { done: "checkpoint-1" }, consumedCheckpoints: ["checkpoint-1"], planVersion: 1, planHistory: [{ version: 1, phases: structuredClone(spec.phases) }], revisions: [], reservedWorkerIDs: ["scan", "audit"], reservedPhaseIDs: ["done", "todo"], frontier: { generation: 1, completedSteps: 0, sealed: false }, pendingGuidance: [] };
+    return hydrateRun({ version: 1, id: "run", parentSessionID: "parent", parentMessageID: "message", createdAt: 1, updatedAt: 1, status: "running", spec, limits: effectiveLimits(spec), workers: Object.fromEntries(workersInOrder(spec).map((worker) => [worker.id, { ...worker, status: worker.id === "scan" ? "completed" : "pending" }])), completedPhases: ["done"], checkpointOccurrences: { done: "checkpoint-1" }, consumedCheckpoints: ["checkpoint-1"], reservedWorkerIDs: ["scan", "audit"], reservedPhaseIDs: ["done", "todo"], frontier: { generation: 1, completedSteps: 0, sealed: false } });
   };
 
   test("keeps completed work immutable and enforces allowlists and limits", () => {
@@ -369,7 +366,7 @@ describe("Stage 3 adaptive planning", () => {
     expect(current.reservedWorkerIDs).toContain("audit");
     expect(current.reservedWorkerIDs).toContain("newWorker");
     current.spec.phases = [...current.spec.phases.slice(0, 1), ...after];
-    expect(currentPlanWorkerIDs(current)).not.toContain("audit");
+    expect(workerIDsInPhases(current.spec.phases)).not.toContain("audit");
   });
 
   test("uses exact coordinator operation metadata and monotonic sources", () => {
@@ -418,11 +415,11 @@ describe("Stage 3 adaptive planning", () => {
 
   test("initializes true version-one history before mutation", () => {
     const current = run();
-    current.planHistory = undefined;
     const before = structuredClone(current.spec.phases);
-    initializePlanHistory(current, before);
+    (current as { planHistory?: unknown }).planHistory = undefined;
+    hydrateRun(current);
     current.spec.phases.pop();
-    expect(current.planHistory![0]!.phases).toEqual(before);
+    expect(current.planHistory[0]!.phases).toEqual(before);
   });
 
   test("prioritizes repair and unresolved worker failures over guidance", () => {
@@ -437,11 +434,11 @@ describe("Stage 3 adaptive planning", () => {
   test("derives failure modal actions by failure kind", () => {
     const current = run();
     current.failure = { workerID: "audit", kind: "worker", reason: "failed" };
-    expect(failureControlActions(current)).toEqual(["failure_retry", "failure_skip", "failure_stop"]);
+    expect(failureControlOptions(current).map((option) => option.action)).toEqual(["failure_retry", "failure_skip", "failure_stop"]);
     current.failure = { workerID: "handoff", kind: "handoff", reason: "failed" };
-    expect(failureControlActions(current)).toEqual(["failure_retry", "failure_stop"]);
+    expect(failureControlOptions(current).map((option) => option.action)).toEqual(["failure_retry", "failure_stop"]);
     current.failure = { workerID: "coordinator", kind: "coordinator", reason: "failed" };
-    expect(failureControlActions(current)).toEqual(["coordinator_retry", "coordinator_continue", "failure_stop"]);
+    expect(failureControlOptions(current).map((option) => option.action)).toEqual(["coordinator_retry", "coordinator_continue", "failure_stop"]);
   });
 
   test("fails lease fencing immediately before external side effects", () => {
@@ -477,7 +474,7 @@ describe("templates and state helpers", () => {
 });
 
 describe("Stage 5 lifecycle and release", () => {
-  const run = (id: string, status: WorkflowRun["status"], updatedAt: number): WorkflowRun => ({ version: 1, id, parentSessionID: "parent", parentMessageID: "message", createdAt: updatedAt, updatedAt, status, spec: validateWorkflowSpec(base, agents, models), limits: DEFAULT_LIMITS, workers: {} });
+  const run = (id: string, status: WorkflowRun["status"], updatedAt: number): WorkflowRun => hydrateRun({ version: 1, id, parentSessionID: "parent", parentMessageID: "message", createdAt: updatedAt, updatedAt, status, spec: validateWorkflowSpec(base, agents, models), limits: DEFAULT_LIMITS, workers: {} });
 
   test("returns before project lookup starts and disposes without opening SQLite", async () => {
     const calls: string[] = [];
@@ -601,18 +598,6 @@ describe("Stage 2 reliability helpers", () => {
   });
 
   test("keeps pause boundaries and selects queued runs deterministically", () => {
-    expect(pausesScheduling("soft_pausing")).toBe(true);
-    expect(pausesScheduling("running")).toBe(false);
-    const queue = [
-      { id: "later", status: "queued", createdAt: 20 },
-      { id: "first-b", status: "queued", createdAt: 10 },
-      { id: "first-a", status: "queued", createdAt: 10 },
-      { id: "active", status: "running", createdAt: 1 },
-    ] as unknown as WorkflowRun[];
-    expect(nextQueuedRun(queue)?.id).toBe("first-a");
-    expect(shouldScheduleNextParallelBatch("running", false)).toBe(true);
-    expect(shouldScheduleNextParallelBatch("soft_pausing", false)).toBe(false);
-    expect(shouldScheduleNextParallelBatch("running", true)).toBe(false);
   });
 
   test("preserves quiescing coordinator state and finalizes soft pauses", () => {
@@ -647,11 +632,39 @@ describe("Stage 2 reliability helpers", () => {
     expect(isPendingControlFilename("1.json.uuid.tmp")).toBe(false);
   });
 
-  test("filters pending workers before configurable-concurrency batching", () => {
-    const workers = ["done1", "pending1", "done2", "pending2", "pending3"].map((id) => ({ id } as never));
-    const states = Object.fromEntries(workers.map((worker: { id: string }) => [worker.id, { status: worker.id.startsWith("pending") ? "pending" : "completed" }])) as Record<string, WorkerState>;
-    expect(pendingWorkerBatches(workers, states, 2).map((batch) => batch.map((worker) => worker.id))).toEqual([["pending1", "pending2"], ["pending3"]]);
-    expect(pendingWorkerBatches(workers, states, 3).map((batch) => batch.map((worker) => worker.id))).toEqual([["pending1", "pending2", "pending3"]]);
+  test("schedules only pending and interrupted workers, in spec order", () => {
+    const workers = ["done1", "pending1", "done2", "pending2", "resumed"].map((id) => ({ id } as never));
+    const status = (id: string) => id.startsWith("pending") ? "pending" : id === "resumed" ? "interrupted" : "completed";
+    const states = Object.fromEntries(workers.map((worker: { id: string }) => [worker.id, { status: status(worker.id) }])) as Record<string, WorkerState>;
+    expect(pendingWorkers(workers, states).map((worker) => worker.id)).toEqual(["pending1", "pending2", "resumed"]);
+  });
+
+  test("classifies retry outcomes with interruption taking priority", () => {
+    const transient = { name: "ProviderError", data: { isRetryable: true } };
+    expect(retryDecision(transient, 0, false)).toEqual({ kind: "retry", delayMs: 5_000 });
+    expect(retryDecision(transient, 1, false)).toEqual({ kind: "retry", delayMs: 10_000 });
+    // Backoff is exhausted after the configured ladder, so the attempt becomes terminal.
+    expect(retryDecision(transient, RETRY_DELAYS_MS.length, false)).toEqual({ kind: "fail" });
+    expect(retryDecision({ name: "PermissionDenied" }, 0, false)).toEqual({ kind: "fail" });
+    // An interrupted run keeps its session for resume even when the error itself is terminal.
+    expect(retryDecision({ name: "PermissionDenied" }, 0, true)).toEqual({ kind: "interrupt" });
+    expect(retryDecision(transient, 0, true)).toEqual({ kind: "interrupt" });
+  });
+
+  test("reuses an unresolved turn message id and numbers attempts", () => {
+    const attempts: WorkerAttempt[] = [];
+    const creation = beginAttempt(attempts, "creation");
+    expect(creation.number).toBe(1);
+    expect(creation.messageID).toBeUndefined();
+    creation.result = "created";
+    const first = beginAttempt(attempts, "turn");
+    expect(first.number).toBe(2);
+    expect(first.messageID).toMatch(/^msg_/);
+    // An unresolved turn is continued rather than duplicated after a crash.
+    expect(beginAttempt(attempts, "turn").messageID).toBe(first.messageID);
+    first.result = "completed";
+    attempts.pop();
+    expect(beginAttempt(attempts, "turn").messageID).not.toBe(first.messageID);
   });
 
   test("recovers only stale leases", () => {

@@ -4,6 +4,7 @@
 
 - Plugin ID: `workflows`
 - Server tool: `workflow`
+- Authoring command: `/workflow-plan` — drives scope, outline, and user agreement before a spec is submitted
 - TUI command: `/workflows`
 - Purpose: deterministic, programmatic orchestration of OpenCode child agents from an agent-authored declarative specification.
 - Inspiration: Claude Code dynamic workflows, adapted to OpenCode's public v1 plugin and TUI APIs.
@@ -65,6 +66,7 @@ Specification rules:
 - Agents must belong to the approved allowlist; worker models must be available at submission.
 - Phases execute sequentially.
 - Steps execute in order.
+- There is no loop or conditional construct. Fan-out whose width is discovered at runtime, and repeat-until-exhausted work, are expressed only as a `checkpoint` phase plus coordinator expansion; `AUTHORING.md` documents the shapes.
 - Only workers inside an explicit parallel step execute concurrently.
 - Parallel work is capped at two active workers.
 - Nested workflows are denied.

@@ -1,24 +1,13 @@
 /** @jsxImportSource @opentui/solid */
 import type { TuiPlugin, TuiPluginApi, TuiPluginModule } from "@opencode-ai/plugin/tui";
 import { mkdir, readdir, rename, rm, stat } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import { createSignal, For, onCleanup, Show } from "solid-js";
-import { canContinueCoordinatorFailure, canDiscardRun, controlDirectory, currentPlanProgress, isLeaseStale, stableJson, startupActions, statePath, TUI_PRESENCE_STALE_MS, tuiPresencePath, type WorkerState, type WorkflowControlAction, type WorkflowRun, workflowProjectDirectory } from "./workflow_shared.ts";
+import { acceptsPlanChange, atomicWrite, canContinueCoordinatorFailure, canDiscardRun, controlDirectory, currentPlanProgress, hydrateRun, type PersistedRun, isControllable, isLeaseStale, isResumable, stableJson, startupActions, statePath, TUI_PRESENCE_STALE_MS, tuiPresencePath, type WorkerState, type WorkflowControlAction, type WorkflowRun, workflowProjectDirectory } from "./workflow_shared.ts";
 import { WorkflowCoordination } from "./workflow_coordination.ts";
 
 type Control = { runID: string; action: WorkflowControlAction; createdAt: number; guidance?: string; workerID?: string; controlID?: string; leaseToken?: string; leaseGeneration?: number; targetOwner?: string };
 export type InspectorSelection = { runID: string; kind: "run" | "phase" | "group" | "worker"; id: string };
-
-async function atomicWrite(path: string, content: string): Promise<void> {
-  await mkdir(dirname(path), { recursive: true });
-  const temporary = `${path}.${crypto.randomUUID()}.tmp`;
-  try {
-    await Bun.write(temporary, content);
-    await rename(temporary, path);
-  } finally {
-    await rm(temporary, { force: true }).catch(() => {});
-  }
-}
 
 async function projectRoot(api: TuiPluginApi): Promise<string> {
   const current = await api.client.project.current();
@@ -37,7 +26,7 @@ async function readRuns(root: string, cache?: Map<string, RunCacheEntry>): Promi
       const info = await stat(path);
       const cached = cache?.get(id);
       if (cached?.ino === info.ino && cached.mtimeMs === info.mtimeMs && cached.size === info.size) return cached.run;
-      const run = await Bun.file(path).json() as WorkflowRun;
+      const run = hydrateRun(await Bun.file(path).json() as PersistedRun);
       cache?.set(id, { ino: info.ino, mtimeMs: info.mtimeMs, size: info.size, run });
       return run;
     } catch { return undefined; }
@@ -54,33 +43,41 @@ async function sendControl(root: string, control: Control): Promise<string> {
   return submitted.controlID;
 }
 
+/** Controls must name the lease generation they observed, so a stale owner cannot act on them. */
+function leaseRef(coordination: WorkflowCoordination, runID: string): Partial<Control> {
+  const owner = coordination.current();
+  return owner?.runID === runID && !isLeaseStale(owner) ? { targetOwner: owner.ownerIdentity, leaseToken: owner.token, leaseGeneration: owner.generation } : {};
+}
+
+/** The public API exposes no auto-approve value, so it is read off the toggle command's title. */
+function autoApproveFromTitle(title: unknown): boolean | undefined {
+  if (typeof title !== "string") return undefined;
+  return title.startsWith("Disable") ? true : title.startsWith("Enable") ? false : undefined;
+}
+
 function detail(run: WorkflowRun): string {
   const worker = (item: { id: string; label: string; agent: string; modelID?: string; variant?: string; prompt: string; schema?: Record<string, unknown> }) =>
     `${item.id}: ${item.label} [${item.agent}${item.modelID ? `, ${item.modelID}` : ""}${item.variant ? `, variant ${item.variant}` : ""}]\n${item.prompt}${item.schema ? `\nSchema: ${JSON.stringify(item.schema)}` : ""}`;
   return `Internal coordinator/handoff model: ${run.parentModel ? `${run.parentModel.providerID}/${run.parentModel.modelID}` : "originating parent model"}\n` + run.spec.phases.map((phase) => `${phase.title}\n${phase.steps.map((step) => step.type === "worker" ? worker(step.worker) : `${step.title ?? step.id}\n${step.workers.map(worker).join("\n")}`).join("\n")}`).join("\n");
 }
 
-export function failureControlActions(run: WorkflowRun): WorkflowControlAction[] {
-  if (!run.failure) return [];
-  if (run.failure.kind === "coordinator" || run.failure.kind === "repair") return ["coordinator_retry", ...(canContinueCoordinatorFailure(run) ? ["coordinator_continue" as const] : []), "failure_stop"];
-  if (run.failure.kind === "handoff") return ["failure_retry", "failure_stop"];
-  return ["failure_retry", "failure_skip", "failure_stop"];
-}
+export type FailureOption = { action: WorkflowControlAction; title: string; description: string };
 
-export function inspectorControlActions(run: WorkflowRun, worker?: WorkerState): Array<WorkflowControlAction | "permission_mode"> {
-  const actions: Array<WorkflowControlAction | "permission_mode"> = ["permission_mode"];
-  if (run.status === "pending") actions.push("approve", "reject");
-  if (run.status === "running") actions.push("soft_pause", "hard_pause");
-  if (["interrupted", "soft_paused", "hard_paused", "stopped"].includes(run.status)) actions.push("resume");
-  if (["running", "soft_pausing", "soft_paused", "hard_paused", "blocked", "repair_required"].includes(run.status)) actions.push("plan_change");
-  if (worker?.status === "running") actions.push("steer");
-  if (["running", "soft_pausing", "soft_paused", "hard_pausing", "hard_paused", "blocked", "repair_required"].includes(run.status)) actions.push("stop");
-  if (canDiscardRun(run)) actions.push("discard");
-  return [...actions, ...failureControlActions(run)];
-}
-
-export function transcriptReturn(selection: InspectorSelection): { name: string; params: Record<string, unknown> } {
-  return { name: "workflows", params: { runID: selection.runID, kind: selection.kind, id: selection.id } };
+export function failureControlOptions(run: WorkflowRun): FailureOption[] {
+  const failure = run.failure;
+  if (!failure) return [];
+  const stop: FailureOption = { action: "failure_stop", title: `Stop after failure: ${run.spec.name}`, description: failure.reason };
+  if (failure.kind === "coordinator" || failure.kind === "repair") return [
+    { action: "coordinator_retry", title: "Retry coordinator", description: failure.reason },
+    ...(canContinueCoordinatorFailure(run) ? [{ action: "coordinator_continue" as const, title: "Continue existing pending plan", description: "Continue without the rejected revision." }] : []),
+    stop,
+  ];
+  if (failure.kind === "handoff") return [{ action: "failure_retry", title: "Retry final handoff", description: failure.reason }, stop];
+  return [
+    { action: "failure_retry", title: `Retry failed worker: ${failure.workerID}`, description: failure.reason },
+    { action: "failure_skip", title: `Skip failed worker: ${failure.workerID}`, description: "Dependent templates trigger immediate coordinator repair." },
+    stop,
+  ];
 }
 
 export function transcriptSelection(runs: WorkflowRun[], params?: Record<string, unknown>): { run: WorkflowRun; worker: WorkerState } | undefined {
@@ -90,9 +87,9 @@ export function transcriptSelection(runs: WorkflowRun[], params?: Record<string,
 }
 
 export function promptRightRun(runs: WorkflowRun[], lease?: { runID: string; heartbeatAt: number }): WorkflowRun | undefined {
-  const visible = (run: WorkflowRun) => ["pending", "queued", "running", "soft_pausing", "soft_paused", "hard_pausing", "hard_paused", "stopping", "blocked", "repair_required"].includes(run.status);
+  const visible = (run: WorkflowRun) => isControllable(run.status) || ["pending", "queued"].includes(run.status);
   const leased = lease && !isLeaseStale(lease) ? runs.find((run) => run.id === lease.runID && visible(run)) : undefined;
-  return leased ?? runs.find((run) => ["running", "soft_pausing", "soft_paused", "hard_pausing", "hard_paused", "stopping", "blocked", "repair_required"].includes(run.status)) ?? runs.find((run) => ["pending", "queued"].includes(run.status));
+  return leased ?? runs.find((run) => isControllable(run.status)) ?? runs.find((run) => ["pending", "queued"].includes(run.status));
 }
 
 function elapsed(worker: WorkerState): string {
@@ -120,11 +117,11 @@ function Dashboard(props: { runs: () => WorkflowRun[]; api: TuiPluginApi; back: 
       if (selected?.kind === "run" && tab() === "Prompt") return `${run.spec.goal}\n\n${detail(run)}`;
       if (selected?.kind === "run" && tab() === "Result") return run.handoff ? stableJson(run.handoff) : run.error ? `No final handoff\n\n${run.error}` : "No final handoff yet";
       if (selected?.kind === "run" && tab() === "Attempts") return [
-        ...(run.coordinatorOperations ?? []).map((operation) => `Coordinator ${operation.id} ${operation.status}\n${operation.attempts.map((attempt) => `#${attempt.number} ${attempt.kind ?? "turn"} ${attempt.result ?? "running"}${attempt.error ? `: ${attempt.error}` : ""}`).join("\n")}`),
+        ...run.coordinatorOperations.map((operation) => `Coordinator ${operation.id} ${operation.status}\n${operation.attempts.map((attempt) => `#${attempt.number} ${attempt.kind ?? "turn"} ${attempt.result ?? "running"}${attempt.error ? `: ${attempt.error}` : ""}`).join("\n")}`),
         ...(run.handoffAttempts?.length ? [`Handoff\n${run.handoffAttempts.map((attempt) => `#${attempt.number} ${attempt.kind ?? "turn"} ${attempt.result ?? "running"}${attempt.error ? `: ${attempt.error}` : ""}`).join("\n")}`] : []),
       ].join("\n\n") || "No coordinator or handoff attempts";
       const errors = [run.error ? `Error: ${run.error}` : "", ...(run.controlErrors ?? []).map((item) => `Control ${item.action} rejected: ${item.error}`)].filter(Boolean).join("\n");
-      return `${summary}\nStatus: ${run.status}\nProgress: ${ids.filter((id) => run.workers[id]?.status === "completed").length}/${ids.length}, ${ids.filter((id) => run.workers[id]?.status === "running").length} running${errors ? `\n${errors}` : ""}\n${run.revisions?.map((revision) => `Revision ${revision.version} (${revision.reason})\n${revision.rationale}\nBefore:\n${stableJson(revision.before)}\nAfter:\n${stableJson(revision.after)}`).join("\n\n") ?? ""}`;
+      return `${summary}\nStatus: ${run.status}\nProgress: ${ids.filter((id) => run.workers[id]?.status === "completed").length}/${ids.length}, ${ids.filter((id) => run.workers[id]?.status === "running").length} running${errors ? `\n${errors}` : ""}\n${run.revisions.map((revision) => `Revision ${revision.version} (${revision.reason})\n${revision.rationale}\nBefore:\n${stableJson(revision.before)}\nAfter:\n${stableJson(revision.after)}`).join("\n\n")}`;
     }
     if (tab() === "Prompt") return worker.prompt;
     if (tab() === "Result") return worker.output === undefined ? "No accepted result" : stableJson(worker.output);
@@ -135,9 +132,7 @@ function Dashboard(props: { runs: () => WorkflowRun[]; api: TuiPluginApi; back: 
   const [autoApprove, setAutoApprove] = createSignal<boolean | undefined>(undefined);
   const resizeTimer = setInterval(() => {
     if (props.api.renderer.width !== width()) setWidth(props.api.renderer.width);
-    const command = props.api.keymap.getCommands({ visibility: "registered", filter: { name: "permission.mode" } })[0];
-    const title = typeof command?.title === "string" ? command.title : "";
-    setAutoApprove(title.startsWith("Disable") ? true : title.startsWith("Enable") ? false : undefined);
+    setAutoApprove(autoApproveFromTitle(props.api.keymap.getCommands({ visibility: "registered", filter: { name: "permission.mode" } })[0]?.title));
   }, 250);
   onCleanup(() => clearInterval(resizeTimer));
   const narrow = () => width() < 100;
@@ -216,11 +211,10 @@ function TranscriptNotFound(props: { api: TuiPluginApi; params?: Record<string, 
 }
 
 function openSteering(api: TuiPluginApi, root: string, run: WorkflowRun, worker: WorkerState, coordination: WorkflowCoordination): void {
-  const owner = coordination.current();
-  const leaseRef = owner?.runID === run.id && !isLeaseStale(owner) ? { targetOwner: owner.ownerIdentity, leaseToken: owner.token, leaseGeneration: owner.generation } : {};
+  const ref = leaseRef(coordination, run.id);
   api.ui.dialog.replace(() => <api.ui.DialogPrompt title={`Steer: ${worker.label}`} placeholder="Guidance delivered at the next safe turn" onConfirm={(guidance) => {
     if (!guidance.trim()) return;
-    void sendControl(root, { runID: run.id, action: "steer", workerID: worker.id, controlID: crypto.randomUUID(), guidance: guidance.trim(), createdAt: Date.now(), ...leaseRef }).then(() => api.ui.dialog.clear());
+    void sendControl(root, { runID: run.id, action: "steer", workerID: worker.id, controlID: crypto.randomUUID(), guidance: guidance.trim(), createdAt: Date.now(), ...ref }).then(() => api.ui.dialog.clear());
   }} />);
 }
 
@@ -232,7 +226,7 @@ async function openDashboard(api: TuiPluginApi, root: string, coordination: Work
   const choices = current.filter((run) => !selectedRun || run.id === selectedRun.id).flatMap((run) => {
     const actions: Array<{ title: string; description: string; value: Control | "permission_mode" }> = [];
     const targetOwner = healthyLease?.runID === run.id ? healthyLease.ownerIdentity : undefined;
-    const leaseRef = targetOwner ? { targetOwner, leaseToken: healthyLease!.token, leaseGeneration: healthyLease!.generation } : {};
+    const ref = targetOwner ? { targetOwner, leaseToken: healthyLease!.token, leaseGeneration: healthyLease!.generation } : {};
     if (run.status === "pending") {
       if (ownsProject) {
         actions.push({ title: `Queue approved plan: ${run.spec.name}`, description: `${run.spec.goal}\n${detail(run)}`, value: { runID: run.id, action: "queue", createdAt: Date.now() } });
@@ -242,29 +236,24 @@ async function openDashboard(api: TuiPluginApi, root: string, coordination: Work
       }
       actions.push({ title: `Reject: ${run.spec.name}`, description: detail(run), value: { runID: run.id, action: "reject", createdAt: Date.now() } });
     }
-    if (["interrupted", "soft_paused", "hard_paused", "stopped"].includes(run.status)) actions.push({ title: `Resume: ${run.spec.name}`, description: detail(run), value: { runID: run.id, action: "resume", createdAt: Date.now(), ...leaseRef } });
+    if (isResumable(run.status)) actions.push({ title: `Resume: ${run.spec.name}`, description: detail(run), value: { runID: run.id, action: "resume", createdAt: Date.now(), ...ref } });
     if (run.status === "running") {
-      actions.push({ title: `Soft pause: ${run.spec.name}`, description: "Stop scheduling after active work finishes.", value: { runID: run.id, action: "soft_pause", createdAt: Date.now(), ...leaseRef } });
-      actions.push({ title: `Hard pause: ${run.spec.name}`, description: "Interrupt active child sessions and preserve them for continuation.", value: { runID: run.id, action: "hard_pause", createdAt: Date.now(), ...leaseRef } });
+      actions.push({ title: `Soft pause: ${run.spec.name}`, description: "Stop scheduling after active work finishes.", value: { runID: run.id, action: "soft_pause", createdAt: Date.now(), ...ref } });
+      actions.push({ title: `Hard pause: ${run.spec.name}`, description: "Interrupt active child sessions and preserve them for continuation.", value: { runID: run.id, action: "hard_pause", createdAt: Date.now(), ...ref } });
     }
     const worker = selectedWorker && selectedWorker.id in run.workers ? run.workers[selectedWorker.id] : undefined;
-    if (worker?.status === "running") actions.push({ title: `Steer: ${worker.label}`, description: "Append guidance for the next safe turn boundary. The current turn is never aborted.", value: { runID: run.id, action: "steer", workerID: worker.id, controlID: crypto.randomUUID(), createdAt: Date.now(), ...leaseRef } });
-    if (["running", "soft_pausing", "soft_paused", "hard_paused", "blocked", "repair_required"].includes(run.status)) actions.push({ title: `Request plan change: ${run.spec.name}`, description: "Enter guidance after selecting this action. Active work reaches its safe worker/group boundary first.", value: { runID: run.id, action: "plan_change", createdAt: Date.now(), ...leaseRef } });
-    if (["running", "soft_pausing", "soft_paused", "hard_pausing", "hard_paused", "blocked", "repair_required"].includes(run.status)) actions.push({ title: `Stop: ${run.spec.name}`, description: "Release the project lease and leave the run resumable.", value: { runID: run.id, action: "stop", createdAt: Date.now(), ...leaseRef } });
-    if (canDiscardRun(run)) actions.push({ title: `Discard: ${run.spec.name}`, description: "Permanently delete this run and all child sessions after confirmation.", value: { runID: run.id, action: "discard", createdAt: Date.now(), ...leaseRef } });
-    if (run.status === "blocked" && run.failure) {
-      if (run.failure.kind === "coordinator" || run.failure.kind === "repair") {
-        actions.push({ title: "Retry coordinator", description: run.failure.reason, value: { runID: run.id, action: "coordinator_retry", createdAt: Date.now(), ...leaseRef } });
-        if (canContinueCoordinatorFailure(run)) actions.push({ title: "Continue existing pending plan", description: "Continue without the rejected revision.", value: { runID: run.id, action: "coordinator_continue", createdAt: Date.now(), ...leaseRef } });
+    if (worker?.status === "running") actions.push({ title: `Steer: ${worker.label}`, description: "Append guidance for the next safe turn boundary. The current turn is never aborted.", value: { runID: run.id, action: "steer", workerID: worker.id, controlID: crypto.randomUUID(), createdAt: Date.now(), ...ref } });
+    if (acceptsPlanChange(run.status)) actions.push({ title: `Request plan change: ${run.spec.name}`, description: "Enter guidance after selecting this action. Active work reaches its safe worker/group boundary first.", value: { runID: run.id, action: "plan_change", createdAt: Date.now(), ...ref } });
+    if (isControllable(run.status)) actions.push({ title: `Stop: ${run.spec.name}`, description: "Release the project lease and leave the run resumable.", value: { runID: run.id, action: "stop", createdAt: Date.now(), ...ref } });
+    if (canDiscardRun(run)) actions.push({ title: `Discard: ${run.spec.name}`, description: "Permanently delete this run and all child sessions after confirmation.", value: { runID: run.id, action: "discard", createdAt: Date.now(), ...ref } });
+    if (run.status === "blocked") {
+      for (const option of failureControlOptions(run)) {
+        actions.push({ title: option.title, description: option.description, value: { runID: run.id, action: option.action, createdAt: Date.now(), ...ref } });
       }
-      if (run.failure.kind !== "coordinator" && run.failure.kind !== "repair") actions.push({ title: `Retry failed worker: ${run.failure.workerID}`, description: run.failure.reason, value: { runID: run.id, action: "failure_retry", createdAt: Date.now(), ...leaseRef } });
-      if (!run.failure.kind || run.failure.kind === "worker") actions.push({ title: `Skip failed worker: ${run.failure.workerID}`, description: "Dependent templates trigger immediate coordinator repair.", value: { runID: run.id, action: "failure_skip", createdAt: Date.now(), ...leaseRef } });
-      actions.push({ title: `Stop after failure: ${run.spec.name}`, description: run.failure.reason, value: { runID: run.id, action: "failure_stop", createdAt: Date.now(), ...leaseRef } });
     }
     return actions;
   });
-  const permissionTitle = ((): unknown => api.keymap.getCommands({ visibility: "registered", filter: { name: "permission.mode" } })[0]?.title)();
-  const autoApproveState = typeof permissionTitle === "string" ? (permissionTitle.startsWith("Disable") ? true : permissionTitle.startsWith("Enable") ? false : undefined) : undefined;
+  const autoApproveState = autoApproveFromTitle(api.keymap.getCommands({ visibility: "registered", filter: { name: "permission.mode" } })[0]?.title);
   choices.unshift({ title: "Toggle OpenCode auto-approve", description: autoApproveState === true ? "Currently ON. Dispatches permission.mode." : autoApproveState === false ? "Currently off. Dispatches permission.mode." : "Dispatches permission.mode. The public API does not expose a reliable current mode.", value: "permission_mode" });
   api.ui.dialog.replace(() => api.ui.DialogSelect<Control | "permission_mode">({
     title: "Workflow plans",
@@ -373,13 +362,11 @@ const WorkflowTuiPlugin: TuiPlugin = async (api) => {
         }
         if (run.status === "blocked" && previous?.status !== "blocked") {
           if (run.failure && api.route.current.name === "workflows") {
-            const owner = currentCoordination.current();
-            const targetOwner = owner?.runID === run.id && !isLeaseStale(owner) ? owner.ownerIdentity : undefined;
-            const leaseRef = targetOwner ? { targetOwner, leaseToken: owner!.token, leaseGeneration: owner!.generation } : {};
+            const ref = leaseRef(currentCoordination, run.id);
             api.ui.dialog.replace(() => api.ui.DialogSelect<Control>({
               title: `Workflow failure: ${run.failure!.workerID}`,
               placeholder: "Choose a failure decision",
-               options: failureControlActions(run).map((action) => ({ title: action === "coordinator_retry" ? "Retry coordinator" : action === "coordinator_continue" ? "Continue existing plan" : action === "failure_retry" ? "Retry" : action === "failure_skip" ? "Skip" : "Stop", description: run.failure!.reason, value: { runID: run.id, action, createdAt: Date.now(), ...leaseRef } })),
+              options: failureControlOptions(run).map((option) => ({ title: option.title, description: option.description, value: { runID: run.id, action: option.action, createdAt: Date.now(), ...ref } })),
               onSelect: (option) => { void sendControl(currentRoot, option.value).then(() => api.ui.dialog.clear()).catch((error) => api.ui.toast({ variant: "error", title: "Workflows", message: error instanceof Error ? error.message : String(error) })); },
             }));
           } else {
@@ -415,7 +402,14 @@ const WorkflowTuiPlugin: TuiPlugin = async (api) => {
     slots: {
       session_prompt_right(_ctx, props) {
         const visible = () => promptRightRun(runs().filter((run) => run.parentSessionID === props.session_id), lease());
-        return <Show when={visible()}>{(run: () => WorkflowRun) => <text fg={run().status === "pending" ? (blink() ? api.theme.current.warning : api.theme.current.textMuted) : api.theme.current.warning} onMouseDown={() => api.route.navigate("workflows", { runID: run().id, kind: "run", id: run().id })}>WF {run().status === "completed" ? "completed" : ["pending", "queued"].includes(run().status) ? run().status : `${currentPlanProgress(run()).completed}/${currentPlanProgress(run()).total}`} | {currentPlanProgress(run()).running} running</text>}</Show>;
+        // Paused, blocked and stopping runs need naming: a bare progress count reads as healthy progress.
+        const label = (run: WorkflowRun) => {
+          if (run.status === "completed" || ["pending", "queued"].includes(run.status)) return run.status;
+          const progress = currentPlanProgress(run);
+          const stalled = run.status !== "running" ? ` ${run.status}` : "";
+          return `${progress.completed}/${progress.total}${stalled} | ${progress.running} running`;
+        };
+        return <Show when={visible()}>{(run: () => WorkflowRun) => <text fg={run().status === "pending" ? (blink() ? api.theme.current.warning : api.theme.current.textMuted) : ["blocked", "repair_required"].includes(run().status) ? api.theme.current.error : api.theme.current.warning} onMouseDown={() => api.route.navigate("workflows", { runID: run().id, kind: "run", id: run().id })}>WF {label(run())}</text>}</Show>;
       },
     },
   });

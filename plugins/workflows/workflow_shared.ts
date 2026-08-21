@@ -1,5 +1,23 @@
+import { mkdir, rename, rm } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
+
+export async function atomicWrite(path: string, content: string): Promise<void> {
+  await mkdir(dirname(path), { recursive: true });
+  const temporary = `${path}.${crypto.randomUUID()}.tmp`;
+  try {
+    await Bun.write(temporary, content);
+    await rename(temporary, path);
+  } finally {
+    await rm(temporary, { force: true }).catch(() => {});
+  }
+}
+
+/** Resolves early when the signal aborts, so retry backoff never outlives a cancelled run. */
+export async function abortableSleep(delayMs: number, signal: AbortSignal): Promise<void> {
+  if (signal.aborted) return;
+  await Promise.race([Bun.sleep(delayMs), new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }))]);
+}
 
 export type ModelRef = { providerID: string; modelID: string };
 
@@ -98,22 +116,50 @@ export type WorkflowRun = {
   handoffAttempts?: WorkerAttempt[];
   synthesisMessageID?: string;
   synthesisQueuedAt?: number;
-  planVersion?: number;
-  planHistory?: Array<{ version: number; phases: PhaseSpec[] }>;
-  revisions?: PlanRevision[];
-  completedPhases?: string[];
-  checkpointOccurrences?: Record<string, string>;
-  consumedCheckpoints?: string[];
-  pendingGuidance?: WorkflowGuidance[];
-  guidanceGeneration?: number;
-  frontier?: ExecutionFrontier;
-  sealedPhases?: string[];
-  coordinator?: CoordinatorState;
-  coordinatorOperations?: CoordinatorOperation[];
-  reservedWorkerIDs?: string[];
-  reservedPhaseIDs?: string[];
+  planVersion: number;
+  planHistory: Array<{ version: number; phases: PhaseSpec[] }>;
+  revisions: PlanRevision[];
+  completedPhases: string[];
+  checkpointOccurrences: Record<string, string>;
+  consumedCheckpoints: string[];
+  pendingGuidance: WorkflowGuidance[];
+  guidanceGeneration: number;
+  frontier: ExecutionFrontier;
+  sealedPhases: string[];
+  coordinator: CoordinatorState;
+  coordinatorOperations: CoordinatorOperation[];
+  reservedWorkerIDs: string[];
+  reservedPhaseIDs: string[];
   controlErrors?: Array<{ id: string; action: WorkflowControlAction; createdAt: number; rejectedAt: number; error: string; workerID?: string }>;
 };
+
+type HydratedField =
+  | "planVersion" | "planHistory" | "revisions" | "completedPhases" | "sealedPhases" | "checkpointOccurrences"
+  | "consumedCheckpoints" | "pendingGuidance" | "guidanceGeneration" | "frontier" | "coordinator"
+  | "coordinatorOperations" | "reservedWorkerIDs" | "reservedPhaseIDs";
+
+/** A run as it may exist on disk: written before the adaptive-planning fields existed. */
+export type PersistedRun = Omit<WorkflowRun, HydratedField> & Partial<Pick<WorkflowRun, HydratedField>>;
+
+// Adaptive-planning fields are always written at run creation, so every read site can treat them as
+// present. Runs persisted before those fields existed are normalized here, once, as they are loaded.
+export function hydrateRun(run: PersistedRun): WorkflowRun {
+  run.planVersion ??= 1;
+  run.planHistory ??= [{ version: 1, phases: structuredClone(run.spec.phases) }];
+  run.revisions ??= [];
+  run.completedPhases ??= [];
+  run.sealedPhases ??= [];
+  run.checkpointOccurrences ??= {};
+  run.consumedCheckpoints ??= [];
+  run.pendingGuidance ??= [];
+  run.guidanceGeneration ??= 0;
+  run.frontier ??= { generation: 0, completedSteps: 0, sealed: false };
+  run.coordinator ??= { status: "idle" };
+  run.coordinatorOperations ??= [];
+  run.reservedWorkerIDs ??= Object.keys(run.workers);
+  run.reservedPhaseIDs ??= run.spec.phases.map((phase) => phase.id);
+  return run as WorkflowRun;
+}
 export type WorkflowLease = { runID: string; ownerIdentity: string; heartbeatAt: number };
 export type WorkflowHandoff = {
   summary: string;
@@ -310,16 +356,20 @@ export function effectiveLimits(spec: WorkflowSpec, maxConcurrency: number = DEF
   return { ...DEFAULT_LIMITS, ...spec.limits, maxConcurrency };
 }
 
-export function workersInOrder(spec: WorkflowSpec): WorkerSpec[] {
-  return spec.phases.flatMap((phase) => phase.steps.flatMap((step) => step.type === "worker" ? [step.worker] : step.workers));
+export function workersInPhases(phases: PhaseSpec[]): WorkerSpec[] {
+  return phases.flatMap((phase) => phase.steps.flatMap((step) => step.type === "worker" ? [step.worker] : step.workers));
 }
 
-export function currentPlanWorkerIDs(run: WorkflowRun): string[] {
-  return workersInOrder(run.spec).map((worker) => worker.id);
+export function workerIDsInPhases(phases: PhaseSpec[]): string[] {
+  return workersInPhases(phases).map((worker) => worker.id);
+}
+
+export function workersInOrder(spec: WorkflowSpec): WorkerSpec[] {
+  return workersInPhases(spec.phases);
 }
 
 export function currentPlanProgress(run: WorkflowRun): { completed: number; total: number; running: number } {
-  const ids = currentPlanWorkerIDs(run);
+  const ids = workerIDsInPhases(run.spec.phases);
   return { completed: ids.filter((id) => run.workers[id]?.status === "completed").length, total: ids.length, running: ids.filter((id) => run.workers[id]?.status === "running").length };
 }
 
@@ -413,9 +463,8 @@ export function isPendingControlFilename(name: string): boolean {
   return name.endsWith(".json") || /\.json\.[^.]+$/.test(name);
 }
 
-export function pendingWorkerBatches(workers: WorkerSpec[], states: Record<string, WorkerState>, concurrency: number): WorkerSpec[][] {
-  const pending = workers.filter((worker) => states[worker.id]?.status === "pending" || states[worker.id]?.status === "interrupted");
-  return Array.from({ length: Math.ceil(pending.length / concurrency) }, (_, index) => pending.slice(index * concurrency, index * concurrency + concurrency));
+export function pendingWorkers(workers: WorkerSpec[], states: Record<string, WorkerState>): WorkerSpec[] {
+  return workers.filter((worker) => states[worker.id]?.status === "pending" || states[worker.id]?.status === "interrupted");
 }
 
 export function promptResponseError(info: { error?: unknown }): void { if (info.error !== undefined) throw info.error; }
@@ -456,18 +505,19 @@ export function planDiff(before: PhaseSpec[], after: PhaseSpec[]): PlanDiffEntry
 }
 
 export function validatePlanRevision(run: WorkflowRun, pending: unknown): PhaseSpec[] {
-  if ((run.revisions?.length ?? 0) >= run.limits.maxRevisions) throw new Error(`Workflow reached maxRevisions ${run.limits.maxRevisions}`);
-  const immutable = run.spec.phases.filter((phase) => run.completedPhases?.includes(phase.id) || run.sealedPhases?.includes(phase.id));
-  const priorPending = run.spec.phases.filter((phase) => !run.completedPhases?.includes(phase.id) && !run.sealedPhases?.includes(phase.id));
+  if (run.revisions.length >= run.limits.maxRevisions) throw new Error(`Workflow reached maxRevisions ${run.limits.maxRevisions}`);
+  const frozen = (phase: PhaseSpec) => run.completedPhases.includes(phase.id) || run.sealedPhases.includes(phase.id);
+  const immutable = run.spec.phases.filter(frozen);
+  const priorPending = run.spec.phases.filter((phase) => !frozen(phase));
   const candidate = validateWorkflowSpec({ ...run.spec, phases: [...immutable, ...(pending as PhaseSpec[])], limits: { maxWorkers: run.limits.maxWorkers, maxRevisions: run.limits.maxRevisions, maxRunMs: run.limits.maxRunMs } });
-  const immutableIDs = new Set(immutable.flatMap((phase) => phase.steps.flatMap((step) => step.type === "worker" ? [step.worker.id] : step.workers.map((worker) => worker.id))));
-  const historical = new Set(run.reservedWorkerIDs ?? Object.keys(run.workers));
-  const reusable = new Set(priorPending.flatMap((phase) => phase.steps.flatMap((step) => step.type === "worker" ? [step.worker.id] : step.workers.map((worker) => worker.id))));
+  const immutableIDs = new Set(workerIDsInPhases(immutable));
+  const historical = new Set(run.reservedWorkerIDs);
+  const reusable = new Set(workerIDsInPhases(priorPending));
   for (const worker of workersInOrder(candidate)) if (!immutableIDs.has(worker.id) && historical.has(worker.id) && !reusable.has(worker.id)) throw new Error(`Worker id ${worker.id} was already used in plan history`);
-  const allIDs = new Set([...historical, ...workersInOrder(candidate).map((worker) => worker.id)]);
+  const allIDs = new Set([...historical, ...workerIDsInPhases(candidate.phases)]);
   if (allIDs.size > run.limits.maxWorkers) throw new Error(`Workflow history has ${allIDs.size} workers, exceeding maxWorkers ${run.limits.maxWorkers}`);
   const reusablePhases = new Set(priorPending.map((phase) => phase.id));
-  const reservedPhases = new Set(run.reservedPhaseIDs ?? run.spec.phases.map((phase) => phase.id));
+  const reservedPhases = new Set(run.reservedPhaseIDs);
   for (const phase of candidate.phases.slice(immutable.length)) if (reservedPhases.has(phase.id) && !reusablePhases.has(phase.id)) throw new Error(`Phase id ${phase.id} was already used in plan history`);
   if (candidate.allowedAgents.some((agent) => !run.spec.allowedAgents.includes(agent))) throw new Error("Revision expands allowedAgents");
   return candidate.phases.slice(immutable.length);
@@ -475,35 +525,29 @@ export function validatePlanRevision(run: WorkflowRun, pending: unknown): PhaseS
 
 export function sealActivePhase(run: WorkflowRun): void {
   const frontier = run.frontier;
-  if (!frontier?.phaseID || frontier.sealed) return;
+  if (!frontier.phaseID || frontier.sealed) return;
   if (frontier.completedSteps === 0) return;
-  initializePlanHistory(run, run.spec.phases);
   const phase = run.spec.phases.find((item) => item.id === frontier.phaseID)!;
-  const removed = phase.steps.slice(frontier.completedSteps).flatMap((step) => step.type === "worker" ? [step.worker.id] : step.workers.map((worker) => worker.id));
-  for (const id of removed) if (run.workers[id]?.status === "pending") run.workers[id]!.status = "retired";
+  for (const id of workerIDsInPhases([{ ...phase, steps: phase.steps.slice(frontier.completedSteps) }])) {
+    if (run.workers[id]?.status === "pending") run.workers[id]!.status = "retired";
+  }
   phase.steps = phase.steps.slice(0, frontier.completedSteps);
   frontier.sealed = true;
   frontier.generation++;
-  run.sealedPhases ??= [];
   if (!run.sealedPhases.includes(phase.id)) run.sealedPhases.push(phase.id);
 }
 
 export function reconcileRevisionWorkers(run: WorkflowRun, before: PhaseSpec[], after: PhaseSpec[]): void {
-  const beforeIDs = new Set(before.flatMap((phase) => phase.steps.flatMap((step) => step.type === "worker" ? [step.worker.id] : step.workers.map((worker) => worker.id))));
-  const afterWorkers = after.flatMap((phase) => phase.steps.flatMap((step) => step.type === "worker" ? [step.worker] : step.workers));
+  const beforeIDs = new Set(workerIDsInPhases(before));
+  const afterWorkers = workersInPhases(after);
   const afterIDs = new Set(afterWorkers.map((worker) => worker.id));
   for (const id of beforeIDs) if (!afterIDs.has(id) && run.workers[id]?.status === "pending") run.workers[id]!.status = "retired";
   for (const worker of afterWorkers) if (!run.workers[worker.id]) run.workers[worker.id] = { ...worker, status: "pending" };
-  run.reservedWorkerIDs = [...new Set([...(run.reservedWorkerIDs ?? Object.keys(run.workers)), ...afterIDs])];
+  run.reservedWorkerIDs = [...new Set([...run.reservedWorkerIDs, ...afterIDs])];
 }
 
 export function assertCoordinatorSource(run: WorkflowRun, operation: CoordinatorOperation): void {
-  if ((run.planVersion ?? 1) !== operation.sourcePlanVersion || (run.frontier?.generation ?? 0) !== operation.sourceFrontierGeneration) throw new Error("Coordinator source plan or execution frontier changed");
-}
-
-export function initializePlanHistory(run: WorkflowRun, before: PhaseSpec[]): void {
-  run.planVersion ??= 1;
-  run.planHistory ??= [{ version: 1, phases: structuredClone(before) }];
+  if (run.planVersion !== operation.sourcePlanVersion || run.frontier.generation !== operation.sourceFrontierGeneration) throw new Error("Coordinator source plan or execution frontier changed");
 }
 
 export function coordinatorRetryable(error: unknown, policyFailure = false): boolean {
@@ -513,7 +557,7 @@ export function coordinatorRetryable(error: unknown, policyFailure = false): boo
 export function pendingCoordinationReason(run: WorkflowRun): "repair" | "plan_change" | undefined {
   if (run.failure?.kind === "repair") return "repair";
   if (run.failure) return undefined;
-  if (run.pendingGuidance?.length) return "plan_change";
+  if (run.pendingGuidance.length) return "plan_change";
 }
 
 export async function drainPendingCoordination(run: WorkflowRun, coordinate: (reason: "repair" | "plan_change") => Promise<boolean>): Promise<boolean> {
@@ -587,6 +631,31 @@ export function retryDelay(attemptNumber: number): number | undefined {
   return RETRY_DELAYS_MS[attemptNumber - 1];
 }
 
+export type RetryDecision = { kind: "interrupt" | "fail" } | { kind: "retry"; delayMs: number };
+
+/**
+ * The three-way outcome every retry loop shares: an interrupted run keeps its session for resume, an
+ * unretryable or exhausted error is terminal, anything else waits out a backoff. Callers keep their own
+ * bookkeeping — worker state, handoff attempts and coordinator operations record attempts differently.
+ */
+export function retryDecision(error: unknown, retriesSoFar: number, interrupted: boolean): RetryDecision {
+  if (interrupted) return { kind: "interrupt" };
+  const delayMs = retryClassification(error) === "none" ? undefined : retryDelay(retriesSoFar + 1);
+  return delayMs === undefined ? { kind: "fail" } : { kind: "retry", delayMs };
+}
+
+/**
+ * Starts an attempt record. A turn whose message ID was never resolved is reused so a resumed run
+ * continues that same turn instead of opening a duplicate one.
+ */
+export function beginAttempt(attempts: WorkerAttempt[], kind: "creation" | "turn"): WorkerAttempt {
+  const last = attempts.at(-1);
+  const attempt: WorkerAttempt = { number: attempts.length + 1, kind, startedAt: Date.now() };
+  if (kind === "turn") attempt.messageID = last?.kind === "turn" && !last.result ? last.messageID : workflowMessageID();
+  attempts.push(attempt);
+  return attempt;
+}
+
 export function pendingTemplateDependency(spec: WorkflowSpec, workers: Record<string, WorkerState>, skippedWorkerID: string): string | undefined {
   for (const worker of workersInOrder(spec)) {
     if (workers[worker.id]?.status === "pending" && templateDependencies(worker.prompt).includes(skippedWorkerID)) return worker.id;
@@ -597,22 +666,21 @@ export function isLeaseStale(lease: Pick<WorkflowLease, "heartbeatAt">, now = Da
   return now - lease.heartbeatAt > LEASE_STALE_MS;
 }
 
-export function nextQueuedRun(runs: Iterable<WorkflowRun>): WorkflowRun | undefined {
-  return [...runs].filter((run) => run.status === "queued").sort((left, right) => Number(right.replacement) - Number(left.replacement) || left.createdAt - right.createdAt || left.id.localeCompare(right.id))[0];
-}
-
 export function replacementControlDecision(observed: { token?: string; generation?: number }, current?: { token: string; generation: number; heartbeatAt: number }, now = Date.now()): "stop_owner" | "start" | "reject" {
   if (!current || isLeaseStale(current, now)) return "start";
   return current.token === observed.token && current.generation === observed.generation ? "stop_owner" : "reject";
 }
 
-export function pausesScheduling(status: WorkflowStatus): boolean {
-  return status === "soft_pausing" || status === "soft_paused" || status === "hard_pausing" || status === "hard_paused" || status === "stopping" || status === "blocked" || status === "repair_required" || status === "stopped" || status === "interrupted";
-}
+const RESUMABLE = new Set<WorkflowStatus>(["interrupted", "soft_paused", "hard_paused", "stopped"]);
+const CONTROLLABLE = new Set<WorkflowStatus>(["running", "soft_pausing", "soft_paused", "hard_pausing", "hard_paused", "stopping", "blocked", "repair_required"]);
+const ACCEPTS_PLAN_CHANGE = new Set<WorkflowStatus>(["running", "soft_pausing", "soft_paused", "hard_paused", "blocked", "repair_required"]);
 
-export function shouldScheduleNextParallelBatch(status: WorkflowStatus, batchFailed: boolean): boolean {
-  return status === "running" && !batchFailed;
-}
+/** Can be restarted from persisted state through the resume control. */
+export function isResumable(status: WorkflowStatus): boolean { return RESUMABLE.has(status); }
+/** Owns or wants the project lease, so stop/pause controls apply. */
+export function isControllable(status: WorkflowStatus): boolean { return CONTROLLABLE.has(status); }
+/** Has pending work a coordinator revision could still change. */
+export function acceptsPlanChange(status: WorkflowStatus): boolean { return ACCEPTS_PLAN_CHANGE.has(status); }
 
 export function isWorkflowControlAction(value: unknown): value is WorkflowControlAction {
   return typeof value === "string" && ["approve", "queue", "replace", "reject", "soft_pause", "hard_pause", "resume", "stop", "discard", "parent_deleted", "failure_retry", "failure_skip", "failure_stop", "plan_change", "coordinator_retry", "coordinator_continue", "steer"].includes(value);
@@ -651,10 +719,6 @@ export function selectWorkflowChild(children: WorkflowChild[], runID: string, wo
   return children.find((child) => child.metadata?.workflowRunID === runID && (workerID ? child.metadata.workflowWorkerID === workerID : child.metadata.workflowHandoff === true));
 }
 
-export function selectCoordinatorChild(children: WorkflowChild[], runID: string): WorkflowChild | undefined {
-  return children.find((child) => child.metadata?.workflowRunID === runID && child.metadata.workflowCoordinator === true);
-}
-
 export function selectCoordinatorOperationChild(children: WorkflowChild[], runID: string, operationID: string): WorkflowChild | undefined {
   return children.find((child) => child.metadata?.workflowRunID === runID && child.metadata.workflowCoordinatorOperationID === operationID);
 }
@@ -673,7 +737,6 @@ export function runDirectory(root: string, runID: string): string { return join(
 export function statePath(root: string, runID: string): string { return join(runDirectory(root, runID), "state.json"); }
 export function eventPath(root: string, runID: string): string { return join(runDirectory(root, runID), "events.ndjson"); }
 export function controlDirectory(root: string): string { return join(root, "controls"); }
-export function leasePath(root: string): string { return join(root, "lease.json"); }
 
 export function isTerminal(status: WorkflowRun["status"]): boolean {
   return status === "completed" || status === "rejected" || status === "failed" || status === "aborted";
@@ -690,7 +753,7 @@ export function ownedChildSessionIDs(run: WorkflowRun, children: WorkflowChild[]
   const ids = new Set<string>();
   for (const worker of Object.values(run.workers)) if (worker.childSessionID) ids.add(worker.childSessionID);
   if (run.handoffSessionID) ids.add(run.handoffSessionID);
-  for (const operation of run.coordinatorOperations ?? []) if (operation.sessionID) ids.add(operation.sessionID);
+  for (const operation of run.coordinatorOperations) if (operation.sessionID) ids.add(operation.sessionID);
   for (const child of children) if (child.metadata?.workflowRunID === run.id) ids.add(child.id);
   ids.delete(run.parentSessionID);
   return [...ids].sort();
