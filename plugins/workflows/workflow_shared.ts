@@ -503,6 +503,19 @@ export function runStatusView(run: WorkflowRun): Record<string, unknown> {
   };
 }
 
+/** Compact scale/health summary for the parent synthesis message; absent statuses are simply omitted. */
+export function runStats(run: WorkflowRun, now = Date.now()): Record<string, unknown> {
+  const workers: Record<string, number> = {};
+  for (const worker of Object.values(run.workers)) workers[worker.status] = (workers[worker.status] ?? 0) + 1;
+  return {
+    workers,
+    durationMs: Math.max(0, now - run.createdAt),
+    tokens: Object.values(run.workers).reduce((sum, worker) => sum + (worker.tokens?.total ?? 0), 0),
+    planVersion: run.planVersion,
+    revisions: run.revisions.length,
+  };
+}
+
 export function queuedSteering(worker: WorkerState): WorkerSteering[] { return (worker.steering ?? []).filter((item) => item.status === "queued"); }
 
 export function acceptWorkerSteering(run: WorkflowRun, workerID: string, text: string, createdAt: number, id: string = crypto.randomUUID()): WorkerSteering {

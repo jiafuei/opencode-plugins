@@ -193,6 +193,8 @@ describe("workflow server", () => {
     expect(h.state.syntheticBody).toMatchObject({ agent: "parent-agent", model });
     expect(run.handoff?.summary).toBe("done");
     expect(h.state.synthetic[0]).toContain(`<workflow_result run_id="${id}">`);
+    expect(h.state.synthetic[0]).toContain(`run stats: {"workers":{"completed":2},"durationMs":`);
+    expect(h.state.synthetic[0]).toContain(`<handoff>`);
     expect((await h.controlResult("ctl-approve")).status).toBe("accepted");
   }, 15_000);
 

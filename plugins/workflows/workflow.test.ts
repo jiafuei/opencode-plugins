@@ -25,6 +25,7 @@ import {
   retryDelay,
   retryDecision,
   runStatusView,
+  runStats,
   beginAttempt,
   RETRY_DELAYS_MS,
   type WorkerAttempt,
@@ -511,6 +512,21 @@ describe("Stage 3 adaptive planning", () => {
     expect(runStatusView(current).handoff).toBeUndefined();
     current.handoff = { summary: "s", completedWork: [], evidence: [], changedFiles: [], verification: [], unresolvedIssues: [], recommendedNextAction: "n" };
     expect(runStatusView(current).handoff).toBe(true);
+  });
+
+  test("summarizes run scale and health for parent synthesis", () => {
+    const current = run();
+    current.createdAt = 1_000;
+    current.planVersion = 2;
+    (current.revisions as unknown[]).push({});
+    current.workers.scan!.status = "completed";
+    current.workers.audit!.status = "failed";
+    current.workers.scan!.tokens = { input: 10, output: 5, reasoning: 1, cacheRead: 0, cacheWrite: 0, total: 16 };
+    current.workers.audit!.tokens = { input: 2, output: 2, reasoning: 0, cacheRead: 0, cacheWrite: 0, total: 4 };
+    expect(runStats(current, 61_000)).toEqual({ workers: { completed: 1, failed: 1 }, durationMs: 60_000, tokens: 20, planVersion: 2, revisions: 1 });
+    const idle = run();
+    idle.createdAt = 1_000;
+    expect(runStats(idle, 2_000)).toEqual({ workers: { completed: 1, pending: 1 }, durationMs: 1_000, tokens: 0, planVersion: 1, revisions: 0 });
   });
 
   test("fails lease fencing immediately before external side effects", () => {

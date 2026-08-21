@@ -31,6 +31,7 @@ import {
   retryDecision,
   type RetryDecision,
   runStatusView,
+  runStats,
   beginAttempt,
   coordinatorRetryable,
   steeringFollowUp,
@@ -895,7 +896,7 @@ const WorkflowPlugin: Plugin = async ({ client, project, directory }, rawOptions
           const queued = await workerClient.session.promptAsync({
             path: { id: run.parentSessionID }, query: { directory },
             // Without agent/model the parent turn falls back to OpenCode's default agent and switches the parent session to it.
-            body: { messageID: run.synthesisMessageID, ...(parent.agent ? { agent: parent.agent } : {}), ...(model ? { model } : {}), ...(parent.variant ? { variant: parent.variant } : {}), parts: [{ type: "text", synthetic: true, text: `<workflow_result run_id="${run.id}">\n${JSON.stringify(run.handoff, null, 2)}\n</workflow_result>` }] },
+            body: { messageID: run.synthesisMessageID, ...(parent.agent ? { agent: parent.agent } : {}), ...(model ? { model } : {}), ...(parent.variant ? { variant: parent.variant } : {}), parts: [{ type: "text", synthetic: true, text: `<workflow_result run_id="${run.id}">\nrun stats: ${JSON.stringify(runStats(run))}\n<handoff>\n${JSON.stringify(run.handoff, null, 2)}\n</handoff>\n</workflow_result>` }] },
             signal,
           });
           if (queued.error) throw queued.error;
