@@ -237,6 +237,22 @@ describe("workflow server", () => {
     expect(blocked.coordinator?.status).toBe("failed");
   }, 15_000);
 
+  test("blocks recoverably on a worker failure while the tool call stays decoupled from the run", async () => {
+    const h = await createHarness();
+    h.state.failChildren = true;
+    const { id, result } = await h.submit(spec([{ id: "p1", title: "Phase", steps: [workerStep("a")] }]));
+    await h.control({ runID: id, action: "approve" });
+    expect((await result).status).toBe("running");
+    const blocked = await h.waitForRun(id, (item) => item.status === "blocked");
+    expect(blocked.failure?.workerID).toBe("a");
+    expect(blocked.error).toContain("Worker a failed");
+    expect(blocked.terminalAt).toBeUndefined();
+    h.state.failChildren = false;
+    await h.control({ runID: id, action: "failure_retry", controlID: "ctl-retry" });
+    expect((await h.waitForRun(id, (item) => item.status === "completed")).handoff?.summary).toBe("done");
+    expect((await h.controlResult("ctl-retry")).status).toBe("accepted");
+  }, 15_000);
+
   test("ignores stop for a lease-less resumable run instead of crashing", async () => {
     const h = await createHarness();
     const id = "interrupted-run";

@@ -278,6 +278,9 @@ const WorkflowPlugin: Plugin = async ({ client, project, directory }, rawOptions
     const next = writeQueue.then(write, write);
     writeQueue = next.then(() => {}, () => {});
     await next;
+    // A blocked/repair_required run needs a user decision, so release a still-pending workflow tool
+    // call without touching the run itself; resolveWaiter is idempotent.
+    if (run.status === "blocked" || run.status === "repair_required") resolveWaiter(run);
   };
 
   const releaseLease = async (runID: string) => {
@@ -1485,7 +1488,7 @@ const WorkflowPlugin: Plugin = async ({ client, project, directory }, rawOptions
           "",
           "Call the `workflow_authoring` tool for the AUTHORING.md reference with worked examples of the common shapes; it returns the full document.",
           "",
-          "The run starts only after the user approves it in the TUI. Returns { runID, status } once the run is running or queued; the final result arrives later as a synthetic <workflow_result> message in this session — do not wait or poll for it.",
+          "The run starts only after the user approves it in the TUI. Returns { runID, status } once the run is running or queued, or early with status \"blocked\" or \"repair_required\" if the run needs a user decision (worker failure, coordinator failure); the run stays resumable from the TUI dashboard and the final result still arrives later as a synthetic <workflow_result> message in this session — do not wait or poll for it.",
         ].join("\n"),
         args: { spec: SPEC_SCHEMA },
         execute: async (args, context) => {
@@ -1526,7 +1529,10 @@ const WorkflowPlugin: Plugin = async ({ client, project, directory }, rawOptions
               waiter.reject(new Error("Workflow tool was aborted"));
             };
             waiters.set(id, {
-              resolve: (finished) => resolve({ title: `Workflow ${finished.status}`, output: JSON.stringify({ runID: id, status: finished.status, ...(finished.error ? { error: finished.error } : {}) }), metadata: { workflowRunID: id, status: finished.status } }),
+              resolve: (finished) => {
+                const error = finished.error ?? finished.failure?.reason;
+                resolve({ title: `Workflow ${finished.status}`, output: JSON.stringify({ runID: id, status: finished.status, ...(error ? { error } : {}) }), metadata: { workflowRunID: id, status: finished.status } });
+              },
               reject,
               removeAbort: () => context.abort.removeEventListener("abort", abort),
             });
