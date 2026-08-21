@@ -245,7 +245,7 @@ describe("workflow spec", () => {
 describe("Stage 4 steering and inspector", () => {
   const run = (): WorkflowRun => {
     const spec = validateWorkflowSpec(base, agents, models);
-    return hydrateRun({ version: 1, id: "run", parentSessionID: "parent", parentMessageID: "message", createdAt: 1, updatedAt: 1, status: "running", spec, limits: effectiveLimits(spec), workers: Object.fromEntries(workersInOrder(spec).map((worker) => [worker.id, { ...worker, status: worker.id === "scan" ? "running" : "pending" }])) });
+    return hydrateRun({ version: 1, id: "run", parentSessionID: "parent", parentMessageID: "message", createdAt: 1, updatedAt: 1, status: "running", spec, limits: effectiveLimits(spec), workers: Object.fromEntries(workersInOrder(spec).map((worker) => [worker.id, { ...worker, status: worker.id === "scan" ? "running" : "pending", steering: [] }])) });
   };
 
   test("accepts only at the active boundary and rejects late steering durably", () => {
@@ -305,7 +305,7 @@ describe("Stage 4 steering and inspector", () => {
     acceptWorkerSteering({ workers: { scan: worker } } as unknown as WorkflowRun, "scan", "preserve", 1, "s1");
     const delivered = steeringFollowUp(worker)!;
     requeueDeliveredSteering(worker, delivered.ids);
-    expect(worker.steering![0]).toMatchObject({ id: "s1", status: "queued", deliveredAt: undefined });
+    expect(worker.steering[0]).toMatchObject({ id: "s1", status: "queued", deliveredAt: undefined });
     expect(steeringFollowUp(worker)!.ids).toEqual(["s1"]);
   });
 
@@ -326,7 +326,7 @@ describe("Stage 4 steering and inspector", () => {
 
   test("derives current-plan progress without retired history", () => {
     const current = run();
-    current.workers.old = { id: "old", label: "Old", agent: "build", prompt: "old", status: "completed" };
+    current.workers.old = { id: "old", label: "Old", agent: "build", prompt: "old", status: "completed", steering: [] };
     current.workers.audit!.status = "completed";
     current.workers.test!.status = "retired";
     expect(currentPlanProgress(current)).toEqual({ completed: 1, total: 3, running: 1 });
@@ -362,7 +362,7 @@ describe("Stage 3 adaptive planning", () => {
       { id: "done", title: "Done", checkpoint: true, steps: [{ type: "worker", worker: { id: "scan", label: "Scan", agent: "explore", prompt: "scan" } }] },
       { id: "todo", title: "Todo", steps: [{ type: "worker", worker: { id: "audit", label: "Audit", agent: "build", prompt: "{{workers.scan.output}}" } }] },
     ] }, agents, models);
-    return hydrateRun({ version: 1, id: "run", parentSessionID: "parent", parentMessageID: "message", createdAt: 1, updatedAt: 1, status: "running", spec, limits: effectiveLimits(spec), workers: Object.fromEntries(workersInOrder(spec).map((worker) => [worker.id, { ...worker, status: worker.id === "scan" ? "completed" : "pending" }])), completedPhases: ["done"], checkpointOccurrences: { done: "checkpoint-1" }, consumedCheckpoints: ["checkpoint-1"], reservedWorkerIDs: ["scan", "audit"], reservedPhaseIDs: ["done", "todo"], frontier: { generation: 1, completedSteps: 0, sealed: false } });
+    return hydrateRun({ version: 1, id: "run", parentSessionID: "parent", parentMessageID: "message", createdAt: 1, updatedAt: 1, status: "running", spec, limits: effectiveLimits(spec), workers: Object.fromEntries(workersInOrder(spec).map((worker) => [worker.id, { ...worker, status: worker.id === "scan" ? "completed" : "pending", steering: [] }])), completedPhases: ["done"], checkpointOccurrences: { done: "checkpoint-1" }, consumedCheckpoints: ["checkpoint-1"], reservedWorkerIDs: ["scan", "audit"], reservedPhaseIDs: ["done", "todo"], frontier: { generation: 1, completedSteps: 0, sealed: false } });
   };
 
   test("keeps completed work immutable and enforces allowlists and limits", () => {
@@ -412,7 +412,7 @@ describe("Stage 3 adaptive planning", () => {
     current.completedPhases = [];
     const phase = current.spec.phases.find((item) => item.id === "todo")!;
     phase.steps.push({ type: "worker", worker: { id: "later", label: "Later", agent: "build", prompt: "later" } });
-    current.workers.later = { id: "later", label: "Later", agent: "build", prompt: "later", status: "pending" };
+    current.workers.later = { id: "later", label: "Later", agent: "build", prompt: "later", status: "pending", steering: [] };
     current.frontier = { generation: 2, phaseID: "todo", completedSteps: 1, sealed: false };
     sealActivePhase(current);
     expect(current.sealedPhases).toEqual(["todo"]);
@@ -570,7 +570,7 @@ describe("templates and state helpers", () => {
 
   test("marks skipped template dependencies for Stage 3 repair", () => {
     const spec = validateWorkflowSpec(base, agents, models);
-    const workers: Record<string, WorkerState> = Object.fromEntries(workersInOrder(spec).map((worker) => [worker.id, { ...worker, status: "pending" }]));
+    const workers: Record<string, WorkerState> = Object.fromEntries(workersInOrder(spec).map((worker) => [worker.id, { ...worker, status: "pending", steering: [] }]));
     workers.scan!.status = "skipped";
     expect(pendingTemplateDependency(spec, workers, "scan")).toBe("audit");
   });
@@ -611,7 +611,7 @@ describe("Stage 5 lifecycle and release", () => {
 
   test("collects persisted and metadata-reconciled children but never the parent", () => {
     const current = run("run", "completed", 1);
-    current.workers = { one: { id: "one", label: "One", agent: "build", prompt: "x", status: "completed", childSessionID: "worker" } };
+    current.workers = { one: { id: "one", label: "One", agent: "build", prompt: "x", status: "completed", steering: [], childSessionID: "worker" } };
     current.handoffSessionID = "handoff";
     current.coordinatorOperations = [{ id: "op", sourcePlanVersion: 1, sourceFrontierGeneration: 1, reason: "checkpoint", guidanceIDs: [], attempts: [], input: "", status: "accepted", sessionID: "coordinator" }];
     expect(ownedChildSessionIDs(current, [{ id: "retry", metadata: { workflowRunID: "run" } }, { id: "parent", metadata: { workflowRunID: "run" } }, { id: "other", metadata: { workflowRunID: "other" } }])).toEqual(["coordinator", "handoff", "retry", "worker"]);

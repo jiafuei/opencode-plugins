@@ -1,3 +1,4 @@
+import { tool } from "@opencode-ai/plugin";
 import { mkdir, rename, rm } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -83,7 +84,7 @@ export type WorkerState = {
   startedAt?: number;
   endedAt?: number;
   activity?: string;
-  steering?: WorkerSteering[];
+  steering: WorkerSteering[];
   tokens?: TokenUsage;
   automaticRetries?: number;
   creationRetries?: number;
@@ -158,6 +159,7 @@ export function hydrateRun(run: PersistedRun): WorkflowRun {
   run.coordinatorOperations ??= [];
   run.reservedWorkerIDs ??= Object.keys(run.workers);
   run.reservedPhaseIDs ??= run.spec.phases.map((phase) => phase.id);
+  for (const worker of Object.values(run.workers)) worker.steering ??= [];
   return run as WorkflowRun;
 }
 export type WorkflowLease = { runID: string; ownerIdentity: string; heartbeatAt: number };
@@ -173,6 +175,40 @@ export type WorkflowHandoff = {
 
 const ID = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/;
 const TEMPLATE_REFERENCE = /^\s*workers\.([A-Za-z][A-Za-z0-9_-]{0,63})\.output((?:\.[A-Za-z_$][A-Za-z0-9_$]*)*)\s*$/;
+const NONEMPTY_TEXT = tool.schema.custom<string>((value) => typeof value === "string" && !!value.trim(), { message: "must be a non-empty string" });
+const TEXT = tool.schema.custom<string>((value) => typeof value === "string", { message: "must be a string" });
+const IDENTIFIER = tool.schema.custom<string>((value) => typeof value === "string" && !!value.trim() && ID.test(value), { message: "must use letters, numbers, _ or - and begin with a letter" });
+const MODEL_ID = tool.schema.custom<string>((value) => typeof value === "string" && !!value.trim() && /^[^\s/]+\/\S+$/.test(value), { message: 'must be a "providerID/modelID" string such as "openai/gpt-1.0" or "anthropic/claude-sonnet-1.0"' });
+export const WORKER_SCHEMA = tool.schema.object({
+  id: IDENTIFIER.describe("Globally unique across the workflow; letters, digits, _ or -, starting with a letter"),
+  label: NONEMPTY_TEXT,
+  agent: IDENTIFIER.optional().default("general").describe("Defaults to 'general'; must be listed in allowedAgents"),
+  modelID: MODEL_ID.optional().describe('"providerID/modelID"; must be an available model. Omit to inherit the originating session model. Set it explicitly on workers that check other workers, so verification does not repeat the same model\'s mistakes.'),
+  variant: TEXT.optional(),
+  prompt: NONEMPTY_TEXT.describe("Self-contained instructions; the worker sees no conversation history. May embed earlier workers' outputs as {{workers.<id>.output}} (append .field for schema outputs; \\{{ for a literal). Forward and same-step sibling references are rejected. When the worker produces bulk data, name the exact file path it must write to."),
+  schema: tool.schema.record(tool.schema.string(), tool.schema.unknown()).optional().describe("JSON Schema for the worker's structured output; only type, enum, required, properties, additionalProperties, and items are enforced. Keep outputs small — they are byte-truncated to fit the 256 KiB coordinator/handoff cap. For bulk results return {path, count, notes}, not the data."),
+});
+export const WORKFLOW_SPEC_SCHEMA = tool.schema.object({
+  version: tool.schema.literal(1),
+  name: NONEMPTY_TEXT,
+  description: NONEMPTY_TEXT.describe("One line shown in the approval dialog and run tree"),
+  goal: NONEMPTY_TEXT.describe("The complete objective AND the condition that ends the run, in a few full sentences — this is the only context a checkpoint coordinator gets besides worker outputs: it has no tools and no conversation history, so everything it must know between phases belongs here. A workflow that repeats until exhausted must state its stopping rule here or it will not converge."),
+  allowedAgents: tool.schema.array(IDENTIFIER).min(1, { message: "must contain at least one agent" }).describe("Unique registered agents workers may use; also bounds anything a checkpoint coordinator adds later"),
+  phases: tool.schema.array(tool.schema.object({
+    id: IDENTIFIER,
+    title: NONEMPTY_TEXT,
+    checkpoint: tool.schema.boolean().optional().describe("After this phase, a coordinator sees its outputs and rewrites ALL remaining phases. This is the only way to express work whose shape is unknown up front — fan-out over a list this phase discovers, or repeat-until-exhausted. There is no loop construct; end the discovering phase with a checkpoint and let the coordinator write the phases that consume it."),
+    steps: tool.schema.array(tool.schema.discriminatedUnion("type", [
+      tool.schema.object({ type: tool.schema.literal("worker"), worker: WORKER_SCHEMA }),
+      tool.schema.object({ type: tool.schema.literal("parallel"), id: IDENTIFIER, title: NONEMPTY_TEXT.optional(), workers: tool.schema.array(WORKER_SCHEMA).min(1, { message: "must not be empty" }) }),
+    ])).min(1, { message: "must not be empty" }),
+  })).min(1, { message: "must not be empty" }),
+  limits: tool.schema.object({
+    maxWorkers: tool.schema.number().int().min(1).optional().describe("Total worker budget. A checkpoint coordinator may only add (maxWorkers - workers already listed) workers, so a spec with checkpoints must set this well above its own worker count or the expansion silently has no room."),
+    maxRevisions: tool.schema.number().int().min(1).optional().describe("Coordinator revisions allowed; each checkpoint consumes one"),
+    maxRunMs: tool.schema.number().int().min(1).optional(),
+  }).optional(),
+});
 export const DEFAULT_LIMITS: WorkflowLimits = { maxWorkers: 100, maxRevisions: 10, maxRunMs: 6 * 60 * 60 * 1000, maxConcurrency: 2 };
 export const RETRY_DELAYS_MS = [5_000, 10_000, 20_000, 30_000, 40_000] as const;
 export const LEASE_HEARTBEAT_MS = 5_000;
@@ -193,44 +229,9 @@ export function normalizeWorkflowOptions(value: Record<string, unknown> | undefi
 
 export function workflowCeilings(options: WorkflowOptions): WorkflowLimits { return { maxWorkers: options.maxWorkers, maxRevisions: options.maxRevisions, maxRunMs: options.maxRunMs, maxConcurrency: options.maxConcurrency }; }
 
-function object(value: unknown, name: string): Record<string, unknown> {
-  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${name} must be an object`);
-  return value as Record<string, unknown>;
-}
-
-function text(value: unknown, name: string): string {
-  if (typeof value !== "string" || !value.trim()) throw new Error(`${name} must be a non-empty string`);
-  return value;
-}
-
-function modelID(value: unknown, name: string): string {
-  const result = text(value, name);
-  if (!/^[^\s/]+\/\S+$/.test(result)) throw new Error(`${name} must be a "providerID/modelID" string such as "openai/gpt-1.0" or "anthropic/claude-sonnet-1.0"`);
-  return result;
-}
-
 export function parseModelID(value: string): ModelRef {
   const separator = value.indexOf("/");
   return { providerID: value.slice(0, separator), modelID: value.slice(separator + 1) };
-}
-
-function array(value: unknown, name: string): unknown[] {
-  if (!Array.isArray(value)) throw new Error(`${name} must be an array`);
-  return value;
-}
-
-function identifier(value: unknown, name: string): string {
-  const result = text(value, name);
-  if (!ID.test(result)) throw new Error(`${name} must use letters, numbers, _ or - and begin with a letter`);
-  return result;
-}
-
-function limit(value: unknown, name: string, maximum: number, fallback: number): number {
-  if (value === undefined) return fallback;
-  if (!Number.isInteger(value) || (value as number) < 1 || (value as number) > maximum) {
-    throw new Error(`${name} must be an integer from 1 to ${maximum}`);
-  }
-  return value as number;
 }
 
 function templateReferences(prompt: string): Array<{ start: number; end: number; id: string; suffix: string }> {
@@ -280,12 +281,12 @@ export function templateSuffixError(schema: Record<string, unknown> | undefined,
     const types = current.type === undefined ? [] : Array.isArray(current.type) ? current.type : [current.type];
     if (Array.isArray(current.enum) && current.enum.every((item) => !item || typeof item !== "object" || Array.isArray(item))) return `the schema restricts it to scalar enum values (${current.enum.map((item) => JSON.stringify(item)).join(", ")}), which cannot be indexed further`;
     if (types.length === 1 && typeof types[0] === "string" && types[0] !== "object") return `the schema types it as ${types[0]}, which cannot be indexed further`;
-    const properties = current.properties && typeof current.properties === "object" && !Array.isArray(current.properties) ? current.properties as Record<string, unknown> : undefined;
-    const verifiable = types.length === 0 ? !!properties || current.additionalProperties === false : types.length === 1 && types[0] === "object";
+    const properties = current.properties && typeof current.properties === "object" && !Array.isArray(current.properties) ? current.properties as Record<string, unknown> : {};
+    const verifiable = types.length === 0 ? !!Object.keys(properties).length || current.additionalProperties === false : types.length === 1 && types[0] === "object";
     if (!verifiable) return undefined;
-    if (!properties || !(segment in properties)) {
+    if (!(segment in properties)) {
       if (current.additionalProperties !== false) return undefined;
-      const keys = Object.keys(properties ?? {});
+      const keys = Object.keys(properties);
       const listed = keys.slice(0, 8).join(", ") + (keys.length > 8 ? ", …" : "");
       return `the schema has no property "${segment}"${keys.length ? ` (available: ${listed})` : ""}`;
     }
@@ -294,157 +295,72 @@ export function templateSuffixError(schema: Record<string, unknown> | undefined,
   return undefined;
 }
 
-function worker(value: unknown, name: string, allowedAgents: Set<string>, registeredModels: ReadonlySet<string> | undefined, known: Map<string, WorkerSpec>, ids: Set<string>): WorkerSpec {
-  const input = object(value, name);
-  const id = identifier(input.id, `${name}.id`);
-  if (ids.has(id)) throw new Error(`Worker id ${id} is not globally unique`);
-  const agent = input.agent === undefined ? "general" : identifier(input.agent, `${name}.agent`);
-  if (!allowedAgents.has(agent)) throw new Error(`Worker ${id} uses agent ${agent} outside allowedAgents`);
-  const prompt = text(input.prompt, `${name}.prompt`);
-  for (const reference of templateReferences(prompt)) {
-    const dependency = known.get(reference.id);
-    if (!dependency) throw new Error(`Worker ${id} references missing, forward, or sibling worker ${reference.id}`);
-    const problem = templateSuffixError(dependency.schema, reference.suffix);
-    if (problem) throw new Error(`Worker ${id} references {{workers.${reference.id}.output${reference.suffix}}} but ${problem}`);
-  }
-  let selectedModel: string | undefined;
-  if (input.modelID !== undefined) {
-    selectedModel = modelID(input.modelID, `${name}.modelID`);
-    if (registeredModels && !registeredModels.has(selectedModel)) throw new Error(`Worker ${id} uses unavailable model "${selectedModel}"`);
-  }
-  if (input.variant !== undefined && typeof input.variant !== "string") throw new Error(`${name}.variant must be a string`);
-  if (input.schema !== undefined) object(input.schema, `${name}.schema`);
-  ids.add(id);
-  return {
-    id,
-    label: text(input.label, `${name}.label`),
-    agent,
-    ...(selectedModel ? { modelID: selectedModel } : {}),
-    ...(input.variant === undefined ? {} : { variant: input.variant as string }),
-    prompt,
-    ...(input.schema === undefined ? {} : { schema: input.schema as Record<string, unknown> }),
-  };
-}
-
-/** Bundles child-element problems so an enclosing level re-raises them without adding its own redundant message. */
-class ProblemList extends Error {
-  constructor(readonly messages: string[]) { super(messages.join("\n")); }
-}
-
-/**
- * Collects every independent problem instead of failing on the first one, so an LLM author sees all
- * fixes in one round trip. Checks that depend on a value (uniqueness of an invalid id, elements of a
- * non-array) are skipped when that value fails; cross-cutting checks run over successfully parsed
- * items. A single problem throws its plain message unchanged; several throw a numbered list.
- */
 export function validateWorkflowSpec(value: unknown, registeredAgents?: ReadonlySet<string>, registeredModels?: ReadonlySet<string>, ceilings: WorkflowLimits = DEFAULT_LIMITS): WorkflowSpec {
-  const input = object(value, "workflow");
+  const parsed = WORKFLOW_SPEC_SCHEMA.safeParse(value);
+  const path = (parts: PropertyKey[]) => parts.reduce<string>((result, part) => typeof part === "number" ? `${result}[${part}]` : `${result}.${String(part)}`, "workflow");
   const problems: string[] = [];
-  const messages = (error: unknown): string[] => error instanceof ProblemList ? error.messages : [error instanceof Error ? error.message : String(error)];
-  const attempt = <T>(check: () => T): T | undefined => {
-    try { return check(); } catch (error) { problems.push(...messages(error)); }
+  const fail = () => {
+    if (problems.length === 1) throw new Error(problems[0]!);
+    if (problems.length > 1) throw new Error(`workflow spec has ${problems.length} problems:\n${problems.map((problem, index) => `${index + 1}. ${problem}`).join("\n")}`);
   };
+  if (!parsed.success) {
+    problems.push(...parsed.error.issues.map((issue) => `${path(issue.path)} ${issue.message}`));
+    fail();
+  }
 
-  attempt(() => { if (input.version !== 1) throw new Error("workflow.version must be 1"); });
-  const name = attempt(() => text(input.name, "workflow.name"));
-  const description = attempt(() => text(input.description, "workflow.description"));
-  const goal = attempt(() => text(input.goal, "workflow.goal"));
+  const spec = parsed.data as WorkflowSpec;
+  const allowedAgents = new Set(spec.allowedAgents);
+  if (allowedAgents.size !== spec.allowedAgents.length) problems.push("workflow.allowedAgents must contain unique agents");
+  if (registeredAgents) for (const agent of allowedAgents) if (!registeredAgents.has(agent)) problems.push(`workflow.allowedAgents contains unregistered agent "${agent}"`);
+  const limits = {
+    maxWorkers: spec.limits?.maxWorkers ?? ceilings.maxWorkers,
+    maxRevisions: spec.limits?.maxRevisions ?? ceilings.maxRevisions,
+    maxRunMs: spec.limits?.maxRunMs ?? ceilings.maxRunMs,
+  };
+  if (limits.maxWorkers > ceilings.maxWorkers) problems.push(`workflow.limits.maxWorkers must be an integer from 1 to ${ceilings.maxWorkers}`);
+  if (limits.maxRevisions > ceilings.maxRevisions) problems.push(`workflow.limits.maxRevisions must be an integer from 1 to ${ceilings.maxRevisions}`);
+  if (limits.maxRunMs > ceilings.maxRunMs) problems.push(`workflow.limits.maxRunMs must be an integer from 1 to ${ceilings.maxRunMs}`);
 
-  const allowedAgents = attempt(() => {
-    const raw = array(input.allowedAgents, "workflow.allowedAgents");
-    const parsed: string[] = [];
-    const elementProblems: string[] = [];
-    raw.forEach((item, index) => {
-      try { parsed.push(identifier(item, `workflow.allowedAgents[${index}]`)); }
-      catch (error) { elementProblems.push(...messages(error)); }
-    });
-    if (elementProblems.length) throw new ProblemList(elementProblems);
-    if (parsed.length === 0 || new Set(parsed).size !== parsed.length) throw new Error("workflow.allowedAgents must contain unique agents");
-    const unregisteredAgent = registeredAgents ? parsed.find((agent) => !registeredAgents.has(agent)) : undefined;
-    if (unregisteredAgent !== undefined) throw new Error(`workflow.allowedAgents contains unregistered agent "${unregisteredAgent}"`);
-    return parsed;
-  });
-
-  const limits = { maxWorkers: ceilings.maxWorkers, maxRevisions: ceilings.maxRevisions, maxRunMs: ceilings.maxRunMs };
-  attempt(() => {
-    const limitsInput = input.limits === undefined ? {} : object(input.limits, "workflow.limits");
-    limits.maxWorkers = attempt(() => limit(limitsInput.maxWorkers, "workflow.limits.maxWorkers", ceilings.maxWorkers, ceilings.maxWorkers)) ?? ceilings.maxWorkers;
-    limits.maxRevisions = attempt(() => limit(limitsInput.maxRevisions, "workflow.limits.maxRevisions", ceilings.maxRevisions, ceilings.maxRevisions)) ?? ceilings.maxRevisions;
-    limits.maxRunMs = attempt(() => limit(limitsInput.maxRunMs, "workflow.limits.maxRunMs", ceilings.maxRunMs, ceilings.maxRunMs)) ?? ceilings.maxRunMs;
-  });
-
-  // Worker ids and template dependencies are global across phases, so parsing state outlives single phases.
-  const ids = new Set<string>();
+  const workerIDs = new Set<string>();
   const known = new Map<string, WorkerSpec>();
-
-  const parseStep = (stepValue: unknown, phaseIndex: number, stepIndex: number, phaseID: string, allowedAgentSet: Set<string>, groupIDs: Set<string>): WorkerStep | ParallelStep => {
-    const name = `workflow.phases[${phaseIndex}].steps[${stepIndex}]`;
-    const step = object(stepValue, name);
-    if (step.type === "worker") {
-      const result = { type: "worker" as const, worker: worker(step.worker, `${name}.worker`, allowedAgentSet, registeredModels, known, ids) };
-      known.set(result.worker.id, result.worker);
-      return result;
+  const phaseIDs = new Set<string>();
+  const checkWorker = (worker: WorkerSpec) => {
+    if (workerIDs.has(worker.id)) problems.push(`Worker id ${worker.id} is not globally unique`);
+    else workerIDs.add(worker.id);
+    if (!allowedAgents.has(worker.agent)) problems.push(`Worker ${worker.id} uses agent ${worker.agent} outside allowedAgents`);
+    if (worker.modelID && registeredModels && !registeredModels.has(worker.modelID)) problems.push(`Worker ${worker.id} uses unavailable model "${worker.modelID}"`);
+    try {
+      for (const reference of templateReferences(worker.prompt)) {
+        const dependency = known.get(reference.id);
+        if (!dependency) {
+          problems.push(`Worker ${worker.id} references missing, forward, or sibling worker ${reference.id}`);
+          continue;
+        }
+        const problem = templateSuffixError(dependency.schema, reference.suffix);
+        if (problem) problems.push(`Worker ${worker.id} references {{workers.${reference.id}.output${reference.suffix}}} but ${problem}`);
+      }
+    } catch (error) {
+      problems.push(error instanceof Error ? error.message : String(error));
     }
-    if (step.type !== "parallel") throw new Error(`${name}.type must be worker or parallel`);
-    const groupID = identifier(step.id, `${name}.id`);
-    if (groupIDs.has(groupID)) throw new Error(`Parallel group id ${groupID} is not unique in phase ${phaseID}`);
-    groupIDs.add(groupID);
-    const rawWorkers = array(step.workers, `${name}.workers`);
-    if (rawWorkers.length === 0) throw new Error(`${name}.workers must not be empty`);
-    const workers: WorkerSpec[] = [];
-    const workerProblems: string[] = [];
-    rawWorkers.forEach((item, workerIndex) => {
-      try { workers.push(worker(item, `${name}.workers[${workerIndex}]`, allowedAgentSet, registeredModels, known, ids)); }
-      catch (error) { workerProblems.push(...messages(error)); }
-    });
-    const title = step.title === undefined ? undefined : text(step.title, `${name}.title`);
-    if (workerProblems.length) throw new ProblemList(workerProblems);
-    for (const item of workers) known.set(item.id, item);
-    return { type: "parallel" as const, id: groupID, ...(title === undefined ? {} : { title }), workers };
   };
 
-  const parsePhase = (phaseValue: unknown, phaseIndex: number, allowedAgentSet: Set<string>, phaseIDs: Set<string>): PhaseSpec => {
-    const name = `workflow.phases[${phaseIndex}]`;
-    const phase = object(phaseValue, name);
-    const id = identifier(phase.id, `${name}.id`);
-    if (phaseIDs.has(id)) throw new Error(`Phase id ${id} is not unique`);
-    phaseIDs.add(id);
-    if (phase.checkpoint !== undefined && typeof phase.checkpoint !== "boolean") throw new Error(`${name}.checkpoint must be a boolean`);
-    const title = text(phase.title, `${name}.title`);
-    const rawSteps = array(phase.steps, `${name}.steps`);
-    if (rawSteps.length === 0) throw new Error(`${name}.steps must not be empty`);
+  for (const phase of spec.phases) {
+    if (phaseIDs.has(phase.id)) problems.push(`Phase id ${phase.id} is not unique`);
+    else phaseIDs.add(phase.id);
     const groupIDs = new Set<string>();
-    const steps: Array<WorkerStep | ParallelStep> = [];
-    const stepProblems: string[] = [];
-    rawSteps.forEach((stepValue, stepIndex) => {
-      try { steps.push(parseStep(stepValue, phaseIndex, stepIndex, id, allowedAgentSet, groupIDs)); }
-      catch (error) { stepProblems.push(...messages(error)); }
-    });
-    if (stepProblems.length) throw new ProblemList(stepProblems);
-    return { id, title, ...(phase.checkpoint === true ? { checkpoint: true } : {}), steps };
-  };
-
-  const phases = allowedAgents && attempt(() => {
-    const rawPhases = array(input.phases, "workflow.phases");
-    if (rawPhases.length === 0) throw new Error("workflow.phases must not be empty");
-    const allowedAgentSet = new Set(allowedAgents);
-    const phaseIDs = new Set<string>();
-    const parsed: PhaseSpec[] = [];
-    const phaseProblems: string[] = [];
-    rawPhases.forEach((phaseValue, phaseIndex) => {
-      try { parsed.push(parsePhase(phaseValue, phaseIndex, allowedAgentSet, phaseIDs)); }
-      catch (error) { phaseProblems.push(...messages(error)); }
-    });
-    if (phaseProblems.length) throw new ProblemList(phaseProblems);
-    return parsed;
-  });
-
-  if (phases && ids.size > limits.maxWorkers) problems.push(`Workflow has ${ids.size} workers, exceeding maxWorkers ${limits.maxWorkers}`);
-
-  // Each field is defined exactly when its check produced no problem, and any problem throws above.
-  if (problems.length === 1) throw new Error(problems[0]!);
-  if (problems.length > 1) throw new Error(`workflow spec has ${problems.length} problems:\n${problems.map((problem, index) => `${index + 1}. ${problem}`).join("\n")}`);
-  return { version: 1, name: name!, description: description!, goal: goal!, allowedAgents: allowedAgents!, phases: phases!, limits };
+    for (const step of phase.steps) {
+      if (step.type === "parallel") {
+        if (groupIDs.has(step.id)) problems.push(`Parallel group id ${step.id} is not unique in phase ${phase.id}`);
+        else groupIDs.add(step.id);
+      }
+      const workers = step.type === "worker" ? [step.worker] : step.workers;
+      for (const worker of workers) checkWorker(worker);
+      for (const worker of workers) if (!known.has(worker.id)) known.set(worker.id, worker);
+    }
+  }
+  if (workerIDs.size > limits.maxWorkers) problems.push(`Workflow has ${workerIDs.size} workers, exceeding maxWorkers ${limits.maxWorkers}`);
+  fail();
+  return { ...spec, limits };
 }
 
 export function effectiveLimits(spec: WorkflowSpec, maxConcurrency: number = DEFAULT_LIMITS.maxConcurrency): WorkflowLimits {
@@ -512,7 +428,7 @@ export function runStats(run: WorkflowRun, now = Date.now()): Record<string, unk
   };
 }
 
-export function queuedSteering(worker: WorkerState): WorkerSteering[] { return (worker.steering ?? []).filter((item) => item.status === "queued"); }
+export function queuedSteering(worker: WorkerState): WorkerSteering[] { return worker.steering.filter((item) => item.status === "queued"); }
 
 export function acceptWorkerSteering(run: WorkflowRun, workerID: string, text: string, createdAt: number, id: string = crypto.randomUUID()): WorkerSteering {
   const worker = run.workers[workerID];
@@ -524,7 +440,7 @@ export function acceptWorkerSteering(run: WorkflowRun, workerID: string, text: s
     item.finalizedAt = Date.now();
     item.error = "Worker is no longer steerable";
   }
-  if (worker) { worker.steering ??= []; worker.steering.push(item); }
+  if (worker) worker.steering.push(item);
   return item;
 }
 
@@ -537,12 +453,12 @@ export function steeringFollowUp(worker: WorkerState, now = Date.now()): { ids: 
 
 export function finalizeDeliveredSteering(worker: WorkerState, ids: string[], now = Date.now()): void {
   const selected = new Set(ids);
-  for (const item of worker.steering ?? []) if (selected.has(item.id)) { item.status = "finalized"; item.finalizedAt = now; }
+  for (const item of worker.steering) if (selected.has(item.id)) { item.status = "finalized"; item.finalizedAt = now; }
 }
 
 export function requeueDeliveredSteering(worker: WorkerState, ids: string[]): void {
   const selected = new Set(ids);
-  for (const item of worker.steering ?? []) if (selected.has(item.id) && item.status === "delivered") { item.status = "queued"; item.deliveredAt = undefined; }
+  for (const item of worker.steering) if (selected.has(item.id) && item.status === "delivered") { item.status = "queued"; item.deliveredAt = undefined; }
 }
 
 export function workerTurnPrompt(hasResolvedTurn: boolean, turnInCycle: number, continuation: WorkerState["continuation"], followUp?: string, priorError?: string): string {
@@ -569,6 +485,20 @@ export function markedUtf8Prefix(value: string, maxPrefixBytes: number): string 
   return `${prefix}\n…[truncated; first ${Buffer.byteLength(prefix)} of ${total} bytes]`;
 }
 
+export function fitTextToBudget(value: string, fits: (candidate: string) => boolean): string | undefined {
+  if (fits(value)) return value;
+  const total = Buffer.byteLength(value);
+  if (!total) return;
+  let low = 0, high = total - 1;
+  while (low < high) {
+    const middle = Math.ceil((low + high) / 2);
+    if (fits(markedUtf8Prefix(value, middle))) low = middle;
+    else high = middle - 1;
+  }
+  const candidate = markedUtf8Prefix(value, low);
+  return fits(candidate) ? candidate : undefined;
+}
+
 export function compactWorkerFailures(workers: Record<string, WorkerState>): Array<{ id: string; status: WorkerState["status"]; error?: string }> {
   return Object.values(workers).filter((worker) => ["failed", "skipped", "aborted"].includes(worker.status)).map((worker) => ({ id: worker.id, status: worker.status, ...(worker.error === undefined ? {} : { error: markedUtf8Prefix(worker.error, 2_048) }) }));
 }
@@ -576,24 +506,13 @@ export function compactWorkerFailures(workers: Record<string, WorkerState>): Arr
 export function coordinatorInput(payload: { outputs: Array<{ id: string; output: string }> }, outputs: Array<{ id: string; output: string }>, maxBytes: number): string | undefined {
   if (Buffer.byteLength(JSON.stringify(payload)) > maxBytes) return;
   for (const output of outputs) {
-    payload.outputs.push(output);
-    if (Buffer.byteLength(JSON.stringify(payload)) <= maxBytes) continue;
-    payload.outputs.pop();
-    const outputBytes = Buffer.byteLength(output.output);
-    if (!outputBytes) continue;
-    let low = 0, high = outputBytes - 1;
-    while (low < high) {
-      const middle = Math.ceil((low + high) / 2);
-      const candidate = { id: output.id, output: markedUtf8Prefix(output.output, middle) };
-      payload.outputs.push(candidate);
+    const fitted = fitTextToBudget(output.output, (candidate) => {
+      payload.outputs.push({ id: output.id, output: candidate });
       const fits = Buffer.byteLength(JSON.stringify(payload)) <= maxBytes;
       payload.outputs.pop();
-      if (fits) low = middle;
-      else high = middle - 1;
-    }
-    const candidate = { id: output.id, output: markedUtf8Prefix(output.output, low) };
-    payload.outputs.push(candidate);
-    if (Buffer.byteLength(JSON.stringify(payload)) > maxBytes) payload.outputs.pop();
+      return fits;
+    });
+    if (fitted !== undefined) payload.outputs.push({ id: output.id, output: fitted });
   }
   return JSON.stringify(payload);
 }
@@ -693,7 +612,7 @@ export function reconcileRevisionWorkers(run: WorkflowRun, before: PhaseSpec[], 
   const afterWorkers = workersInPhases(after);
   const afterIDs = new Set(afterWorkers.map((worker) => worker.id));
   for (const id of beforeIDs) if (!afterIDs.has(id) && run.workers[id]?.status === "pending") run.workers[id]!.status = "retired";
-  for (const worker of afterWorkers) if (!run.workers[worker.id]) run.workers[worker.id] = { ...worker, status: "pending" };
+  for (const worker of afterWorkers) if (!run.workers[worker.id]) run.workers[worker.id] = { ...worker, status: "pending", steering: [] };
   run.reservedWorkerIDs = [...new Set([...run.reservedWorkerIDs, ...afterIDs])];
 }
 
