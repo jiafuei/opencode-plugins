@@ -406,11 +406,11 @@ export function requeueDeliveredSteering(worker: WorkerState, ids: string[]): vo
   for (const item of worker.steering ?? []) if (selected.has(item.id) && item.status === "delivered") { item.status = "queued"; item.deliveredAt = undefined; }
 }
 
-export function workerTurnPrompt(hasResolvedTurn: boolean, turnInCycle: number, continuation: WorkerState["continuation"], followUp?: string): string {
+export function workerTurnPrompt(hasResolvedTurn: boolean, turnInCycle: number, continuation: WorkerState["continuation"], followUp?: string, priorError?: string): string {
   if (followUp) return followUp;
   if (!hasResolvedTurn) return "original";
   if (continuation === "resume") return "Continue the interrupted work. Return the requested final result.";
-  return "Your prior attempt failed. Correct the issue and return the requested final result.";
+  return priorError ? `Your prior attempt failed with this error:\n\n${priorError}\n\nCorrect the issue and return the requested final result.` : "Your prior attempt failed. Correct the issue and return the requested final result.";
 }
 
 export function utf8Prefix(value: string, maxBytes: number): string {

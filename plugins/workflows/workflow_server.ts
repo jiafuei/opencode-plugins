@@ -547,8 +547,9 @@ const WorkflowPlugin: Plugin = async ({ client, project, directory }, rawOptions
       for (let attemptNumber = 1; ; attemptNumber++) {
         state.attempts ??= [];
         const attempt = beginAttempt(state.attempts, "turn");
-        const hasResolvedTurn = !!state.attempts.slice(0, -1).find((item) => item.kind === "turn" && item.result);
-        const selectedPrompt = workerTurnPrompt(hasResolvedTurn, attemptNumber, state.continuation, followUp?.prompt);
+        const priorAttempts = state.attempts.slice(0, -1);
+        const hasResolvedTurn = !!priorAttempts.find((item) => item.kind === "turn" && item.result);
+        const selectedPrompt = workerTurnPrompt(hasResolvedTurn, attemptNumber, state.continuation, followUp?.prompt, priorAttempts.filter((item) => item.kind === "turn" && item.error).at(-1)?.error);
         const continuation = selectedPrompt === "original" ? prompt : selectedPrompt;
         attempt.steeringIDs = followUp?.ids;
         attempt.retryCycle = state.automaticRetries ?? 0;
@@ -701,9 +702,10 @@ const WorkflowPlugin: Plugin = async ({ client, project, directory }, rawOptions
     if (operation.sessionID) activeSessions.get(run.id)?.add(operation.sessionID);
     for (let retry = operation.attempts.filter((item) => item.kind === "turn" && item.result === "retrying").length; operation.sessionID && retry <= 5; retry++) {
       const attempt = beginAttempt(operation.attempts, "turn");
+      const priorError = operation.attempts.slice(0, -1).filter((item) => item.kind === "turn" && item.error).at(-1)?.error;
       try {
         assertOwned(run);
-        const response = await workerClient.session.prompt({ path: { id: operation.sessionID }, query: { directory }, signal, body: { messageID: attempt.messageID, agent: COORDINATOR_AGENT, ...(model ? { model } : {}), format: { type: "json_schema", schema: COORDINATOR_SCHEMA, retryCount: 0 }, parts: [{ type: "text", text: retry ? "Correct malformed structured output and return the required result." : COORDINATOR_PROMPT + operation.input }] } });
+        const response = await workerClient.session.prompt({ path: { id: operation.sessionID }, query: { directory }, signal, body: { messageID: attempt.messageID, agent: COORDINATOR_AGENT, ...(model ? { model } : {}), format: { type: "json_schema", schema: COORDINATOR_SCHEMA, retryCount: 0 }, parts: [{ type: "text", text: retry ? `Your prior attempt failed with this error:\n\n${priorError}\n\nReturn the correct structured result.` : COORDINATOR_PROMPT + operation.input }] } });
         if (!response.data) throw response.error;
         promptResponseError(response.data.info);
         validateJsonSchema(COORDINATOR_SCHEMA as unknown as Record<string, unknown>, response.data.info.structured);
@@ -836,11 +838,12 @@ const WorkflowPlugin: Plugin = async ({ client, project, directory }, rawOptions
       for (let retry = (run.handoffAttempts ?? []).filter((item) => item.kind === "turn" && item.result === "retrying").length; !run.handoff; retry++) {
         run.handoffAttempts ??= [];
         const attempt = beginAttempt(run.handoffAttempts, "turn");
+        const priorError = run.handoffAttempts.slice(0, -1).filter((item) => item.kind === "turn" && item.error).at(-1)?.error;
         try {
           assertOwned(run);
           const response = await workerClient.session.prompt({
             path: { id: run.handoffSessionID }, query: { directory }, signal,
-             body: { messageID: attempt.messageID, agent: HANDOFF_AGENT, ...(model ? { model } : {}), format: { type: "json_schema", schema: HANDOFF_SCHEMA, retryCount: 0 }, parts: [{ type: "text", text: retry ? "Correct the malformed handoff and return the required structured result." : initialPrompt }] },
+             body: { messageID: attempt.messageID, agent: HANDOFF_AGENT, ...(model ? { model } : {}), format: { type: "json_schema", schema: HANDOFF_SCHEMA, retryCount: 0 }, parts: [{ type: "text", text: retry ? `Your prior attempt failed with this error:\n\n${priorError}\n\nCorrect the malformed handoff and return the required structured result.` : initialPrompt }] },
           });
           if (!response.data) throw response.error;
           promptResponseError(response.data.info);

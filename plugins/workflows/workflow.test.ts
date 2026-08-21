@@ -226,6 +226,7 @@ describe("Stage 4 steering and inspector", () => {
     expect(workerTurnPrompt(true, 2, undefined)).toContain("prior attempt failed");
     expect(workerTurnPrompt(true, 1, "retry")).toContain("prior attempt failed");
     expect(workerTurnPrompt(true, 1, "resume")).toContain("Continue the interrupted work");
+    expect(workerTurnPrompt(true, 1, "retry", undefined, "boom")).toBe("Your prior attempt failed with this error:\n\nboom\n\nCorrect the issue and return the requested final result.");
   });
 
   test("throws authoritative response errors before output handling", () => {
