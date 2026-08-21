@@ -264,15 +264,52 @@ export function templateDependencies(prompt: string): string[] {
   return dependencies;
 }
 
-function worker(value: unknown, name: string, allowedAgents: Set<string>, registeredModels: ReadonlySet<string> | undefined, known: Set<string>, ids: Set<string>): WorkerSpec {
+/**
+ * Compares a template reference's field path against the referenced worker's declared output schema
+ * so typos fail at spec validation instead of mid-run. Returns a problem description only when the
+ * path provably cannot exist; anything unverifiable (no schema, mixed or absent types) yields
+ * undefined, leaving renderTemplate as the runtime backstop.
+ */
+export function templateSuffixError(schema: Record<string, unknown> | undefined, suffix: string): string | undefined {
+  if (!schema) return undefined;
+  const segments = suffix.split(".").filter(Boolean); // TEMPLATE_REFERENCE already consumed the ".output" prefix
+  let node: unknown = schema;
+  for (const segment of segments) {
+    if (!node || typeof node !== "object" || Array.isArray(node)) return undefined;
+    const current = node as Record<string, unknown>;
+    const types = current.type === undefined ? [] : Array.isArray(current.type) ? current.type : [current.type];
+    if (Array.isArray(current.enum)) return `the schema restricts it to enum values (${current.enum.map((item) => JSON.stringify(item)).join(", ")}), which cannot be indexed further`;
+    if (types.length === 1 && typeof types[0] === "string" && types[0] !== "object") return `the schema types it as ${types[0]}, which cannot be indexed further`;
+    const verifiable = types.length === 0 ? !!current.properties && typeof current.properties === "object" : types.length === 1 && types[0] === "object";
+    if (!verifiable) return undefined;
+    const properties = current.properties as Record<string, unknown>;
+    if (!(segment in properties)) {
+      const keys = Object.keys(properties);
+      const listed = keys.slice(0, 8).join(", ") + (keys.length > 8 ? ", …" : "");
+      return `the schema has no property "${segment}"${keys.length ? ` (available: ${listed})` : ""}`;
+    }
+    node = properties[segment];
+    while (node && typeof node === "object" && !Array.isArray(node)) {
+      const items = (node as Record<string, unknown>).items;
+      if (!items || typeof items !== "object" || Array.isArray(items)) break;
+      node = items; // array schemas index into their item schema
+    }
+  }
+  return undefined;
+}
+
+function worker(value: unknown, name: string, allowedAgents: Set<string>, registeredModels: ReadonlySet<string> | undefined, known: Map<string, WorkerSpec>, ids: Set<string>): WorkerSpec {
   const input = object(value, name);
   const id = identifier(input.id, `${name}.id`);
   if (ids.has(id)) throw new Error(`Worker id ${id} is not globally unique`);
   const agent = input.agent === undefined ? "general" : identifier(input.agent, `${name}.agent`);
   if (!allowedAgents.has(agent)) throw new Error(`Worker ${id} uses agent ${agent} outside allowedAgents`);
   const prompt = text(input.prompt, `${name}.prompt`);
-  for (const dependency of templateDependencies(prompt)) {
-    if (!known.has(dependency)) throw new Error(`Worker ${id} references missing, forward, or sibling worker ${dependency}`);
+  for (const reference of templateReferences(prompt)) {
+    const dependency = known.get(reference.id);
+    if (!dependency) throw new Error(`Worker ${id} references missing, forward, or sibling worker ${reference.id}`);
+    const problem = templateSuffixError(dependency.schema, reference.suffix);
+    if (problem) throw new Error(`Worker ${id} references {{workers.${reference.id}.output${reference.suffix}}} but ${problem}`);
   }
   let selectedModel: string | undefined;
   if (input.modelID !== undefined) {
@@ -342,14 +379,14 @@ export function validateWorkflowSpec(value: unknown, registeredAgents?: Readonly
 
   // Worker ids and template dependencies are global across phases, so parsing state outlives single phases.
   const ids = new Set<string>();
-  const known = new Set<string>();
+  const known = new Map<string, WorkerSpec>();
 
   const parseStep = (stepValue: unknown, phaseIndex: number, stepIndex: number, phaseID: string, allowedAgentSet: Set<string>, groupIDs: Set<string>): WorkerStep | ParallelStep => {
     const name = `workflow.phases[${phaseIndex}].steps[${stepIndex}]`;
     const step = object(stepValue, name);
     if (step.type === "worker") {
       const result = { type: "worker" as const, worker: worker(step.worker, `${name}.worker`, allowedAgentSet, registeredModels, known, ids) };
-      known.add(result.worker.id);
+      known.set(result.worker.id, result.worker);
       return result;
     }
     if (step.type !== "parallel") throw new Error(`${name}.type must be worker or parallel`);
@@ -366,7 +403,7 @@ export function validateWorkflowSpec(value: unknown, registeredAgents?: Readonly
     });
     const title = step.title === undefined ? undefined : text(step.title, `${name}.title`);
     if (workerProblems.length) throw new ProblemList(workerProblems);
-    for (const item of workers) known.add(item.id);
+    for (const item of workers) known.set(item.id, item);
     return { type: "parallel" as const, id: groupID, ...(title === undefined ? {} : { title }), workers };
   };
 

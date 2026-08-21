@@ -149,6 +149,36 @@ describe("workflow spec", () => {
     expect(() => validateWorkflowSpec(malformed, agents, models)).toThrow("Invalid workflow template reference");
   });
 
+  test("accepts template field paths verified against referenced worker schemas", () => {
+    const schemad = structuredClone(base);
+    schemad.phases[0]!.steps[0]!.worker.schema = {
+      type: "object",
+      properties: {
+        repos: { type: "array", items: { type: "object", properties: { name: { type: "string" }, stars: { type: "number" } } } },
+        summary: { type: "string" },
+      },
+    };
+    schemad.phases[0]!.steps[1]!.workers[0]!.prompt = "Use {{workers.scan.output.repos.name}}";
+    expect(() => validateWorkflowSpec(schemad, agents, models)).not.toThrow();
+  });
+
+  test("rejects schema-mismatched template paths at validation time", () => {
+    const schemad = structuredClone(base);
+    schemad.phases[0]!.steps[0]!.worker.schema = { type: "object", properties: { repos: { type: "array" }, summary: { type: "string" } } };
+    const typo = structuredClone(schemad);
+    typo.phases[0]!.steps[1]!.workers[0]!.prompt = "Use {{workers.scan.output.repoz}}";
+    expect(() => validateWorkflowSpec(typo, agents, models)).toThrow('no property "repoz" (available: repos, summary)');
+    const indexed = structuredClone(schemad);
+    indexed.phases[0]!.steps[1]!.workers[0]!.prompt = "Use {{workers.scan.output.summary.length}}";
+    expect(() => validateWorkflowSpec(indexed, agents, models)).toThrow("cannot be indexed");
+  });
+
+  test("leaves template paths of schema-less workers to runtime checking", () => {
+    const unschemad = structuredClone(base);
+    unschemad.phases[0]!.steps[1]!.workers[0]!.prompt = "Use {{workers.scan.output.anything.deeper}}";
+    expect(() => validateWorkflowSpec(unschemad, agents, models)).not.toThrow();
+  });
+
   test("allows unrelated brace syntax and escaped workflow references", () => {
     const literal = structuredClone(base);
     literal.phases[0]!.steps[0]!.worker.prompt = "Inspect ${{ github.ref }} and {{ jinja_value }}";
