@@ -8,6 +8,7 @@
     "./tui": "./workflow_tui.tsx"
   },
   "files": [
+    "AUTHORING.md",
     "workflow_server.ts",
     "workflow_tui.tsx",
     "workflow_shared.ts",

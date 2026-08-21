@@ -1,6 +1,6 @@
 import { tool, type Config, type Plugin } from "@opencode-ai/plugin";
 import { mkdir, readdir, rename, rm } from "node:fs/promises";
-import { appendFileSync, renameSync } from "node:fs";
+import { appendFileSync, readFileSync, renameSync } from "node:fs";
 import { dirname, join } from "node:path";
 import {
   controlDirectory,
@@ -215,6 +215,7 @@ function handoffPrompt(run: WorkflowRun, inputBytes: number): string | undefined
 }
 
 const WorkflowPlugin: Plugin = async ({ client, project, directory }, rawOptions) => {
+  const authoringDoc = (() => { try { return readFileSync(join(import.meta.dir, "AUTHORING.md"), "utf8"); } catch { return "AUTHORING.md is unavailable in this installation of the workflows plugin."; } })();
   const options = normalizeWorkflowOptions(rawOptions);
   const ceilings = workflowCeilings(options);
   const root = workflowProjectDirectory(project.id, directory);
@@ -1478,7 +1479,7 @@ const WorkflowPlugin: Plugin = async ({ client, project, directory }, rawOptions
           "",
           "DATA. Workers share no memory: each prompt must stand alone, and the only channel between them is `{{workers.<id>.output}}` or files on disk. Worker outputs are byte-truncated to fit a 256 KiB cap before they reach a checkpoint coordinator or the final handoff, so workers that produce bulk results must write them to an agreed scratch path and return only {path, count, notes}. The final handoff is a fixed report schema (summary, evidence, changed files, unresolved issues) — it is not the deliverable, so a workflow that produces an artifact writes it to a file and cites the path.",
           "",
-          "Read AUTHORING.md in this plugin's directory for worked examples of the common shapes.",
+          "Call the `workflow_authoring` tool for the AUTHORING.md reference with worked examples of the common shapes; it returns the full document.",
           "",
           "The run starts only after the user approves it in the TUI. Returns { runID, status } once the run is running or queued; the final result arrives later as a synthetic <workflow_result> message in this session — do not wait or poll for it.",
         ].join("\n"),
@@ -1529,6 +1530,11 @@ const WorkflowPlugin: Plugin = async ({ client, project, directory }, rawOptions
             if (context.abort.aborted) abort();
           });
         },
+      },
+      workflow_authoring: {
+        description: "Return the full AUTHORING.md reference for designing a `workflow` spec: the four facts that decide a spec's shape, worked examples of the common workflow shapes (discover/fan-out/verify, adversarial verification, staged migration), and the pre-submission checklist. Read this before writing your first workflow spec or when a spec design question arises. Cheap to call; returns only this document.",
+        args: {},
+        execute: async () => ({ title: "AUTHORING.md", output: authoringDoc }),
       },
     },
     event: async ({ event }) => {
