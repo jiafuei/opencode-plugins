@@ -293,63 +293,125 @@ function worker(value: unknown, name: string, allowedAgents: Set<string>, regist
   };
 }
 
+/** Bundles child-element problems so an enclosing level re-raises them without adding its own redundant message. */
+class ProblemList extends Error {
+  constructor(readonly messages: string[]) { super(messages.join("\n")); }
+}
+
+/**
+ * Collects every independent problem instead of failing on the first one, so an LLM author sees all
+ * fixes in one round trip. Checks that depend on a value (uniqueness of an invalid id, elements of a
+ * non-array) are skipped when that value fails; cross-cutting checks run over successfully parsed
+ * items. A single problem throws its plain message unchanged; several throw a numbered list.
+ */
 export function validateWorkflowSpec(value: unknown, registeredAgents?: ReadonlySet<string>, registeredModels?: ReadonlySet<string>, ceilings: WorkflowLimits = DEFAULT_LIMITS): WorkflowSpec {
   const input = object(value, "workflow");
-  if (input.version !== 1) throw new Error("workflow.version must be 1");
-  const allowedAgents = array(input.allowedAgents, "workflow.allowedAgents").map((item, index) => identifier(item, `workflow.allowedAgents[${index}]`));
-  if (allowedAgents.length === 0 || new Set(allowedAgents).size !== allowedAgents.length) throw new Error("workflow.allowedAgents must contain unique agents");
-  const unregisteredAgent = registeredAgents ? allowedAgents.find((agent) => !registeredAgents.has(agent)) : undefined;
-  if (unregisteredAgent !== undefined) throw new Error(`workflow.allowedAgents contains unregistered agent "${unregisteredAgent}"`);
-  const limitsInput = input.limits === undefined ? {} : object(input.limits, "workflow.limits");
-  const limits = {
-    maxWorkers: limit(limitsInput.maxWorkers, "workflow.limits.maxWorkers", ceilings.maxWorkers, ceilings.maxWorkers),
-    maxRevisions: limit(limitsInput.maxRevisions, "workflow.limits.maxRevisions", ceilings.maxRevisions, ceilings.maxRevisions),
-    maxRunMs: limit(limitsInput.maxRunMs, "workflow.limits.maxRunMs", ceilings.maxRunMs, ceilings.maxRunMs),
+  const problems: string[] = [];
+  const messages = (error: unknown): string[] => error instanceof ProblemList ? error.messages : [error instanceof Error ? error.message : String(error)];
+  const attempt = <T>(check: () => T): T | undefined => {
+    try { return check(); } catch (error) { problems.push(...messages(error)); }
   };
-  const allowedAgentSet = new Set(allowedAgents);
+
+  attempt(() => { if (input.version !== 1) throw new Error("workflow.version must be 1"); });
+  const name = attempt(() => text(input.name, "workflow.name"));
+  const description = attempt(() => text(input.description, "workflow.description"));
+  const goal = attempt(() => text(input.goal, "workflow.goal"));
+
+  const allowedAgents = attempt(() => {
+    const raw = array(input.allowedAgents, "workflow.allowedAgents");
+    const parsed: string[] = [];
+    const elementProblems: string[] = [];
+    raw.forEach((item, index) => {
+      try { parsed.push(identifier(item, `workflow.allowedAgents[${index}]`)); }
+      catch (error) { elementProblems.push(...messages(error)); }
+    });
+    if (elementProblems.length) throw new ProblemList(elementProblems);
+    if (parsed.length === 0 || new Set(parsed).size !== parsed.length) throw new Error("workflow.allowedAgents must contain unique agents");
+    const unregisteredAgent = registeredAgents ? parsed.find((agent) => !registeredAgents.has(agent)) : undefined;
+    if (unregisteredAgent !== undefined) throw new Error(`workflow.allowedAgents contains unregistered agent "${unregisteredAgent}"`);
+    return parsed;
+  });
+
+  const limits = { maxWorkers: ceilings.maxWorkers, maxRevisions: ceilings.maxRevisions, maxRunMs: ceilings.maxRunMs };
+  attempt(() => {
+    const limitsInput = input.limits === undefined ? {} : object(input.limits, "workflow.limits");
+    limits.maxWorkers = attempt(() => limit(limitsInput.maxWorkers, "workflow.limits.maxWorkers", ceilings.maxWorkers, ceilings.maxWorkers)) ?? ceilings.maxWorkers;
+    limits.maxRevisions = attempt(() => limit(limitsInput.maxRevisions, "workflow.limits.maxRevisions", ceilings.maxRevisions, ceilings.maxRevisions)) ?? ceilings.maxRevisions;
+    limits.maxRunMs = attempt(() => limit(limitsInput.maxRunMs, "workflow.limits.maxRunMs", ceilings.maxRunMs, ceilings.maxRunMs)) ?? ceilings.maxRunMs;
+  });
+
+  // Worker ids and template dependencies are global across phases, so parsing state outlives single phases.
   const ids = new Set<string>();
   const known = new Set<string>();
-  const phaseIDs = new Set<string>();
-  const phases = array(input.phases, "workflow.phases").map((phaseValue, phaseIndex) => {
-    const phase = object(phaseValue, `workflow.phases[${phaseIndex}]`);
-    const id = identifier(phase.id, `workflow.phases[${phaseIndex}].id`);
+
+  const parseStep = (stepValue: unknown, phaseIndex: number, stepIndex: number, phaseID: string, allowedAgentSet: Set<string>, groupIDs: Set<string>): WorkerStep | ParallelStep => {
+    const name = `workflow.phases[${phaseIndex}].steps[${stepIndex}]`;
+    const step = object(stepValue, name);
+    if (step.type === "worker") {
+      const result = { type: "worker" as const, worker: worker(step.worker, `${name}.worker`, allowedAgentSet, registeredModels, known, ids) };
+      known.add(result.worker.id);
+      return result;
+    }
+    if (step.type !== "parallel") throw new Error(`${name}.type must be worker or parallel`);
+    const groupID = identifier(step.id, `${name}.id`);
+    if (groupIDs.has(groupID)) throw new Error(`Parallel group id ${groupID} is not unique in phase ${phaseID}`);
+    groupIDs.add(groupID);
+    const rawWorkers = array(step.workers, `${name}.workers`);
+    if (rawWorkers.length === 0) throw new Error(`${name}.workers must not be empty`);
+    const workers: WorkerSpec[] = [];
+    const workerProblems: string[] = [];
+    rawWorkers.forEach((item, workerIndex) => {
+      try { workers.push(worker(item, `${name}.workers[${workerIndex}]`, allowedAgentSet, registeredModels, known, ids)); }
+      catch (error) { workerProblems.push(...messages(error)); }
+    });
+    const title = step.title === undefined ? undefined : text(step.title, `${name}.title`);
+    if (workerProblems.length) throw new ProblemList(workerProblems);
+    for (const item of workers) known.add(item.id);
+    return { type: "parallel" as const, id: groupID, ...(title === undefined ? {} : { title }), workers };
+  };
+
+  const parsePhase = (phaseValue: unknown, phaseIndex: number, allowedAgentSet: Set<string>, phaseIDs: Set<string>): PhaseSpec => {
+    const name = `workflow.phases[${phaseIndex}]`;
+    const phase = object(phaseValue, name);
+    const id = identifier(phase.id, `${name}.id`);
     if (phaseIDs.has(id)) throw new Error(`Phase id ${id} is not unique`);
     phaseIDs.add(id);
-    if (phase.checkpoint !== undefined && typeof phase.checkpoint !== "boolean") throw new Error(`workflow.phases[${phaseIndex}].checkpoint must be a boolean`);
+    if (phase.checkpoint !== undefined && typeof phase.checkpoint !== "boolean") throw new Error(`${name}.checkpoint must be a boolean`);
+    const title = text(phase.title, `${name}.title`);
+    const rawSteps = array(phase.steps, `${name}.steps`);
+    if (rawSteps.length === 0) throw new Error(`${name}.steps must not be empty`);
     const groupIDs = new Set<string>();
-    const steps = array(phase.steps, `workflow.phases[${phaseIndex}].steps`).map((stepValue, stepIndex) => {
-      const step = object(stepValue, `workflow.phases[${phaseIndex}].steps[${stepIndex}]`);
-      const name = `workflow.phases[${phaseIndex}].steps[${stepIndex}]`;
-      if (step.type === "worker") {
-        const result = { type: "worker" as const, worker: worker(step.worker, `${name}.worker`, allowedAgentSet, registeredModels, known, ids) };
-        known.add(result.worker.id);
-        return result;
-      }
-      if (step.type !== "parallel") throw new Error(`${name}.type must be worker or parallel`);
-      const groupID = identifier(step.id, `${name}.id`);
-      if (groupIDs.has(groupID)) throw new Error(`Parallel group id ${groupID} is not unique in phase ${id}`);
-      groupIDs.add(groupID);
-      const workers = array(step.workers, `${name}.workers`).map((item, workerIndex) =>
-        worker(item, `${name}.workers[${workerIndex}]`, allowedAgentSet, registeredModels, known, ids),
-      );
-      if (workers.length === 0) throw new Error(`${name}.workers must not be empty`);
-      for (const item of workers) known.add(item.id);
-      return { type: "parallel" as const, id: groupID, ...(step.title === undefined ? {} : { title: text(step.title, `${name}.title`) }), workers };
+    const steps: Array<WorkerStep | ParallelStep> = [];
+    const stepProblems: string[] = [];
+    rawSteps.forEach((stepValue, stepIndex) => {
+      try { steps.push(parseStep(stepValue, phaseIndex, stepIndex, id, allowedAgentSet, groupIDs)); }
+      catch (error) { stepProblems.push(...messages(error)); }
     });
-    if (steps.length === 0) throw new Error(`workflow.phases[${phaseIndex}].steps must not be empty`);
-    return { id, title: text(phase.title, `workflow.phases[${phaseIndex}].title`), ...(phase.checkpoint === true ? { checkpoint: true } : {}), steps };
-  });
-  if (phases.length === 0) throw new Error("workflow.phases must not be empty");
-  if (ids.size > limits.maxWorkers) throw new Error(`Workflow has ${ids.size} workers, exceeding maxWorkers ${limits.maxWorkers}`);
-  return {
-    version: 1,
-    name: text(input.name, "workflow.name"),
-    description: text(input.description, "workflow.description"),
-    goal: text(input.goal, "workflow.goal"),
-    allowedAgents,
-    phases,
-    limits,
+    if (stepProblems.length) throw new ProblemList(stepProblems);
+    return { id, title, ...(phase.checkpoint === true ? { checkpoint: true } : {}), steps };
   };
+
+  const phases = allowedAgents && attempt(() => {
+    const rawPhases = array(input.phases, "workflow.phases");
+    if (rawPhases.length === 0) throw new Error("workflow.phases must not be empty");
+    const allowedAgentSet = new Set(allowedAgents);
+    const phaseIDs = new Set<string>();
+    const parsed: PhaseSpec[] = [];
+    const phaseProblems: string[] = [];
+    rawPhases.forEach((phaseValue, phaseIndex) => {
+      try { parsed.push(parsePhase(phaseValue, phaseIndex, allowedAgentSet, phaseIDs)); }
+      catch (error) { phaseProblems.push(...messages(error)); }
+    });
+    if (phaseProblems.length) throw new ProblemList(phaseProblems);
+    return parsed;
+  });
+
+  if (phases && ids.size > limits.maxWorkers) problems.push(`Workflow has ${ids.size} workers, exceeding maxWorkers ${limits.maxWorkers}`);
+
+  // Each field is defined exactly when its check produced no problem, and any problem throws above.
+  if (problems.length === 1) throw new Error(problems[0]!);
+  if (problems.length > 1) throw new Error(`workflow spec has ${problems.length} problems:\n${problems.map((problem, index) => `${index + 1}. ${problem}`).join("\n")}`);
+  return { version: 1, name: name!, description: description!, goal: goal!, allowedAgents: allowedAgents!, phases: phases!, limits };
 }
 
 export function effectiveLimits(spec: WorkflowSpec, maxConcurrency: number = DEFAULT_LIMITS.maxConcurrency): WorkflowLimits {

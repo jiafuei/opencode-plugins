@@ -176,6 +176,23 @@ describe("workflow spec", () => {
     limits.limits = { maxWorkers: 101 };
     expect(() => validateWorkflowSpec(limits, agents, models)).toThrow("1 to 100");
   });
+
+  test("reports multiple unrelated problems in one aggregated error", () => {
+    const broken = structuredClone(base);
+    broken.name = "";
+    (broken as Record<string, unknown>).goal = 42;
+    broken.phases[0]!.id = "bad id!";
+    let message = "";
+    try {
+      validateWorkflowSpec(broken, agents, models);
+    } catch (error) {
+      message = (error as Error).message;
+    }
+    expect(message).toContain("workflow spec has 3 problems:");
+    expect(message).toContain("1. workflow.name must be a non-empty string");
+    expect(message).toContain("workflow.goal must be a non-empty string");
+    expect(message).toContain("workflow.phases[0].id must use letters, numbers, _ or - and begin with a letter");
+  });
 });
 
 describe("Stage 4 steering and inspector", () => {
