@@ -30,6 +30,7 @@ import {
   renderTemplate,
   retryDecision,
   type RetryDecision,
+  runStatusView,
   beginAttempt,
   coordinatorRetryable,
   steeringFollowUp,
@@ -1532,6 +1533,23 @@ const WorkflowPlugin: Plugin = async ({ client, project, directory }, rawOptions
             context.abort.addEventListener("abort", abort, { once: true });
             if (context.abort.aborted) abort();
           });
+        },
+      },
+      workflow_status: {
+        description: "Return the current state of a workflow run: status, current phase, per-worker states, failure reason, and plan revision count. Read-only — use it to answer questions about a run's progress or diagnose a blocked/stopped run. The final result arrives separately as a synthetic <workflow_result> message.",
+        args: { runID: tool.schema.string().describe("The runID previously returned by the workflow tool") },
+        // ToolDefinition infers bare-ZodRawShape args, so the parameter is annotated explicitly.
+        execute: async (args: { runID: string }) => {
+          // Memory first: disk state can lag the live run. The disk fallback must work while another
+          // process owns the lease, so this never acquires one.
+          let run = runs.get(args.runID);
+          if (!run) {
+            if (!/^[A-Za-z0-9_-]{1,128}$/.test(args.runID)) throw new Error("Invalid workflow run ID");
+            const state = Bun.file(statePath(root, args.runID));
+            if (!await state.exists()) throw new Error(`No workflow run found for ${args.runID}`);
+            run = hydrateRun(await state.json() as PersistedRun);
+          }
+          return { title: `Workflow ${run.status}`, output: JSON.stringify(runStatusView(run), null, 2) };
         },
       },
       workflow_authoring: {

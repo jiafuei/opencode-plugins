@@ -24,6 +24,7 @@ import {
   retryClassification,
   retryDelay,
   retryDecision,
+  runStatusView,
   beginAttempt,
   RETRY_DELAYS_MS,
   type WorkerAttempt,
@@ -487,6 +488,29 @@ describe("Stage 3 adaptive planning", () => {
     expect(failureControlOptions(current).map((option) => option.action)).toEqual(["failure_retry", "failure_stop"]);
     current.failure = { workerID: "coordinator", kind: "coordinator", reason: "failed" };
     expect(failureControlOptions(current).map((option) => option.action)).toEqual(["coordinator_retry", "coordinator_continue", "failure_stop"]);
+  });
+
+  test("projects a compact read-only status view", () => {
+    const current = run();
+    current.frontier.phaseID = "todo";
+    current.error = "Coordinator failed: boom";
+    current.failure = { workerID: "audit", kind: "worker", reason: "boom" };
+    current.workers.scan!.startedAt = 10;
+    current.workers.scan!.activity = "Completed";
+    const view = runStatusView(current);
+    expect(view).toMatchObject({ runID: "run", name: "Review", description: "Review a change", goal: "Find issues", status: "running", error: "Coordinator failed: boom", planVersion: 1, revisions: 0, failure: { workerID: "audit", reason: "boom" } });
+    expect(view.phases).toEqual([
+      { id: "done", title: "Done", checkpoint: true, status: "completed" },
+      { id: "todo", title: "Todo", status: "active" },
+    ]);
+    expect(view.workers).toEqual([
+      { id: "scan", label: "Scan", agent: "explore", status: "completed", activity: "Completed", startedAt: 10 },
+      { id: "audit", label: "Audit", agent: "build", status: "pending" },
+    ]);
+    expect(JSON.stringify(view)).not.toContain("prompt");
+    expect(runStatusView(current).handoff).toBeUndefined();
+    current.handoff = { summary: "s", completedWork: [], evidence: [], changedFiles: [], verification: [], unresolvedIssues: [], recommendedNextAction: "n" };
+    expect(runStatusView(current).handoff).toBe(true);
   });
 
   test("fails lease fencing immediately before external side effects", () => {

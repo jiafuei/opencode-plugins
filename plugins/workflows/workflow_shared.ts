@@ -472,6 +472,37 @@ export function currentPlanProgress(run: WorkflowRun): { completed: number; tota
   return { completed: ids.filter((id) => run.workers[id]?.status === "completed").length, total: ids.length, running: ids.filter((id) => run.workers[id]?.status === "running").length };
 }
 
+/** Compact read-only projection for the workflow_status tool: no prompts, outputs, or attempts. */
+export function runStatusView(run: WorkflowRun): Record<string, unknown> {
+  const phaseStatus = (phaseID: string): "completed" | "active" | "pending" =>
+    run.completedPhases.includes(phaseID) || run.sealedPhases.includes(phaseID) ? "completed" : run.frontier.phaseID === phaseID ? "active" : "pending";
+  return {
+    runID: run.id,
+    name: run.spec.name,
+    description: run.spec.description,
+    status: run.status,
+    ...(run.error === undefined ? {} : { error: run.error }),
+    createdAt: run.createdAt,
+    updatedAt: run.updatedAt,
+    planVersion: run.planVersion,
+    revisions: run.revisions.length,
+    goal: run.spec.goal,
+    phases: run.spec.phases.map((phase) => ({ id: phase.id, title: phase.title, ...(phase.checkpoint ? { checkpoint: true } : {}), status: phaseStatus(phase.id) })),
+    workers: Object.values(run.workers).map((worker) => ({
+      id: worker.id,
+      label: worker.label,
+      agent: worker.agent,
+      status: worker.status,
+      ...(worker.activity === undefined ? {} : { activity: worker.activity }),
+      ...(worker.error === undefined ? {} : { error: worker.error }),
+      ...(worker.startedAt === undefined ? {} : { startedAt: worker.startedAt }),
+      ...(worker.endedAt === undefined ? {} : { endedAt: worker.endedAt }),
+    })),
+    ...(run.failure === undefined ? {} : { failure: { workerID: run.failure.workerID, reason: run.failure.reason } }),
+    ...(run.handoff === undefined ? {} : { handoff: true }),
+  };
+}
+
 export function queuedSteering(worker: WorkerState): WorkerSteering[] { return (worker.steering ?? []).filter((item) => item.status === "queued"); }
 
 export function acceptWorkerSteering(run: WorkflowRun, workerID: string, text: string, createdAt: number, id: string = crypto.randomUUID()): WorkerSteering {

@@ -10,7 +10,10 @@ process.env.XDG_DATA_HOME = mkdtempSync(join(tmpdir(), "workflow-server-test-"))
 
 type ToolResult = { output: string };
 type ServerHooks = {
-  tool: { workflow: { execute: (args: { spec: unknown }, context: unknown) => Promise<ToolResult> } };
+  tool: {
+    workflow: { execute: (args: { spec: unknown }, context: unknown) => Promise<ToolResult> };
+    workflow_status: { execute: (args: { runID: string }) => Promise<ToolResult> };
+  };
   dispose: () => Promise<void>;
 };
 
@@ -251,6 +254,22 @@ describe("workflow server", () => {
     expect(outcome.status).toBe("ignored");
     expect(outcome.error).toContain("interrupted");
     expect((await Bun.file(statePath(h.root, id)).json() as WorkflowRun).status).toBe("interrupted");
+  }, 15_000);
+
+  test("answers workflow_status from memory and disk without owning the lease", async () => {
+    const h = await createHarness();
+    const { id } = await h.submit(spec([{ id: "p1", title: "Phase", steps: [workerStep("a")] }]));
+    await h.waitForRun(id, (run) => run.status === "pending");
+    const live = JSON.parse((await h.hooks.tool.workflow_status.execute({ runID: id })).output);
+    expect(live).toMatchObject({ runID: id, name: "server-test", status: "pending", revisions: 0 });
+    expect(live.phases).toEqual([{ id: "p1", title: "Phase", status: "pending" }]);
+    // Written after startup, so it only exists on disk — the cross-process path.
+    const foreign = { version: 1, id: "foreign-run", parentSessionID: "parent-session", parentMessageID: "parent-message", createdAt: 1, updatedAt: 1, status: "running", spec: spec([{ id: "p1", title: "Phase", steps: [workerStep("a")] }]), limits: { maxWorkers: 100, maxRevisions: 10, maxRunMs: 21_600_000, maxConcurrency: 2 }, workers: {} };
+    await mkdir(runDirectory(h.root, "foreign-run"), { recursive: true });
+    await Bun.write(statePath(h.root, "foreign-run"), JSON.stringify(foreign));
+    expect(JSON.parse((await h.hooks.tool.workflow_status.execute({ runID: "foreign-run" })).output)).toMatchObject({ runID: "foreign-run", status: "running" });
+    await expect(h.hooks.tool.workflow_status.execute({ runID: "../escape" })).rejects.toThrow("Invalid workflow run ID");
+    await expect(h.hooks.tool.workflow_status.execute({ runID: "missing-run" })).rejects.toThrow("No workflow run found for missing-run");
   }, 15_000);
 
   test("runs a parallel group at the configured max_concurrency", async () => {
