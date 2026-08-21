@@ -175,10 +175,10 @@ export type WorkflowHandoff = {
 
 const ID = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/;
 const TEMPLATE_REFERENCE = /^\s*workers\.([A-Za-z][A-Za-z0-9_-]{0,63})\.output((?:\.[A-Za-z_$][A-Za-z0-9_$]*)*)\s*$/;
-const NONEMPTY_TEXT = tool.schema.custom<string>((value) => typeof value === "string" && !!value.trim(), { message: "must be a non-empty string" });
-const TEXT = tool.schema.custom<string>((value) => typeof value === "string", { message: "must be a string" });
-const IDENTIFIER = tool.schema.custom<string>((value) => typeof value === "string" && !!value.trim() && ID.test(value), { message: "must use letters, numbers, _ or - and begin with a letter" });
-const MODEL_ID = tool.schema.custom<string>((value) => typeof value === "string" && !!value.trim() && /^[^\s/]+\/\S+$/.test(value), { message: 'must be a "providerID/modelID" string such as "openai/gpt-1.0" or "anthropic/claude-sonnet-1.0"' });
+const NONEMPTY_TEXT = tool.schema.string({ message: "must be a non-empty string" }).refine((value) => !!value.trim(), { message: "must be a non-empty string" });
+const TEXT = tool.schema.string({ message: "must be a string" });
+const IDENTIFIER = tool.schema.string({ message: "must use letters, numbers, _ or - and begin with a letter" }).refine((value) => !!value.trim() && ID.test(value), { message: "must use letters, numbers, _ or - and begin with a letter" });
+const MODEL_ID = tool.schema.string({ message: 'must be a "providerID/modelID" string such as "openai/gpt-1.0" or "anthropic/claude-sonnet-1.0"' }).refine((value) => !!value.trim() && /^[^\s/]+\/\S+$/.test(value), { message: 'must be a "providerID/modelID" string such as "openai/gpt-1.0" or "anthropic/claude-sonnet-1.0"' });
 export const WORKER_SCHEMA = tool.schema.object({
   id: IDENTIFIER.describe("Globally unique across the workflow; letters, digits, _ or -, starting with a letter"),
   label: NONEMPTY_TEXT,

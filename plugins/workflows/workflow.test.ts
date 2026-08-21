@@ -1,7 +1,9 @@
 import { describe, expect, test } from "bun:test";
+import { tool } from "@opencode-ai/plugin";
 import type { TuiPluginApi } from "@opencode-ai/plugin/tui";
 import {
   DEFAULT_LIMITS,
+  WORKFLOW_SPEC_SCHEMA,
   effectiveLimits,
   drainPendingCoordination,
   eventPath,
@@ -104,6 +106,11 @@ const base: Omit<WorkflowSpec, "phases"> & { phases: [FixturePhase] | [] } = {
 };
 
 describe("workflow spec", () => {
+  test("can be represented as JSON Schema", () => {
+    const schema = tool.schema.toJSONSchema(tool.schema.object({ spec: WORKFLOW_SPEC_SCHEMA }));
+    expect(schema).toMatchObject({ type: "object", properties: { spec: { type: "object" } } });
+  });
+
   test("normalizes valid deterministic work", () => {
     const spec = validateWorkflowSpec(base, agents, models);
     expect(spec.limits).toEqual({ maxWorkers: DEFAULT_LIMITS.maxWorkers, maxRevisions: DEFAULT_LIMITS.maxRevisions, maxRunMs: DEFAULT_LIMITS.maxRunMs });
