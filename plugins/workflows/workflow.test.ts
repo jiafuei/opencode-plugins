@@ -616,8 +616,11 @@ describe("Stage 2 reliability helpers", () => {
     const failed = { id: "bad", label: "Bad", agent: "build", prompt: "secret", status: "failed", error: "boom", output: "body", attempts: [{ number: 1, startedAt: 1 }] } as WorkerState;
     expect(compactWorkerFailures({ bad: failed })).toEqual([{ id: "bad", status: "failed", error: "boom" }]);
     failed.error = "x".repeat(3_000);
-    expect(Buffer.byteLength(compactWorkerFailures({ bad: failed })[0]!.error!)).toBe(2_048);
-    expect(utf8Prefix("a😀b", 4)).toBe("a");
+    const truncatedError = compactWorkerFailures({ bad: failed })[0]!.error!;
+    expect(truncatedError.startsWith("x".repeat(2_048))).toBe(true);
+    expect(truncatedError.endsWith("\n…[truncated; first 2048 of 3000 bytes]")).toBe(true);
+    expect(utf8Prefix("a😀b", 6)).toBe("a😀b");
+    expect(utf8Prefix("a😀b", 4)).toBe("a\n…[truncated; first 1 of 6 bytes]");
     const payload = { marker: "😀", outputs: [] as Array<{ id: string; output: string }> };
     const input = coordinatorInput(payload, [{ id: "one", output: "😀😀😀" }], 54)!;
     expect(Buffer.byteLength(input)).toBeLessThanOrEqual(54);

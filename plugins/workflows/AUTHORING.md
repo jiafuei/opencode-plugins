@@ -8,7 +8,7 @@ Reference for the agent writing a `workflow` spec. Run `/workflow-plan <request>
 
 **`checkpoint: true` is the loop.** After a checkpoint phase, a coordinator sees that phase's outputs and rewrites every remaining phase. It may add phases and workers that did not exist at submission. This is the only way to express a fan-out whose width you learn at runtime, or work that repeats until nothing new turns up. Its budget is `limits.maxWorkers` minus the workers already in the spec, so a spec with checkpoints must set `maxWorkers` well above its own worker count. Each checkpoint also consumes one of `maxRevisions` (default 10).
 
-**Outputs are truncated, files are not.** Worker outputs are byte-truncated — mid-string, silently — to fit a 256 KiB cap before reaching a checkpoint coordinator or the final handoff. Anything larger than a summary goes to a file; the output carries `{path, count, notes}`. Workers inherit the parent session's permissions, so they can write.
+**Outputs are truncated, files are not.** Worker outputs are byte-truncated — mid-string, with a `[truncated]` marker appended — to fit a 256 KiB cap before reaching a checkpoint coordinator or the final handoff. Anything larger than a summary goes to a file; the output carries `{path, count, notes}`. Workers inherit the parent session's permissions, so they can write.
 
 **Workers and coordinators are blind.** A worker sees only its own prompt. A checkpoint coordinator sees `goal`, the current plan, worker outputs, and failures — no tools, no conversation history. Whatever must survive between phases goes in `goal` or in a file.
 

@@ -418,7 +418,7 @@ export function utf8Prefix(value: string, maxBytes: number): string {
   if (bytes.length <= maxBytes) return value;
   const decoder = new TextDecoder("utf-8", { fatal: true });
   for (let length = Math.max(0, maxBytes); length >= 0; length--) {
-    try { return decoder.decode(bytes.subarray(0, length)); } catch {}
+    try { return decoder.decode(bytes.subarray(0, length)) + `\n…[truncated; first ${length} of ${bytes.length} bytes]`; } catch {}
   }
   return "";
 }
