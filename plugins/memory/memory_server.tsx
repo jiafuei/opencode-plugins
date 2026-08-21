@@ -477,7 +477,9 @@ const MemoryPlugin: Plugin = async ({ client, directory }, options) => {
     while (Buffer.byteLength(state.agentOutputs.join("\n\n")) > AGENT_OUTPUT_BYTES) state.agentOutputs.shift();
   };
 
-  const runWorker = async (parentID: string, model: ModelRef, schema: object, system: string, prompt: string) => {
+  type WorkerActivity = "classification" | "extraction" | "maintenance";
+
+  const runWorker = async (parentID: string, model: ModelRef, schema: object, system: string, prompt: string, activity: WorkerActivity) => {
     const signal = AbortSignal.timeout(WORKER_TIMEOUT_MS);
     const created = await workerClient.session.create({
       body: {
@@ -485,7 +487,7 @@ const MemoryPlugin: Plugin = async ({ client, directory }, options) => {
         title: "Memory worker",
         agent: WORKER_AGENT,
         model: { id: model.modelID, providerID: model.providerID },
-        metadata: { memoryWorker: true },
+        metadata: { memoryWorker: true, memoryActivity: activity },
         permission: [
           { permission: "*", pattern: "*", action: "deny" },
           { permission: "StructuredOutput", pattern: "*", action: "allow" },
@@ -537,6 +539,7 @@ const MemoryPlugin: Plugin = async ({ client, directory }, options) => {
         SAVE_CLASSIFIER_SCHEMA,
         "You are a project-memory classifier. Return only the requested structured result.",
         classifierPrompt(input),
+        "classification",
       ));
     } catch (error) {
       await log("warn", "Memory classification failed", { error: error instanceof Error ? error.message : String(error) });
@@ -615,6 +618,7 @@ const MemoryPlugin: Plugin = async ({ client, directory }, options) => {
         existingContent === undefined
           ? sourceText(snapshot, true)
           : `<existing_topic current_type="${typeOf(existingContent)}">\n${existingContent}\n</existing_topic>\n\n${sourceText(snapshot, true)}`,
+        "extraction",
       ));
       const result = await saveLearning(sessionID, decision, expectedRevision, existingContent, extracted);
       if (result === false) await log("info", "Skipped stale memory update", { target: decision.target });
@@ -662,7 +666,7 @@ const MemoryPlugin: Plugin = async ({ client, directory }, options) => {
       let selected: IndexEntry[];
       try {
          const decision = await runWorker(sessionID, classifierModel, CONSOLIDATION_SELECTION_SCHEMA,
-          CONSOLIDATION_SELECTION_PROMPT, entries.map(indexLine).join("\n")) as { files?: unknown };
+          CONSOLIDATION_SELECTION_PROMPT, entries.map(indexLine).join("\n"), "maintenance") as { files?: unknown };
         if (!Array.isArray(decision?.files) || !decision.files.every((file) => typeof file === "string")) throw new Error("Invalid consolidation selection");
         const files = decision.files as string[];
         if (files.length === 0) {
@@ -687,7 +691,7 @@ const MemoryPlugin: Plugin = async ({ client, directory }, options) => {
 
       let extracted: ExtractorResult;
       try {
-        extracted = validateExtraction(await runWorker(sessionID, extractorModel, EXTRACTOR_SCHEMA, CONSOLIDATION_PROMPT, topics));
+        extracted = validateExtraction(await runWorker(sessionID, extractorModel, EXTRACTOR_SCHEMA, CONSOLIDATION_PROMPT, topics, "maintenance"));
       } catch (error) {
         await log("warn", "Memory consolidation failed", { error: error instanceof Error ? error.message : String(error) });
         return;

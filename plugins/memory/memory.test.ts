@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdir, mkdtemp, readdir, rm } from "node:fs/promises";
 import { join } from "node:path";
 import MemoryModule, { memoryProjectKey as serverProjectKey } from "./memory_server.tsx";
-import { memoryProjectKey as tuiProjectKey } from "./memory_tui.tsx";
+import MemoryTui, { managedIndexEntries, memoryProjectKey as tuiProjectKey, topicRevision, topicSessionId } from "./memory_tui.tsx";
 
 const originalDataHome = process.env.XDG_DATA_HOME;
 afterEach(() => {
@@ -106,9 +106,13 @@ describe("memory persistence", () => {
     ];
     let worker = 0;
     const workerPrompts: string[] = [];
+    const workerMetadata: unknown[] = [];
     const client = {
       session: {
-        create: async () => ({ data: { id: `worker-${worker}` } }),
+        create: async (options: { body: { metadata?: unknown } }) => {
+          workerMetadata.push(options.body.metadata);
+          return { data: { id: `worker-${worker}` } };
+        },
         prompt: async (options: { body: { parts: { text: string }[] } }) => {
           workerPrompts.push(options.body.parts[0]!.text);
           return { data: { info: { structured: structured[worker++] } } };
@@ -154,6 +158,8 @@ describe("memory persistence", () => {
     expect(workerPrompts[0]).not.toContain("FAILED_EVIDENCE");
     expect(workerPrompts[0]).not.toContain("The focused Bun test is the confirmed approach.");
     expect(workerPrompts[1]).toContain("The focused Bun test is the confirmed approach.");
+    expect(workerMetadata[0]).toEqual({ memoryWorker: true, memoryActivity: "classification" });
+    expect(workerMetadata[1]).toEqual({ memoryWorker: true, memoryActivity: "extraction" });
     await rm(dataHome, { recursive: true, force: true });
   });
 
@@ -405,6 +411,187 @@ describe("memory persistence", () => {
     await app.message("ses_background", "Third while classification is pending.");
     classification.resolve({ action: "none", target: null });
     await app.hooks.dispose!();
+    await rm(dataHome, { recursive: true, force: true });
+  });
+});
+
+type Toast = { variant?: string; title?: string; message: string };
+
+async function tuiFixture(directory: string) {
+  const toasts: Toast[] = [];
+  const handlers = new Map<string, Array<(event: never) => void>>();
+  const disposers: Array<() => void | Promise<void>> = [];
+  const api = {
+    keymap: { registerLayer: () => {} },
+    event: {
+      on: (type: string, handler: (event: never) => void) => {
+        const list = handlers.get(type) ?? handlers.set(type, []).get(type)!;
+        list.push(handler);
+        return () => {
+          list.splice(list.indexOf(handler), 1);
+        };
+      },
+    },
+    lifecycle: {
+      signal: new AbortController().signal,
+      onDispose: (fn: () => void | Promise<void>) => {
+        disposers.push(fn);
+        return () => {};
+      },
+    },
+    ui: { toast: (toast: Toast) => toasts.push(toast) },
+    state: { path: { directory } },
+  };
+  await MemoryTui.tui(api as never, undefined as never, {} as never);
+  return {
+    toasts,
+    sessionCreated: (info: { id: string; parentID?: string; metadata?: Record<string, unknown> }) => {
+      for (const handler of [...handlers.get("session.created") ?? []]) {
+        handler({ properties: { sessionID: info.id, info } } as never);
+      }
+    },
+    dispose: () => Promise.all(disposers.map((dispose) => dispose())),
+  };
+}
+
+describe("memory tui parsing helpers", () => {
+  test("parses managed index entries and topic session ids", () => {
+    const entries = managedIndexEntries(
+      "# Project memory\n\n- [First](first.md) - One\n- [Second](second.md) - Two\n- [Nested](nested/third.md) - No\nnot an entry\n",
+    );
+    expect([...entries.keys()]).toEqual(["first.md", "second.md"]);
+    expect(entries.get("first.md")).toEqual({ title: "First", summary: "One" });
+
+    expect(topicSessionId('---\nrevision: "abc"\ntype: "project"\nsessionId: "ses_x"\n---\n\nbody')).toBe("ses_x");
+    expect(topicSessionId("---\nsessionId: ses_y\n---\n")).toBe("ses_y");
+    expect(topicSessionId("no frontmatter")).toBeUndefined();
+    expect(topicRevision('---\nrevision: "abc123"\nsessionId: "ses_x"\n---\n')).toBe("abc123");
+    expect(topicRevision("no frontmatter")).toBeUndefined();
+  });
+});
+
+describe("memory tui notifications", () => {
+  test.serial("toasts one review per classifier and saves only for observed worker parents", async () => {
+    const dataHome = await mkdtemp("/tmp/opencode-memory-tui-");
+    process.env.XDG_DATA_HOME = dataHome;
+    const directory = "/tmp/memory-tui-project";
+    const memoryDirectory = join(dataHome, "opencode", "memory", tuiProjectKey(directory));
+    const app = await tuiFixture(directory);
+
+    app.sessionCreated({ id: "ses_worker_1", parentID: "ses_parent", metadata: { memoryWorker: true, memoryActivity: "classification" } });
+    app.sessionCreated({ id: "ses_worker_2", parentID: "ses_parent", metadata: { memoryWorker: true, memoryActivity: "extraction" } });
+    app.sessionCreated({ id: "ses_worker_3", parentID: "ses_other", metadata: { memoryWorker: true, memoryActivity: "maintenance" } });
+    app.sessionCreated({ id: "ses_child", parentID: "ses_parent" });
+    expect(app.toasts.filter((toast) => toast.message === "Reviewing conversation...")).toHaveLength(1);
+    app.sessionCreated({ id: "ses_worker_4", parentID: "ses_parent", metadata: { memoryWorker: true, memoryActivity: "classification" } });
+    expect(app.toasts.filter((toast) => toast.message === "Reviewing conversation...")).toHaveLength(2);
+
+    // The project directory appears after startup with a write from an
+    // untracked session; the TUI must stay silent.
+    await mkdir(memoryDirectory, { recursive: true });
+    await Bun.write(join(memoryDirectory, "other.md"), '---\nsessionId: "ses_other_instance"\n---\n\nother\n');
+    await Bun.write(join(memoryDirectory, "index.md"), "# Project memory\n\n- [Other](other.md) - Other topic\n");
+    await Bun.sleep(600);
+    expect(app.toasts.filter((toast) => toast.variant === "success")).toEqual([]);
+
+    // A committed write attributed to the observed worker parent toasts once.
+    await Bun.write(join(memoryDirectory, "saved.md"), '---\ntype: "project"\nsessionId: "ses_parent"\n---\n\nsaved\n');
+    await Bun.write(
+      join(memoryDirectory, "index.md"),
+      "# Project memory\n\n- [Other](other.md) - Other topic\n- [Saved topic](saved.md) - Saved summary\n",
+    );
+    await until(() => app.toasts.filter((toast) => toast.message === "Saved: Saved topic").length === 1);
+    await Bun.sleep(400);
+    expect(app.toasts.filter((toast) => toast.variant === "success")).toHaveLength(1);
+    await app.dispose();
+    await rm(dataHome, { recursive: true, force: true });
+  });
+
+  test.serial("toasts a first-ever save that commits before the directory attach runs", async () => {
+    const dataHome = await mkdtemp("/tmp/opencode-memory-tui-first-");
+    process.env.XDG_DATA_HOME = dataHome;
+    const directory = "/tmp/memory-tui-first";
+    const memoryDirectory = join(dataHome, "opencode", "memory", tuiProjectKey(directory));
+    const app = await tuiFixture(directory);
+    app.sessionCreated({ id: "ses_worker", parentID: "ses_parent", metadata: { memoryWorker: true, memoryActivity: "classification" } });
+
+    // Fully commit the first save before the root watcher callback can run.
+    await mkdir(memoryDirectory, { recursive: true });
+    await Bun.write(join(memoryDirectory, "first.md"), '---\ntype: "project"\nsessionId: "ses_parent"\n---\n\nfirst\n');
+    await Bun.write(join(memoryDirectory, "index.md"), "# Project memory\n\n- [First ever](first.md) - First summary\n");
+    await until(() => app.toasts.some((toast) => toast.message === "Saved: First ever"));
+    await app.dispose();
+    await rm(dataHome, { recursive: true, force: true });
+  });
+
+  test.serial("does not toast for content that already exists at startup", async () => {
+    const dataHome = await mkdtemp("/tmp/opencode-memory-tui-existing-");
+    process.env.XDG_DATA_HOME = dataHome;
+    const directory = "/tmp/memory-tui-existing";
+    const memoryDirectory = join(dataHome, "opencode", "memory", tuiProjectKey(directory));
+    await mkdir(memoryDirectory, { recursive: true });
+    await Bun.write(join(memoryDirectory, "index.md"), "# Project memory\n\n- [Existing](existing.md) - Existing\n");
+    await Bun.write(join(memoryDirectory, "existing.md"), '---\nrevision: "old"\nsessionId: "ses_old"\n---\n\nold\n');
+
+    const app = await tuiFixture(directory);
+    await Bun.sleep(300);
+    expect(app.toasts).toEqual([]);
+
+    // Replacements of an existing tracked topic are detected via index diffs.
+    app.sessionCreated({ id: "ses_worker", parentID: "ses_parent", metadata: { memoryWorker: true, memoryActivity: "classification" } });
+    await Bun.write(join(memoryDirectory, "existing.md"), '---\nrevision: "new"\nsessionId: "ses_parent"\n---\n\nupdated\n');
+    await Bun.write(join(memoryDirectory, "index.md"), "# Project memory\n\n- [Existing updated](existing.md) - Updated\n");
+    await until(() => app.toasts.some((toast) => toast.message === "Saved: Existing updated"));
+    await app.dispose();
+    await rm(dataHome, { recursive: true, force: true });
+  });
+
+  test.serial("detects same-title replacements by revision and ignores unchanged rewrites", async () => {
+    const dataHome = await mkdtemp("/tmp/opencode-memory-tui-replace-");
+    process.env.XDG_DATA_HOME = dataHome;
+    const directory = "/tmp/memory-tui-replace";
+    const memoryDirectory = join(dataHome, "opencode", "memory", tuiProjectKey(directory));
+    await mkdir(memoryDirectory, { recursive: true });
+    const line = "# Project memory\n\n- [Stable title](topic.md) - Stable summary\n";
+    await Bun.write(join(memoryDirectory, "index.md"), line);
+    await Bun.write(join(memoryDirectory, "topic.md"), '---\nrevision: "rev-a"\ntype: "project"\nsessionId: "ses_old"\n---\n\nold body\n');
+
+    const app = await tuiFixture(directory);
+    app.sessionCreated({ id: "ses_worker", parentID: "ses_parent", metadata: { memoryWorker: true, memoryActivity: "classification" } });
+    await Bun.sleep(300);
+    expect(app.toasts.filter((toast) => toast.variant === "success")).toEqual([]);
+
+    // Rewriting the exact same committed content is not a save.
+    await Bun.write(join(memoryDirectory, "topic.md"), '---\nrevision: "rev-a"\ntype: "project"\nsessionId: "ses_old"\n---\n\nold body\n');
+    await Bun.sleep(700);
+    expect(app.toasts.filter((toast) => toast.variant === "success")).toEqual([]);
+
+    // A new revision behind an unchanged index line is a committed replacement.
+    await Bun.write(join(memoryDirectory, "topic.md"), '---\nrevision: "rev-b"\ntype: "project"\nsessionId: "ses_parent"\n---\n\nnew body\n');
+    await Bun.write(join(memoryDirectory, "index.md"), line);
+    await until(() => app.toasts.some((toast) => toast.message === "Saved: Stable title"));
+    await Bun.sleep(300);
+    expect(app.toasts.filter((toast) => toast.variant === "success")).toHaveLength(1);
+    await app.dispose();
+    await rm(dataHome, { recursive: true, force: true });
+  });
+
+  test.serial("disposes watchers so later writes stay silent", async () => {
+    const dataHome = await mkdtemp("/tmp/opencode-memory-tui-");
+    process.env.XDG_DATA_HOME = dataHome;
+    const directory = "/tmp/memory-tui-dispose";
+    const memoryDirectory = join(dataHome, "opencode", "memory", tuiProjectKey(directory));
+    await mkdir(memoryDirectory, { recursive: true });
+    await Bun.write(join(memoryDirectory, "index.md"), "# Project memory\n");
+
+    const app = await tuiFixture(directory);
+    app.sessionCreated({ id: "ses_worker", parentID: "ses_parent", metadata: { memoryWorker: true } });
+    await app.dispose();
+
+    await Bun.write(join(memoryDirectory, "late.md"), '---\nsessionId: "ses_parent"\n---\n\nlate\n');
+    await Bun.write(join(memoryDirectory, "index.md"), "# Project memory\n\n- [Late](late.md) - Late\n");
+    await Bun.sleep(400);
+    expect(app.toasts.filter((toast) => toast.variant === "success")).toEqual([]);
     await rm(dataHome, { recursive: true, force: true });
   });
 });
