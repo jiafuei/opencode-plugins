@@ -159,7 +159,7 @@ const SPEC_SCHEMA = tool.schema.object({
   version: tool.schema.literal(1),
   name: tool.schema.string(),
   description: tool.schema.string().describe("One line shown in the approval dialog and run tree"),
-  goal: tool.schema.string().describe("The complete objective AND the condition that ends the run, in full sentences. This is the only context a checkpoint coordinator gets besides worker outputs — it has no tools and no conversation history. A workflow that repeats until exhausted must state its stopping rule here or it will not converge."),
+  goal: tool.schema.string().describe("The complete objective AND the condition that ends the run, in a few full sentences — this is the only context a checkpoint coordinator gets besides worker outputs: it has no tools and no conversation history, so everything it must know between phases belongs here. A workflow that repeats until exhausted must state its stopping rule here or it will not converge."),
   allowedAgents: tool.schema.array(tool.schema.string()).min(1).describe("Unique registered agents workers may use; also bounds anything a checkpoint coordinator adds later"),
   phases: tool.schema.array(tool.schema.object({
     id: tool.schema.string(),
