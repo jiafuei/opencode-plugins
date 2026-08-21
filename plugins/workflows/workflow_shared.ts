@@ -278,22 +278,18 @@ export function templateSuffixError(schema: Record<string, unknown> | undefined,
     if (!node || typeof node !== "object" || Array.isArray(node)) return undefined;
     const current = node as Record<string, unknown>;
     const types = current.type === undefined ? [] : Array.isArray(current.type) ? current.type : [current.type];
-    if (Array.isArray(current.enum)) return `the schema restricts it to enum values (${current.enum.map((item) => JSON.stringify(item)).join(", ")}), which cannot be indexed further`;
+    if (Array.isArray(current.enum) && current.enum.every((item) => !item || typeof item !== "object" || Array.isArray(item))) return `the schema restricts it to scalar enum values (${current.enum.map((item) => JSON.stringify(item)).join(", ")}), which cannot be indexed further`;
     if (types.length === 1 && typeof types[0] === "string" && types[0] !== "object") return `the schema types it as ${types[0]}, which cannot be indexed further`;
-    const verifiable = types.length === 0 ? !!current.properties && typeof current.properties === "object" : types.length === 1 && types[0] === "object";
+    const properties = current.properties && typeof current.properties === "object" && !Array.isArray(current.properties) ? current.properties as Record<string, unknown> : undefined;
+    const verifiable = types.length === 0 ? !!properties || current.additionalProperties === false : types.length === 1 && types[0] === "object";
     if (!verifiable) return undefined;
-    const properties = current.properties as Record<string, unknown>;
-    if (!(segment in properties)) {
-      const keys = Object.keys(properties);
+    if (!properties || !(segment in properties)) {
+      if (current.additionalProperties !== false) return undefined;
+      const keys = Object.keys(properties ?? {});
       const listed = keys.slice(0, 8).join(", ") + (keys.length > 8 ? ", …" : "");
       return `the schema has no property "${segment}"${keys.length ? ` (available: ${listed})` : ""}`;
     }
     node = properties[segment];
-    while (node && typeof node === "object" && !Array.isArray(node)) {
-      const items = (node as Record<string, unknown>).items;
-      if (!items || typeof items !== "object" || Array.isArray(items)) break;
-      node = items; // array schemas index into their item schema
-    }
   }
   return undefined;
 }
@@ -561,29 +557,41 @@ export function utf8Prefix(value: string, maxBytes: number): string {
   if (bytes.length <= maxBytes) return value;
   const decoder = new TextDecoder("utf-8", { fatal: true });
   for (let length = Math.max(0, maxBytes); length >= 0; length--) {
-    try { return decoder.decode(bytes.subarray(0, length)) + `\n…[truncated; first ${length} of ${bytes.length} bytes]`; } catch {}
+    try { return decoder.decode(bytes.subarray(0, length)); } catch {}
   }
   return "";
 }
 
+export function markedUtf8Prefix(value: string, maxPrefixBytes: number): string {
+  const total = Buffer.byteLength(value);
+  if (total <= maxPrefixBytes) return value;
+  const prefix = utf8Prefix(value, maxPrefixBytes);
+  return `${prefix}\n…[truncated; first ${Buffer.byteLength(prefix)} of ${total} bytes]`;
+}
+
 export function compactWorkerFailures(workers: Record<string, WorkerState>): Array<{ id: string; status: WorkerState["status"]; error?: string }> {
-  return Object.values(workers).filter((worker) => ["failed", "skipped", "aborted"].includes(worker.status)).map((worker) => ({ id: worker.id, status: worker.status, ...(worker.error === undefined ? {} : { error: utf8Prefix(worker.error, 2_048) }) }));
+  return Object.values(workers).filter((worker) => ["failed", "skipped", "aborted"].includes(worker.status)).map((worker) => ({ id: worker.id, status: worker.status, ...(worker.error === undefined ? {} : { error: markedUtf8Prefix(worker.error, 2_048) }) }));
 }
 
 export function coordinatorInput(payload: { outputs: Array<{ id: string; output: string }> }, outputs: Array<{ id: string; output: string }>, maxBytes: number): string | undefined {
   if (Buffer.byteLength(JSON.stringify(payload)) > maxBytes) return;
   for (const output of outputs) {
-    let low = 0, high = Buffer.byteLength(output.output);
+    payload.outputs.push(output);
+    if (Buffer.byteLength(JSON.stringify(payload)) <= maxBytes) continue;
+    payload.outputs.pop();
+    const outputBytes = Buffer.byteLength(output.output);
+    if (!outputBytes) continue;
+    let low = 0, high = outputBytes - 1;
     while (low < high) {
       const middle = Math.ceil((low + high) / 2);
-      const candidate = { id: output.id, output: utf8Prefix(output.output, middle) };
+      const candidate = { id: output.id, output: markedUtf8Prefix(output.output, middle) };
       payload.outputs.push(candidate);
       const fits = Buffer.byteLength(JSON.stringify(payload)) <= maxBytes;
       payload.outputs.pop();
       if (fits) low = middle;
       else high = middle - 1;
     }
-    const candidate = { id: output.id, output: utf8Prefix(output.output, low) };
+    const candidate = { id: output.id, output: markedUtf8Prefix(output.output, low) };
     payload.outputs.push(candidate);
     if (Buffer.byteLength(JSON.stringify(payload)) > maxBytes) payload.outputs.pop();
   }

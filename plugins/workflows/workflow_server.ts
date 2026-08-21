@@ -79,7 +79,7 @@ import {
   isPendingControlFilename,
   pendingWorkers,
   parseModelID,
-  utf8Prefix,
+  markedUtf8Prefix,
 } from "./workflow_shared.ts";
 import { WorkflowCoordination, type LeaseToken } from "./workflow_coordination.ts";
 
@@ -201,16 +201,21 @@ function handoffPrompt(run: WorkflowRun, inputBytes: number): string | undefined
   if (Buffer.byteLength(prompt()) > inputBytes) return;
   for (const worker of workersInOrder(run.spec)) {
     const output = outputText(run.workers[worker.id]?.output);
-    let low = 0, high = Buffer.byteLength(output);
+    payload.workers.push({ id: worker.id, label: worker.label, output });
+    if (Buffer.byteLength(prompt()) <= inputBytes) continue;
+    payload.workers.pop();
+    const outputBytes = Buffer.byteLength(output);
+    if (!outputBytes) continue;
+    let low = 0, high = outputBytes - 1;
     while (low < high) {
       const middle = Math.ceil((low + high) / 2);
-      payload.workers.push({ id: worker.id, label: worker.label, output: utf8Prefix(output, middle) });
+      payload.workers.push({ id: worker.id, label: worker.label, output: markedUtf8Prefix(output, middle) });
       const fits = Buffer.byteLength(prompt()) <= inputBytes;
       payload.workers.pop();
       if (fits) low = middle;
       else high = middle - 1;
     }
-    payload.workers.push({ id: worker.id, label: worker.label, output: utf8Prefix(output, low) });
+    payload.workers.push({ id: worker.id, label: worker.label, output: markedUtf8Prefix(output, low) });
     if (Buffer.byteLength(prompt()) > inputBytes) payload.workers.pop();
   }
   return prompt();

@@ -73,6 +73,7 @@ import {
   coordinatorInput,
   finalizeSoftPause,
   isPendingControlFilename,
+  markedUtf8Prefix,
   pendingWorkers,
   utf8Prefix,
   workflowProjectDirectory,
@@ -155,24 +156,38 @@ describe("workflow spec", () => {
     const schemad = structuredClone(base);
     schemad.phases[0]!.steps[0]!.worker.schema = {
       type: "object",
+      additionalProperties: false,
       properties: {
-        repos: { type: "array", items: { type: "object", properties: { name: { type: "string" }, stars: { type: "number" } } } },
+        repo: { type: "object", additionalProperties: false, properties: { name: { type: "string" }, stars: { type: "number" } } },
         summary: { type: "string" },
       },
     };
-    schemad.phases[0]!.steps[1]!.workers[0]!.prompt = "Use {{workers.scan.output.repos.name}}";
+    schemad.phases[0]!.steps[1]!.workers[0]!.prompt = "Use {{workers.scan.output.repo.name}}";
     expect(() => validateWorkflowSpec(schemad, agents, models)).not.toThrow();
+    expect(renderTemplate(schemad.phases[0]!.steps[1]!.workers[0]!.prompt, { scan: { repo: { name: "opencode" } } })).toBe("Use opencode");
   });
 
   test("rejects schema-mismatched template paths at validation time", () => {
     const schemad = structuredClone(base);
-    schemad.phases[0]!.steps[0]!.worker.schema = { type: "object", properties: { repos: { type: "array" }, summary: { type: "string" } } };
+    schemad.phases[0]!.steps[0]!.worker.schema = { type: "object", additionalProperties: false, properties: { repos: { type: "array" }, summary: { type: "string" } } };
     const typo = structuredClone(schemad);
     typo.phases[0]!.steps[1]!.workers[0]!.prompt = "Use {{workers.scan.output.repoz}}";
     expect(() => validateWorkflowSpec(typo, agents, models)).toThrow('no property "repoz" (available: repos, summary)');
+    const array = structuredClone(schemad);
+    array.phases[0]!.steps[1]!.workers[0]!.prompt = "Use {{workers.scan.output.repos.name}}";
+    expect(() => validateWorkflowSpec(array, agents, models)).toThrow("schema types it as array");
     const indexed = structuredClone(schemad);
     indexed.phases[0]!.steps[1]!.workers[0]!.prompt = "Use {{workers.scan.output.summary.length}}";
     expect(() => validateWorkflowSpec(indexed, agents, models)).toThrow("cannot be indexed");
+  });
+
+  test("leaves fields on open object schemas to runtime checking", () => {
+    for (const schema of [{ type: "object" }, { type: "object", properties: { known: { type: "string" } } }]) {
+      const open = structuredClone(base);
+      open.phases[0]!.steps[0]!.worker.schema = schema;
+      open.phases[0]!.steps[1]!.workers[0]!.prompt = "Use {{workers.scan.output.dynamic}}";
+      expect(() => validateWorkflowSpec(open, agents, models)).not.toThrow();
+    }
   });
 
   test("leaves template paths of schema-less workers to runtime checking", () => {
@@ -707,7 +722,13 @@ describe("Stage 2 reliability helpers", () => {
     expect(truncatedError.startsWith("x".repeat(2_048))).toBe(true);
     expect(truncatedError.endsWith("\n…[truncated; first 2048 of 3000 bytes]")).toBe(true);
     expect(utf8Prefix("a😀b", 6)).toBe("a😀b");
-    expect(utf8Prefix("a😀b", 4)).toBe("a\n…[truncated; first 1 of 6 bytes]");
+    expect(utf8Prefix("a😀b", 4)).toBe("a");
+    expect(markedUtf8Prefix("a😀b", 4)).toBe("a\n…[truncated; first 1 of 6 bytes]");
+    const exact = JSON.stringify({ outputs: [{ id: "one", output: "123456789012" }] });
+    expect(coordinatorInput({ outputs: [] }, [{ id: "one", output: "123456789012" }], Buffer.byteLength(exact))).toBe(exact);
+    const marked = coordinatorInput({ outputs: [] }, [{ id: "one", output: "x".repeat(100) }], 100)!;
+    expect(Buffer.byteLength(marked)).toBeLessThanOrEqual(100);
+    expect(marked).toContain("[truncated;");
     const payload = { marker: "😀", outputs: [] as Array<{ id: string; output: string }> };
     const input = coordinatorInput(payload, [{ id: "one", output: "😀😀😀" }], 54)!;
     expect(Buffer.byteLength(input)).toBeLessThanOrEqual(54);
