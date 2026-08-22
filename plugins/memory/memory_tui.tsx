@@ -19,6 +19,7 @@ type Choice =
 const INDEX_FILE = "index.md";
 const SETTINGS_FILE = "settings.json";
 const INDEX_ENTRY = /^- \[([^\]]+)]\(([^)]+\.md)\) - (.+)$/;
+const INDEX_METADATA = /^\[[a-z]+\|[^|\]]+\|\d{4}-\d{2}-\d{2}\]\s*/;
 const SESSION_ID = /^sessionId:\s*"?([^"\s]+)"?\s*$/m;
 const REVISION = /^revision:\s*"?([^"\s]+)"?\s*$/m;
 const PARENT_TTL_MS = 15 * 60_000;
@@ -39,7 +40,8 @@ export function managedIndexEntries(content: string): Map<string, { title: strin
     const match = line.match(INDEX_ENTRY);
     const file = match?.[2];
     if (!file || basename(file) !== file) continue;
-    entries.set(file, { title: match[1]!, summary: match[3]! });
+    const summary = match[3]!.replace(INDEX_METADATA, "");
+    entries.set(file, { title: match[1]!, summary });
   }
   return entries;
 }
