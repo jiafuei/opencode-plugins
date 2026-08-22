@@ -1,0 +1,29 @@
+{
+  "name": "@jiafuei/opencode-claude-oauth",
+  "version": "0.0.1",
+  "description": "Claude Pro/Max subscription auth for OpenCode with Claude Code request fingerprinting, tested for parity with oh-my-pi's Cowork transport",
+  "type": "module",
+  "exports": {
+    "./server": "./claude_oauth.ts"
+  },
+  "files": [
+    "claude_oauth.ts",
+    "README.md"
+  ],
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "anthropic",
+    "claude",
+    "oauth"
+  ],
+  "engines": {
+    "opencode": ">=1.18.20"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "@opencode-ai/plugin": "^1.18.20"
+  }
+}

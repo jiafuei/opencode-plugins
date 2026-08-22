@@ -10,7 +10,10 @@
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
+    "@ai-sdk/anthropic": "3.0.82",
     "@types/bun": "latest",
-    "typescript": "^5"
+    "ai": "6.0.168",
+    "typescript": "^5",
+    "zod": "4.1.8"
   }
 }
