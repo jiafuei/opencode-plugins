@@ -11,7 +11,6 @@ import {
   mapStainlessArch,
   patchCch,
   rewriteBody,
-  stableRequestId,
   stripClaudeToolPrefix,
   transformJsonToolUseNames,
 } from "./claude_oauth.ts";
@@ -386,27 +385,10 @@ describe("mapStainlessArch", () => {
   });
 });
 
-describe("stableRequestId", () => {
-  test("reuses the id for the same key and issues a fresh one per logical request", () => {
-    const first = stableRequestId("https://api.anthropic.com/v1/messages\0body-a");
-    expect(first).toMatch(/^[0-9a-f-]{36}$/);
-    expect(stableRequestId("https://api.anthropic.com/v1/messages\0body-a")).toBe(first);
-    expect(stableRequestId("https://api.anthropic.com/v1/messages\0body-b")).not.toBe(first);
-    expect(stableRequestId("https://api.anthropic.com/v1/messages?beta=true\0body-a")).not.toBe(first);
-  });
-
-  test("is bounded: entries beyond the cap are evicted (no leak)", () => {
-    const pinned = stableRequestId("pinned-key");
-    // Overflow the cache; the pinned entry (inserted first) gets evicted.
-    for (let i = 0; i < 512; i++) stableRequestId(`key-${i}`);
-    expect(stableRequestId("pinned-key")).not.toBe(pinned);
-  });
-});
-
 describe("patchCch", () => {
   test("patches the placeholder with the XXHash64 low-20-bit hex attestation", () => {
     const encoded = new TextEncoder().encode(rewriteBody(baseBody, {}).json);
-    expect(patchCch(encoded)).toBe(true);
+    expect(patchCch(encoded)).toBe("patched");
     const patched = new TextDecoder().decode(encoded);
     const cch = patched.match(/cch=([0-9a-f]{5})/)?.[1];
     expect(cch).toBeDefined();
@@ -415,7 +397,24 @@ describe("patchCch", () => {
 
   test("leaves bodies without the billing header untouched", () => {
     const encoded = new TextEncoder().encode(JSON.stringify({ model: "x", messages: [], stream: true }));
-    expect(patchCch(encoded)).toBe(false);
+    expect(patchCch(encoded)).toBe("no-billing-header");
+  });
+
+  test("returns unanchored when the billing block is present but the placeholder is gone", () => {
+    const json = rewriteBody(baseBody, {}).json.replace("cch=00000", "cch=zzzzz");
+    const encoded = new TextEncoder().encode(json);
+    expect(patchCch(encoded)).toBe("unanchored");
+    // The body must be left byte-identical (graceful fallback).
+    expect(new TextDecoder().decode(encoded)).toBe(json);
+  });
+
+  test("returns unanchored when the placeholder sits outside the anchor window", () => {
+    const json = rewriteBody(baseBody, {})
+      .json
+      .replace(`${BILLING_PREFIX} cc_version`, `${BILLING_PREFIX} ${"x".repeat(151)}cc_version`);
+    const encoded = new TextEncoder().encode(json);
+    expect(patchCch(encoded)).toBe("unanchored");
+    expect(new TextDecoder().decode(encoded)).toBe(json);
   });
 });
 
@@ -523,7 +522,7 @@ describe("rewriteBody tool name cloaking", () => {
     const json = rewriteBody(toolBody, {}).json;
     expect(json).toContain('"name":"_get_weather"');
     const encoded = new TextEncoder().encode(json);
-    expect(patchCch(encoded)).toBe(true);
+    expect(patchCch(encoded)).toBe("patched");
     const patched = new TextDecoder().decode(encoded);
     const cch = patched.match(/cch=([0-9a-f]{5})/)?.[1]!;
     // Recompute the expected hash over the final prefixed body with the
@@ -620,13 +619,14 @@ describe("createSseToolNameTransform", () => {
     expect(decoded).toContain('"partial_json":"\\"content_block_start\\""');
   });
 
-  test("emits incrementally without buffering the whole response", async () => {
+  test("emits complete events incrementally without buffering the whole response", async () => {
     const transform = createSseToolNameTransform();
     const reader = transform.readable.getReader();
     const writer = transform.writable.getWriter();
     const bytes = new TextEncoder().encode(SSE_PAYLOAD);
-    const firstBreak = bytes.indexOf(10) + 1;
-    // Only the first line has been fed; its output must already be readable.
+    // The first event (through its blank line) is readable as soon as it has
+    // been fed — nothing beyond the current event is buffered.
+    const firstBreak = SSE_PAYLOAD.indexOf("\n\n") + 2;
     // The write is not awaited first: TransformStream writes stall until the
     // readable side is being consumed.
     const writeFirst = writer.write(bytes.subarray(0, firstBreak));
@@ -666,6 +666,58 @@ describe("createSseToolNameTransform", () => {
     const bytes = new TextEncoder().encode('data: not-json{"type":"content_block_start"\n\n');
     const output = await collect(fragmentedStream(bytes, [3]).pipeThrough(createSseToolNameTransform()));
     expect(new TextDecoder().decode(output)).toBe('data: not-json{"type":"content_block_start"\n\n');
+  });
+
+  test("joins multiple data: lines per SSE rules before JSON parsing and rewrites as one", async () => {
+    const payload =
+      'data: {"type":"content_block_start","index":9,\n' +
+      'data: "content_block":{"type":"tool_use","id":"toolu_09","name":"_split_name","input":{}}}\n' +
+      "\n";
+    const output = await collect(
+      fragmentedStream(new TextEncoder().encode(payload), [13]).pipeThrough(createSseToolNameTransform()),
+    );
+    const dataLines = new TextDecoder().decode(output).split("\n").filter((line) => line.startsWith("data:"));
+    expect(dataLines).toHaveLength(1);
+    expect(JSON.parse(dataLines[0]!.slice("data: ".length))).toEqual({
+      type: "content_block_start",
+      index: 9,
+      content_block: { type: "tool_use", id: "toolu_09", name: "split_name", input: {} },
+    });
+  });
+
+  test("uncloaks tool_use names in message_start.message.content blocks", async () => {
+    const payload =
+      'event: message_start\n' +
+      'data: {"type":"message_start","message":{"id":"msg_ms","role":"assistant","content":[' +
+      '{"type":"text","text":"hi"},' +
+      '{"type":"tool_use","id":"toolu_10","name":"_prefixed","input":{}}' +
+      ']}}\r\n\r\n';
+    const output = await collect(
+      fragmentedStream(new TextEncoder().encode(payload), [17]).pipeThrough(createSseToolNameTransform()),
+    );
+    const dataLine = new TextDecoder()
+      .decode(output)
+      .split("\n")
+      .find((line) => line.startsWith("data:"))!;
+    const event = JSON.parse(dataLine.slice("data: ".length));
+    expect(event.message.content[0]).toEqual({ type: "text", text: "hi" });
+    expect(event.message.content[1].name).toBe("prefixed");
+    expect(event.message.content[1].id).toBe("toolu_10");
+  });
+
+  test("fails clearly when a partial event exceeds the assembly cap", async () => {
+    // No blank line: the record never completes and keeps growing.
+    const payload = `data: "${"x".repeat(2 * 1024 * 1024)}"\n`;
+    let error: unknown;
+    try {
+      await collect(
+        fragmentedStream(new TextEncoder().encode(payload), [4096]).pipeThrough(createSseToolNameTransform()),
+      );
+    } catch (e) {
+      error = e;
+    }
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toMatch(/exceeded.*bytes/i);
   });
 });
 

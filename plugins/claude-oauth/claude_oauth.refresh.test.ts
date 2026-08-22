@@ -76,11 +76,11 @@ function useDataDir(): { restore: () => void } {
   const dir = mkdtempSync(path.join(tmpdir(), "claude-oauth-refresh-"));
   const prev = process.env.XDG_DATA_HOME;
   process.env.XDG_DATA_HOME = dir;
-  refreshTestSeam.inFlightRefreshes.clear();
+  refreshTestSeam.resetInFlightRefreshes();
   return {
     restore: () => {
       process.env.XDG_DATA_HOME = prev;
-      refreshTestSeam.inFlightRefreshes.clear();
+      refreshTestSeam.resetInFlightRefreshes();
       rmSync(dir, { recursive: true, force: true });
     },
   };
@@ -88,11 +88,17 @@ function useDataDir(): { restore: () => void } {
 
 function holdLease(dir: string, ageMs = 0): void {
   mkdirSync(dir, { recursive: true });
-  writeFileSync(path.join(dir, "owner"), JSON.stringify({ pid: 999999, at: Date.now() - ageMs }));
+  writeFileSync(
+    path.join(dir, "owner"),
+    JSON.stringify({ owner: "foreign-holder", pid: 999999, at: Date.now() - ageMs }),
+  );
 }
 
 interface Harness {
+  /** The starting auth record; persist() mirrors into it like the real store. */
   authState: Record<string, unknown>;
+  /** Replace what getAuth returns entirely (logout, type switch, ...). */
+  setAuth: (value: unknown) => void;
   persisted: Persisted[];
   events: string[];
   options: Record<string, any>;
@@ -103,7 +109,8 @@ async function makeHarness(opts?: {
   /** Replace the default persist behavior (return an error body or throw). */
   setImpl?: (body: Persisted) => Promise<unknown>;
 }): Promise<Harness> {
-  const authState = structuredClone(opts?.auth ?? EXPIRED_AUTH);
+  const authState = structuredClone(opts?.auth ?? EXPIRED_AUTH) as Record<string, unknown>;
+  let currentAuth: unknown = authState;
   const persisted: Persisted[] = [];
   const events: string[] = [];
   const plugin = await ClaudeOAuthPlugin({
@@ -112,13 +119,16 @@ async function makeHarness(opts?: {
         set: async ({ body }: { body: Persisted }) => {
           events.push("persist");
           if (opts?.setImpl) return opts.setImpl(body);
+          // Like OpenCode's server: auth.set persists into the store that
+          // getAuth reads, so post-refresh re-reads observe the new credential.
+          Object.assign(authState, structuredClone(body));
           persisted.push(structuredClone(body));
         },
       },
     },
   } as never);
-  const options = await plugin.auth!.loader!(async () => authState as never, {} as never);
-  return { authState, persisted, events, options };
+  const options = await plugin.auth!.loader!(async () => currentAuth as never, {} as never);
+  return { authState, setAuth: (value) => (currentAuth = value), persisted, events, options };
 }
 
 function callFetch(options: Record<string, any>): Promise<Response> {
@@ -259,7 +269,7 @@ describe("shared refresh coordination", () => {
   serialTest("recovers from a stale lease left by a crashed process", async () => {
     const data = useDataDir();
     const lease = refreshTestSeam.leaseDirFor("stored-account:stale-refresh");
-    holdLease(lease, 120_000); // older than the lease TTL
+    holdLease(lease, 200_000); // older than the lease TTL
     let tokenCalls = 0;
     const mock = mockFetch((url) => {
       if (isTokenCall(url)) {
@@ -311,6 +321,307 @@ describe("shared refresh coordination", () => {
       const h = await makeHarness();
       await callFetch(h.options);
       expect(h.persisted[0]?.refresh).toBe("stale-refresh");
+    } finally {
+      mock.restore();
+      data.restore();
+    }
+  });
+});
+
+describe("refresh lease ownership", () => {
+  serialTest("release only removes the lease when the owner token matches", () => {
+    const base = mkdtempSync(path.join(tmpdir(), "claude-oauth-owner-"));
+    const dir = path.join(base, "lease");
+    try {
+      const first = refreshTestSeam.tryAcquireLease(dir);
+      expect(typeof first).toBe("string");
+      // A replacement lease appears under the same directory (a takeover by
+      // another holder) while we still hold our now-outdated token.
+      writeFileSync(
+        path.join(dir, "owner"),
+        JSON.stringify({ owner: "replacement-owner", pid: 424242, at: Date.now() }),
+      );
+      refreshTestSeam.releaseLease(dir, first!);
+      // Our stale token must NOT delete another holder's replacement lease.
+      expect(existsSync(dir)).toBe(true);
+      expect(refreshTestSeam.readLeaseOwner(dir)?.owner).toBe("replacement-owner");
+      // Releasing with the matching token removes it.
+      refreshTestSeam.releaseLease(dir, "replacement-owner");
+      expect(existsSync(dir)).toBe(false);
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  serialTest("an ownerless fresh lease directory (holder mid-installation) is never stolen", () => {
+    const base = mkdtempSync(path.join(tmpdir(), "claude-oauth-install-"));
+    const dir = path.join(base, "lease");
+    try {
+      // Mirrors the window between the holder's winning mkdir and its
+      // owner-record write: the directory exists but carries no owner yet.
+      mkdirSync(dir);
+      expect(refreshTestSeam.tryAcquireLease(dir)).toBeNull();
+      // Stealing here would let the dispossessed holder overwrite our owner
+      // record afterwards, leaving two live holders. Only once the directory
+      // ages past the lease TTL does the takeover proceed.
+      const originalNow = refreshTestSeam.leaseClock.now;
+      refreshTestSeam.leaseClock.now = () => Date.now() + 200_000;
+      try {
+        const stolen = refreshTestSeam.tryAcquireLease(dir);
+        expect(typeof stolen).toBe("string");
+        expect(refreshTestSeam.readLeaseOwner(dir)?.owner).toBe(stolen!);
+      } finally {
+        refreshTestSeam.leaseClock.now = originalNow;
+      }
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  serialTest("stale takeover installs a fresh verified owner token", () => {
+    const base = mkdtempSync(path.join(tmpdir(), "claude-oauth-takeover-"));
+    const dir = path.join(base, "lease");
+    try {
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(
+        path.join(dir, "owner"),
+        JSON.stringify({ owner: "dead-owner", pid: 999999, at: Date.now() - 200_000 }),
+      );
+      const stolen = refreshTestSeam.tryAcquireLease(dir);
+      expect(stolen).not.toBeNull();
+      expect(stolen).not.toBe("dead-owner");
+      const recorded = refreshTestSeam.readLeaseOwner(dir)!;
+      expect(recorded.owner).toBe(stolen!);
+      expect(recorded.pid).toBe(process.pid);
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  serialTest("a live lease held well past 10s is never stolen; the waiter adopts the landed peer refresh", async () => {
+    const data = useDataDir();
+    const lease = refreshTestSeam.leaseDirFor("stored-account:stale-refresh");
+    let fakeNow = Date.now();
+    const originalNow = refreshTestSeam.leaseClock.now;
+    const originalSleep = refreshTestSeam.leaseClock.sleep;
+    refreshTestSeam.leaseClock.now = () => fakeNow;
+
+    mkdirSync(lease, { recursive: true });
+    const foreignOwner = { owner: "foreign-live-owner", pid: 999999, at: fakeNow };
+    writeFileSync(path.join(lease, "owner"), JSON.stringify(foreignOwner));
+
+    let tokenCalls = 0;
+    const mock = mockFetch((url) => {
+      if (isTokenCall(url)) {
+        tokenCalls++;
+        return tokenResponse();
+      }
+      return jsonResponse({ id: "msg" });
+    });
+
+    let h!: Harness;
+    let peerLanded = false;
+    const landPeer = () => {
+      expect(peerLanded).toBe(false);
+      peerLanded = true;
+      // We have polled against this live holder far past the old bounded-wait
+      // horizon and never stole its lease.
+      expect(fakeNow - foreignOwner.at).toBeGreaterThanOrEqual(11_000);
+      expect(refreshTestSeam.readLeaseOwner(lease)?.owner).toBe("foreign-live-owner");
+      // The peer's refresh lands and it frees the lease.
+      Object.assign(h.authState, { access: "peer-access", expires: fakeNow + 3600_000 });
+      rmSync(lease, { recursive: true, force: true });
+    };
+
+    try {
+      h = await makeHarness();
+      refreshTestSeam.leaseClock.sleep = async (ms: number) => {
+        fakeNow += ms;
+        await Bun.sleep(1); // yield so other queued work can run
+        if (!peerLanded && fakeNow - foreignOwner.at >= 11_000) landPeer();
+      };
+      await callFetch(h.options);
+      expect(tokenCalls).toBe(0); // live lease was never taken over
+      expect(peerLanded).toBe(true);
+      const sent = mock.calls.filter((c) => c.url.includes("/v1/messages"));
+      expect(sent).toHaveLength(1);
+      expect(new Headers(sent[0]!.init!.headers).get("authorization")).toBe("Bearer peer-access");
+    } finally {
+      refreshTestSeam.leaseClock.now = originalNow;
+      refreshTestSeam.leaseClock.sleep = originalSleep;
+      mock.restore();
+      data.restore();
+    }
+  });
+});
+
+describe("mid-refresh auth transitions", () => {
+  serialTest("logout during the network refresh discards the result and fails clearly", async () => {
+    const data = useDataDir();
+    let h!: Harness;
+    let tokenCalls = 0;
+    const mock = mockFetch((url) => {
+      if (isTokenCall(url)) {
+        tokenCalls++;
+        h.setAuth(undefined);
+        return tokenResponse();
+      }
+      return jsonResponse({ id: "msg" });
+    });
+    try {
+      h = await makeHarness();
+      await expect(callFetch(h.options)).rejects.toThrow(/missing.*opencode auth login/i);
+      expect(tokenCalls).toBe(1);
+      expect(mock.calls.filter((c) => c.url.includes("/v1/messages"))).toHaveLength(0);
+      expect(h.persisted).toHaveLength(0);
+    } finally {
+      mock.restore();
+      data.restore();
+    }
+  });
+
+  serialTest("API-key transition during the refresh dispatches an ordinary API request", async () => {
+    const data = useDataDir();
+    let h!: Harness;
+    const mock = mockFetch((url) => {
+      if (isTokenCall(url)) {
+        h.setAuth({ type: "api", key: "sk-ant-switched" });
+        return tokenResponse();
+      }
+      return jsonResponse({ id: "msg" });
+    });
+    try {
+      h = await makeHarness();
+      const response = await callFetch(h.options);
+      expect(response.status).toBe(200);
+      const sent = mock.calls.filter((c) => c.url.includes("/v1/messages"));
+      expect(sent).toHaveLength(1);
+      const headers = new Headers(sent[0]!.init!.headers);
+      expect(headers.get("x-api-key")).toBe("sk-ant-switched");
+      expect(headers.get("authorization")).toBeNull();
+      expect(headers.get("user-agent") ?? "").not.toContain("claude-cli");
+      expect(sent[0]!.url).toBe("https://api.anthropic.com/v1/messages"); // no ?beta=true
+      expect(String(sent[0]!.init!.body)).not.toContain("x-anthropic-billing-header");
+      expect(h.persisted).toHaveLength(0);
+    } finally {
+      mock.restore();
+      data.restore();
+    }
+  });
+
+  serialTest("a new OAuth login during the refresh wins over the stale refresh result", async () => {
+    const data = useDataDir();
+    let h!: Harness;
+    let tokenCalls = 0;
+    const mock = mockFetch((url) => {
+      if (isTokenCall(url)) {
+        tokenCalls++;
+        h.setAuth({
+          type: "oauth",
+          access: "login-access",
+          refresh: "login-refresh",
+          expires: Date.now() + 3600_000,
+          accountId: "new-account",
+        });
+        return tokenResponse();
+      }
+      return jsonResponse({ id: "msg" });
+    });
+    try {
+      h = await makeHarness();
+      await callFetch(h.options);
+      expect(tokenCalls).toBe(1);
+      const sent = mock.calls.filter((c) => c.url.includes("/v1/messages"));
+      expect(sent).toHaveLength(1);
+      expect(new Headers(sent[0]!.init!.headers).get("authorization")).toBe("Bearer login-access");
+      expect(h.persisted).toHaveLength(0);
+      expect(existsSync(refreshTestSeam.leaseDirFor("stored-account:stale-refresh"))).toBe(false);
+    } finally {
+      mock.restore();
+      data.restore();
+    }
+  });
+
+  serialTest("auth disappearing while waiting on a live lease fails clearly without network", async () => {
+    const data = useDataDir();
+    const lease = refreshTestSeam.leaseDirFor("stored-account:stale-refresh");
+    holdLease(lease); // live foreign holder
+    let tokenCalls = 0;
+    const mock = mockFetch((url) => {
+      if (isTokenCall(url)) {
+        tokenCalls++;
+        return tokenResponse();
+      }
+      return jsonResponse({ id: "msg" });
+    });
+    try {
+      const h = await makeHarness();
+      const peer = setTimeout(() => {
+        h.setAuth(undefined);
+        rmSync(lease, { recursive: true, force: true });
+      }, 30);
+      try {
+        await expect(callFetch(h.options)).rejects.toThrow(/missing.*opencode auth login/i);
+      } finally {
+        clearTimeout(peer);
+      }
+      expect(tokenCalls).toBe(0);
+      expect(mock.calls.filter((c) => c.url.includes("/v1/messages"))).toHaveLength(0);
+      expect(h.persisted).toHaveLength(0);
+    } finally {
+      mock.restore();
+      data.restore();
+    }
+  });
+
+  serialTest("dispatch uses the latest persisted credential after a successful shared refresh", async () => {
+    const data = useDataDir();
+    const mock = mockFetch((url) => (isTokenCall(url) ? tokenResponse() : jsonResponse({ id: "msg" })));
+    try {
+      const h = await makeHarness();
+      await callFetch(h.options);
+      const sent = mock.calls.filter((c) => c.url.includes("/v1/messages"));
+      expect(new Headers(sent[0]!.init!.headers).get("authorization")).toBe("Bearer new-access");
+      // persist() wrote into the store before dispatch; the request carried
+      // exactly what was persisted.
+      expect(h.authState.access).toBe("new-access");
+      expect(h.events[0]).toBe("persist");
+    } finally {
+      mock.restore();
+      data.restore();
+    }
+  });
+});
+
+describe("test-surface hygiene", () => {
+  serialTest("the refresh seam exposes no raw refresh tokens or internal maps", () => {
+    // The old seam exported the raw-keyed in-flight map itself.
+    expect("inFlightRefreshes" in (refreshTestSeam as Record<string, unknown>)).toBe(false);
+    // Safe reset/introspection methods exist instead.
+    expect(refreshTestSeam.resetInFlightRefreshes).toBeTypeOf("function");
+    expect(refreshTestSeam.inFlightKeys()).toHaveLength(0);
+    // The key derivation hashes the credential identity.
+    const key = refreshTestSeam.inFlightKey("stored-account", "stale-refresh");
+    expect(key).toMatch(/^[0-9a-f]{64}$/);
+    expect(key).not.toContain("stale-refresh");
+  });
+
+  serialTest("in-flight refresh keys are hashed while a refresh is pending", async () => {
+    const data = useDataDir();
+    const lease = refreshTestSeam.leaseDirFor("stored-account:stale-refresh");
+    holdLease(lease); // live foreign holder keeps the refresh in flight
+    const mock = mockFetch((url) => (isTokenCall(url) ? tokenResponse() : jsonResponse({ id: "msg" })));
+    try {
+      const h = await makeHarness();
+      const pending = callFetch(h.options);
+      await Bun.sleep(30); // let it register the shared refresh promise
+      const keys = refreshTestSeam.inFlightKeys();
+      expect(keys).toHaveLength(1);
+      expect(keys[0]).toBe(refreshTestSeam.inFlightKey("stored-account", "stale-refresh"));
+      expect(JSON.stringify(keys)).not.toContain("stale-refresh");
+      // Unwind: free the lease so the refresh completes normally.
+      rmSync(lease, { recursive: true, force: true });
+      await pending;
     } finally {
       mock.restore();
       data.restore();

@@ -27,8 +27,9 @@ used for `Bun.hash.xxHash64`). Then run `opencode auth login`, pick
   just the authorization code (`code#state` works too).
 - **Anthropic API key** — plain API-key auth, untouched by this plugin.
 
-Both OAuth flows share a 5-minute timeout per login attempt; concurrent logins
-are keyed by their `state` parameter so they never interfere.
+Both OAuth flows share a 5-minute timeout per login attempt. Callback state is
+isolated per browser flow, but OpenCode keeps one pending authorization per
+provider, so do not start multiple Anthropic login attempts concurrently.
 
 ## What it does
 
@@ -40,7 +41,8 @@ tested):
 - `Authorization: Bearer sk-ant-oat01-…` (never `x-api-key`) and
   `?beta=true` on `/v1/messages`
 - `User-Agent: claude-cli/2.1.220 (external, claude-desktop)`, `x-app: cli`,
-  retry-stable `x-client-request-id`, the Stainless header set, and
+  a per-invocation `x-client-request-id` (stable across SDK retries of the
+  same request, fresh per logical invocation), the Stainless header set, and
   `X-Claude-Code-Session-Id` per session
 - The Claude Code beta profile (`claude-code-20250219`, interleaved thinking,
   context management, …), chosen per request shape (utility vs agent profile);
@@ -71,21 +73,42 @@ tested):
 
 Access tokens are refreshed ~5 minutes before expiry. Refreshes dedupe across
 loader instances via an in-process promise map, and across processes via an
-exclusive filesystem lease (60s stale-holder takeover, bounded 10s wait) under
-OpenCode's data directory — rotation means only one winner per credential.
+exclusive filesystem lease under OpenCode's data directory: a live holder is
+waited on until its refresh lands, and a holder that crashes or remains
+suspended is taken over after its lease record goes 120s stale. Before
+persisting, the refresh re-checks that the stored
+credential is still the grant it refreshed, so a concurrent logout or new
+login is never overwritten. Rotation means only one winner per credential.
 Rotated tokens are persisted back into OpenCode's auth store before use.
 
 Auth transitions are handled live: switching to API-key auth or logging out
 while a session runs switches the request path accordingly (no OAuth
 fingerprinting on the API-key path).
 
+### Credential safety
+
+- **Official endpoint only.** OAuth bearer tokens are attached exclusively to
+  `https://api.anthropic.com` requests. HTTP, localhost, alternate hosts,
+  credentials-in-URL, and custom baseURL destinations are rejected before any
+  network activity — use Anthropic API-key auth for gateways/proxies instead.
+- **Validated token envelopes.** A 200 token response missing a nonempty
+  `access_token` / `refresh_token` (login) or a finite positive `expires_in`
+  fails before identity resolution, persistence, or dispatch.
+- **Sanitized token errors.** Token-endpoint error bodies are read only up to
+  16 KiB and reduced to the structured `error`/`error_description` fields plus
+  the HTTP status — raw bodies and credentials never appear in thrown errors.
+- **No OAuth residue on the API-key path.** When auth switches to an API key,
+  the session marker header and any stale bearer are stripped and the real
+  `x-api-key` set, leaving the ordinary SDK request untouched.
+
 ## Grant lifetime
 
-Like Claude Code itself, the OAuth grant has an absolute **~30-day lifetime**
-(observed heuristic). Refresh-token rotation does not extend it. The plugin
-records authorization time at login in a sidecar file and logs a warning once
-the grant reaches ~28 days; terminal refresh failures (`invalid_grant`) report
-the observed grant age and ask you to re-login.
+The OAuth grant typically stays valid for around 30 days — an **observed**
+lifetime, not a guaranteed protocol limit (matching Claude Code itself).
+Refresh-token rotation does not extend it. The plugin records authorization
+time at login in a sidecar file and logs a warning once the grant reaches ~28
+days; terminal refresh failures (`invalid_grant`) report the observed grant
+age and ask you to re-login.
 
 ## Storage
 
@@ -94,11 +117,44 @@ files written with mode 0600:
 
 - `claude-oauth-install-id` — stable random install ID feeding the device ID
 - `claude-oauth/grants.json` — authorization timestamps only (never tokens)
+- `claude-oauth/grants.lock/` — transient cross-process sidecar lock
 - `claude-oauth/refresh-lease/<hash>/` — transient cross-process refresh lease
 
 Credentials themselves live only in OpenCode's auth store. OpenCode's OAuth
 schema persists just `accountId`; email/org identity resolved during login is
 transient only — there is deliberately no second credential store.
+
+## Limitations
+
+- **Best-effort application-layer parity.** The plugin mirrors the headers,
+  payload, beta profile, tool-name transport, and `cch` behavior tested against
+  the current oh-my-pi Cowork implementation. It does not reproduce Claude
+  Code's TLS handshake, ALPN, HTTP stack, or every future client release. The
+  pinned Claude Code version/fingerprint constants will need updates as the
+  upstream client changes.
+- **Official endpoint only.** Subscription OAuth cannot be used through custom
+  base URLs, enterprise gateways, or signing proxies. Those configurations
+  must use API-key auth.
+- **OpenCode owns retry policy.** The plugin does not copy oh-my-pi's custom
+  first-event/idle watchdogs, pre-content retry loop, or strict-tool,
+  invalid-thinking-signature, and fast-mode recovery paths. Requests use
+  OpenCode and the Anthropic SDK's normal retry/error behavior.
+- **No speculative model filtering.** OpenCode's Anthropic catalog remains
+  visible while using OAuth. If Anthropic rejects a model for subscription
+  credentials, the error is surfaced when that model is called rather than the
+  plugin maintaining an unverified allowlist.
+- **Host lifecycle limits.** OpenCode stores one pending authorization per
+  provider and persists no organization UUID/name for OAuth. A live auth-type
+  change can also leave model cost metadata at its previous value until the
+  provider instance reloads, although request authentication switches safely.
+- **Bounded response rewriting.** Tool-name uncloaking supports normal
+  Anthropic SSE and JSON responses. A single SSE event larger than 1 MiB or a
+  JSON response larger than the configured safety bound is rejected instead
+  of buffered without limit.
+- **Refresh recovery delay.** If a refresh owner crashes or is suspended,
+  another process may wait up to the 120-second stale-lease threshold before
+  taking over. This favors avoiding duplicate rotating-token refreshes over
+  immediate recovery.
 
 ## Development
 

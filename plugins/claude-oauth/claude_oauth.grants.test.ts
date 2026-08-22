@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -104,6 +105,9 @@ describe("grant-age sidecar", () => {
       const grants = readGrantsFile();
       expect(grants["account-a"]).toBe(T0);
       expect(statSync(grantsPath()).mode & 0o777).toBe(0o600);
+      // Data directories created by the sidecar are owner-only.
+      expect(statSync(path.join(process.env.XDG_DATA_HOME!, "opencode")).mode & 0o777).toBe(0o700);
+      expect(statSync(path.join(process.env.XDG_DATA_HOME!, "opencode", "claude-oauth")).mode & 0o777).toBe(0o700);
     } finally {
       env.restore();
     }
@@ -330,6 +334,79 @@ describe("grant-age sidecar", () => {
       expect(readGrantsFile()).toEqual({ "account-a": T0 - 29 * DAY_MS });
     } finally {
       globalThis.fetch = originalFetch;
+      env.restore();
+    }
+  });
+});
+
+describe("grant key migration (refresh-hash → accountId)", () => {
+  function hashKey(refreshToken: string): string {
+    return createHash("sha256").update(refreshToken).digest("hex").slice(0, 16);
+  }
+
+  serialTest("a grant first keyed by refresh hash falls back to it and migrates once accountId is known", async () => {
+    const env = useGrantsEnv();
+    const legacy = T0 - 29 * DAY_MS;
+    // Grant recorded before the accountId was known.
+    seedGrantsFile({ [hashKey("stale-refresh")]: legacy });
+    const originalFetch = globalThis.fetch;
+    try {
+      globalThis.fetch = (async (input: string | URL | Request) => {
+        const url = String(input instanceof Request ? input.url : input);
+        if (url.includes("/v1/oauth/token")) {
+          return new Response(JSON.stringify({ error: "invalid_grant", error_description: "expired" }), {
+            status: 400,
+            headers: { "content-type": "application/json" },
+          });
+        }
+        return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
+      }) as typeof fetch;
+      const h = await makeHarness({
+        auth: {
+          type: "oauth",
+          access: "stale-access",
+          refresh: "stale-refresh",
+          expires: Date.now() - 1000,
+          accountId: "account-a",
+        },
+      });
+      const error = await h.options
+        .fetch!("https://api.anthropic.com/v1/messages", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ model: "claude-sonnet-4-6", messages: [], max_tokens: 1 }),
+        })
+        .catch((e: unknown) => e);
+      // Fallback lookup found the legacy entry, so the observed age survives.
+      expect(error).toBeInstanceOf(AnthropicReauthRequiredError);
+      expect((error as Error).message).toMatch(/Observed grant age: ~29 day\(s\)/);
+      // The history moved onto the stable account key; the refresh-hash key is
+      // gone, so a later rotation cannot lose the age.
+      expect(readGrantsFile()).toEqual({ "account-a": legacy });
+    } finally {
+      globalThis.fetch = originalFetch;
+      env.restore();
+    }
+  });
+
+  serialTest("migration never overwrites an existing account-keyed entry", async () => {
+    const env = useGrantsEnv();
+    try {
+      seedGrantsFile({ [hashKey("refresh-a")]: T0 - 40 * DAY_MS, "account-a": T0 - 5 * DAY_MS });
+      const h = await makeHarness({
+        auth: {
+          type: "oauth",
+          access: "a",
+          refresh: "refresh-a",
+          expires: Date.now() + 3_600_000,
+          accountId: "account-a",
+        },
+      });
+      // Fresh credential: no stale-grant warning from either entry.
+      expect(h.warnings).toHaveLength(0);
+      // Both entries are preserved untouched (no migration clobbered account-a).
+      expect(readGrantsFile()).toEqual({ [hashKey("refresh-a")]: T0 - 40 * DAY_MS, "account-a": T0 - 5 * DAY_MS });
+    } finally {
       env.restore();
     }
   });

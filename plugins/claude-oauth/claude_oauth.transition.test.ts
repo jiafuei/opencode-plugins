@@ -200,9 +200,16 @@ describe("chat.headers claudeOAuth marker", () => {
     return output.headers;
   }
 
-  test("marker propagates the stable session id even when apiKey is overridden by provider config", async () => {
+  test("marker propagates the stable session id and a fresh per-invocation request id", async () => {
     const headers = await runHeaders({ apiKey: "sk-user-configured-key", claudeOAuth: true });
     expect(headers["X-Claude-Code-Session-Id"]).toBe("ses_transition-test");
+    expect(headers["x-claude-oauth-request-id"]).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+  });
+
+  test("each logical invocation gets a distinct private request id", async () => {
+    const first = await runHeaders({ apiKey: "k", claudeOAuth: true });
+    const second = await runHeaders({ apiKey: "k", claudeOAuth: true });
+    expect(first["x-claude-oauth-request-id"]).not.toBe(second["x-claude-oauth-request-id"]);
   });
 
   test("dummy apiKey alone does NOT enable session propagation without the marker", async () => {

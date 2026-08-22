@@ -481,42 +481,108 @@ describe("request capture: header parity", () => {
   });
 });
 
-describe("request capture: x-client-request-id retry stability", () => {
+describe("request capture: x-client-request-id per-invocation semantics", () => {
+  // Private plugin transport header set by chat.headers; never sent on the wire.
+  const REQUEST_ID_HEADER = "x-claude-oauth-request-id";
+  const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
   async function makeLoaderFetch() {
     const plugin = await ClaudeOAuthPlugin({ client: { auth: { set: async () => {} } } } as never);
     return plugin.auth!.loader!(async () => OAUTH_AUTH as never, {} as never);
   }
 
-  const MESSAGES_INIT = (body: string): RequestInit => ({
-    method: "POST",
-    headers: { "content-type": "application/json", "X-Claude-Code-Session-Id": "session-retry" },
-    body,
+  test("distinct identical logical SDK invocations get different ids", async () => {
+    const { anthropic, captured } = await setupHarness();
+    const invoke = () =>
+      streamText({
+        model: anthropic("claude-sonnet-4-6"),
+        system: "You are a coding agent.",
+        prompt: "hello world, this is the first user message",
+        maxOutputTokens: 128000,
+        headers: { "X-Claude-Code-Session-Id": "session-test-1" },
+      });
+    await (await invoke()).text;
+    await (await invoke()).text;
+
+    expect(captured).toHaveLength(2);
+    const idA = captured[0]!.headers["x-client-request-id"]!;
+    const idB = captured[1]!.headers["x-client-request-id"]!;
+    expect(idA).toMatch(UUID);
+    expect(idB).toMatch(UUID);
+    expect(idB).not.toBe(idA);
   });
 
-  test("same request retried reuses the id; different bodies get fresh ids", async () => {
+  test("SDK retries reusing prepared headers keep the same id; fallback mints fresh ones; no private-header leakage", async () => {
     const options = await makeLoaderFetch();
     const ids: string[] = [];
+    let privateHeaderSeenOnWire = false;
     const originalFetch = globalThis.fetch;
-    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
-      ids.push(new Headers(init?.headers).get("x-client-request-id")!);
+    globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+      const headers = new Headers(init?.headers);
+      if (headers.has(REQUEST_ID_HEADER)) privateHeaderSeenOnWire = true;
+      ids.push(headers.get("x-client-request-id")!);
       return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
     }) as typeof fetch;
     try {
-      const bodyA = JSON.stringify({ model: "claude-sonnet-4-6", messages: [{ role: "user", content: "a" }], max_tokens: 1 });
-      const bodyB = JSON.stringify({ model: "claude-sonnet-4-6", messages: [{ role: "user", content: "b" }], max_tokens: 1 });
-      // Simulated SDK retries: identical request fired three times.
-      await options.fetch!("https://api.anthropic.com/v1/messages", MESSAGES_INIT(bodyA));
-      await options.fetch!("https://api.anthropic.com/v1/messages", MESSAGES_INIT(bodyA));
-      await options.fetch!("https://api.anthropic.com/v1/messages", MESSAGES_INIT(bodyA));
-      // A different logical request must not inherit the id.
-      await options.fetch!("https://api.anthropic.com/v1/messages", MESSAGES_INIT(bodyB));
+      const body = JSON.stringify({ model: "claude-sonnet-4-6", messages: [{ role: "user", content: "a" }], max_tokens: 1 });
+      // chat.headers output as it arrives at fetch: one prepared invocation,
+      // retried by the SDK three times with identical prepared headers.
+      const retryInit: RequestInit = {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          [REQUEST_ID_HEADER]: "11111111-2222-3333-4444-555555555555",
+          "X-Claude-Code-Session-Id": "session-retry",
+        },
+        body,
+      };
+      await options.fetch!("https://api.anthropic.com/v1/messages", { ...retryInit });
+      await options.fetch!("https://api.anthropic.com/v1/messages", { ...retryInit });
+      await options.fetch!("https://api.anthropic.com/v1/messages", { ...retryInit });
+      // A separate logical invocation without the hook header falls back to a
+      // freshly minted UUID.
+      await options.fetch!("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: { "content-type": "application/json", "X-Claude-Code-Session-Id": "session-retry" },
+        body,
+      });
+      await options.fetch!("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: { "content-type": "application/json", "X-Claude-Code-Session-Id": "session-retry" },
+        body,
+      });
     } finally {
       globalThis.fetch = originalFetch;
     }
-    expect(ids).toHaveLength(4);
-    expect(ids[0]).toMatch(/^[0-9a-f-]{36}$/);
+    expect(ids).toHaveLength(5);
+    // Retries reuse the hook-provided id verbatim.
+    expect(ids[0]).toBe("11111111-2222-3333-4444-555555555555");
     expect(ids[1]).toBe(ids[0]);
     expect(ids[2]).toBe(ids[0]);
+    // Fallback: fresh valid UUIDs, distinct per direct request.
+    expect(ids[3]).toMatch(UUID);
+    expect(ids[4]).toMatch(UUID);
+    expect(ids[4]).not.toBe(ids[3]);
     expect(ids[3]).not.toBe(ids[0]);
+    // The private marker must be stripped everywhere before dispatch.
+    expect(privateHeaderSeenOnWire).toBe(false);
+  });
+
+  test("null-body streaming response is returned unchanged", async () => {
+    const options = await makeLoaderFetch();
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (_input: string | URL | Request, _init?: RequestInit) =>
+      new Response(undefined, { status: 200, headers: { "content-type": "text/event-stream" } })) as typeof fetch;
+    try {
+      const response = await options.fetch!("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: { "content-type": "application/json", [REQUEST_ID_HEADER]: "11111111-2222-3333-4444-555555555555" },
+        body: JSON.stringify({ model: "claude-sonnet-4-6", messages: [{ role: "user", content: "a" }], max_tokens: 1 }),
+      });
+      expect(response.body).toBeNull();
+      expect(response.status).toBe(200);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
   });
 });

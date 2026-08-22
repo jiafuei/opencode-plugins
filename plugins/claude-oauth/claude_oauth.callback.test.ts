@@ -246,3 +246,123 @@ describe("browser OAuth callback lifecycle", () => {
     expect((errB as Error).message).toContain("disposed");
   });
 });
+
+describe("callback HTTP hardening", () => {
+  test("accepts GET only; POST never settles a valid flow", async () => {
+    const { result, restore } = await browserAuthorize();
+    try {
+      const { redirectUri, state } = authorizeParams(result.url);
+      const res = await fetch(redirectUri, {
+        method: "POST",
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+        body: `code=stolen&state=${state}`,
+      });
+      expect(res.status).toBe(405);
+      expect(res.headers.get("allow")).toBe("GET");
+      // The valid flow is untouched and still completes over GET.
+      expect(seam.pendingFlows.has(state)).toBe(true);
+      const ok = await httpGet(callbackUrl(redirectUri, { code: "c", state }));
+      expect(ok.body).toContain("Login successful");
+      expect(await result.callback()).toMatchObject({ type: "success" });
+    } finally {
+      restore();
+    }
+  });
+
+  test("callback HTML sends no-store/no-cache/no-referrer/nosniff headers", async () => {
+    const server = await seam.startCallbackServer();
+    const redirect = `http://127.0.0.1:${(server.address() as AddressInfo).port}/callback`;
+
+    for (const query of [
+      { code: "c-hdr", state: registerAndReturnState() },
+      { error: "access_denied", state: registerAndReturnState() },
+      { code: "x", state: "unknown-state" },
+    ] as Record<string, string>[]) {
+      const res = await fetch(callbackUrl(redirect, query));
+      expect(res.status).toBe(200);
+      expect(res.headers.get("cache-control")).toBe("no-store");
+      expect(res.headers.get("pragma")).toBe("no-cache");
+      expect(res.headers.get("referrer-policy")).toBe("no-referrer");
+      expect(res.headers.get("x-content-type-options")).toBe("nosniff");
+      await res.text();
+    }
+
+    function registerAndReturnState(): string {
+      const state = `st-hdr-${Math.random().toString(36).slice(2)}`;
+      seam.registerFlow(state);
+      return state;
+    }
+  });
+});
+
+describe("setup interleaving / server lifetime", () => {
+  test("the flow is registered before the server bind resolves", async () => {
+    const fakeServer = {
+      address: () => ({ address: "127.0.0.1", family: "IPv4", port: 54545 }),
+      close: () => {},
+      listening: true,
+    } as unknown as Server;
+    seam.setListenImpl(async () => {
+      // While the bind is still pending, this authorize's flow must already
+      // be reserved — otherwise a concurrent settle could auto-close the
+      // server beneath the in-flight setup.
+      expect(seam.pendingFlows.size).toBe(1);
+      return fakeServer;
+    });
+    try {
+      const { result } = await browserAuthorize();
+      expect(new URL(result.url).searchParams.get("redirect_uri")).toBe("http://127.0.0.1:54545/callback");
+    } finally {
+      seam.disposeOAuth();
+      seam.setListenImpl(undefined);
+    }
+  });
+
+  test("a failing bind settles exactly its own flow and leaves other flows alive", async () => {
+    const survivor = seam.registerFlow("st-survive-bind");
+    seam.setListenImpl(async () => {
+      throw new Error("bind refused");
+    });
+    try {
+      let thrown: unknown;
+      try {
+        await browserAuthorize();
+      } catch (error) {
+        thrown = error;
+      }
+      expect((thrown as Error).message).toContain("bind refused");
+      // The failed setup's flow was removed; the unrelated survivor remains.
+      expect(seam.pendingFlows.has("st-survive-bind")).toBe(true);
+      expect(seam.pendingFlows.size).toBe(1);
+      expect(survivor).toBeDefined();
+    } finally {
+      seam.disposeOAuth();
+      seam.setListenImpl(undefined);
+    }
+  });
+
+  test("completing one flow does not strand a concurrently reserved flow on the shared server", async () => {
+    const tokenBodies: Record<string, any>[] = [];
+    const first = await browserAuthorize(tokenBodies);
+    const second = await browserAuthorize(tokenBodies);
+    try {
+      const one = authorizeParams(first.result.url);
+      const two = authorizeParams(second.result.url);
+      expect(one.redirectUri).toBe(two.redirectUri);
+
+      // First flow completes fully while the second is still only reserved.
+      await httpGet(callbackUrl(one.redirectUri, { code: "code-one", state: one.state }));
+      expect((await first.result.callback()).type).toBe("success");
+      expect(seam.pendingFlows.size).toBe(1);
+      // The server must still be listening for the second flow.
+      expect(seam.server()?.listening).toBe(true);
+
+      await httpGet(callbackUrl(two.redirectUri, { code: "code-two", state: two.state }));
+      expect((await second.result.callback()).type).toBe("success");
+      expect(seam.server()).toBeUndefined();
+    } finally {
+      first.restore();
+      second.restore();
+    }
+  });
+});
