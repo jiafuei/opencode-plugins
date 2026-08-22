@@ -641,6 +641,48 @@ describe("memory persistence", () => {
     await rm(dataHome, { recursive: true, force: true });
   });
 
+  test.serial("persists a delayed commit after deletion without queueing a delta", async () => {
+    const dataHome = await mkdtemp("/tmp/opencode-memory-race-");
+    process.env.XDG_DATA_HOME = dataHome;
+    const directory = "/tmp/memory-race-project";
+    const path = await store(dataHome, directory, []);
+    const started = Promise.withResolvers<void>();
+    const gate = Promise.withResolvers<Extraction>();
+    const app = await fixture(directory, ({ system }) => {
+      if (system.includes("classifier")) return saveDecisions(createDecision("a durable rule"));
+      started.resolve();
+      return gate.promise;
+    });
+    const transform = (messages: FakeMessage[]) => app.hooks["experimental.chat.messages.transform"]!({} as never, { messages } as never);
+
+    await app.message("ses_race", "One.");
+    await app.message("ses_race", "Two.");
+    await app.message("ses_race", "Three.");
+    await started.promise;
+
+    // Delete while the extractor is parked mid-flight. The delayed commit may
+    // still persist, but must not queue update state for the deleted session.
+    await app.hooks.event!({ event: { type: "session.deleted", properties: { info: { id: "ses_race" } } } } as never);
+    gate.resolve(memoryExtraction({
+      title: "Late rule",
+      summary: "A rule committed after deletion.",
+      type: "instruction",
+      scope: "project",
+      content: "Persist even when the originating session disappears mid-save.",
+    }));
+    const indexPath = join(path, "index.md");
+    await until(async () => (await Bun.file(indexPath).text()).includes("Late rule"));
+    // Drain all background work so the post-commit delta handling has settled.
+    await app.hooks.dispose!();
+
+    // A later or reconstructed transform of the deleted session must not
+    // receive the late commit as a synthetic delta.
+    const revived: FakeMessage = { info: { id: "msg_revived", sessionID: "ses_race", role: "user" }, parts: [{ type: "text", text: "reconstructed turn" }] };
+    await transform([revived]);
+    expect(revived.parts).toHaveLength(1);
+    await rm(dataHome, { recursive: true, force: true });
+  });
+
   test.serial("keeps one stable synthetic part across repeated transforms and reloaded history", async () => {
     const dataHome = await mkdtemp("/tmp/opencode-memory-stable-");
     process.env.XDG_DATA_HOME = dataHome;
