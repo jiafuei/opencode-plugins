@@ -814,7 +814,7 @@ function observedGrantAgeMs(refreshToken: string, accountId?: string): number | 
 
 /**
  * One warning per process/account once the grant nears its observed ~30-day
- * absolute lifetime. Log failures are swallowed so they never block auth.
+ * absolute lifetime. Notification failures are swallowed so they never block auth.
  */
 async function warnOnStaleGrant(
   client: PluginInput["client"],
@@ -825,20 +825,29 @@ async function warnOnStaleGrant(
   const ageMs = observedGrantAgeMs(refreshToken, accountId);
   if (ageMs === undefined || ageMs < GRANT_WARN_AGE_MS || grantTestSeam.warnedGrantKeys.has(key)) return;
   grantTestSeam.warnedGrantKeys.add(key);
+  const ageDays = Math.floor(ageMs / DAY_MS);
   try {
     await client.app.log({
       body: {
         service: "claude-oauth",
         level: "warn",
         message:
-          `Anthropic OAuth grant for ${accountId ? `account ${accountId}` : "this credential"} is ~${Math.floor(ageMs / DAY_MS)} days old. ` +
+          `Anthropic OAuth grant for ${accountId ? `account ${accountId}` : "this credential"} is ~${ageDays} days old. ` +
           "~30 days is an observed heuristic for the absolute grant lifetime — interactive re-login (`opencode auth login` → Anthropic → Claude Pro/Max) may soon be required.",
-        extra: { ageDays: Math.floor(ageMs / DAY_MS) },
+        extra: { ageDays },
       },
     });
-  } catch {
-    // Logging is advisory; never block auth on it.
-  }
+  } catch {}
+  try {
+    await client.tui.showToast({
+      body: {
+        title: "Anthropic OAuth grant expiring soon",
+        message: `Grant is ~${ageDays} days old. Run opencode auth login and select Anthropic → Claude Pro/Max soon.`,
+        variant: "warning",
+        duration: 10_000,
+      },
+    });
+  } catch {}
 }
 
 // ---------------------------------------------------------------------------

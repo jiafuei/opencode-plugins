@@ -59,6 +59,7 @@ function seedGrantsFile(grants: Record<string, number>, raw?: string): void {
 
 interface Harness {
   warnings: Array<{ service: string; level: string; message: string }>;
+  toasts: Array<{ title?: string; message: string; variant: string; duration?: number }>;
   persisted: unknown[];
   options: Record<string, any>;
 }
@@ -67,6 +68,8 @@ async function makeHarness(opts?: {
   auth?: Record<string, unknown>;
   /** Replace the app.log implementation. */
   logImpl?: (body: unknown) => Promise<unknown>;
+  /** Replace the tui.showToast implementation. */
+  toastImpl?: (body: unknown) => Promise<unknown>;
 }): Promise<Harness> {
   const authState = opts?.auth ?? {
     type: "oauth",
@@ -76,6 +79,7 @@ async function makeHarness(opts?: {
     accountId: "account-a",
   };
   const warnings: Harness["warnings"] = [];
+  const toasts: Harness["toasts"] = [];
   const persisted: unknown[] = [];
   const plugin = await ClaudeOAuthPlugin({
     client: {
@@ -90,10 +94,16 @@ async function makeHarness(opts?: {
           warnings.push(body);
         },
       },
+      tui: {
+        showToast: async ({ body }: { body: Harness["toasts"][number] }) => {
+          if (opts?.toastImpl) return opts.toastImpl(body);
+          toasts.push(body);
+        },
+      },
     },
   } as never);
   const options = await plugin.auth!.loader!(async () => structuredClone(authState) as never, {} as never);
-  return { warnings, persisted, options };
+  return { warnings, toasts, persisted, options };
 }
 
 describe("grant-age sidecar", () => {
@@ -206,6 +216,7 @@ describe("grant-age sidecar", () => {
         },
       });
       expect(h.warnings).toHaveLength(0);
+      expect(h.toasts).toHaveLength(0);
       expect(h.options.fetch).toBeTypeOf("function");
     } finally {
       env.restore();
@@ -226,6 +237,7 @@ describe("grant-age sidecar", () => {
         },
       });
       expect(h.warnings).toHaveLength(0);
+      expect(h.toasts).toHaveLength(0);
     } finally {
       env.restore();
     }
@@ -248,9 +260,18 @@ describe("grant-age sidecar", () => {
       expect(first.warnings[0]!.message).toMatch(/28 days old/);
       expect(first.warnings[0]!.message).toMatch(/~30 days is an observed heuristic/i);
       expect(first.warnings[0]!.message).toMatch(/opencode auth login/);
+      expect(first.toasts).toEqual([
+        {
+          title: "Anthropic OAuth grant expiring soon",
+          message: "Grant is ~28 days old. Run opencode auth login and select Anthropic → Claude Pro/Max soon.",
+          variant: "warning",
+          duration: 10_000,
+        },
+      ]);
       // A second loader instance in the same process must not warn again.
       const second = await makeHarness({ auth });
       expect(second.warnings).toHaveLength(0);
+      expect(second.toasts).toHaveLength(0);
     } finally {
       env.restore();
     }
@@ -267,6 +288,7 @@ describe("grant-age sidecar", () => {
         auth: { type: "oauth", access: "b", refresh: "r2", expires: Date.now() + 3_600_000, accountId: "account-b" },
       });
       expect(second.warnings).toHaveLength(1);
+      expect(second.toasts).toHaveLength(1);
       expect(second.warnings[0]!.message).toContain("account-b");
     } finally {
       env.restore();
@@ -290,6 +312,30 @@ describe("grant-age sidecar", () => {
         },
       });
       expect(h.options.fetch).toBeTypeOf("function");
+      expect(h.toasts).toHaveLength(1);
+    } finally {
+      env.restore();
+    }
+  });
+
+  serialTest("toast failure never blocks the loader or warning log", async () => {
+    const env = useGrantsEnv();
+    try {
+      seedGrantsFile({ "account-a": T0 - 40 * DAY_MS });
+      const h = await makeHarness({
+        auth: {
+          type: "oauth",
+          access: "a",
+          refresh: "r",
+          expires: Date.now() + 3_600_000,
+          accountId: "account-a",
+        },
+        toastImpl: async () => {
+          throw new Error("toast endpoint down");
+        },
+      });
+      expect(h.options.fetch).toBeTypeOf("function");
+      expect(h.warnings).toHaveLength(1);
     } finally {
       env.restore();
     }
