@@ -2,6 +2,9 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { createAnthropic } from "@ai-sdk/anthropic";
 import { generateText } from "ai";
 import { ClaudeOAuthPlugin } from "./claude_oauth.ts";
+import { coworkTransport } from "./cowork_fetch.ts";
+
+coworkTransport.impl = (input, init) => globalThis.fetch(input, init);
 
 // Auth-transition safety: the OAuth loader installs a custom fetch that stays
 // cached inside the Anthropic SDK client. These tests cover what happens when

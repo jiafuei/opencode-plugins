@@ -1,12 +1,10 @@
 # @jiafuei/opencode-claude-oauth
 
 Claude Pro/Max subscription login for OpenCode. Adds OAuth auth methods to the
-built-in `anthropic` provider and rewrites requests to carry Claude Code
-(`claude-cli`) subscription traffic characteristics — headers, beta profile,
-billing/system fingerprint, `metadata.user_id` attribution, and the `cch`
-attestation. The application-layer behavior is matched against Claude Code
-2.1.228; byte-for-byte equivalence is not claimed because Bun owns the HTTP
-transport and header serialization.
+built-in `anthropic` provider and rewrites requests using selectable Claude
+CLI, Cowork desktop-agent, or Agent SDK CLI wire profiles. This includes
+ordered HTTP/1.1 headers, beta profiles, billing/system fingerprints,
+`metadata.user_id` attribution, tool-name transport, and `cch` attestation.
 
 ## Install
 
@@ -15,6 +13,33 @@ transport and header serialization.
   "plugin": ["@jiafuei/opencode-claude-oauth"]
 }
 ```
+
+## Spoofing profiles
+
+`spoofingProfile` selects one coherent wire identity. It defaults to `"cli"`.
+
+| Value | Reference | Version / entrypoint | CCH and request chain |
+| --- | --- | --- | --- |
+| `"cli"` | Claude Code CLI | `2.1.228` / `cli` | Claude CLI normalization; `cc_prev_req` and `cc_prompt_id` enabled |
+| `"cowork"` | oh-my-pi Cowork | `2.1.220` / `claude-desktop` | Raw serialized-body CCH; no billing request chain |
+| `"sdk-cli"` | pi-black Agent SDK CLI | `2.1.224` / `sdk-cli` | Top-level model/max-token normalization; no billing request chain |
+
+```json
+{
+  "plugin": [
+    ["@jiafuei/opencode-claude-oauth", { "spoofingProfile": "cowork" }]
+  ]
+}
+```
+
+The `sdk-cli` profile derives identity from this plugin's stable install ID and
+the OAuth account. It never reads `~/.claude.json` or `CLAUDE_CONFIG_DIR`.
+
+All profiles use the custom ordered HTTPS transport. CLI and SDK CLI use the
+header order observed in genuine Claude CLI captures; Cowork uses OMP's
+desktop-agent order. Direct HTTPS uses HTTP/1.1 and preserves header casing and
+order. A configured proxy intentionally falls back to the runtime fetch so the
+proxy is honored, which means exact transport ordering is not retained there.
 
 ### AI SDK request options
 
@@ -44,12 +69,13 @@ For example, to disable it for one model:
 }
 ```
 
-This setting is optional with the plugin: OAuth request rewriting removes the
-SDK-generated `eager_input_streaming` field at the wire boundary regardless.
+This setting is optional for the default CLI profile, which removes the
+SDK-generated `eager_input_streaming` field at the wire boundary. Cowork and
+SDK CLI preserve the Agent SDK field.
 
 Billing attribution is enabled by default. To omit the
 `x-anthropic-billing-header` and its `cch`, `cc_prev_req`, and `cc_prompt_id`
-fields while retaining OAuth authentication and the Claude CLI identity:
+fields while retaining OAuth authentication and the selected profile identity:
 
 ```json
 {
@@ -74,58 +100,54 @@ concurrently.
 ## What it does
 
 When the stored anthropic credential is an OAuth grant, the plugin's auth
-loader installs a custom fetch for `/v1/messages` and
+loader installs the ordered transport for `/v1/messages` and
 `/v1/messages/count_tokens` calls to the official `api.anthropic.com`
 endpoint:
 
 - `Authorization: Bearer sk-ant-oat01-…` (never `x-api-key`) and
   `?beta=true` on `/v1/messages`
-- `User-Agent: claude-cli/2.1.228 (external, cli)`, `x-app: cli`,
+- The selected profile's exact `User-Agent`, `x-app: cli`,
   a per-invocation `x-client-request-id` (stable across SDK retries of the
   same request, fresh per logical invocation), the Stainless header set, and
   `X-Claude-Code-Session-Id` per session; OpenCode's internal session-routing
   headers are stripped before dispatch
-- The Claude Code beta profile (`oauth-2025-04-20`, interleaved thinking,
-  redacted thinking, context management, and related features), chosen per
-  request shape (utility vs agent profile);
+- The selected client's beta profile, chosen per request shape (utility vs
+  agent profile);
   SDK/caller-supplied betas are preserved and deduplicated after it, except
   `fine-grained-tool-streaming-2025-05-14` (absent from Claude Code's profile),
   the SDK's obsolete `structured-outputs-2025-11-13` tool beta, and
   `context-1m-2025-08-07` (hard-429'd for subscription credentials).
 - Body rewrite:
-  - `system[0]` = `x-anthropic-billing-header` with the CC version fingerprint,
-    `system[1]` = `You are Claude Code, Anthropic's official CLI for Claude.`
-    (both skipped for claude-3-5-haiku)
+  - `system[0]` = `x-anthropic-billing-header` with the selected version and
+    entrypoint; `system[1]` carries the selected CLI or Agent SDK identity.
+    CLI and Cowork skip both for claude-3-5-haiku; SDK CLI does not.
   - `metadata.user_id` = `{device_id, account_uuid, session_id}` JSON envelope
     with a stable per-install device ID and a UUIDv4 session ID persisted per
     OpenCode conversation; existing valid CC attribution is preserved verbatim
   - `max_tokens` clamped to ≤ 64000; incoming `stream` is preserved as-is
-  - `thinking.display` and the redundant default `tool_choice:{type:"auto"}`
-    are omitted; non-default tool choices and other thinking fields are kept
-  - SDK-added `eager_input_streaming` is omitted and tool input schemas are
-    closed with top-level `additionalProperties:false`; existing ephemeral cache
-    breakpoints use `ttl:"1h"`, with the first cached system block globally
-    scoped, and advertise the corresponding extended-cache beta
-  - `context_management`: incoming edits are preserved; when thinking is on,
-    exactly one `{type:"clear_thinking_20251015", keep:"all"}` edit is
-    guaranteed first
-- The `cch` attestation: XXHash64 over the canonical final body after blanking
-  model values and omitting `fallbacks`, `fallback_credit_token`, and
-  `max_tokens` (low 20 bits as 5 hex chars), patched over the `cch=00000`
-  placeholder
-- Billing state follows a conversation: `cc_prompt_id` remains stable for the
+  - CLI omits `thinking.display` and SDK `eager_input_streaming`, upgrades
+    ephemeral cache breakpoints to one hour, and preserves incoming context
+    edits while adding clear-thinking first. Cowork and SDK CLI preserve Agent
+    SDK fields and caches and replace active context edits with one keep-all
+    clear-thinking edit.
+  - The redundant default `tool_choice:{type:"auto"}` is omitted and tool input
+    schemas are closed with top-level `additionalProperties:false`.
+- The selected `cch` algorithm from the profile table, patched over the
+  `cch=00000` placeholder as five lowercase hex characters.
+- In CLI mode, billing state follows a conversation: `cc_prompt_id` remains stable for the
   same OpenCode message, and the next successful request includes the prior
   Anthropic `request-id` as `cc_prev_req`. Request chains persist across
   OpenCode restarts and are shared safely by concurrent processes; generation
   fencing prevents late responses from restoring state cleared by compaction,
   deletion, or an auth transition. If SQLite is unavailable, inference
   continues with process-local tracking but restart/cross-process continuity is
-  temporarily unavailable
-- Token-count requests use Claude Code's dedicated beta profile and header set,
+  temporarily unavailable. Cowork and SDK CLI do not emit or persist this
+  request chain.
+- Token-count requests use the selected profile's beta and header set,
   omit `X-Stainless-Timeout`, preserve their body shape apart from tool
   normalization, and are not response-rewritten
-- Custom tool names are cloaked under the synthetic MCP namespace
-  `mcp__occli__` on the way out (definitions, `tool_choice`, historical
+- Custom tool names are cloaked with one `_` prefix on the way out
+  (definitions, `tool_choice`, historical
   `tool_use` blocks) and the exact prefix is stripped on the way in through both
   streaming SSE (`content_block_start`) and non-streaming JSON responses, so
   OpenCode's logical tool names remain unchanged
@@ -196,12 +218,11 @@ transient only — there is deliberately no second credential store.
 
 ## Limitations
 
-- **Best-effort application-layer parity.** The plugin mirrors the headers,
-  payload, beta profile, tool-name transport, and `cch` behavior tested against
-  Claude Code 2.1.228. It does not reproduce Claude Code's TLS handshake, ALPN,
-  HTTP stack, exact header order, or every future client release. The pinned
-  version and fingerprint constants will need updates as the upstream client
-  changes.
+- **Version-pinned parity.** The plugin mirrors the selected profile's headers,
+  payload, beta profile, tool-name transport, and `cch` behavior. Direct HTTPS
+  reproduces the captured HTTP/1.1 header order, but not Claude's TLS handshake
+  or every runtime detail. Proxy fallback uses runtime fetch. Pinned profile
+  constants must be updated when their reference clients change.
 - **Official endpoint only.** Subscription OAuth cannot be used through custom
   base URLs, enterprise gateways, or signing proxies. Those configurations
   must use API-key auth.

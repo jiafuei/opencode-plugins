@@ -1,7 +1,7 @@
 {
   "name": "@jiafuei/opencode-claude-oauth",
   "version": "0.0.1",
-  "description": "Claude Pro/Max subscription auth for OpenCode with Claude Code request fingerprinting, tested for parity with oh-my-pi's Cowork transport",
+  "description": "Claude Pro/Max subscription auth for OpenCode with CLI, Cowork, and SDK CLI wire profiles",
   "type": "module",
   "exports": {
     "./server": "./claude_oauth.ts"
@@ -9,6 +9,7 @@
   "files": [
     "claude_oauth.ts",
     "wire_format.ts",
+    "cowork_fetch.ts",
     "request_chain.ts",
     "local_storage.ts",
     "README.md"

@@ -37,10 +37,19 @@ function getInstallId(): string {
   }
 }
 
-export function deriveDeviceId(accountId?: string): string {
+/**
+ * Derive a stable device ID from the plugin's install ID. The hash domains are
+ * profile-specific (Claude CLI/SDK CLI vs Cowork/OMP), and all reuse this
+ * plugin's stable install ID.
+ */
+export function deriveDeviceId(
+  accountId?: string,
+  installDomain = "claude-oauth-device-id-v1:",
+  accountDomain = "claude-oauth-device-id-v2",
+): string {
   const hash = createHash("sha256");
   if (accountId) {
-    return hash.update("claude-oauth-device-id-v2\0").update(getInstallId()).update("\0").update(accountId).digest("hex");
+    return hash.update(`${accountDomain}\0`).update(getInstallId()).update("\0").update(accountId).digest("hex");
   }
-  return hash.update("claude-oauth-device-id-v1:").update(getInstallId()).digest("hex");
+  return hash.update(installDomain).update(getInstallId()).digest("hex");
 }

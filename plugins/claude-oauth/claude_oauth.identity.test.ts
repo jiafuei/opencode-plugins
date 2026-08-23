@@ -5,6 +5,9 @@ import {
   fetchOAuthIdentity,
   resolveIdentity,
 } from "./claude_oauth.ts";
+import { coworkTransport } from "./cowork_fetch.ts";
+
+coworkTransport.impl = (input, init) => globalThis.fetch(input, init);
 
 const TOKEN_BODY = {
   access_token: "access-1",

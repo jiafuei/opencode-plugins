@@ -4,20 +4,23 @@ import { mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } 
 import path from "node:path";
 import {
   buildBetas,
-  CLAUDE_CODE_VERSION,
-  COUNT_TOKENS_BETAS,
+  CLI_PROFILE,
+  countTokensBetas,
   createSseToolNameTransform,
   extractUserIdSessionId,
   prefixRequestToolNames,
   readBoundedJsonText,
   REQUEST_ID_PATTERN,
+  resolveSpoofingProfile,
   rewriteBody,
-  STAINLESS_HEADERS,
+  stainlessHeaders,
   transformJsonToolUseNames,
   uncloakedResponseHeaders,
 } from "./wire_format.ts";
+import type { SpoofingProfile } from "./wire_format.ts";
 import { RequestChainTracker, requestChainCredentialKey } from "./request_chain.ts";
 import { opencodeDataDir } from "./local_storage.ts";
+import { buildEnforcedHeaders, coworkTransport } from "./cowork_fetch.ts";
 
 // Preserve the historical public API: tests and package consumers import these
 // from the plugin entry.
@@ -30,6 +33,8 @@ export {
   stripClaudeToolPrefix,
   transformJsonToolUseNames,
 } from "./wire_format.ts";
+export { resolveSpoofingProfile } from "./wire_format.ts";
+export type { SpoofingProfile } from "./wire_format.ts";
 
 // Configure in `opencode.json` like:
 //
@@ -56,7 +61,6 @@ const SCOPES =
   rot13("bet:perngr_ncv_xrl hfre:cebsvyr hfre:vasrerapr hfre:frffvbaf:pynhqr_pbqr hfre:zpc_freiref hfre:svyr_hcybnq");
 const REFRESH_SCOPES = rot13("hfre:cebsvyr hfre:vasrerapr hfre:frffvbaf:pynhqr_pbqr hfre:zpc_freiref hfre:svyr_hcybnq");
 
-const USER_AGENT = `claude-cli/${CLAUDE_CODE_VERSION} (external, cli)`;
 const AXIOS_USER_AGENT = "axios/1.15.2";
 const AXIOS_ACCEPT = "application/json, text/plain, */*";
 const OAUTH_DUMMY_KEY = "opencode-oauth-dummy-key";
@@ -871,12 +875,21 @@ function buildAuthorizeUrl(redirectUri: string, pkce: PkceCodes, state: string):
 
 export interface ClaudeOAuthOptions {
   attributionHeader?: boolean;
+  /**
+   * Client identity spoofed on the Anthropic wire: "cli" (default) mirrors
+   * Claude Code 2.1.228; "cowork" mirrors oh-my-pi's Cowork desktop-agent;
+   * "sdk-cli" mirrors pi-black's Agent SDK CLI identity. Every profile uses
+   * the ordered HTTP/1.1 transport.
+   */
+  spoofingProfile?: SpoofingProfile["id"];
 }
 
 type ClaudeOAuthInternalOptions = ClaudeOAuthOptions & { databasePath?: string };
 
 export const ClaudeOAuthPlugin: Plugin = async (input: PluginInput, options?: PluginOptions | ClaudeOAuthOptions) => {
   const pluginOptions = options as ClaudeOAuthInternalOptions | undefined;
+  // Validated once at the option boundary; unsupported values throw here.
+  const profile = resolveSpoofingProfile(pluginOptions?.spoofingProfile);
   const attributionHeader = pluginOptions?.attributionHeader !== false;
   const promptIds = new Map<string, Map<string, string>>();
   // Owns SQLite persistence, the process-local fallback, and every
@@ -1126,7 +1139,8 @@ export const ClaudeOAuthPlugin: Plugin = async (input: PluginInput, options?: Pl
               const incomingUserId = (JSON.parse(body) as Record<string, any>).metadata?.user_id
               const attributedSessionId = typeof incomingUserId === "string" ? extractUserIdSessionId(incomingUserId) : undefined
               const initialChainSessionId = opencodeSessionId ?? hookSessionId ?? attributedSessionId
-              if (attributionHeader && initialChainSessionId) {
+              // Only the CLI profile tracks request chains; the Agent SDK profiles do not.
+              if (profile.billingChain && attributionHeader && initialChainSessionId) {
                 requestChain = {
                   sessionId: initialChainSessionId,
                   ...requestChains.startRequest(requestCredential, initialChainSessionId, logicalRequestId),
@@ -1138,9 +1152,10 @@ export const ClaudeOAuthPlugin: Plugin = async (input: PluginInput, options?: Pl
                 attributionHeader,
                 previousRequestId: requestChain?.requestId,
                 promptId,
+                profile,
               })
               sessionId = rewrittenSessionId
-              if (!requestChain && attributionHeader && sessionId) {
+              if (!requestChain && profile.billingChain && attributionHeader && sessionId) {
                 requestChain = {
                   sessionId,
                   ...requestChains.startRequest(requestCredential, sessionId, logicalRequestId),
@@ -1149,40 +1164,43 @@ export const ClaudeOAuthPlugin: Plugin = async (input: PluginInput, options?: Pl
               body = json
               // Headers.get is case-insensitive, so SDK betas arrive regardless
               // of the caller's key casing.
-              headers.set("anthropic-beta", buildBetas(thinking, hasTools, hasLongCache, headers.get("anthropic-beta")))
+              headers.set("anthropic-beta", buildBetas(thinking, hasTools, hasLongCache, headers.get("anthropic-beta"), profile))
             } else if (isCountTokens && typeof body === "string" && body.startsWith("{")) {
               const params = JSON.parse(body) as Record<string, any>
-              prefixRequestToolNames(params)
+              prefixRequestToolNames(params, profile)
               body = JSON.stringify(params)
-              headers.set("anthropic-beta", COUNT_TOKENS_BETAS)
+              headers.set("anthropic-beta", countTokensBetas(profile))
             }
 
             headers.delete("x-api-key")
-            headers.set("Authorization", `Bearer ${access}`)
+            let response: Response
             if (isMessagesApi) {
-              // Preserve genuine claude-cli callers; everything else gets the
-              // fixed Claude CLI UA (case-insensitive prefix check).
-              const incomingUserAgent = headers.get("User-Agent")
-              headers.set(
-                "User-Agent",
-                incomingUserAgent?.toLowerCase().startsWith("claude-cli") ? incomingUserAgent : USER_AGENT,
-              )
-              headers.set("Accept", "application/json")
-              headers.set("Content-Type", "application/json")
-              headers.set("anthropic-version", "2023-06-01")
-              headers.set("anthropic-dangerous-direct-browser-access", "true")
-              headers.set("x-app", "cli")
-              headers.set("Connection", "keep-alive")
-              headers.set("Accept-Encoding", "gzip, deflate, br, zstd")
-              // Retry-stable across SDK retries of this invocation (they reuse
-              // the prepared headers), fresh per logical invocation.
-              headers.set("x-client-request-id", logicalRequestId)
-              for (const [key, value] of Object.entries(STAINLESS_HEADERS)) headers.set(key, value)
-              if (isCountTokens) headers.delete("X-Stainless-Timeout")
+              // Every spoofing profile uses the ordered HTTP/1.1 transport.
+              // It only engages for a plain header record, which this builder
+              // supplies in the profile's captured order.
+              const stainless = stainlessHeaders(profile)
+              if (isCountTokens) delete stainless["X-Stainless-Timeout"]
+              const wireHeaders = buildEnforcedHeaders(headers, {
+                order: profile.id === "cowork" ? "cowork" : "cli",
+                userAgent: profile.userAgent,
+                sessionId,
+                betas: headers.get("anthropic-beta") ?? undefined,
+                authorization: `Bearer ${access}`,
+                clientRequestId: logicalRequestId,
+                stainless,
+              })
+              response = await coworkTransport.impl(requestTarget, {
+                ...init,
+                method: init?.method ?? "POST",
+                headers: wireHeaders,
+                body,
+                signal: init?.signal,
+              })
+            } else {
+              headers.set("Authorization", `Bearer ${access}`)
+              if (sessionId) headers.set("X-Claude-Code-Session-Id", sessionId)
+              response = await fetch(requestTarget, { ...init, headers, body })
             }
-            if (sessionId) headers.set("X-Claude-Code-Session-Id", sessionId)
-
-            const response = await fetch(requestTarget, { ...init, headers, body })
             if (!isMessages) return response
             const responseRequestId = response.headers.get("request-id")
             const completedChain = requestChain
@@ -1225,7 +1243,7 @@ export const ClaudeOAuthPlugin: Plugin = async (input: PluginInput, options?: Pl
             const contentType = response.headers.get("content-type") ?? ""
             if (contentType.includes("text/event-stream")) {
               if (!response.body) return response
-              return new Response(response.body.pipeThrough(createSseToolNameTransform(recordPreviousRequest)), {
+              return new Response(response.body.pipeThrough(createSseToolNameTransform(recordPreviousRequest, profile.toolPrefix)), {
                 status: response.status,
                 statusText: response.statusText,
                 headers: uncloakedResponseHeaders(response),
@@ -1233,7 +1251,7 @@ export const ClaudeOAuthPlugin: Plugin = async (input: PluginInput, options?: Pl
             }
             if (contentType.includes("application/json")) {
               const text = await readBoundedJsonText(response)
-              const transformed = transformJsonToolUseNames(text)
+              const transformed = transformJsonToolUseNames(text, profile.toolPrefix)
               try {
                 if ((JSON.parse(text) as { type?: unknown }).type === "message") await recordPreviousRequest?.()
               } catch {}
@@ -1333,7 +1351,9 @@ export const ClaudeOAuthPlugin: Plugin = async (input: PluginInput, options?: Pl
       // fetch. SDK retries reuse the prepared headers — and therefore this id;
       // a separate identical invocation runs this hook again and gets a new one.
       output.headers[REQUEST_ID_HEADER] = randomUUID()
-      if (attributionHeader) {
+      // Only the CLI profile carries billing prompt attribution; the Agent SDK
+      // profiles never allocate or transport a private prompt-id marker.
+      if (attributionHeader && profile.billingChain) {
         let sessionPrompts = promptIds.get(input.sessionID)
         if (!sessionPrompts) {
           sessionPrompts = new Map()

@@ -3,6 +3,9 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { AnthropicReauthRequiredError, ClaudeOAuthPlugin, refreshTestSeam } from "./claude_oauth.ts";
+import { coworkTransport } from "./cowork_fetch.ts";
+
+coworkTransport.impl = (input, init) => globalThis.fetch(input, init);
 
 interface Persisted {
   refresh?: string;

@@ -9,40 +9,201 @@ import { deriveDeviceId } from "./local_storage.ts";
 
 export const CLAUDE_CODE_VERSION = "2.1.228";
 
-const UTILITY_PROFILE_BETAS = [
-  "oauth-2025-04-20",
-  "interleaved-thinking-2025-05-14",
-  "redact-thinking-2026-02-12",
-  "thinking-token-count-2026-05-13",
-  "context-management-2025-06-27",
-  "prompt-caching-scope-2026-01-05",
-  "structured-outputs-2025-12-15",
-];
-
-const AGENT_PROFILE_BETAS = [
-  "claude-code-20250219",
-  "oauth-2025-04-20",
-  "interleaved-thinking-2025-05-14",
-  "redact-thinking-2026-02-12",
-  "thinking-token-count-2026-05-13",
-  "context-management-2025-06-27",
-  "prompt-caching-scope-2026-01-05",
-  "mid-conversation-system-2026-04-07",
-];
-
-export const COUNT_TOKENS_BETAS = [
-  "claude-code-20250219",
-  "oauth-2025-04-20",
-  "interleaved-thinking-2025-05-14",
-  "context-management-2025-06-27",
-  "token-counting-2024-11-01",
-].join(",");
-
+// Beta tokens shared by the profile definitions below.
+const CLAUDE_CODE_20250219_BETA = "claude-code-20250219";
+const OAUTH_BETA = "oauth-2025-04-20";
+const INTERLEAVED_THINKING_BETA = "interleaved-thinking-2025-05-14";
+const REDACT_THINKING_BETA = "redact-thinking-2026-02-12";
+const THINKING_TOKEN_COUNT_BETA = "thinking-token-count-2026-05-13";
+const CONTEXT_MANAGEMENT_BETA = "context-management-2025-06-27";
+const PROMPT_CACHING_SCOPE_BETA = "prompt-caching-scope-2026-01-05";
+const STRUCTURED_OUTPUTS_BETA = "structured-outputs-2025-12-15";
+const MID_CONVERSATION_SYSTEM_BETA = "mid-conversation-system-2026-04-07";
+const ADVANCED_TOOL_USE_BETA = "advanced-tool-use-2025-11-20";
 const EFFORT_BETA = "effort-2025-11-24";
 const FALLBACK_CREDIT_BETA = "fallback-credit-2026-06-01";
-const ADVANCED_TOOL_USE_BETA = "advanced-tool-use-2025-11-20";
 const EXTENDED_CACHE_TTL_BETA = "extended-cache-ttl-2025-04-11";
-// These caller-supplied betas are absent from Claude Code's wire profile.
+const TOKEN_COUNTING_BETA = "token-counting-2024-11-01";
+
+/**
+ * One client identity on the Anthropic wire. `cli` mirrors Claude Code
+ * 2.1.228 (the plugin's historical default); `cowork` mirrors oh-my-pi's
+ * Cowork desktop-agent profile (packages/ai/src/providers/
+ * {claude-code-fingerprint,anthropic,cowork-fetch}.ts); `sdk-cli` mirrors
+ * pi-black's Agent SDK CLI profile (src/claude-code-protocol.ts) without any
+ * local Claude configuration reads.
+ */
+export interface SpoofingProfile {
+  id: "cli" | "cowork" | "sdk-cli";
+  version: string;
+  userAgent: string;
+  billingEntrypoint: string;
+  systemInstruction: string;
+  toolPrefix: string;
+  stainlessPackageVersion: string;
+  deviceDomainInstall: string;
+  deviceDomainAccount: string;
+  /**
+   * CCH attestation input: "normalized" hashes the CLI canonical body
+   * (model blanked; fallbacks/fallback_credit_token/max_tokens omitted);
+   * "sdk-normalized" clones the final body, blanks only the top-level model
+   * and drops top-level max_tokens (pi-black semantics); "raw" hashes the
+   * final serialized body with the placeholder in place.
+   */
+  cchMode: "normalized" | "raw" | "sdk-normalized";
+  /** Billing carries cc_prev_req/cc_prompt_id and request chains are tracked across requests. */
+  billingChain: boolean;
+  /** Keep SDK-only fields (eager_input_streaming, thinking.display) on the wire. */
+  preserveSdkFields: boolean;
+  /** Upgrade ephemeral cache breakpoints to ttl:"1h" (first system block globally scoped). */
+  upgradeCaches: boolean;
+  /** Active thinking replaces incoming context_management edits with the single keep-all clear-thinking edit. */
+  replaceContextManagement: boolean;
+  /** Skip billing + identity injection for claude-3-5-haiku (CLI/Cowork gate). */
+  skipIdentityForHaiku: boolean;
+  /** Advertise fallback credit on every request rather than agent requests only. */
+  fallbackOnAllRequests: boolean;
+  utilityBetas: readonly string[];
+  agentBetas: readonly string[];
+}
+
+export const CLI_PROFILE: SpoofingProfile = {
+  id: "cli",
+  version: CLAUDE_CODE_VERSION,
+  userAgent: `claude-cli/${CLAUDE_CODE_VERSION} (external, cli)`,
+  billingEntrypoint: "cli",
+  systemInstruction: "You are Claude Code, Anthropic's official CLI for Claude.",
+  toolPrefix: "_",
+  stainlessPackageVersion: "0.112.1",
+  deviceDomainInstall: "claude-oauth-device-id-v1:",
+  deviceDomainAccount: "claude-oauth-device-id-v2",
+  cchMode: "normalized",
+  billingChain: true,
+  preserveSdkFields: false,
+  upgradeCaches: true,
+  replaceContextManagement: false,
+  skipIdentityForHaiku: true,
+  fallbackOnAllRequests: true,
+  utilityBetas: [
+    OAUTH_BETA,
+    INTERLEAVED_THINKING_BETA,
+    REDACT_THINKING_BETA,
+    THINKING_TOKEN_COUNT_BETA,
+    CONTEXT_MANAGEMENT_BETA,
+    PROMPT_CACHING_SCOPE_BETA,
+    STRUCTURED_OUTPUTS_BETA,
+  ],
+  agentBetas: [
+    CLAUDE_CODE_20250219_BETA,
+    OAUTH_BETA,
+    INTERLEAVED_THINKING_BETA,
+    REDACT_THINKING_BETA,
+    THINKING_TOKEN_COUNT_BETA,
+    CONTEXT_MANAGEMENT_BETA,
+    PROMPT_CACHING_SCOPE_BETA,
+    MID_CONVERSATION_SYSTEM_BETA,
+  ],
+};
+
+export const COWORK_PROFILE: SpoofingProfile = {
+  id: "cowork",
+  version: "2.1.220",
+  userAgent: `claude-cli/2.1.220 (external, claude-desktop)`,
+  billingEntrypoint: "claude-desktop",
+  systemInstruction: "You are a Claude agent, built on Anthropic's Claude Agent SDK.",
+  toolPrefix: "_",
+  stainlessPackageVersion: "0.94.0",
+  deviceDomainInstall: "omp-claude-device-id-v1:",
+  deviceDomainAccount: "omp-claude-device-id-v2",
+  cchMode: "raw",
+  billingChain: false,
+  preserveSdkFields: true,
+  upgradeCaches: false,
+  replaceContextManagement: true,
+  skipIdentityForHaiku: true,
+  fallbackOnAllRequests: false,
+  utilityBetas: [
+    INTERLEAVED_THINKING_BETA,
+    THINKING_TOKEN_COUNT_BETA,
+    CONTEXT_MANAGEMENT_BETA,
+    PROMPT_CACHING_SCOPE_BETA,
+    STRUCTURED_OUTPUTS_BETA,
+  ],
+  agentBetas: [
+    CLAUDE_CODE_20250219_BETA,
+    INTERLEAVED_THINKING_BETA,
+    THINKING_TOKEN_COUNT_BETA,
+    CONTEXT_MANAGEMENT_BETA,
+    PROMPT_CACHING_SCOPE_BETA,
+    MID_CONVERSATION_SYSTEM_BETA,
+    ADVANCED_TOOL_USE_BETA,
+  ],
+};
+
+/**
+ * pi-black's sdk-cli profile. Version/entrypoint/UA/system instruction mirror
+ * src/claude-code-protocol.ts; betas reuse this plugin's CLI profiles
+ * (pi-black's header was `claude-code-20250219,oauth-2025-04-20,…`), and the
+ * Stainless baseline stays at the plugin's pinned 2.1.228-era values since
+ * pi-black does not pin a distinct package version. Identity is derived from
+ * this plugin's install ID plus the OAuth account — never from `.claude.json`
+ * or any local Claude configuration.
+ */
+export const SDK_CLI_PROFILE: SpoofingProfile = {
+  id: "sdk-cli",
+  version: "2.1.224",
+  userAgent: `claude-cli/2.1.224 (external, sdk-cli)`,
+  billingEntrypoint: "sdk-cli",
+  systemInstruction: "You are a Claude agent, built on Anthropic's Claude Agent SDK.",
+  toolPrefix: "_",
+  stainlessPackageVersion: "0.112.1",
+  deviceDomainInstall: "claude-oauth-device-id-v1:",
+  deviceDomainAccount: "claude-oauth-device-id-v2",
+  cchMode: "sdk-normalized",
+  billingChain: false,
+  preserveSdkFields: true,
+  upgradeCaches: false,
+  replaceContextManagement: true,
+  // pi-black injects billing and identity for every model, haiku included.
+  skipIdentityForHaiku: false,
+  fallbackOnAllRequests: true,
+  utilityBetas: [CLAUDE_CODE_20250219_BETA, ...CLI_PROFILE.utilityBetas],
+  agentBetas: CLI_PROFILE.agentBetas,
+};
+
+const SPOOFING_PROFILES: Record<string, SpoofingProfile> = {
+  cli: CLI_PROFILE,
+  cowork: COWORK_PROFILE,
+  "sdk-cli": SDK_CLI_PROFILE,
+};
+
+/** Resolve the plugin's spoofingProfile option once at the boundary. Undefined selects CLI. */
+export function resolveSpoofingProfile(value: unknown): SpoofingProfile {
+  if (value === undefined) return CLI_PROFILE;
+  const profile = SPOOFING_PROFILES[value as string];
+  if (!profile) {
+    throw new Error(
+      `claude-oauth: unsupported spoofingProfile "${String(value)}" — expected "cli", "cowork", or "sdk-cli"`,
+    );
+  }
+  return profile;
+}
+
+export const COUNT_TOKENS_BETAS = [
+  CLAUDE_CODE_20250219_BETA,
+  OAUTH_BETA,
+  INTERLEAVED_THINKING_BETA,
+  CONTEXT_MANAGEMENT_BETA,
+  TOKEN_COUNTING_BETA,
+].join(",");
+
+/** Token-counting beta header for a profile: CLI's dedicated list, or the selected utility profile plus token counting. */
+export function countTokensBetas(profile: SpoofingProfile = CLI_PROFILE): string {
+  if (profile.id === "cli") return COUNT_TOKENS_BETAS;
+  return [...profile.utilityBetas, TOKEN_COUNTING_BETA].join(",");
+}
+
+// These caller-supplied betas are absent from the supported wire profiles.
 // context-1m additionally hard-429s OAuth subscription requests.
 const STRIPPED_BETAS = new Set([
   "context-1m-2025-08-07",
@@ -56,30 +217,40 @@ function isActiveThinking(thinking: unknown): boolean {
 }
 
 /**
- * Build the final anthropic-beta header: the Claude profile first, then
+ * Build the final anthropic-beta header: the profile's betas first, then
  * deduplicated SDK/caller extras (compact, PDF, MCP, skills/files, fast mode,
- * task budgets, fallback, ...). `incoming` is the request's existing
- * anthropic-beta header value, if any.
+ * task budgets, ...). `incoming` is the request's existing anthropic-beta
+ * header value, if any. Effort/fallback follow each profile's rules: CLI adds
+ * fallback credit unconditionally; Cowork (matching OMP) adds effort and
+ * fallback credit only on agent requests.
  */
 export function buildBetas(
   thinking: unknown,
   hasTools: boolean,
   hasLongCache: boolean,
   incoming?: string | null,
+  profile: SpoofingProfile = CLI_PROFILE,
 ): string {
   const agent = hasTools || isActiveThinking(thinking);
-  const betas = [...(agent ? AGENT_PROFILE_BETAS : UTILITY_PROFILE_BETAS)];
-  const incomingBetas = incoming?.split(",").map((beta) => beta.trim()) ?? [];
-  if (agent && incomingBetas.includes(ADVANCED_TOOL_USE_BETA)) betas.push(ADVANCED_TOOL_USE_BETA);
-  if (agent && isActiveThinking(thinking)) betas.push(EFFORT_BETA);
-  betas.push(FALLBACK_CREDIT_BETA);
-  if (hasLongCache) betas.push(EXTENDED_CACHE_TTL_BETA);
+  const betas = [...(agent ? profile.agentBetas : profile.utilityBetas)];
   const seen = new Set(betas);
+  const push = (beta: string) => {
+    if (!seen.has(beta)) {
+      seen.add(beta);
+      betas.push(beta);
+    }
+  };
+  const incomingBetas = incoming?.split(",").map((beta) => beta.trim()) ?? [];
+  if (agent && incomingBetas.includes(ADVANCED_TOOL_USE_BETA)) push(ADVANCED_TOOL_USE_BETA);
+  if (agent && isActiveThinking(thinking)) push(EFFORT_BETA);
+  // CLI and sdk-cli advertise fallback credit on every request; Cowork
+  // (matching OMP) only on agent requests.
+  if (agent || profile.fallbackOnAllRequests) push(FALLBACK_CREDIT_BETA);
+  if (hasLongCache && profile.upgradeCaches) push(EXTENDED_CACHE_TTL_BETA);
   if (incomingBetas.length > 0) {
     for (const beta of incomingBetas) {
       if (!beta || seen.has(beta) || STRIPPED_BETAS.has(beta)) continue;
-      seen.add(beta);
-      betas.push(beta);
+      push(beta);
     }
   }
   return betas.join(",");
@@ -102,7 +273,7 @@ export function mapStainlessArch(arch: string): "x64" | "arm64" | "x86" | `other
   }
 }
 
-// Static Stainless headers emitted by the Claude runtime.
+// Static Stainless headers emitted by the Claude runtime (CLI profile).
 export const STAINLESS_HEADERS: Record<string, string> = {
   "X-Stainless-Arch": mapStainlessArch(process.arch),
   "X-Stainless-Lang": "js",
@@ -114,11 +285,18 @@ export const STAINLESS_HEADERS: Record<string, string> = {
   "X-Stainless-Timeout": "600",
 };
 
+/** Stainless header set for a profile; only the package version differs between profiles. */
+export function stainlessHeaders(profile: SpoofingProfile): Record<string, string> {
+  return { ...STAINLESS_HEADERS, "X-Stainless-Package-Version": profile.stainlessPackageVersion };
+}
+
 // ---------------------------------------------------------------------------
 // Custom tool name cloaking
 // ---------------------------------------------------------------------------
 
-const TOOL_PREFIX = "mcp__occli__";
+// Every profile cloaks custom tool names under a single leading underscore;
+// Anthropic built-in tool names are exempt and responses strip exactly one.
+const TOOL_PREFIX = "_";
 
 // Anthropic built-in tool names are never prefixed or stripped. Server tools
 // from the pinned @ai-sdk/anthropic additionally carry versioned `type` fields
@@ -131,30 +309,31 @@ function isBuiltinToolName(name: string): boolean {
   return BUILTIN_TOOL_NAMES.has(name.toLowerCase());
 }
 
-export function applyClaudeToolPrefix(name: string): string {
+export function applyClaudeToolPrefix(name: string, prefix: string = TOOL_PREFIX): string {
   if (isBuiltinToolName(name)) return name;
   // Always prepend, including when a logical name already starts with the
   // namespace, so stripping exactly one prefix always round-trips.
-  return `${TOOL_PREFIX}${name}`;
+  return `${prefix}${name}`;
 }
 
-export function stripClaudeToolPrefix(name: string): string {
-  if (!name.startsWith(TOOL_PREFIX)) return name;
-  return name.slice(TOOL_PREFIX.length);
+export function stripClaudeToolPrefix(name: string, prefix: string = TOOL_PREFIX): string {
+  if (!name.startsWith(prefix)) return name;
+  return name.slice(prefix.length);
 }
 
 /**
- * Remove SDK-only eager streaming flags, close top-level input schemas, and
- * prefix every custom tool name carried by an Anthropic request body, in place:
- * custom tool definitions (no versioned `type`), `tool_choice.name`, and
- * historical assistant `tool_use` blocks. IDs and `tool_result` blocks are
- * preserved verbatim.
+ * Remove SDK-only eager streaming flags (unless the profile preserves them),
+ * close top-level input schemas, and prefix every custom tool name carried by
+ * an Anthropic request body, in place: custom tool definitions (no versioned
+ * `type`), `tool_choice.name`, and historical assistant `tool_use` blocks. IDs
+ * and `tool_result` blocks are preserved verbatim.
  */
-export function prefixRequestToolNames(params: Record<string, any>): void {
+export function prefixRequestToolNames(params: Record<string, any>, profile: SpoofingProfile = CLI_PROFILE): void {
+  const prefix = profile.toolPrefix;
   if (Array.isArray(params.tools)) {
     for (const tool of params.tools) {
       if (!tool || typeof tool !== "object") continue;
-      delete tool.eager_input_streaming;
+      if (!profile.preserveSdkFields) delete tool.eager_input_streaming;
       if (tool.input_schema && typeof tool.input_schema === "object" && !Array.isArray(tool.input_schema)) {
         tool.input_schema.additionalProperties = false;
       }
@@ -162,7 +341,7 @@ export function prefixRequestToolNames(params: Record<string, any>): void {
       // (web_search_20250305, computer_20250124, ...); custom function tools
       // have no `type` at all.
       if (typeof tool.type === "string") continue;
-      if (typeof tool.name === "string") tool.name = applyClaudeToolPrefix(tool.name);
+      if (typeof tool.name === "string") tool.name = applyClaudeToolPrefix(tool.name, prefix);
     }
   }
   const toolChoice = params.tool_choice;
@@ -172,14 +351,14 @@ export function prefixRequestToolNames(params: Record<string, any>): void {
     toolChoice.type === "tool" &&
     typeof toolChoice.name === "string"
   ) {
-    toolChoice.name = applyClaudeToolPrefix(toolChoice.name);
+    toolChoice.name = applyClaudeToolPrefix(toolChoice.name, prefix);
   }
   if (Array.isArray(params.messages)) {
     for (const message of params.messages) {
       if (!message || typeof message !== "object" || !Array.isArray(message.content)) continue;
       for (const block of message.content) {
         if (block?.type === "tool_use" && typeof block.name === "string") {
-          block.name = applyClaudeToolPrefix(block.name);
+          block.name = applyClaudeToolPrefix(block.name, prefix);
         }
       }
     }
@@ -191,7 +370,7 @@ export function prefixRequestToolNames(params: Record<string, any>): void {
 // ---------------------------------------------------------------------------
 
 /** Strip the cloaking prefix from `content[].type === "tool_use"` names in a non-streaming JSON response body. */
-export function transformJsonToolUseNames(body: string): string {
+export function transformJsonToolUseNames(body: string, prefix: string = TOOL_PREFIX): string {
   let parsed: unknown;
   try {
     parsed = JSON.parse(body);
@@ -201,7 +380,7 @@ export function transformJsonToolUseNames(body: string): string {
   if (!parsed || typeof parsed !== "object" || !Array.isArray((parsed as Record<string, any>).content)) return body;
   for (const block of (parsed as Record<string, any>).content) {
     if (block?.type === "tool_use" && typeof block.name === "string") {
-      block.name = stripClaudeToolPrefix(block.name);
+      block.name = stripClaudeToolPrefix(block.name, prefix);
     }
   }
   return JSON.stringify(parsed);
@@ -224,6 +403,7 @@ const SSE_EVENT_BUFFER_LIMIT = 1024 * 1024;
  */
 export function createSseToolNameTransform(
   onComplete?: () => void | Promise<void>,
+  prefix: string = TOOL_PREFIX,
 ): TransformStream<Uint8Array, Uint8Array> {
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
@@ -240,7 +420,7 @@ export function createSseToolNameTransform(
     if (event?.type === "content_block_start") {
       const block = event.content_block;
       if (block?.type === "tool_use" && typeof block.name === "string") {
-        return { ...event, content_block: { ...block, name: stripClaudeToolPrefix(block.name) } };
+        return { ...event, content_block: { ...block, name: stripClaudeToolPrefix(block.name, prefix) } };
       }
       return undefined;
     }
@@ -249,7 +429,7 @@ export function createSseToolNameTransform(
       const content = event.message.content.map((block: any) => {
         if (block?.type !== "tool_use" || typeof block.name !== "string") return block;
         changed = true;
-        return { ...block, name: stripClaudeToolPrefix(block.name) };
+        return { ...block, name: stripClaudeToolPrefix(block.name, prefix) };
       });
       return changed ? { ...event, message: { ...event.message, content } } : undefined;
     }
@@ -397,26 +577,34 @@ type ContentBlock = {
 const BILLING_SALT = "59cf53e54c78";
 const BILLING_HEADER_PREFIX = "x-anthropic-billing-header:";
 const MAX_OUTPUT_TOKENS = 64000;
-const SDK_INSTRUCTION = "You are Claude Code, Anthropic's official CLI for Claude.";
 
 // Valid Claude Code request ids (billing cc_prev_req and response request-id).
 export const REQUEST_ID_PATTERN = /^req_[A-Za-z0-9_-]{1,36}$/;
 
-function createBillingHeader(firstUserMessageText: string, previousRequestId?: string, promptId?: string): string {
+function createBillingHeader(
+  firstUserMessageText: string,
+  previousRequestId: string | undefined,
+  promptId: string | undefined,
+  profile: SpoofingProfile,
+): string {
   // Fingerprint: SHA256(salt + msg[4] + msg[7] + msg[20] + version)[:3],
   // chars taken from the first user message (not the system prompt).
   const k = [4, 7, 20]
     .map((i) => firstUserMessageText[i] ?? "0")
     .join("");
   const versionSuffix = createHash("sha256")
-    .update(`${BILLING_SALT}${k}${CLAUDE_CODE_VERSION}`)
+    .update(`${BILLING_SALT}${k}${profile.version}`)
     .digest("hex")
     .slice(0, 3);
   // The CCH placeholder is replaced after the complete request object is assembled.
   return (
-    `${BILLING_HEADER_PREFIX} cc_version=${CLAUDE_CODE_VERSION}.${versionSuffix}; cc_entrypoint=cli; ${CCH_PLACEHOLDER_STR};` +
-    (previousRequestId && REQUEST_ID_PATTERN.test(previousRequestId) ? ` cc_prev_req=${previousRequestId};` : "") +
-    (promptId && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(promptId)
+    `${BILLING_HEADER_PREFIX} cc_version=${profile.version}.${versionSuffix}; cc_entrypoint=${profile.billingEntrypoint}; ${CCH_PLACEHOLDER_STR};` +
+    // Only the CLI profile chains request state through the billing block;
+    // Cowork and SDK CLI carry neither cc_prev_req nor cc_prompt_id.
+    (profile.billingChain && previousRequestId && REQUEST_ID_PATTERN.test(previousRequestId)
+      ? ` cc_prev_req=${previousRequestId};`
+      : "") +
+    (profile.billingChain && promptId && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(promptId)
       ? ` cc_prompt_id=${promptId};`
       : "")
   );
@@ -496,13 +684,16 @@ const CANONICAL_BODY_KEYS = [
 ];
 
 /**
- * Rewrite a /v1/messages body into Claude Code shape:
- * - system[0] billing header (+ system[1] Claude CLI instruction)
+ * Rewrite a /v1/messages body into the active profile's shape:
+ * - system[0] billing header (+ system[1] profile identity block)
  * - metadata.user_id in the CC attribution envelope
  * - max_tokens clamped to <= 64000
- * - existing ephemeral cache breakpoints upgraded to one-hour retention
- * - context_management merged: incoming edits are preserved; active thinking
- *   additionally guarantees exactly one clear_thinking_20251015 keep-all edit
+ * - CLI only: existing ephemeral cache breakpoints upgraded to one-hour
+ *   retention; thinking.display and eager_input_streaming stripped;
+ *   context_management merged with the clear-thinking edit guaranteed first
+ * - Cowork/SDK CLI: SDK fields preserved, caches untouched, and active
+ *   thinking emits a single keep-all clear-thinking edit; their CCH modes
+ *   follow OMP and pi-black respectively
  * - known keys rebuilt in canonical order (incl. output_config / fallbacks),
  *   remaining keys appended in their original relative order;
  *   incoming `stream` is preserved as-is
@@ -515,12 +706,14 @@ export function rewriteBody(
     attributionHeader?: boolean;
     previousRequestId?: string;
     promptId?: string;
+    profile?: SpoofingProfile;
   },
 ): { json: string; thinking: unknown; hasTools: boolean; hasLongCache: boolean; sessionId?: string } {
+  const profile = ctx.profile ?? CLI_PROFILE;
   const params = JSON.parse(body) as Record<string, any>;
   // Cloak custom tool names before anything else, so cch hashes the
   // already-prefixed final body.
-  prefixRequestToolNames(params);
+  prefixRequestToolNames(params, profile);
   if (
     params.tool_choice?.type === "auto" &&
     typeof params.tool_choice === "object" &&
@@ -531,8 +724,10 @@ export function rewriteBody(
   const hasTools = Array.isArray(params.tools) && params.tools.length > 0;
 
   const modelId: string = params.model ?? "";
-  // Like CC: neither the billing header nor the SDK instruction goes to haiku.
-  const injectFingerprint = !modelId.startsWith("claude-3-5-haiku");
+  // CLI/Cowork follow CC's gate: neither the billing header nor the identity
+  // instruction goes to haiku. pi-black's sdk-cli injects for every model.
+  const injectFingerprint =
+    !profile.skipIdentityForHaiku || !modelId.startsWith("claude-3-5-haiku");
 
   // Normalize incoming system content (string → text block, array kept as-is,
   // including caller fields like cache_control). Skip injection entirely when a
@@ -554,15 +749,17 @@ export function rewriteBody(
     );
   }
 
-  const hasIdentityBlock = systemBlocks.some((block) => block?.text === SDK_INSTRUCTION);
+  const hasIdentityBlock = systemBlocks.some((block) => block?.text === profile.systemInstruction);
   const fingerprintBlocks: ContentBlock[] = [];
   if (injectFingerprint && ctx.attributionHeader !== false && !hasBillingBlock) {
     fingerprintBlocks.push({
       type: "text",
-      text: createBillingHeader(extractFirstUserText(params.messages), ctx.previousRequestId, ctx.promptId),
+      text: createBillingHeader(extractFirstUserText(params.messages), ctx.previousRequestId, ctx.promptId, profile),
     });
   }
-  if (injectFingerprint && !hasIdentityBlock) fingerprintBlocks.push({ type: "text", text: SDK_INSTRUCTION });
+  if (injectFingerprint && !hasIdentityBlock) {
+    fingerprintBlocks.push({ type: "text", text: profile.systemInstruction });
+  }
   const system = [...fingerprintBlocks, ...systemBlocks];
 
   let hasLongCache = false;
@@ -575,15 +772,19 @@ export function rewriteBody(
     hasLongCache = true;
     return true;
   };
-  for (const block of system) {
-    if (normalizeCacheControl(block, !hasGlobalSystemCache)) hasGlobalSystemCache = true;
+  // Only the CLI profile rewrites caller cache breakpoints; Cowork and SDK CLI
+  // forward them untouched and do not advertise the extended-cache beta.
+  if (profile.upgradeCaches) {
+    for (const block of system) {
+      if (normalizeCacheControl(block, !hasGlobalSystemCache)) hasGlobalSystemCache = true;
+    }
+    for (const tool of params.tools ?? []) normalizeCacheControl(tool);
+    for (const message of params.messages ?? []) {
+      if (!Array.isArray(message?.content)) continue;
+      for (const block of message.content) normalizeCacheControl(block);
+    }
+    normalizeCacheControl(params);
   }
-  for (const tool of params.tools ?? []) normalizeCacheControl(tool);
-  for (const message of params.messages ?? []) {
-    if (!Array.isArray(message?.content)) continue;
-    for (const block of message.content) normalizeCacheControl(block);
-  }
-  normalizeCacheControl(params);
 
   const incomingUserId = params.metadata?.user_id;
   // Preserve valid CC attribution verbatim — the legacy cloaking id or the
@@ -600,7 +801,7 @@ export function rewriteBody(
   } else {
     const accountId = readMetadataAccountId(params.metadata) ?? ctx.accountId;
     const envelope: Record<string, string> = {
-      device_id: deriveDeviceId(accountId),
+      device_id: deriveDeviceId(accountId, profile.deviceDomainInstall, profile.deviceDomainAccount),
     };
     if (accountId) envelope.account_uuid = accountId;
     envelope.session_id = ctx.sessionId ?? randomUUID().toLowerCase();
@@ -611,24 +812,29 @@ export function rewriteBody(
 
   const thinking =
     params.thinking && typeof params.thinking === "object"
-      ? Object.fromEntries(Object.entries(params.thinking).filter(([key]) => key !== "display"))
+      ? profile.preserveSdkFields
+        ? { ...params.thinking }
+        : Object.fromEntries(Object.entries(params.thinking).filter(([key]) => key !== "display"))
       : params.thinking;
-  // Merge, don't replace: keep any incoming context_management intact
-  // (compact_20260112, clear_tool_uses_20250919, unknown future edits) and
-  // only guarantee the clear-thinking edit when thinking is active. Incoming
-  // objects are copied, never mutated.
+  // CLI merges, keeping any incoming context_management intact
+  // (compact_20260112, clear_tool_uses_20250919, unknown future edits) while
+  // guaranteeing the clear-thinking edit first. Cowork and SDK CLI emit a
+  // single keep-all edit, replacing whatever arrived. Incoming objects are
+  // copied, never mutated.
   const incomingContextManagement = params.context_management;
   let contextManagement: Record<string, any> | undefined;
   if (isActiveThinking(thinking)) {
-    contextManagement = {
-      ...incomingContextManagement,
-      edits: [
-        { type: "clear_thinking_20251015", keep: "all" },
-        ...((incomingContextManagement?.edits ?? []).filter(
-          (edit: { type?: unknown }) => edit?.type !== "clear_thinking_20251015",
-        )),
-      ],
-    };
+    contextManagement = profile.replaceContextManagement
+      ? { edits: [{ type: "clear_thinking_20251015", keep: "all" }] }
+      : {
+          ...incomingContextManagement,
+          edits: [
+            { type: "clear_thinking_20251015", keep: "all" },
+            ...((incomingContextManagement?.edits ?? []).filter(
+              (edit: { type?: unknown }) => edit?.type !== "clear_thinking_20251015",
+            )),
+          ],
+        };
   } else if (incomingContextManagement) {
     contextManagement = incomingContextManagement;
   }
@@ -664,16 +870,33 @@ export function rewriteBody(
       block.text.includes(CCH_PLACEHOLDER_STR),
   );
   if (billingBlock?.text) {
-    const normalized = JSON.stringify(rewritten, (key, value) => {
-      if (key === "model" && typeof value === "string") return "";
-      if (key === "fallbacks" && Array.isArray(value)) return undefined;
-      if (key === "fallback_credit_token" && typeof value === "string") return undefined;
-      if (key === "max_tokens" && typeof value === "number") return undefined;
-      return value;
-    });
-    const hash = Bun.hash.xxHash64(cchEncoder.encode(normalized), CCH_SEED);
-    const cch = (hash & 0xfffffn).toString(16).padStart(5, "0");
-    billingBlock.text = billingBlock.text.replace(CCH_PLACEHOLDER_STR, `cch=${cch}`);
+    if (profile.cchMode === "raw") {
+      // Cowork attests the raw final serialized body: hash it with the
+      // placeholder still in place, then patch the placeholder (OMP's
+      // wrapFetchForCch behavior, applied before serialization here).
+      const serialized = JSON.stringify(rewritten);
+      const hash = Bun.hash.xxHash64(cchEncoder.encode(serialized), CCH_SEED);
+      const cch = (hash & 0xfffffn).toString(16).padStart(5, "0");
+      billingBlock.text = billingBlock.text.replace(CCH_PLACEHOLDER_STR, `cch=${cch}`);
+    } else {
+      let normalized: string;
+      if (profile.cchMode === "sdk-normalized") {
+        const sdkBody: Record<string, any> = { ...rewritten, model: "" };
+        delete sdkBody.max_tokens;
+        normalized = JSON.stringify(sdkBody);
+      } else {
+        normalized = JSON.stringify(rewritten, (key, value) => {
+          if (key === "model" && typeof value === "string") return "";
+          if (key === "fallbacks" && Array.isArray(value)) return undefined;
+          if (key === "fallback_credit_token" && typeof value === "string") return undefined;
+          if (key === "max_tokens" && typeof value === "number") return undefined;
+          return value;
+        });
+      }
+      const hash = Bun.hash.xxHash64(cchEncoder.encode(normalized), CCH_SEED);
+      const cch = (hash & 0xfffffn).toString(16).padStart(5, "0");
+      billingBlock.text = billingBlock.text.replace(CCH_PLACEHOLDER_STR, `cch=${cch}`);
+    }
   }
 
   return { json: JSON.stringify(rewritten), thinking, hasTools, hasLongCache, sessionId };

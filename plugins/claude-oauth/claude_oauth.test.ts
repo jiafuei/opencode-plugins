@@ -13,6 +13,7 @@ import {
   stripClaudeToolPrefix,
   transformJsonToolUseNames,
 } from "./claude_oauth.ts";
+import { coworkTransport } from "./cowork_fetch.ts";
 
 const BILLING_PREFIX = "x-anthropic-billing-header:";
 
@@ -504,13 +505,13 @@ describe("rewriteBody cch", () => {
 
 describe("tool name prefix helpers", () => {
   test("round-trips logical names through apply/strip exactly once", () => {
-    for (const name of ["get_weather", "_secret_tool", "mcp__occli__nested", "a"]) {
+    for (const name of ["get_weather", "_secret_tool", "nested_tool", "a"]) {
       expect(stripClaudeToolPrefix(applyClaudeToolPrefix(name))).toBe(name);
     }
-    expect(applyClaudeToolPrefix("_secret_tool")).toBe("mcp__occli___secret_tool");
-    expect(stripClaudeToolPrefix("mcp__occli___secret_tool")).toBe("_secret_tool");
+    expect(applyClaudeToolPrefix("_secret_tool")).toBe("__secret_tool");
+    expect(stripClaudeToolPrefix("__secret_tool")).toBe("_secret_tool");
     expect(stripClaudeToolPrefix("plain")).toBe("plain");
-    expect(stripClaudeToolPrefix("_plain")).toBe("_plain");
+    expect(stripClaudeToolPrefix("_plain")).toBe("plain");
   });
 
   test("never prefixes Anthropic built-in tool names", () => {
@@ -568,8 +569,8 @@ describe("rewriteBody tool name cloaking", () => {
   test("prefixes custom tool definitions, tool_choice, and historical tool_use names", () => {
     const out = parse(rewriteBody(toolBody, {}).json);
     expect(out.tools.map((t: any) => t.name)).toEqual([
-      "mcp__occli__get_weather",
-      "mcp__occli___secret",
+      "_get_weather",
+      "__secret",
       "web_search",
       // Versioned server tools keep their SDK-assigned names.
       "web_search",
@@ -578,14 +579,14 @@ describe("rewriteBody tool name cloaking", () => {
       "computer",
       "bash",
     ]);
-    expect(out.tool_choice).toEqual({ type: "tool", name: "mcp__occli__get_weather" });
+    expect(out.tool_choice).toEqual({ type: "tool", name: "_get_weather" });
     expect(out.tools.every((tool: any) => tool.eager_input_streaming === undefined)).toBe(true);
     expect(out.tools.slice(0, 3).every((tool: any) => tool.input_schema.additionalProperties === false)).toBe(true);
     const assistant = out.messages[1].content;
     expect(assistant[1]).toEqual({
       type: "tool_use",
       id: "toolu_01",
-      name: "mcp__occli__get_weather",
+      name: "_get_weather",
       input: { city: "SF" },
     });
     // Server/MCP tool_use blocks keep their names.
@@ -615,7 +616,7 @@ describe("rewriteBody tool name cloaking", () => {
 
   test("cch hashes custom tool prefixes as retained request content", () => {
     const json = rewriteBody(toolBody, {}).json;
-    expect(json).toContain('"name":"mcp__occli__get_weather"');
+    expect(json).toContain('"name":"_get_weather"');
     const cch = json.match(/cch=([0-9a-f]{5})/)?.[1]!;
     const changed = rewriteBody(toolBody.replaceAll("get_weather", "other_tool"), {}).json;
     expect(changed.match(/cch=([0-9a-f]{5})/)?.[1]).not.toBe(cch);
@@ -634,10 +635,10 @@ const SSE_EVENTS = [
   'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}',
   'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"checking the weather"}}',
   'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}',
-  'event: content_block_start\ndata: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_01","name":"mcp__occli__get_weather","input":{}}}',
+  'event: content_block_start\ndata: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_01","name":"_get_weather","input":{}}}',
   'event: content_block_delta\ndata: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\\"city\\":\\"SF\\"}"}}',
   'event: content_block_stop\ndata: {"type":"content_block_stop","index":1}',
-  'event: content_block_start\ndata: {"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"toolu_02","name":"mcp__occli___secret","input":{}}}',
+  'event: content_block_start\ndata: {"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"toolu_02","name":"__secret","input":{}}}',
   'event: content_block_delta\ndata: {"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{\\"city\\":\\"NY\\"}"}}',
   'event: content_block_stop\ndata: {"type":"content_block_stop","index":2}',
   'event: content_block_start\ndata: {"type":"content_block_start","index":3,"content_block":{"type":"tool_use","id":"toolu_03","name":"web_search","input":{}}}',
@@ -653,8 +654,8 @@ const SSE_PAYLOAD = SSE_EVENTS.map((event, i) => event + (i % 3 === 1 ? "\r\n\r\
 
 // The same payload with tool_use names uncloaked — the expected output bytes.
 const SSE_EXPECTED = SSE_PAYLOAD
-  .replace('"name":"mcp__occli__get_weather"', '"name":"get_weather"')
-  .replace('"name":"mcp__occli___secret"', '"name":"_secret"');
+  .replace('"name":"_get_weather"', '"name":"get_weather"')
+  .replace('"name":"__secret"', '"name":"_secret"');
 
 async function collect(stream: ReadableStream<Uint8Array>): Promise<Uint8Array> {
   const chunks: Uint8Array[] = [];
@@ -744,7 +745,7 @@ describe("createSseToolNameTransform", () => {
   });
 
   test("flushes a final line without a trailing newline", async () => {
-    const bytes = new TextEncoder().encode('data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t","name":"mcp__occli__x","input":{}}}');
+    const bytes = new TextEncoder().encode('data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t","name":"_x","input":{}}}');
     const output = await collect(fragmentedStream(bytes, [4]).pipeThrough(createSseToolNameTransform()));
     expect(new TextDecoder().decode(output)).toBe(
       'data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t","name":"x","input":{}}}',
@@ -760,7 +761,7 @@ describe("createSseToolNameTransform", () => {
   test("joins multiple data: lines per SSE rules before JSON parsing and rewrites as one", async () => {
     const payload =
       'data: {"type":"content_block_start","index":9,\n' +
-      'data: "content_block":{"type":"tool_use","id":"toolu_09","name":"mcp__occli__split_name","input":{}}}\n' +
+      'data: "content_block":{"type":"tool_use","id":"toolu_09","name":"_split_name","input":{}}}\n' +
       "\n";
     const output = await collect(
       fragmentedStream(new TextEncoder().encode(payload), [13]).pipeThrough(createSseToolNameTransform()),
@@ -779,7 +780,7 @@ describe("createSseToolNameTransform", () => {
       'event: message_start\n' +
       'data: {"type":"message_start","message":{"id":"msg_ms","role":"assistant","content":[' +
       '{"type":"text","text":"hi"},' +
-      '{"type":"tool_use","id":"toolu_10","name":"mcp__occli__prefixed","input":{}}' +
+      '{"type":"tool_use","id":"toolu_10","name":"_prefixed","input":{}}' +
       ']}}\r\n\r\n';
     const output = await collect(
       fragmentedStream(new TextEncoder().encode(payload), [17]).pipeThrough(createSseToolNameTransform()),
@@ -818,8 +819,8 @@ describe("transformJsonToolUseNames", () => {
       role: "assistant",
       content: [
         { type: "text", text: "hi" },
-        { type: "tool_use", id: "toolu_01", name: "mcp__occli__get_weather", input: { city: "SF" } },
-        { type: "tool_use", id: "toolu_02", name: "mcp__occli___secret", input: {} },
+        { type: "tool_use", id: "toolu_01", name: "_get_weather", input: { city: "SF" } },
+        { type: "tool_use", id: "toolu_02", name: "__secret", input: {} },
         { type: "tool_use", id: "toolu_03", name: "web_search", input: {} },
       ],
       stop_reason: "tool_use",
@@ -884,8 +885,8 @@ describe("SDK integration: tool name cloaking through plugin fetch", () => {
     model: "claude-sonnet-4-6",
     content: [
       { type: "text", text: "It is sunny." },
-      { type: "tool_use", id: "toolu_01", name: "mcp__occli__get_weather", input: { city: "SF" } },
-      { type: "tool_use", id: "toolu_02", name: "mcp__occli___secret", input: {} },
+      { type: "tool_use", id: "toolu_01", name: "_get_weather", input: { city: "SF" } },
+      { type: "tool_use", id: "toolu_02", name: "__secret", input: {} },
     ],
     stop_reason: "tool_use",
     stop_sequence: null,
@@ -897,6 +898,7 @@ describe("SDK integration: tool name cloaking through plugin fetch", () => {
     const plugin = await ClaudeOAuthPlugin({ client: { auth: { set: async () => {} } } } as never);
     const options = await plugin.auth!.loader!(async () => OAUTH_AUTH as never, {} as never);
     const originalFetch = globalThis.fetch;
+    const originalTransport = coworkTransport.impl;
     const mock = (async (input: string | URL | Request, init?: RequestInit) => {
       const url = String(input);
       const body = typeof init?.body === "string" ? init.body : new TextDecoder().decode(init?.body as Uint8Array);
@@ -904,11 +906,13 @@ describe("SDK integration: tool name cloaking through plugin fetch", () => {
       return responder(url, body);
     }) as typeof fetch;
     globalThis.fetch = mock;
+    coworkTransport.impl = (input, init) => globalThis.fetch(input, init);
     return {
       // The SDK must go through the plugin's OAuth fetch wrapper.
       fetch: options.fetch!,
       restore: () => {
         globalThis.fetch = originalFetch;
+        coworkTransport.impl = originalTransport;
       },
     };
   }
@@ -950,13 +954,13 @@ describe("SDK integration: tool name cloaking through plugin fetch", () => {
       // but custom names carry exactly one prefix.
       const first = JSON.parse(captured[0]!.body);
       expect(first.tools.map((t: any) => t.name)).toEqual([
-        "mcp__occli__get_weather",
-        "mcp__occli___secret",
+        "_get_weather",
+        "__secret",
         "web_search",
       ]);
       expect(first.tools.every((tool: any) => tool.eager_input_streaming === undefined)).toBe(true);
       expect(first.tools.every((tool: any) => tool.input_schema.additionalProperties === false)).toBe(true);
-      expect(first.tool_choice).toEqual({ type: "tool", name: "mcp__occli__get_weather" });
+      expect(first.tool_choice).toEqual({ type: "tool", name: "_get_weather" });
       expect(captured[0]!.url).toContain("beta=true");
 
       // Follow-up request: historical assistant tool_use names are re-prefixed,
@@ -965,8 +969,8 @@ describe("SDK integration: tool name cloaking through plugin fetch", () => {
       const assistant = second.messages.find((m: any) => m.role === "assistant");
       const toolUses = assistant.content.filter((b: any) => b.type === "tool_use");
       expect(toolUses.map((b: any) => b.name)).toEqual([
-        "mcp__occli__get_weather",
-        "mcp__occli___secret",
+        "_get_weather",
+        "__secret",
         "web_search",
       ]);
       expect(toolUses.map((b: any) => b.id)).toEqual(["toolu_01", "toolu_02", "toolu_03"]);
@@ -1002,8 +1006,8 @@ describe("SDK integration: tool name cloaking through plugin fetch", () => {
       expect(result.text).toBe("It is sunny.");
       // Request side was prefixed.
       expect(JSON.parse(captured[0]!.body).tools.map((t: any) => t.name)).toEqual([
-        "mcp__occli__get_weather",
-        "mcp__occli___secret",
+        "_get_weather",
+        "__secret",
       ]);
       // Non-streaming request keeps stream absent; response JSON was transformed.
       expect(JSON.parse(captured[0]!.body).stream).toBeUndefined();
@@ -1040,10 +1044,12 @@ describe("plugin hooks", () => {
     const options = await plugin.auth!.loader!(async () => OAUTH_AUTH as never, {} as never);
     const capturedUrls: string[] = [];
     const originalFetch = globalThis.fetch;
+    const originalTransport = coworkTransport.impl;
     globalThis.fetch = (async (input: string | URL | Request) => {
       capturedUrls.push(String(input));
       return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
     }) as typeof fetch;
+    coworkTransport.impl = (input, init) => globalThis.fetch(input, init);
     try {
       await options.fetch!("https://api.anthropic.com/v1/messages?foo=bar", {
         method: "POST",
@@ -1052,6 +1058,7 @@ describe("plugin hooks", () => {
       });
     } finally {
       globalThis.fetch = originalFetch;
+      coworkTransport.impl = originalTransport;
     }
     expect(capturedUrls).toEqual(["https://api.anthropic.com/v1/messages?foo=bar&beta=true"]);
   });

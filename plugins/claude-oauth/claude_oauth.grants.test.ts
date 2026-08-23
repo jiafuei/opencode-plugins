@@ -4,6 +4,9 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, wri
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { AnthropicReauthRequiredError, ClaudeOAuthPlugin, grantTestSeam } from "./claude_oauth.ts";
+import { coworkTransport } from "./cowork_fetch.ts";
+
+coworkTransport.impl = (input, init) => globalThis.fetch(input, init);
 
 // Bun runs async tests concurrently by default; these suites mock
 // globalThis.fetch and share module-level state (warned-grant dedup set), so

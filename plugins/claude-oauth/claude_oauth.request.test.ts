@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { mkdtempSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -7,6 +7,7 @@ import { createAnthropic } from "@ai-sdk/anthropic";
 import { generateText, streamText, tool } from "ai";
 import { z } from "zod";
 import { ClaudeOAuthPlugin, mapStainlessArch } from "./claude_oauth.ts";
+import { coworkTransport } from "./cowork_fetch.ts";
 
 // Integration-style request capture harness.
 //
@@ -87,9 +88,14 @@ function jsonResponse(): Response {
 }
 
 let cleanupFetch: (() => void) | undefined;
+const originalTransport = coworkTransport.impl;
+beforeEach(() => {
+  coworkTransport.impl = (input, init) => globalThis.fetch(input, init);
+});
 afterEach(() => {
   cleanupFetch?.();
   cleanupFetch = undefined;
+  coworkTransport.impl = originalTransport;
 });
 
 async function setupHarness() {
@@ -322,7 +328,7 @@ describe("request capture: SDK-generated beta/context-management data", () => {
     expect(betas).not.toContain("structured-outputs-2025-11-13");
     expect(betas).not.toContain("advanced-tool-use-2025-11-20");
     expect(betas).toContain("extended-cache-ttl-2025-04-11");
-    expect(body.tools[0].name).toBe("mcp__occli__lookup");
+    expect(body.tools[0].name).toBe("_lookup");
     expect(body.tools[0].eager_input_streaming).toBeUndefined();
     expect(body.tools[0].input_schema.additionalProperties).toBe(false);
     expect(body.system[2].cache_control).toEqual({ type: "ephemeral", ttl: "1h", scope: "global" });
@@ -331,7 +337,7 @@ describe("request capture: SDK-generated beta/context-management data", () => {
 });
 
 describe("request capture: header parity", () => {
-  test("preserves incoming claude-cli User-Agents verbatim regardless of casing", async () => {
+  test("forces the selected profile User-Agent over incoming claude-cli values", async () => {
     const { anthropic, captured } = await setupHarness();
     const userAgents = ["claude-cli/9.9.9 (custom-build)", "CLAUDE-CLI/1.2.3"];
     for (const userAgent of userAgents) {
@@ -343,8 +349,8 @@ describe("request capture: header parity", () => {
       });
       await result.text;
     }
-    for (const [index, userAgent] of userAgents.entries()) {
-      expect(captured[index]!.headers["user-agent"]!.startsWith(userAgent)).toBe(true);
+    for (const [index] of userAgents.entries()) {
+      expect(captured[index]!.headers["user-agent"]).toBe("claude-cli/2.1.228 (external, cli)");
     }
   });
 
@@ -535,9 +541,9 @@ describe("request capture: x-client-request-id per-invocation semantics", () => 
     const body = JSON.parse(captured!.bodyText);
     expect(body.system).toBeUndefined();
     expect(body.metadata).toBeUndefined();
-    expect(body.tools[0].name).toBe("mcp__occli__get_weather");
+    expect(body.tools[0].name).toBe("_get_weather");
     expect(body.tools[0].input_schema.additionalProperties).toBe(false);
-    expect(body.messages[0].content[0].name).toBe("mcp__occli__get_weather");
+    expect(body.messages[0].content[0].name).toBe("_get_weather");
   });
 
   test("prompt ids stay stable and successful request ids chain through billing metadata", async () => {
