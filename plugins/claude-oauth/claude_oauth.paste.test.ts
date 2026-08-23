@@ -67,69 +67,46 @@ function authorizeParams(url: string): { redirectUri: string; state: string } {
 }
 
 describe("paste code flow", () => {
-  test("full redirect URL with a mismatched state fails locally without a token exchange", async () => {
-    const h = await makePasteHarness();
-    try {
-      const { redirectUri, state } = authorizeParams(h.result.url);
-      const pasted = `${redirectUri}?${new URLSearchParams({ code: "real-code", state: `WRONG-${state}` })}`;
-      const result = await h.result.callback(pasted);
-      expect(result.type).toBe("failed");
-      // Rejected before any network work.
-      expect(h.tokenCalls).toHaveLength(0);
-      // Actionable log guidance, never echoing pasted material.
-      const logged = h.warnings.join("\n");
-      expect(logged).toMatch(/state does not match/i);
-      expect(logged).toContain("opencode auth login");
-      expect(logged).not.toContain("real-code");
-      expect(logged).not.toContain(`WRONG-${state}`);
-    } finally {
-      h.restore();
+  test("mismatched state fails locally for redirect URL and code#state formats", async () => {
+    for (const format of ["redirect", "fragment"] as const) {
+      const h = await makePasteHarness();
+      try {
+        const { redirectUri, state } = authorizeParams(h.result.url);
+        const wrongState = `WRONG-${state}`;
+        const pasted =
+          format === "redirect"
+            ? `${redirectUri}?${new URLSearchParams({ code: "real-code", state: wrongState })}`
+            : `real-code#${wrongState}`;
+        const result = await h.result.callback(pasted);
+        expect(result.type).toBe("failed");
+        expect(h.tokenCalls).toHaveLength(0);
+        const logged = h.warnings.join("\n");
+        expect(logged).toMatch(/state does not match/i);
+        expect(logged).not.toContain("real-code");
+        expect(logged).not.toContain(wrongState);
+      } finally {
+        h.restore();
+      }
     }
   });
 
-  test("`code#state` with a mismatched state fragment fails locally without a token exchange", async () => {
-    const h = await makePasteHarness();
-    try {
-      const { state } = authorizeParams(h.result.url);
-      const result = await h.result.callback(`real-code#other-state`);
-      void state;
-      expect(result.type).toBe("failed");
-      expect(h.tokenCalls).toHaveLength(0);
-      const logged = h.warnings.join("\n");
-      expect(logged).toMatch(/state does not match/i);
-      expect(logged).not.toContain("real-code");
-      expect(logged).not.toContain("other-state");
-    } finally {
-      h.restore();
-    }
-  });
-
-  test("a correct full redirect URL succeeds and exchanges with the generated state", async () => {
-    const h = await makePasteHarness();
-    try {
-      const { redirectUri, state } = authorizeParams(h.result.url);
-      const pasted = `${redirectUri}?${new URLSearchParams({ code: "good-code", state })}`;
-      const result = await h.result.callback(pasted);
-      expect(result.type).toBe("success");
-      expect(h.tokenCalls).toHaveLength(1);
-      expect(h.tokenCalls[0]!.body.code).toBe("good-code");
-      expect(h.tokenCalls[0]!.body.state).toBe(state);
-    } finally {
-      h.restore();
-    }
-  });
-
-  test("a correct bare `code#state` succeeds", async () => {
-    const h = await makePasteHarness();
-    try {
-      const { state } = authorizeParams(h.result.url);
-      const result = await h.result.callback(`good-code#${state}`);
-      expect(result.type).toBe("success");
-      expect(h.tokenCalls).toHaveLength(1);
-      expect(h.tokenCalls[0]!.body.code).toBe("good-code");
-      expect(h.tokenCalls[0]!.body.state).toBe(state);
-    } finally {
-      h.restore();
+  test("valid redirect URL and code#state formats exchange the generated state", async () => {
+    for (const format of ["redirect", "fragment"] as const) {
+      const h = await makePasteHarness();
+      try {
+        const { redirectUri, state } = authorizeParams(h.result.url);
+        const pasted =
+          format === "redirect"
+            ? `${redirectUri}?${new URLSearchParams({ code: "good-code", state })}`
+            : `good-code#${state}`;
+        const result = await h.result.callback(pasted);
+        expect(result.type).toBe("success");
+        expect(h.tokenCalls).toHaveLength(1);
+        expect(h.tokenCalls[0]!.body.code).toBe("good-code");
+        expect(h.tokenCalls[0]!.body.state).toBe(state);
+      } finally {
+        h.restore();
+      }
     }
   });
 

@@ -59,31 +59,30 @@ function jsonResponse(body: unknown, status = 200): Response {
 }
 
 describe("extractIdentity normalization", () => {
-  serialTest("normalizes empty and non-string account/organization fields to undefined", () => {
-    const identity = extractIdentity({
-      ...TOKEN_BODY,
-      account: { uuid: "", email_address: undefined as unknown as string },
-      organization: { uuid: 42 as unknown as string, name: "" },
-    });
-    expect(identity).toEqual({ accountId: undefined, email: undefined, orgId: undefined, orgName: undefined });
-  });
-
-  serialTest("keeps non-empty strings verbatim", () => {
-    const identity = extractIdentity({
-      ...TOKEN_BODY,
-      account: { uuid: "acct-1", email_address: "a@b.c" },
-      organization: { uuid: "org-1", name: "Org" },
-    });
-    expect(identity).toEqual({ accountId: "acct-1", email: "a@b.c", orgId: "org-1", orgName: "Org" });
-  });
-
-  serialTest("tolerates entirely missing blocks", () => {
-    expect(extractIdentity(TOKEN_BODY)).toEqual({
-      accountId: undefined,
-      email: undefined,
-      orgId: undefined,
-      orgName: undefined,
-    });
+  serialTest("normalizes missing, invalid, and valid identity fields", () => {
+    const empty = { accountId: undefined, email: undefined, orgId: undefined, orgName: undefined };
+    const cases = [
+      {
+        input: {
+          ...TOKEN_BODY,
+          account: { uuid: "", email_address: undefined as unknown as string },
+          organization: { uuid: 42 as unknown as string, name: "" },
+        },
+        expected: empty,
+      },
+      {
+        input: {
+          ...TOKEN_BODY,
+          account: { uuid: "acct-1", email_address: "a@b.c" },
+          organization: { uuid: "org-1", name: "Org" },
+        },
+        expected: { accountId: "acct-1", email: "a@b.c", orgId: "org-1", orgName: "Org" },
+      },
+      { input: TOKEN_BODY, expected: empty },
+    ];
+    for (const { input, expected } of cases) {
+      expect(extractIdentity(input)).toEqual(expected);
+    }
   });
 });
 

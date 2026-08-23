@@ -26,7 +26,7 @@ const CALLBACK_PATH = "/callback";
 const SCOPES =
   "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
 
-const CLAUDE_CODE_VERSION = "2.1.220";
+const CLAUDE_CODE_VERSION = "2.1.228";
 const USER_AGENT = `claude-cli/${CLAUDE_CODE_VERSION} (external, claude-desktop)`;
 const SDK_INSTRUCTION = "You are a Claude agent, built on Anthropic's Claude Agent SDK.";
 const MAX_OUTPUT_TOKENS = 64000;
@@ -1122,8 +1122,7 @@ function createBillingHeader(firstUserMessageText: string): string {
     .update(`${BILLING_SALT}${k}${CLAUDE_CODE_VERSION}`)
     .digest("hex")
     .slice(0, 3);
-  // cch=00000 is a placeholder replaced with the real attestation hash before
-  // the request hits the wire (see patchCch).
+  // cch=00000 is replaced after the complete request object is assembled.
   return `${BILLING_HEADER_PREFIX} cc_version=${CLAUDE_CODE_VERSION}.${versionSuffix}; cc_entrypoint=claude-desktop; cch=00000;`;
 }
 
@@ -1131,36 +1130,6 @@ function createBillingHeader(firstUserMessageText: string): string {
 const CCH_SEED = 0x4d659218e32a3268n;
 const CCH_PLACEHOLDER_STR = "cch=00000";
 const cchEncoder = new TextEncoder();
-const CCH_PLACEHOLDER = cchEncoder.encode(CCH_PLACEHOLDER_STR);
-// Anchor for the billing-header placeholder inside system[0]:
-// `"system":[{"type":"text","text":"x-anthropic-billing-header:` — matches the
-// exact JSON prefix of the first system block. `messages` serializes before
-// `system` in Anthropic SDK payloads, so user content can never collide with it.
-const BILLING_SYSTEM_MARKER = cchEncoder.encode(`"system":[{"type":"text","text":"${BILLING_HEADER_PREFIX}`);
-const CCH_BILLING_SEARCH_WINDOW = 150;
-
-export type CchPatchResult = "patched" | "no-billing-header" | "unanchored";
-
-/**
- * Replace the cch=00000 placeholder with the real attestation, in place.
- * - "patched": placeholder found anchored to the billing system block and replaced.
- * - "no-billing-header": body carries no billing system block; nothing to do.
- * - "unanchored": billing block present but the placeholder is missing or
- *   outside the anchor window — the body (placeholder included) goes out
- *   unchanged rather than corrupting an unverified position.
- */
-export function patchCch(body: Uint8Array): CchPatchResult {
-  const view = Buffer.from(body.buffer, body.byteOffset, body.byteLength);
-  const markerIdx = view.indexOf(BILLING_SYSTEM_MARKER);
-  if (markerIdx === -1) return "no-billing-header";
-  const searchFrom = markerIdx + BILLING_SYSTEM_MARKER.length;
-  const idx = view.indexOf(CCH_PLACEHOLDER, searchFrom);
-  if (idx === -1 || idx - searchFrom > CCH_BILLING_SEARCH_WINDOW) return "unanchored";
-  const h = Bun.hash.xxHash64(body, CCH_SEED);
-  const cch = (h & 0xfffffn).toString(16).padStart(5, "0");
-  for (let i = 0; i < 5; i++) body[idx + 4 + i] = cch.charCodeAt(i);
-  return "patched";
-}
 
 // ---------------------------------------------------------------------------
 // Custom tool name cloaking
@@ -1471,7 +1440,7 @@ export function rewriteBody(
 ): { json: string; thinking: unknown; hasTools: boolean; sessionId?: string } {
   const params = JSON.parse(body) as Record<string, any>;
   // Cloak custom tool names before anything else, so cch hashes the
-  // already-prefixed final body (patchCch runs on the encoded output below).
+  // already-prefixed final body.
   prefixRequestToolNames(params);
   const hasTools = Array.isArray(params.tools) && params.tools.length > 0;
 
@@ -1569,6 +1538,25 @@ export function rewriteBody(
   }
   for (const [key, value] of Object.entries(params)) {
     if (!(key in rewritten) && value !== undefined) rewritten[key] = value;
+  }
+
+  const billingBlock = system.find(
+    (block) =>
+      typeof block?.text === "string" &&
+      block.text.startsWith(BILLING_HEADER_PREFIX) &&
+      block.text.includes(CCH_PLACEHOLDER_STR),
+  );
+  if (billingBlock?.text) {
+    const normalized = JSON.stringify(rewritten, (key, value) => {
+      if (key === "model" && typeof value === "string") return "";
+      if (key === "fallbacks" && Array.isArray(value)) return undefined;
+      if (key === "fallback_credit_token" && typeof value === "string") return undefined;
+      if (key === "max_tokens" && typeof value === "number") return undefined;
+      return value;
+    });
+    const hash = Bun.hash.xxHash64(cchEncoder.encode(normalized), CCH_SEED);
+    const cch = (hash & 0xfffffn).toString(16).padStart(5, "0");
+    billingBlock.text = billingBlock.text.replace(CCH_PLACEHOLDER_STR, `cch=${cch}`);
   }
 
   return { json: JSON.stringify(rewritten), thinking, hasTools, sessionId };
@@ -1763,7 +1751,7 @@ export const ClaudeOAuthPlugin: Plugin = async (input: PluginInput) => {
             const hookSessionId = headers.get(SESSION_ID_HEADER) ?? undefined
             let sessionId = hookSessionId
             let body: RequestInit["body"] = init?.body
-            const isMessages = url.pathname.endsWith("/messages")
+            const isMessages = url.pathname === "/v1/messages"
             let requestTarget: typeof requestInput = requestInput
             // Claude Code hits the official API with ?beta=true on /messages;
             // existing query params are preserved.
@@ -1777,24 +1765,7 @@ export const ClaudeOAuthPlugin: Plugin = async (input: PluginInput) => {
                 accountId,
               })
               sessionId = bodySessionId
-              const encoded = cchEncoder.encode(json)
-              if (patchCch(encoded) === "unanchored") {
-                // Advisory only: the billing block is present but the
-                // placeholder could not be safely anchored, so the body goes
-                // out with the placeholder intact. Never fails the request and
-                // never adds wire headers.
-                input.client.app
-                  .log({
-                    body: {
-                      service: "claude-oauth",
-                      level: "warn",
-                      message:
-                        "Anthropic request carried a billing attestation placeholder that could not be anchored to the billing system block; it was sent unreplaced.",
-                    },
-                  })
-                  .catch(() => {})
-              }
-              body = encoded
+              body = json
               // Headers.get is case-insensitive, so SDK betas arrive regardless
               // of the caller's key casing.
               headers.set("anthropic-beta", buildBetas(thinking, hasTools, headers.get("anthropic-beta")))

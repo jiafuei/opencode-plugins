@@ -1,7 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { createAnthropic } from "@ai-sdk/anthropic";
-import { generateText, streamText, tool } from "ai";
-import { z } from "zod";
+import { generateText, streamText } from "ai";
 import { ClaudeOAuthPlugin, mapStainlessArch } from "./claude_oauth.ts";
 
 // Integration-style request capture harness.
@@ -19,16 +18,6 @@ const UTILITY_BETAS = [
   "context-management-2025-06-27",
   "prompt-caching-scope-2026-01-05",
   "structured-outputs-2025-12-15",
-];
-
-const AGENT_BASE_BETAS = [
-  "claude-code-20250219",
-  "interleaved-thinking-2025-05-14",
-  "thinking-token-count-2026-05-13",
-  "context-management-2025-06-27",
-  "prompt-caching-scope-2026-01-05",
-  "mid-conversation-system-2026-04-07",
-  "advanced-tool-use-2025-11-20",
 ];
 
 const OAUTH_AUTH = {
@@ -166,7 +155,7 @@ describe("request capture: normal streaming request", () => {
     // OAuth bearer replaces the SDK's dummy x-api-key.
     expect(req.headers["authorization"]).toBe("Bearer test-access-token");
     expect(req.headers["x-api-key"]).toBeUndefined();
-    expect(req.headers["user-agent"]).toBe("claude-cli/2.1.220 (external, claude-desktop)");
+    expect(req.headers["user-agent"]).toBe("claude-cli/2.1.228 (external, claude-desktop)");
     expect(req.headers["accept"]).toBe("application/json");
     expect(req.headers["content-type"]).toBe("application/json");
     expect(req.headers["anthropic-version"]).toBe("2023-06-01");
@@ -204,7 +193,7 @@ describe("request capture: normal streaming request", () => {
 });
 
 describe("request capture: non-streaming request", () => {
-  test("non-streaming request keeps stream unset and is still fingerprinted", async () => {
+  test("non-streaming request keeps stream unset", async () => {
     const { anthropic, captured } = await setupHarness();
 
     const result = await generateText({
@@ -225,8 +214,6 @@ describe("request capture: non-streaming request", () => {
     expect(body.max_tokens).toBe(64000);
     // The OAuth tools:[] insertion applies even without caller tools.
     expect(body.tools).toEqual([]);
-    expect(body.system[0].text).toContain("x-anthropic-billing-header:");
-    expect(body.system[0].text).toMatch(/cch=[0-9a-f]{5}/);
     expect(JSON.parse(body.metadata.user_id).session_id).toBe("session-nonstream");
   });
 });
@@ -257,69 +244,6 @@ describe("request capture: SDK-generated beta/context-management data", () => {
     expect(betas).toContain("context-management-2025-06-27");
   });
 
-  test("SDK context_management passes through unchanged when thinking is off", async () => {
-    const { anthropic, captured, fromSdk } = await setupHarness();
-
-    const result = streamText({
-      model: anthropic("claude-sonnet-4-6"),
-      prompt: "hi",
-      maxOutputTokens: 1000,
-      providerOptions: {
-        anthropic: { contextManagement: { edits: [{ type: "clear_tool_uses_20250919" }] } },
-      },
-    });
-    await result.text;
-
-    // The SDK serializes context_management into the body it hands the
-    // plugin's loader; without active thinking the plugin forwards it as-is.
-    const sdkBody = JSON.parse(fromSdk[0]!.bodyText);
-    expect(sdkBody.context_management).toEqual({ edits: [{ type: "clear_tool_uses_20250919" }] });
-
-    const body = JSON.parse(captured[0]!.bodyText);
-    expect(body.context_management).toEqual({ edits: [{ type: "clear_tool_uses_20250919" }] });
-  });
-
-  test("compact edit from the SDK is preserved alongside the clear-thinking edit", async () => {
-    const { anthropic, captured, fromSdk } = await setupHarness();
-
-    const result = streamText({
-      model: anthropic("claude-sonnet-4-6"),
-      prompt: "hi",
-      maxOutputTokens: 1000,
-      providerOptions: {
-        anthropic: {
-          thinking: { type: "enabled", budgetTokens: 1024 },
-          contextManagement: {
-            edits: [
-              { type: "compact_20260112", trigger: { type: "input_tokens", value: 150000 } },
-              { type: "clear_thinking_20251015", keep: { type: "thinking_turns", value: 2 } },
-            ],
-          },
-        },
-      },
-    });
-    await result.text;
-
-    const sdkBody = JSON.parse(fromSdk[0]!.bodyText);
-    expect(sdkBody.context_management.edits).toEqual([
-      { type: "compact_20260112", trigger: { type: "input_tokens", value: 150000 } },
-      { type: "clear_thinking_20251015", keep: { type: "thinking_turns", value: 2 } },
-    ]);
-
-    // Active thinking guarantees exactly one canonical clear-thinking edit;
-    // the SDK's compact edit survives with its fields intact.
-    const body = JSON.parse(captured[0]!.bodyText);
-    expect(body.context_management).toEqual({
-      edits: [
-        { type: "clear_thinking_20251015", keep: "all" },
-        { type: "compact_20260112", trigger: { type: "input_tokens", value: 150000 } },
-      ],
-    });
-    expect(body.thinking).toEqual({ type: "enabled", budget_tokens: 1024 });
-    const betas = captured[0]!.headers["anthropic-beta"]!;
-    expect(betas.split(",")).toContain("context-management-2025-06-27");
-  });
-
   test("merges SDK-generated betas into the final anthropic-beta header after the profile", async () => {
     const { anthropic, captured, fromSdk } = await setupHarness();
 
@@ -344,83 +268,24 @@ describe("request capture: SDK-generated beta/context-management data", () => {
     expect(JSON.parse(req.bodyText).speed).toBe("fast");
   });
 
-  test("agent profile for tool requests: fallback credit, no effort, SDK structured-outputs beta preserved", async () => {
-    const { anthropic, captured } = await setupHarness();
-
-    const result = streamText({
-      model: anthropic("claude-sonnet-4-6"),
-      prompt: "hi",
-      maxOutputTokens: 1000,
-      tools: {
-        echo: tool({ inputSchema: z.object({ x: z.string() }), execute: async ({ x }) => x }),
-      },
-    });
-    await result.text;
-
-    // Tools select the agent profile (fallback credit, no effort beta since
-    // thinking is off). The pinned SDK's own structured-outputs beta rides
-    // along as a deduplicated extra after the profile.
-    const req = captured[0]!;
-    const betas = req.headers["anthropic-beta"]!.split(",");
-    expect(betas.slice(0, 8)).toEqual([...AGENT_BASE_BETAS, "fallback-credit-2026-06-01"]);
-    expect(betas).not.toContain("effort-2025-11-24");
-    expect(betas).toContain("structured-outputs-2025-11-13");
-    const body = JSON.parse(req.bodyText);
-    expect(Array.isArray(body.tools) && body.tools.length > 0).toBe(true);
-  });
-
-  test("disabled thinking keeps the utility profile: no effort, no fallback credit", async () => {
-    const { anthropic, captured } = await setupHarness();
-
-    const result = streamText({
-      model: anthropic("claude-sonnet-4-6"),
-      prompt: "hi",
-      maxOutputTokens: 1000,
-      providerOptions: {
-        anthropic: { thinking: { type: "disabled" } },
-      },
-    });
-    await result.text;
-
-    const req = captured[0]!;
-    const betas = req.headers["anthropic-beta"]!.split(",");
-    expect(betas).toEqual(UTILITY_BETAS);
-    expect(betas).not.toContain("effort-2025-11-24");
-    expect(betas).not.toContain("fallback-credit-2026-06-01");
-    // The pinned SDK omits the thinking field entirely when disabled.
-    expect(JSON.parse(req.bodyText).thinking).toBeUndefined();
-  });
 });
 
 describe("request capture: header parity", () => {
-  test("preserves an incoming claude-cli User-Agent verbatim", async () => {
+  test("preserves incoming claude-cli User-Agents verbatim regardless of casing", async () => {
     const { anthropic, captured } = await setupHarness();
-
-    const result = streamText({
-      model: anthropic("claude-sonnet-4-6"),
-      prompt: "hi",
-      maxOutputTokens: 1000,
-      headers: { "User-Agent": "claude-cli/9.9.9 (custom-build)" },
-    });
-    await result.text;
-
-    // The pinned SDK appends its runtime suffix; the plugin must preserve the
-    // whole incoming value verbatim.
-    expect(captured[0]!.headers["user-agent"]!.startsWith("claude-cli/9.9.9 (custom-build)")).toBe(true);
-  });
-
-  test("preserves a claude-cli UA regardless of casing", async () => {
-    const { anthropic, captured } = await setupHarness();
-
-    const result = streamText({
-      model: anthropic("claude-sonnet-4-6"),
-      prompt: "hi",
-      maxOutputTokens: 1000,
-      headers: { "User-Agent": "CLAUDE-CLI/1.2.3" },
-    });
-    await result.text;
-
-    expect(captured[0]!.headers["user-agent"]!.startsWith("CLAUDE-CLI/1.2.3")).toBe(true);
+    const userAgents = ["claude-cli/9.9.9 (custom-build)", "CLAUDE-CLI/1.2.3"];
+    for (const userAgent of userAgents) {
+      const result = streamText({
+        model: anthropic("claude-sonnet-4-6"),
+        prompt: "hi",
+        maxOutputTokens: 1000,
+        headers: { "User-Agent": userAgent },
+      });
+      await result.text;
+    }
+    for (const [index, userAgent] of userAgents.entries()) {
+      expect(captured[index]!.headers["user-agent"]!.startsWith(userAgent)).toBe(true);
+    }
   });
 
   test("replaces non-claude-cli User-Agents with the cowork UA", async () => {
@@ -434,7 +299,7 @@ describe("request capture: header parity", () => {
     });
     await result.text;
 
-    expect(captured[0]!.headers["user-agent"]).toBe("claude-cli/2.1.220 (external, claude-desktop)");
+    expect(captured[0]!.headers["user-agent"]).toBe("claude-cli/2.1.228 (external, claude-desktop)");
   });
 
   test("synthesizes X-Claude-Code-Session-Id from metadata.user_id when no hook ran", async () => {

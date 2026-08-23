@@ -209,34 +209,28 @@ describe("shared refresh coordination", () => {
     }
   });
 
-  serialTest("persistence returning an error object fails loudly and releases the lease", async () => {
-    const data = useDataDir();
-    const h = await makeHarness({ setImpl: async () => ({ error: { name: "ValidationError" } }) });
-    const mock = mockFetch((url) => (isTokenCall(url) ? tokenResponse() : jsonResponse({})));
-    try {
-      await expect(callFetch(h.options)).rejects.toThrow(/persist refreshed Anthropic credentials/i);
-      expect(mock.calls.filter((c) => isTokenCall(c.url))).toHaveLength(1);
-      expect(existsSync(refreshTestSeam.leaseDirFor("stored-account:stale-refresh"))).toBe(false);
-    } finally {
-      mock.restore();
-      data.restore();
-    }
-  });
-
-  serialTest("persistence throwing fails the request and releases the lease", async () => {
-    const data = useDataDir();
-    const h = await makeHarness({
-      setImpl: async () => {
-        throw new Error("auth.set boom");
-      },
-    });
-    const mock = mockFetch((url) => (isTokenCall(url) ? tokenResponse() : jsonResponse({})));
-    try {
-      await expect(callFetch(h.options)).rejects.toThrow("auth.set boom");
-      expect(existsSync(refreshTestSeam.leaseDirFor("stored-account:stale-refresh"))).toBe(false);
-    } finally {
-      mock.restore();
-      data.restore();
+  serialTest("persistence failures fail the request and release the lease", async () => {
+    for (const mode of ["error-result", "throw"] as const) {
+      const data = useDataDir();
+      const h = await makeHarness({
+        setImpl:
+          mode === "error-result"
+            ? async () => ({ error: { name: "ValidationError" } })
+            : async () => {
+                throw new Error("auth.set boom");
+              },
+      });
+      const mock = mockFetch((url) => (isTokenCall(url) ? tokenResponse() : jsonResponse({})));
+      try {
+        await expect(callFetch(h.options)).rejects.toThrow(
+          mode === "error-result" ? /persist refreshed Anthropic credentials/i : "auth.set boom",
+        );
+        expect(mock.calls.filter((c) => isTokenCall(c.url))).toHaveLength(1);
+        expect(existsSync(refreshTestSeam.leaseDirFor("stored-account:stale-refresh"))).toBe(false);
+      } finally {
+        mock.restore();
+        data.restore();
+      }
     }
   });
 

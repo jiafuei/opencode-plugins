@@ -9,7 +9,6 @@ import {
   ClaudeOAuthPlugin,
   createSseToolNameTransform,
   mapStainlessArch,
-  patchCch,
   rewriteBody,
   stripClaudeToolPrefix,
   transformJsonToolUseNames,
@@ -40,7 +39,7 @@ function expectedVersionSuffix(text: string): string {
     .map((i) => text[i] ?? "0")
     .join("");
   return createHash("sha256")
-    .update(`59cf53e54c78${k}2.1.220`)
+    .update(`59cf53e54c78${k}2.1.228`)
     .digest("hex")
     .slice(0, 3);
 }
@@ -51,21 +50,9 @@ describe("rewriteBody", () => {
     const out = parse(rewriteBody(baseBody, {}).json);
     expect(Array.isArray(out.system)).toBe(true);
     expect(out.system[0].text).toContain(BILLING_PREFIX);
-    expect(out.system[0].text).toContain(`cc_version=2.1.220.${expectedVersionSuffix(firstUserText)}`);
-    expect(out.system[0].text).toContain("cch=00000");
+    expect(out.system[0].text).toContain(`cc_version=2.1.228.${expectedVersionSuffix(firstUserText)}`);
     expect(out.system[1].text).toBe("You are a Claude agent, built on Anthropic's Claude Agent SDK.");
     expect(out.system[2].text).toBe("You are a coding agent.");
-  });
-
-  test("keeps the cch anchor intact so the attestation can be patched", () => {
-    const json = rewriteBody(baseBody, {}).json;
-    const marker = `"system":[{"type":"text","text":"${BILLING_PREFIX}`;
-    const markerIdx = json.indexOf(marker);
-    expect(markerIdx).toBeGreaterThanOrEqual(0);
-    const placeholderIdx = json.indexOf("cch=00000", markerIdx);
-    expect(placeholderIdx - markerIdx).toBeLessThanOrEqual(150);
-    // Escaped user content can never produce the raw anchor bytes.
-    expect(json.slice(0, markerIdx)).not.toContain('cch=00000');
   });
 
   test("skips billing header and SDK instruction for claude-3-5-haiku", () => {
@@ -102,11 +89,11 @@ describe("rewriteBody", () => {
     const out = parse(rewriteBody(body, {}).json);
     // Fingerprint chars come from "abcdefgh" only ('e','h', pad '0'), not the
     // joined multi-block text.
-    expect(out.system[0].text).toContain(`cc_version=2.1.220.${expectedVersionSuffix("abcdefgh")}`);
+    expect(out.system[0].text).toContain(`cc_version=2.1.228.${expectedVersionSuffix("abcdefgh")}`);
   });
 
   test("does not duplicate billing/SDK injection when a billing block already exists", () => {
-    const existing = `${BILLING_PREFIX} cc_version=2.1.220.abc; cc_entrypoint=claude-desktop; cch=00000;`;
+    const existing = `${BILLING_PREFIX} cc_version=2.1.228.abc; cc_entrypoint=claude-desktop; cch=00000;`;
     const body = JSON.stringify({
       model: "claude-sonnet-4-6",
       messages: [{ role: "user", content: "hi" }],
@@ -385,36 +372,40 @@ describe("mapStainlessArch", () => {
   });
 });
 
-describe("patchCch", () => {
-  test("patches the placeholder with the XXHash64 low-20-bit hex attestation", () => {
-    const encoded = new TextEncoder().encode(rewriteBody(baseBody, {}).json);
-    expect(patchCch(encoded)).toBe("patched");
-    const patched = new TextDecoder().decode(encoded);
-    const cch = patched.match(/cch=([0-9a-f]{5})/)?.[1];
-    expect(cch).toBeDefined();
-    expect(cch).not.toBe("00000");
+describe("rewriteBody cch", () => {
+  const billingHeader = "x-anthropic-billing-header: cch=00000;";
+  const body = {
+    model: "claude-sonnet-4-6",
+    max_tokens: 64000,
+    messages: [{ role: "user", content: "hello" }],
+    fallback_credit_token: "credit",
+    system: [{ type: "text", text: billingHeader }],
+    tools: [],
+    metadata: { user_id: JSON.stringify({ device_id: "dev", session_id: "session" }) },
+    fallbacks: [{ model: "claude-opus-4-6" }],
+    stream: true,
+  };
+
+  function cch(input: Record<string, any>): string {
+    const out = parse(rewriteBody(JSON.stringify(input), {}).json);
+    const text = out.system.find((block: any) => block.text?.startsWith(BILLING_PREFIX)).text;
+    return text.match(/cch=([0-9a-f]{5})/)![1]!;
+  }
+
+  test("matches the canonical normalized-body reference vector", () => {
+    expect(cch(body)).toBe("6f56e");
   });
 
-  test("leaves bodies without the billing header untouched", () => {
-    const encoded = new TextEncoder().encode(JSON.stringify({ model: "x", messages: [], stream: true }));
-    expect(patchCch(encoded)).toBe("no-billing-header");
+  test("leaves an existing billing value without a placeholder unchanged", () => {
+    const existing = billingHeader.replace("cch=00000", "cch=abcde");
+    const out = parse(rewriteBody(JSON.stringify({ ...body, system: [{ type: "text", text: existing }] }), {}).json);
+    expect(out.system[0].text).toBe(existing);
   });
 
-  test("returns unanchored when the billing block is present but the placeholder is gone", () => {
-    const json = rewriteBody(baseBody, {}).json.replace("cch=00000", "cch=zzzzz");
-    const encoded = new TextEncoder().encode(json);
-    expect(patchCch(encoded)).toBe("unanchored");
-    // The body must be left byte-identical (graceful fallback).
-    expect(new TextDecoder().decode(encoded)).toBe(json);
-  });
-
-  test("returns unanchored when the placeholder sits outside the anchor window", () => {
-    const json = rewriteBody(baseBody, {})
-      .json
-      .replace(`${BILLING_PREFIX} cc_version`, `${BILLING_PREFIX} ${"x".repeat(151)}cc_version`);
-    const encoded = new TextEncoder().encode(json);
-    expect(patchCch(encoded)).toBe("unanchored");
-    expect(new TextDecoder().decode(encoded)).toBe(json);
+  test("replaces only the first placeholder in the billing block", () => {
+    const repeated = billingHeader.replace(";", " cch=00000;");
+    const out = parse(rewriteBody(JSON.stringify({ ...body, system: [{ type: "text", text: repeated }] }), {}).json);
+    expect(out.system[0].text).toMatch(/cch=[0-9a-f]{5} cch=00000/);
   });
 });
 
@@ -473,6 +464,7 @@ describe("rewriteBody tool name cloaking", () => {
       { type: "bash_20250124", name: "bash" },
     ],
     tool_choice: { type: "tool", name: "get_weather" },
+    metadata: { user_id: JSON.stringify({ device_id: "dev", session_id: "tool-session" }) },
     max_tokens: 100,
   });
 
@@ -512,18 +504,12 @@ describe("rewriteBody tool name cloaking", () => {
     });
   });
 
-  test("cch hashes the already-prefixed final request body", () => {
+  test("cch hashes custom tool prefixes as retained request content", () => {
     const json = rewriteBody(toolBody, {}).json;
     expect(json).toContain('"name":"_get_weather"');
-    const encoded = new TextEncoder().encode(json);
-    expect(patchCch(encoded)).toBe("patched");
-    const patched = new TextDecoder().decode(encoded);
-    const cch = patched.match(/cch=([0-9a-f]{5})/)?.[1]!;
-    // Recompute the expected hash over the final prefixed body with the
-    // placeholder restored — must match what was sent.
-    const placeholder = new TextEncoder().encode(patched.replace(`cch=${cch}`, "cch=00000"));
-    const expected = (Bun.hash.xxHash64(placeholder, 0x4d659218e32a3268n) & 0xfffffn).toString(16).padStart(5, "0");
-    expect(cch).toBe(expected);
+    const cch = json.match(/cch=([0-9a-f]{5})/)?.[1]!;
+    const changed = rewriteBody(toolBody.replaceAll("get_weather", "other_tool"), {}).json;
+    expect(changed.match(/cch=([0-9a-f]{5})/)?.[1]).not.toBe(cch);
   });
 });
 

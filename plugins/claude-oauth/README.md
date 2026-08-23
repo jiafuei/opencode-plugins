@@ -40,7 +40,7 @@ tested):
 
 - `Authorization: Bearer sk-ant-oat01-…` (never `x-api-key`) and
   `?beta=true` on `/v1/messages`
-- `User-Agent: claude-cli/2.1.220 (external, claude-desktop)`, `x-app: cli`,
+- `User-Agent: claude-cli/2.1.228 (external, claude-desktop)`, `x-app: cli`,
   a per-invocation `x-client-request-id` (stable across SDK retries of the
   same request, fresh per logical invocation), the Stainless header set, and
   `X-Claude-Code-Session-Id` per session
@@ -59,9 +59,10 @@ tested):
   - `context_management`: incoming edits are preserved; when thinking is on,
     exactly one `{type:"clear_thinking_20251015", keep:"all"}` edit is
     guaranteed first
-- The `cch` attestation: XXHash64 over the final body (seed
-  `0x4d659218e32a3268`, low 20 bits as 5 hex chars) patched byte-wise over the
-  `cch=00000` placeholder
+- The `cch` attestation: XXHash64 over the canonical final body after blanking
+  model values and omitting `fallbacks`, `fallback_credit_token`, and
+  `max_tokens` (seed `0x4d659218e32a3268`, low 20 bits as 5 hex chars), patched
+  over the `cch=00000` placeholder
 - Custom tool names are cloaked with a `_` prefix on the way out (definitions,
   `tool_choice`, historical `tool_use` blocks) and stripped back on the way in
   through both streaming SSE (`content_block_start`) and non-streaming JSON

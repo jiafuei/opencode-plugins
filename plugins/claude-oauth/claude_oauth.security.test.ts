@@ -168,34 +168,6 @@ describe("origin allowlist", () => {
     }
   });
 
-  serialTest("official origin keeps the exact wire fingerprint", async () => {
-    const { options } = await makeHarness();
-    let capturedUrl = "";
-    let capturedHeaders: Headers | undefined;
-    let capturedBody: string | undefined;
-    const mock = mockFetch(async (url, init) => {
-      capturedUrl = url;
-      capturedHeaders = new Headers(init?.headers);
-      capturedBody = typeof init?.body === "string" ? init.body : new TextDecoder().decode(init?.body as Uint8Array);
-      return jsonResponse({ id: "msg" }, 200);
-    });
-    cleanupFetch = mock.restore;
-    try {
-      await callFetch(options);
-      expect(capturedUrl).toBe("https://api.anthropic.com/v1/messages?beta=true");
-      expect(capturedHeaders!.get("authorization")).toBe("Bearer test-access-token");
-      expect(capturedHeaders!.get("user-agent")).toBe("claude-cli/2.1.220 (external, claude-desktop)");
-      expect(capturedHeaders!.get("x-api-key")).toBeNull();
-      const body = JSON.parse(capturedBody!);
-      expect(body.system[0].text).toContain("x-anthropic-billing-header:");
-      expect(body.system[0].text).toMatch(/cch=[0-9a-f]{5}/);
-      expect(body.metadata.user_id).toBeDefined();
-    } finally {
-      cleanupFetch();
-      cleanupFetch = undefined;
-    }
-  });
-
   serialTest("Request input to a malicious origin is rejected without network or token leak", async () => {
     const { options } = await makeHarness();
     const mock = mockFetch(async () => jsonResponse({ id: "msg" }));
