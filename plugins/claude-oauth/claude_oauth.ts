@@ -312,21 +312,11 @@ async function exchangeCode(
   verifier: string,
   redirectUri: string,
 ): Promise<{ access: string; refresh: string; expires: number; accountId?: string }> {
-  // Pasted codes may carry the state as a `code#state` fragment.
-  let exchangeCode = code;
-  let exchangeState = state;
-  const fragment = code.indexOf("#");
-  if (fragment >= 0) {
-    exchangeCode = code.slice(0, fragment);
-    const fragmentState = code.slice(fragment + 1);
-    if (fragmentState.length > 0) exchangeState = fragmentState;
-  }
-
   const data = await postToken({
     grant_type: "authorization_code",
     client_id: CLIENT_ID,
-    code: exchangeCode,
-    state: exchangeState,
+    code,
+    state,
     redirect_uri: redirectUri,
     code_verifier: verifier,
   });
@@ -539,14 +529,14 @@ async function performSharedRefresh(
   getAuth: () => Promise<any>,
   persist: (tokens: RefreshedCredential) => Promise<void>,
 ): Promise<RefreshedCredential | null> {
-  const identity = `${startAuth.accountId ?? ""}:${startAuth.refresh}`;
+  const credentialIdentity = `${startAuth.accountId ?? ""}:${startAuth.refresh}`;
   const key = inFlightKey(startAuth.accountId, startAuth.refresh);
   const inFlight = inFlightRefreshes.get(key);
   if (inFlight) return inFlight;
   const promise = (async (): Promise<RefreshedCredential | null> => {
     // The on-disk lease stays keyed by the composite identity (hashed once
     // inside refreshLeaseDir); only the in-process map key is the extra hash.
-    const dir = refreshLeaseDir(identity);
+    const dir = refreshLeaseDir(credentialIdentity);
     const ownerId = await waitForLease(dir, startAuth, getAuth);
     if (ownerId === null) return null;
     try {
@@ -1155,9 +1145,10 @@ export const ClaudeOAuthPlugin: Plugin = async (input: PluginInput, options?: Pl
             // SDK client. The CURRENT stored auth is classified exactly once,
             // here at the boundary.
             let auth = await readAuth();
+            let url: URL | undefined;
 
             if (auth.kind === "oauth") {
-              const url = requestInput instanceof URL ? requestInput : new URL(typeof requestInput === "string" ? requestInput : requestInput.url);
+              url = requestInput instanceof URL ? requestInput : new URL(typeof requestInput === "string" ? requestInput : requestInput.url);
 
               // Origin allowlist: the OAuth bearer token is attached only to
               // official Anthropic API traffic. HTTP, localhost, alternate
@@ -1234,7 +1225,7 @@ export const ClaudeOAuthPlugin: Plugin = async (input: PluginInput, options?: Pl
               );
             }
 
-            const url = requestInput instanceof URL ? requestInput : new URL(typeof requestInput === "string" ? requestInput : requestInput.url);
+            if (!url) throw new Error("OAuth request URL was not initialized");
             const access = auth.access
             const accountId = auth.accountId
             const headers = new Headers(init?.headers)
@@ -1267,9 +1258,9 @@ export const ClaudeOAuthPlugin: Plugin = async (input: PluginInput, options?: Pl
             const hookSessionId = headers.get(SESSION_ID_HEADER) ?? undefined
             let sessionId = hookSessionId
             let body: RequestInit["body"] = init?.body
-            let requestChainSessionId: string | undefined
-            let requestChainGeneration: number | undefined
-            let requestChainSequence: number | undefined
+            let requestChain:
+              | { sessionId: string; requestId?: string; generation: number; sequence: number }
+              | undefined
             const isMessages = url.pathname === "/v1/messages"
             const isCountTokens = url.pathname === "/v1/messages/count_tokens"
             const isMessagesApi = isMessages || isCountTokens
@@ -1283,13 +1274,13 @@ export const ClaudeOAuthPlugin: Plugin = async (input: PluginInput, options?: Pl
             if (isMessages && typeof body === "string" && body.startsWith("{")) {
               const incomingUserId = (JSON.parse(body) as Record<string, any>).metadata?.user_id
               const attributedSessionId = typeof incomingUserId === "string" ? extractUserIdSessionId(incomingUserId) : undefined
-              requestChainSessionId = hookSessionId ?? attributedSessionId
-              const requestChain =
-                attributionHeader && requestChainSessionId
-                  ? requestChains.startRequest(requestCredential, requestChainSessionId, logicalRequestId)
-                  : undefined
-              requestChainGeneration = requestChain?.generation
-              requestChainSequence = requestChain?.sequence
+              const initialChainSessionId = hookSessionId ?? attributedSessionId
+              if (attributionHeader && initialChainSessionId) {
+                requestChain = {
+                  sessionId: initialChainSessionId,
+                  ...requestChains.startRequest(requestCredential, initialChainSessionId, logicalRequestId),
+                }
+              }
               const { json, thinking, hasTools, sessionId: rewrittenSessionId } = rewriteBody(body, {
                 sessionId: hookSessionId,
                 accountId,
@@ -1298,11 +1289,11 @@ export const ClaudeOAuthPlugin: Plugin = async (input: PluginInput, options?: Pl
                 promptId,
               })
               sessionId = rewrittenSessionId
-              requestChainSessionId ??= sessionId
-              if (attributionHeader && requestChainSessionId && requestChainGeneration === undefined) {
-                const state = requestChains.startRequest(requestCredential, requestChainSessionId, logicalRequestId)
-                requestChainGeneration = state.generation
-                requestChainSequence = state.sequence
+              if (!requestChain && attributionHeader && sessionId) {
+                requestChain = {
+                  sessionId,
+                  ...requestChains.startRequest(requestCredential, sessionId, logicalRequestId),
+                }
               }
               body = json
               // Headers.get is case-insensitive, so SDK betas arrive regardless
@@ -1335,9 +1326,7 @@ export const ClaudeOAuthPlugin: Plugin = async (input: PluginInput, options?: Pl
               // Retry-stable across SDK retries of this invocation (they reuse
               // the prepared headers), fresh per logical invocation.
               headers.set("x-client-request-id", logicalRequestId)
-              for (const [key, value] of Object.entries(STAINLESS_HEADERS)) {
-                if (!isCountTokens || key !== "X-Stainless-Timeout") headers.set(key, value)
-              }
+              for (const [key, value] of Object.entries(STAINLESS_HEADERS)) headers.set(key, value)
               if (isCountTokens) headers.delete("X-Stainless-Timeout")
             }
             if (sessionId) headers.set("X-Claude-Code-Session-Id", sessionId)
@@ -1345,8 +1334,9 @@ export const ClaudeOAuthPlugin: Plugin = async (input: PluginInput, options?: Pl
             const response = await fetch(requestTarget, { ...init, headers, body })
             if (!isMessages) return response
             const responseRequestId = response.headers.get("request-id")
+            const completedChain = requestChain
             const recordPreviousRequest =
-              attributionHeader && response.ok && requestChainSessionId && requestChainGeneration !== undefined && requestChainSequence !== undefined && responseRequestId && REQUEST_ID_PATTERN.test(responseRequestId)
+              response.ok && completedChain && responseRequestId && REQUEST_ID_PATTERN.test(responseRequestId)
                 ? async () => {
                     let latest: AuthSnapshot;
                     try {
@@ -1366,16 +1356,15 @@ export const ClaudeOAuthPlugin: Plugin = async (input: PluginInput, options?: Pl
                       return
                     }
                     if (createHash("sha256").update(latest.access).digest("hex") !== accessFingerprint) return
-                    if (requestStateGeneration === requestGeneration) {
-                      requestChains.completeRequest(
-                        requestCredential,
-                        requestChainSessionId,
-                        logicalRequestId,
-                        requestChainGeneration,
-                        requestChainSequence,
-                        responseRequestId,
-                      )
-                    }
+                    if (requestStateGeneration !== requestGeneration) return
+                    requestChains.completeRequest(
+                      requestCredential,
+                      completedChain.sessionId,
+                      logicalRequestId,
+                      completedChain.generation,
+                      completedChain.sequence,
+                      responseRequestId,
+                    )
                   }
                 : undefined
             // Uncloak custom tool names on the way back. Streaming responses are

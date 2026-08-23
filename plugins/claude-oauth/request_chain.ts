@@ -236,9 +236,13 @@ export class RequestChainTracker {
   startRequest(credentialKey: string, sessionId: string, logicalRequestId: string): RequestChainState {
     const memoryKey = `${credentialKey}\0${sessionId}`;
     const logicalKey = `${memoryKey}\0${logicalRequestId}`;
-    let state = this.tryStore((database) => database.startRequest(sessionId, credentialKey, logicalRequestId));
-    let sequence = state?.sequence;
-    if (!state) {
+    const stored = this.tryStore((database) => database.startRequest(sessionId, credentialKey, logicalRequestId));
+    let state: RequestChainState;
+    let sequence: number;
+    if (stored) {
+      state = stored;
+      sequence = stored.sequence;
+    } else {
       const current = this.previousRequestIds.get(memoryKey) ?? {
         generation: 0,
         sequence: 0,
@@ -253,9 +257,9 @@ export class RequestChainTracker {
       credentialKey,
       sessionId,
       generation: state.generation,
-      sequence: sequence!,
+      sequence,
     });
-    return { ...state, sequence: sequence! };
+    return { ...state, sequence };
   }
 
   /**
@@ -317,14 +321,7 @@ export class RequestChainTracker {
 
   /** A fresh login invalidates every chain for every session and credential. */
   resetAll(): void {
-    for (const [key, state] of this.previousRequestIds) {
-      this.previousRequestIds.set(key, {
-        generation: state.generation + 1,
-        sequence: 0,
-        completedSequence: 0,
-      });
-    }
-    this.logicalRequestSequences.clear();
+    this.resetMemoryEntries(() => true);
     this.tryStore((database) => database.resetAll());
   }
 
