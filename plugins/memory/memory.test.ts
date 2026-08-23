@@ -5,6 +5,7 @@ import MemoryModule, {
   dreamDue,
   indexLine,
   insightSources,
+  memoryErrorMessage,
   memoryProjectKey as serverProjectKey,
   parseIndexLine,
   validateDreamOptions,
@@ -31,6 +32,7 @@ async function fixture(
     extractor_variant?: string;
     dream_model?: string;
     dream_variant?: string;
+    dream_timeout_ms?: number;
     interval?: number;
     idle_delay_ms?: number;
     dream_interval_hours?: number;
@@ -165,6 +167,16 @@ describe("memory project directory keys", () => {
     for (const directory of ["/tmp/project", "/tmp/My Project+", "/a/b-c", "/a-b/c"]) {
       expect(tuiProjectKey(directory)).toBe(serverProjectKey(directory));
     }
+  });
+});
+
+describe("memory worker errors", () => {
+  test("preserves Error and SDK NamedError messages", () => {
+    expect(memoryErrorMessage(new DOMException("The operation was aborted due to timeout", "TimeoutError")))
+      .toBe("TimeoutError: The operation was aborted due to timeout");
+    expect(memoryErrorMessage({ name: "APIError", data: { message: "Bad Gateway", statusCode: 502 } }))
+      .toBe("APIError: Bad Gateway");
+    expect(memoryErrorMessage({})).toBe("Unknown error object");
   });
 });
 
@@ -1068,6 +1080,13 @@ describe("memory dreaming configuration", () => {
     }
     for (const bad of [{ dream_min_additions: 0 }, { dream_min_additions: -2 }, { dream_min_additions: 1.5 }]) {
       expect(() => validateDreamOptions(bad as never)).toThrow("dream_min_additions");
+    }
+  });
+
+  test("validates the dream worker timeout", async () => {
+    for (const dream_timeout_ms of [0, 999, 1.5, Number.NaN]) {
+      await expect(fixture("/tmp/memory-dream-timeout", () => saveDecisions(), { dream_timeout_ms }))
+        .rejects.toThrow("dream_timeout_ms");
     }
   });
 

@@ -16,6 +16,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "nod
 //     "extractor_variant": "high",
 //     "dream_model": "provider/memory-model",
 //     "dream_variant": "high",
+//     "dream_timeout_ms": 90000,
 //     "interval": 6,
 //     "idle_delay_ms": 300000,
 //     "dream_interval_hours": 36,
@@ -30,6 +31,7 @@ type MemoryOptions = {
   extractor_variant?: string;
   dream_model?: string;
   dream_variant?: string;
+  dream_timeout_ms?: number;
   interval?: number;
   idle_delay_ms?: number;
   dream_interval_hours?: number;
@@ -121,6 +123,22 @@ type WorkerClient = {
   };
 };
 
+export function memoryErrorMessage(error: unknown): string {
+  if (error instanceof Error) return error.name === "Error" ? error.message : `${error.name}: ${error.message}`;
+  if (typeof error === "string") return error;
+  if (error && typeof error === "object") {
+    const value = error as { name?: unknown; message?: unknown; data?: unknown; error?: unknown };
+    const data = value.data && typeof value.data === "object" ? value.data as { message?: unknown } : undefined;
+    const message = value.message ?? data?.message;
+    if (typeof message === "string") return typeof value.name === "string" ? `${value.name}: ${message}` : message;
+    if (value.error !== undefined && value.error !== error) return memoryErrorMessage(value.error);
+    const serialized = JSON.stringify(error);
+    if (serialized !== "{}") return serialized;
+    return "Unknown error object";
+  }
+  return String(error);
+}
+
 const WORKER_AGENT = "memory-worker-internal";
 const INDEX_FILE = "index.md";
 const SETTINGS_FILE = "settings.json";
@@ -134,6 +152,7 @@ const PROMPT_BYTES = 12 * 1024;
 const ACTIVITY_BYTES = 6 * 1024;
 const AGENT_OUTPUT_BYTES = 12 * 1024;
 const WORKER_TIMEOUT_MS = 30_000;
+const DEFAULT_DREAM_TIMEOUT_MS = 90_000;
 const LOCK_STALE_MS = 10 * 60_000;
 const INDEX_SUMMARY_LENGTH = 149;
 const MAX_DECISIONS = 3;
@@ -622,9 +641,11 @@ const MemoryPlugin: Plugin = async ({ client, directory }, options) => {
   const extractorVariant = parseVariant(source.extractor_variant, "extractor_variant");
   const configuredDream = parseModel(source.dream_model);
   const dreamVariant = parseVariant(source.dream_variant, "dream_variant");
+  const dreamTimeout = source.dream_timeout_ms ?? DEFAULT_DREAM_TIMEOUT_MS;
   const interval = source.interval ?? 6;
   const idleDelay = source.idle_delay_ms ?? 300_000;
   const dreamOptions = validateDreamOptions(source);
+  if (!Number.isInteger(dreamTimeout) || dreamTimeout < 1_000) throw new Error("Memory dream_timeout_ms must be an integer of at least 1000");
   if (!Number.isInteger(interval) || interval < 2) throw new Error("Memory interval must be an integer of at least 2");
   if (!Number.isInteger(idleDelay) || idleDelay < 1_000) throw new Error("Memory idle_delay_ms must be at least 1000");
 
@@ -865,7 +886,7 @@ const MemoryPlugin: Plugin = async ({ client, directory }, options) => {
   type WorkerActivity = "classification" | "extraction" | "maintenance" | "dream";
 
   const runWorker = async (parentID: string, model: WorkerModel, schema: object, system: string, prompt: string, activity: WorkerActivity) => {
-    const signal = AbortSignal.timeout(WORKER_TIMEOUT_MS);
+    const signal = AbortSignal.timeout(activity === "dream" ? dreamTimeout : WORKER_TIMEOUT_MS);
     const created = await workerClient.session.create({
       body: {
         parentID,
@@ -881,7 +902,7 @@ const MemoryPlugin: Plugin = async ({ client, directory }, options) => {
       query: { directory },
       signal,
     });
-    if (!created.data) throw new Error(`Could not create memory worker: ${JSON.stringify(created.error)}`);
+    if (!created.data) throw new Error(`Could not create memory worker: ${memoryErrorMessage(signal.aborted ? signal.reason : created.error)}`);
 
     const sessionID = created.data.id;
     internalSessionIDs.add(sessionID);
@@ -900,7 +921,7 @@ const MemoryPlugin: Plugin = async ({ client, directory }, options) => {
         },
         signal,
       });
-      if (!response.data) throw new Error(`Memory worker failed: ${JSON.stringify(response.error)}`);
+      if (!response.data) throw new Error(`Memory worker failed: ${memoryErrorMessage(signal.aborted ? signal.reason : response.error)}`);
       completed = true;
       return response.data.info.structured;
     } finally {

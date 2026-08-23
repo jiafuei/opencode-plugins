@@ -89,6 +89,7 @@ To customize the server plugin, edit its entry in `opencode.json`:
        "extractor_variant": "xhigh",
        "dream_model": "anthropic/claude-sonnet-4-6",
        "dream_variant": "high",
+       "dream_timeout_ms": 90000,
        "interval": 6,
        "idle_delay_ms": 300000,
        "dream_interval_hours": 36,
@@ -114,6 +115,7 @@ Options:
 | `extractor_variant` | classifier variant when the model falls back | Variant for extractor workers |
 | `dream_model` | extractor, classifier, then `small_model` | Memory dreaming selection and curation model |
 | `dream_variant` | extractor or classifier variant when the model falls back | Variant for dream workers |
+| `dream_timeout_ms` | `90000` | Timeout for each dream selector or curator worker; integer of at least `1000` |
 | `interval` | `6` | User turns between periodic checkpoints; minimum `2` |
 | `idle_delay_ms` | `300000` | Delay before pending short-session turns are classified |
 | `dream_interval_hours` | `36` | Minimum elapsed hours before automatic dreaming; must be greater than `0` |
