@@ -352,7 +352,7 @@ describe("token envelope validation", () => {
       cleanupFetch = mock.restore;
       try {
         const plugin = await ClaudeOAuthPlugin({ client: { auth: { set: async () => {} } } } as never);
-        const pasteMethod = plugin.auth!.methods![1]!;
+        const pasteMethod = plugin.auth!.methods!.find((method) => method.label === "Claude Pro/Max")!;
         const flow = (await pasteMethod.authorize!()) as { url: string; callback: (code: string) => Promise<{ type: string }> };
         // The pasted `code#state` fragment must carry this login's generated state.
         const state = new URL(flow.url).searchParams.get("state")!;
@@ -385,7 +385,7 @@ describe("token envelope validation", () => {
     cleanupFetch = mock.restore;
     try {
       const plugin = await ClaudeOAuthPlugin({ client: { auth: { set: async () => {} } } } as never);
-      const pasteMethod = plugin.auth!.methods![1]!;
+      const pasteMethod = plugin.auth!.methods!.find((method) => method.label === "Claude Pro/Max")!;
       const flow = (await pasteMethod.authorize!()) as { url: string; callback: (code: string) => Promise<{ type: string }> };
       const state = new URL(flow.url).searchParams.get("state")!;
       const result = await flow.callback(`some-code#${state}`);

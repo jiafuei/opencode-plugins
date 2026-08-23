@@ -49,7 +49,7 @@ async function makePasteHarness(): Promise<Harness> {
         },
       },
     } as never);
-    const pasteMethod = plugin.auth!.methods!.find((m) => m.label === "Claude Pro/Max (paste code)")!;
+    const pasteMethod = plugin.auth!.methods!.find((m) => m.label === "Claude Pro/Max")!;
     const result = (await pasteMethod.authorize!()) as Harness["result"];
     return { result, tokenCalls, warnings, restore: () => (globalThis.fetch = originalFetch) };
   } catch (error) {
@@ -67,6 +67,17 @@ function authorizeParams(url: string): { redirectUri: string; state: string } {
 }
 
 describe("paste code flow", () => {
+  test("uses Claude Code's registered authorization endpoint and redirect URI", async () => {
+    const h = await makePasteHarness();
+    try {
+      const url = new URL(h.result.url);
+      expect(url.origin + url.pathname).toBe("https://claude.com/cai/oauth/authorize");
+      expect(url.searchParams.get("redirect_uri")).toBe("https://platform.claude.com/oauth/code/callback");
+    } finally {
+      h.restore();
+    }
+  });
+
   test("mismatched state fails locally for redirect URL and code#state formats", async () => {
     for (const format of ["redirect", "fragment"] as const) {
       const h = await makePasteHarness();
@@ -104,6 +115,7 @@ describe("paste code flow", () => {
         expect(h.tokenCalls).toHaveLength(1);
         expect(h.tokenCalls[0]!.body.code).toBe("good-code");
         expect(h.tokenCalls[0]!.body.state).toBe(state);
+        expect(h.tokenCalls[0]!.body.redirect_uri).toBe("https://platform.claude.com/oauth/code/callback");
       } finally {
         h.restore();
       }

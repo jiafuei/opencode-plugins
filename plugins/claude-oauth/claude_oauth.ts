@@ -1,6 +1,4 @@
 import type { Hooks, Plugin, PluginInput, PluginOptions } from "@opencode-ai/plugin";
-import { createServer, type Server } from "node:http";
-import type { AddressInfo } from "node:net";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
@@ -39,8 +37,8 @@ export {
 //   "plugin": ["@jiafuei/opencode-claude-oauth"]
 // }
 //
-// Then run `opencode auth login`, pick Anthropic, and choose one of the
-// Claude Pro/Max OAuth methods. Requests to the Anthropic provider are then
+// Then run `opencode auth login`, pick Anthropic, and choose Claude Pro/Max.
+// Requests to the Anthropic provider are then
 // fingerprinted to look exactly like Claude Code (claude-cli) subscription
 // traffic, so your Pro/Max subscription is used instead of API credits.
 
@@ -49,12 +47,11 @@ function rot13(value: string): string {
 }
 
 const CLIENT_ID = rot13("9q1p250n-r61o-44q9-88rq-5944q1962s5r"); // Claude Code's public OAuth client ID
-const AUTHORIZE_URL = rot13("uggcf://pynhqr.nv/bnhgu/nhgubevmr");
+const AUTHORIZE_URL = rot13("uggcf://pynhqr.pbz/pnv/bnhgu/nhgubevmr");
 const TOKEN_URL = rot13("uggcf://cyngsbez.pynhqr.pbz/i1/bnhgu/gbxra");
 const PROFILE_URL = rot13("uggcf://ncv.naguebcvp.pbz/ncv/bnhgu/cebsvyr");
 const ROLES_URL = rot13("uggcf://ncv.naguebcvp.pbz/ncv/bnhgu/pynhqr_pyv/ebyrf");
-const CALLBACK_PORT = 54545;
-const CALLBACK_PATH = "/callback";
+const REDIRECT_URI = rot13("uggcf://cyngsbez.pynhqr.pbz/bnhgu/pbqr/pnyyonpx");
 const SCOPES =
   rot13("bet:perngr_ncv_xrl hfre:cebsvyr hfre:vasrerapr hfre:frffvbaf:pynhqr_pbqr hfre:zpc_freiref hfre:svyr_hcybnq");
 const REFRESH_SCOPES = rot13("hfre:cebsvyr hfre:vasrerapr hfre:frffvbaf:pynhqr_pbqr hfre:zpc_freiref hfre:svyr_hcybnq");
@@ -854,179 +851,11 @@ async function warnOnStaleGrant(
   } catch {}
 }
 
-// ---------------------------------------------------------------------------
-// Callback server for the browser flow
-// ---------------------------------------------------------------------------
-
-// Loopback only: the callback server never binds a routable interface.
-const CALLBACK_HOST = "127.0.0.1";
 const FLOW_TIMEOUT_MS = 5 * 60 * 1000;
-
-// Browser-hardening headers on every callback response: never cached, never
-// reinterpreted via MIME sniffing, and no referrer leakage.
-const CALLBACK_RESPONSE_HEADERS: Record<string, string> = {
-  "Cache-Control": "no-store",
-  Pragma: "no-cache",
-  "Referrer-Policy": "no-referrer",
-  "X-Content-Type-Options": "nosniff",
-};
-
-interface PendingFlow {
-  state: string;
-  resolve: (code: string) => void;
-  reject: (error: Error) => void;
-  timer: ReturnType<typeof setTimeout>;
-  settled: boolean;
-}
-
-// Per-flow state keyed by the OAuth `state` parameter, so concurrent logins
-// never overwrite each other and stale/mismatched callbacks can't cancel an
-// active flow they don't belong to.
-const pendingFlows = new Map<string, PendingFlow>();
-let oauthServer: Server | undefined;
-let serverStart: Promise<Server> | undefined;
-
-function settleFlow(flow: PendingFlow, outcome: { code: string } | { error: Error }): void {
-  if (flow.settled) return;
-  flow.settled = true;
-  clearTimeout(flow.timer);
-  pendingFlows.delete(flow.state);
-  if ("error" in outcome) flow.reject(outcome.error);
-  else flow.resolve(outcome.code);
-  if (pendingFlows.size === 0) stopCallbackServer();
-}
-
-function handleCallbackRequest(url: URL): { ok: boolean; message: string } {
-  const state = url.searchParams.get("state");
-  // Only the flow owning this exact state is touched; unknown, expired, or
-  // malformed requests must not cancel another active flow.
-  const flow = state ? pendingFlows.get(state) : undefined;
-  if (!flow) {
-    return { ok: false, message: "This login request is unknown or has expired. Restart login in OpenCode." };
-  }
-  const error = url.searchParams.get("error");
-  if (error) {
-    settleFlow(flow, { error: new Error(url.searchParams.get("error_description") || error) });
-    return { ok: false, message: "Login failed. You can close this window and retry from OpenCode." };
-  }
-  const code = url.searchParams.get("code");
-  if (!code) {
-    settleFlow(flow, { error: new Error("Missing authorization code") });
-    return { ok: false, message: "Missing authorization code." };
-  }
-  settleFlow(flow, { code });
-  return { ok: true, message: "You can close this window and return to OpenCode." };
-}
-
-function listenOn(port: number): Promise<Server> {
-  return new Promise((resolve, reject) => {
-    const server = createServer((req, res) => {
-      // The OAuth redirect is a browser navigation: accept GET only. Anything
-      // else is rejected without touching flow state.
-      if (req.method !== "GET") {
-        res.writeHead(405, { Allow: "GET", ...CALLBACK_RESPONSE_HEADERS });
-        res.end("Method not allowed");
-        return;
-      }
-      const url = new URL(req.url || "/", `http://${CALLBACK_HOST}`);
-      if (url.pathname !== CALLBACK_PATH) {
-        res.writeHead(404, CALLBACK_RESPONSE_HEADERS);
-        res.end("Not found");
-        return;
-      }
-      const { ok, message } = handleCallbackRequest(url);
-      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", ...CALLBACK_RESPONSE_HEADERS });
-      res.end(`<html><body><h2>${ok ? "Login successful" : "Login failed"}</h2><p>${message}</p></body></html>`);
-    });
-    server.once("error", reject);
-    server.listen(port, CALLBACK_HOST, () => resolve(server));
-  });
-}
-
-// Bind step used by startCallbackServer; overridable only from tests (failure
-// injection). Production code never touches this.
-let listenImpl: (port: number) => Promise<Server> = listenOn;
-
-// Concurrency-safe: simultaneous authorize() calls share one startup attempt.
-async function startCallbackServer(): Promise<Server> {
-  if (oauthServer) return oauthServer;
-  serverStart ??= (async () => {
-    let server: Server;
-    try {
-      server = await listenImpl(CALLBACK_PORT);
-    } catch {
-      // Preferred port busy (e.g. another session): fall back to an ephemeral
-      // loopback port so the login still works.
-      server = await listenImpl(0);
-    }
-    oauthServer = server;
-    return server;
-  })();
-  try {
-    return await serverStart;
-  } catch (error) {
-    serverStart = undefined;
-    throw error;
-  }
-}
-
-function stopCallbackServer(): void {
-  if (!oauthServer) return;
-  const server = oauthServer;
-  oauthServer = undefined;
-  // Allow a fresh startup attempt (and a fresh port pick) after this.
-  serverStart = undefined;
-  server.close(() => {});
-}
-
-// Creates and registers the callback promise before authorize() returns, so a
-// browser redirect arriving before OpenCode invokes callback() is retained.
-function registerFlow(state: string, timeoutMs: number = FLOW_TIMEOUT_MS): Promise<string> {
-  let resolve!: (code: string) => void;
-  let reject!: (error: Error) => void;
-  const promise = new Promise<string>((res, rej) => {
-    resolve = res;
-    reject = rej;
-  });
-  // The promise may be rejected with no one awaiting it (dispose before
-  // callback(), timeout after abandonment); keep that from surfacing as an
-  // unhandled rejection.
-  promise.catch(() => {});
-  const flow: PendingFlow = {} as PendingFlow;
-  flow.state = state;
-  flow.resolve = resolve;
-  flow.reject = reject;
-  flow.settled = false;
-  flow.timer = setTimeout(() => {
-    settleFlow(flow, { error: new Error("OAuth callback timeout - authorization took too long") });
-  }, timeoutMs);
-  pendingFlows.set(state, flow);
-  return promise;
-}
-
-// Rejects every pending flow and closes the server.
-function disposeOAuth(): void {
-  for (const flow of [...pendingFlows.values()]) {
-    settleFlow(flow, { error: new Error("OAuth login cancelled: plugin disposed") });
-  }
-  stopCallbackServer();
-}
-
-export const callbackTestSeam = {
-  startCallbackServer,
-  registerFlow,
-  disposeOAuth,
-  pendingFlows,
-  server: () => oauthServer,
-  /** Swap the bind step for failure injection; pass undefined to restore. */
-  setListenImpl: (impl?: (port: number) => Promise<Server>) => {
-    listenImpl = impl ?? listenOn;
-  },
-};
 
 function buildAuthorizeUrl(redirectUri: string, pkce: PkceCodes, state: string): string {
   const params = new URLSearchParams({
-    // Non-standard: required by claude.ai to return the raw code.
+    // Non-standard: required by Claude's authorization page to return the raw code.
     code: "true",
     client_id: CLIENT_ID,
     response_type: "code",
@@ -1413,57 +1242,15 @@ export const ClaudeOAuthPlugin: Plugin = async (input: PluginInput, options?: Pl
       methods: [
         {
           type: "oauth",
-          label: "Claude Pro/Max (browser)",
+          label: "Claude Pro/Max",
           authorize: async () => {
             const pkce = await generatePKCE()
             const state = base64UrlEncode(crypto.getRandomValues(new Uint8Array(32)).buffer)
-            // Register/reserve the flow BEFORE starting the server: while any
-            // flow is in setup, pendingFlows is nonempty, so another flow
-            // settling can never auto-close the server beneath this authorize()
-            // call. Registration before returning also retains a redirect that
-            // lands before OpenCode invokes callback().
-            const codePromise = registerFlow(state)
-            try {
-              const server = await startCallbackServer()
-              const port = (server.address() as AddressInfo).port
-              const redirectUri = `http://${CALLBACK_HOST}:${port}${CALLBACK_PATH}`
-              return {
-                url: buildAuthorizeUrl(redirectUri, pkce, state),
-                instructions:
-                  "Complete login in your browser. Note: the OAuth grant typically stays valid for around 30 days (an observed lifetime, not a guaranteed protocol limit) — after that you may need to re-login.",
-                method: "auto" as const,
-                callback: async () => {
-                  // The flow settles (and cleans itself up) via the callback
-                  // server, its timeout, or disposal; once no flows remain the
-                  // server stops.
-                  const code = await codePromise
-                  return finishLogin(code, state, pkce.verifier, redirectUri)
-                },
-              }
-            } catch (error) {
-              // Startup/build failed: settle exactly this flow so it does not
-              // linger until its timeout. Other flows are untouched.
-              const flow = pendingFlows.get(state)
-              if (flow) settleFlow(flow, { error: error instanceof Error ? error : new Error(String(error)) })
-              throw error
-            }
-          },
-        },
-        {
-          type: "oauth",
-          label: "Claude Pro/Max (paste code)",
-          authorize: async () => {
-            // Serverless: no callback server is started; the redirect URI is
-            // only echoed back in the token exchange.
-            const redirectUri = `http://localhost:${CALLBACK_PORT}${CALLBACK_PATH}`
-            const pkce = await generatePKCE()
-            const state = base64UrlEncode(crypto.getRandomValues(new Uint8Array(32)).buffer)
-            // Five-minute authorization window, mirroring FLOW_TIMEOUT_MS.
             const startedAt = Date.now()
             return {
-              url: buildAuthorizeUrl(redirectUri, pkce, state),
+              url: buildAuthorizeUrl(REDIRECT_URI, pkce, state),
               instructions:
-                "Open the URL, complete login, then paste the redirected URL or just the authorization code (it may look like `<code>#<state>`) within 5 minutes. Note: the OAuth grant typically stays valid for around 30 days (an observed lifetime, not a guaranteed protocol limit) — after that you may need to re-login.",
+                "Complete login in your browser, then paste the authorization code shown by Claude within 5 minutes. It may look like `<code>#<state>`. Note: the OAuth grant typically stays valid for around 30 days (an observed lifetime, not a guaranteed protocol limit) — after that you may need to re-login.",
               method: "code" as const,
               callback: async (pasted: string) => {
                 const failed = (reason: string): { type: "failed" } => {
@@ -1507,7 +1294,7 @@ export const ClaudeOAuthPlugin: Plugin = async (input: PluginInput, options?: Pl
                   if (pastedState.length > 0 && pastedState !== state) {
                     return failed("the pasted state does not match this login session")
                   }
-                  const tokens = await finishLogin(code, state, pkce.verifier, redirectUri)
+                  const tokens = await finishLogin(code, state, pkce.verifier, REDIRECT_URI)
                   return tokens
                 } catch {
                   // Never surface the pasted code/state or raw endpoint errors.
@@ -1567,7 +1354,6 @@ export const ClaudeOAuthPlugin: Plugin = async (input: PluginInput, options?: Pl
     dispose: async () => {
       promptIds.clear()
       requestChains.close()
-      disposeOAuth()
     },
   }
   return hooks

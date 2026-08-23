@@ -919,7 +919,7 @@ describe("plugin hooks", () => {
   test("exposes auth methods for anthropic", async () => {
     const plugin = await ClaudeOAuthPlugin({} as never);
     expect(plugin.auth?.provider).toBe("anthropic");
-    expect(plugin.auth?.methods.map((m) => m.type)).toEqual(["oauth", "oauth", "api"]);
+    expect(plugin.auth?.methods.map((m) => m.type)).toEqual(["oauth", "api"]);
     expect(plugin.provider?.id).toBe("anthropic");
   });
 

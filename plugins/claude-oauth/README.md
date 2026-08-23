@@ -32,16 +32,13 @@ Requires OpenCode ≥ 1.18.20 and [Bun](https://bun.sh) (OpenCode's runtime,
 used for `Bun.hash.xxHash64`). Then run `opencode auth login`, pick
 **Anthropic**, and choose:
 
-- **Claude Pro/Max (browser)** — opens claude.ai OAuth in your browser; a
-  loopback callback server on 127.0.0.1 (port 54545, falling back to an
-  ephemeral port if busy) completes the flow automatically.
-- **Claude Pro/Max (paste code)** — headless flow; paste the redirect URL or
-  just the authorization code (`code#state` works too).
+- **Claude Pro/Max** — opens Claude OAuth in your browser; paste the
+  authorization code shown after login (`code#state` works too).
 - **Anthropic API key** — plain API-key auth, untouched by this plugin.
 
-Both OAuth flows share a 5-minute timeout per login attempt. Callback state is
-isolated per browser flow, but OpenCode keeps one pending authorization per
-provider, so do not start multiple Anthropic login attempts concurrently.
+OAuth login has a 5-minute timeout per attempt. OpenCode keeps one pending
+authorization per provider, so do not start multiple Anthropic login attempts
+concurrently.
 
 ## What it does
 
