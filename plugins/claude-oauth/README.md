@@ -14,7 +14,14 @@ ordered HTTP/1.1 headers, beta profiles, billing/system fingerprints,
 }
 ```
 
-## Spoofing profiles
+## Plugin options
+
+| Option | Type | Default | Description |
+| --- | --- | --- | --- |
+| `spoofingProfile` | `"cli" \| "cowork" \| "sdk-cli"` | `"cli"` | Selects the complete client wire profile. |
+| `attributionHeader` | `boolean` | `true` | Controls the billing header and `cch`; profile identity remains enabled when false. |
+
+### Spoofing profiles
 
 `spoofingProfile` selects one coherent wire identity. It defaults to `"cli"`.
 
@@ -178,7 +185,8 @@ fingerprinting on the API-key path).
 - **Official endpoint only.** OAuth bearer tokens are attached exclusively to
   `https://api.anthropic.com` requests. HTTP, localhost, alternate hosts,
   credentials-in-URL, and custom baseURL destinations are rejected before any
-  network activity — use Anthropic API-key auth for gateways/proxies instead.
+  network activity. A forward proxy may be supplied to the official endpoint;
+  custom gateways still require Anthropic API-key auth.
 - **Validated token envelopes.** A 200 token response missing a nonempty
   `access_token` / `refresh_token` (login) or a finite positive `expires_in`
   fails before identity resolution, persistence, or dispatch.
