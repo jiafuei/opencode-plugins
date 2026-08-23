@@ -84,8 +84,11 @@ To customize the server plugin, edit its entry in `opencode.json`:
   "plugin": [
     ["@jiafuei/opencode-memory", {
        "classifier_model": "anthropic/claude-haiku-4-5",
+       "classifier_variant": "low",
        "extractor_model": "anthropic/claude-sonnet-4-6",
+       "extractor_variant": "high",
        "dream_model": "anthropic/claude-sonnet-4-6",
+       "dream_variant": "high",
        "interval": 6,
        "idle_delay_ms": 300000,
        "dream_interval_hours": 36,
@@ -100,14 +103,19 @@ Options:
 | Option | Default | Purpose |
 | --- | --- | --- |
 | `classifier_model` | `small_model` | Background save classification and maintenance selection model |
+| `classifier_variant` | model default | Variant for classifier workers |
 | `extractor_model` | classifier model | Background extraction and consolidation model |
+| `extractor_variant` | classifier variant when the model falls back | Variant for extractor workers |
 | `dream_model` | extractor, classifier, then `small_model` | Memory dreaming selection and curation model |
+| `dream_variant` | extractor or classifier variant when the model falls back | Variant for dream workers |
 | `interval` | `6` | User turns between periodic checkpoints; minimum `2` |
 | `idle_delay_ms` | `300000` | Delay before pending short-session turns are classified |
 | `dream_interval_hours` | `36` | Minimum elapsed hours before automatic dreaming; must be greater than `0` |
 | `dream_min_additions` | `7` | Minimum ordinary creates or replacements before automatic dreaming; positive integer |
 
 Set `small_model` or `classifier_model` to enable save classification. Reading memory uses the normal local `read` tool and does not require a model worker.
+
+Variant fallback follows model fallback. For example, an extractor without `extractor_model` or `extractor_variant` inherits both classifier settings. If `extractor_model` is set explicitly, it uses that model's default variant unless `extractor_variant` is also set.
 
 For manual installation, register the same package in `tui.json`:
 

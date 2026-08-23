@@ -11,8 +11,11 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "nod
 //   "small_model": "provider/light-model",
 //   "plugin": [["@jiafuei/opencode-memory", {
 //     "classifier_model": "provider/light-model",
+//     "classifier_variant": "low",
 //     "extractor_model": "provider/memory-model",
+//     "extractor_variant": "high",
 //     "dream_model": "provider/memory-model",
+//     "dream_variant": "high",
 //     "interval": 6,
 //     "idle_delay_ms": 300000,
 //     "dream_interval_hours": 36,
@@ -22,8 +25,11 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "nod
 
 type MemoryOptions = {
   classifier_model?: string;
+  classifier_variant?: string;
   extractor_model?: string;
+  extractor_variant?: string;
   dream_model?: string;
+  dream_variant?: string;
   interval?: number;
   idle_delay_ms?: number;
   dream_interval_hours?: number;
@@ -33,6 +39,10 @@ type MemoryOptions = {
 type ModelRef = {
   providerID: string;
   modelID: string;
+};
+
+type WorkerModel = ModelRef & {
+  variant?: string;
 };
 
 type MemoryType = "preference" | "instruction" | "recap" | "reference";
@@ -268,6 +278,17 @@ function parseModel(value: string | undefined): ModelRef | undefined {
     throw new Error(`Memory model must use provider/model format: ${value}`);
   }
   return { providerID: value.slice(0, separator), modelID: value.slice(separator + 1) };
+}
+
+function parseVariant(value: string | undefined, option: string): string | undefined {
+  if (value === undefined) return;
+  if (typeof value !== "string" || !value.trim()) throw new Error(`Memory ${option} must be a nonempty string`);
+  return value.trim();
+}
+
+function resolveWorkerModel(model: ModelRef | undefined, variant: string | undefined, fallback?: WorkerModel): WorkerModel | undefined {
+  if (model) return { ...model, variant };
+  if (fallback) return { ...fallback, variant: variant ?? fallback.variant };
 }
 
 function limitText(value: string, bytes: number): string {
@@ -596,8 +617,11 @@ export function memoryProjectKey(directory: string): string {
 const MemoryPlugin: Plugin = async ({ client, directory }, options) => {
   const source = (options ?? {}) as PluginOptions & MemoryOptions;
   const configuredClassifier = parseModel(source.classifier_model);
+  const classifierVariant = parseVariant(source.classifier_variant, "classifier_variant");
   const configuredExtractor = parseModel(source.extractor_model);
+  const extractorVariant = parseVariant(source.extractor_variant, "extractor_variant");
   const configuredDream = parseModel(source.dream_model);
+  const dreamVariant = parseVariant(source.dream_variant, "dream_variant");
   const interval = source.interval ?? 6;
   const idleDelay = source.idle_delay_ms ?? 300_000;
   const dreamOptions = validateDreamOptions(source);
@@ -620,13 +644,20 @@ const MemoryPlugin: Plugin = async ({ client, directory }, options) => {
   const systemContexts = new Map<string, Promise<string>>();
   const internalSessionIDs = new Set<string>();
   const background = new Set<Promise<unknown>>();
-  let smallModel: ModelRef | undefined;
+  let classifierModel: WorkerModel | undefined;
+  let extractorModel: WorkerModel | undefined;
+  let dreamModel: WorkerModel | undefined;
   let writeQueue = Promise.resolve();
   let maintenanceJob: Promise<void> | undefined;
   let initialMaintenanceScheduled = false;
   let initialDreamCheckDone = false;
   let dreamJob: Promise<void> | undefined;
   let disposed = false;
+
+  const dreamModelFields = (model?: WorkerModel) => ({
+    model: model ? `${model.providerID}/${model.modelID}` : null,
+    variant: model?.variant ?? null,
+  });
 
   const log = async (level: "debug" | "info" | "warn" | "error", message: string, extra?: Record<string, unknown>) => {
     await workerClient.app.log({ body: { service: "memory", level, message, extra }, query: { directory } }).catch(() => {});
@@ -833,14 +864,14 @@ const MemoryPlugin: Plugin = async ({ client, directory }, options) => {
 
   type WorkerActivity = "classification" | "extraction" | "maintenance" | "dream";
 
-  const runWorker = async (parentID: string, model: ModelRef, schema: object, system: string, prompt: string, activity: WorkerActivity) => {
+  const runWorker = async (parentID: string, model: WorkerModel, schema: object, system: string, prompt: string, activity: WorkerActivity) => {
     const signal = AbortSignal.timeout(WORKER_TIMEOUT_MS);
     const created = await workerClient.session.create({
       body: {
         parentID,
         title: "Memory worker",
         agent: WORKER_AGENT,
-        model: { id: model.modelID, providerID: model.providerID },
+        model: { id: model.modelID, providerID: model.providerID, variant: model.variant },
         metadata: { memoryWorker: true, memoryActivity: activity },
         permission: [
           { permission: "*", pattern: "*", action: "deny" },
@@ -861,7 +892,8 @@ const MemoryPlugin: Plugin = async ({ client, directory }, options) => {
         query: { directory },
         body: {
           agent: WORKER_AGENT,
-          model,
+          model: { providerID: model.providerID, modelID: model.modelID },
+          variant: model.variant,
           system,
           format: { type: "json_schema", schema, retryCount: 1 },
           parts: [{ type: "text", text: prompt }],
@@ -882,7 +914,7 @@ const MemoryPlugin: Plugin = async ({ client, directory }, options) => {
 
   const classify = async (input: {
     sessionID: string;
-    model: ModelRef;
+    model: WorkerModel;
     source: SourceSnapshot;
     index: string;
   }) => {
@@ -968,8 +1000,7 @@ const MemoryPlugin: Plugin = async ({ client, directory }, options) => {
     expectedRevision?: string,
     existingContent?: string,
   ) => {
-    const classifierModel = configuredClassifier ?? smallModel;
-    const model = configuredExtractor ?? classifierModel;
+    const model = extractorModel;
     if (!model) return false;
     try {
       const subjectBlock = `<subject>\n${decision.subject}\n</subject>`;
@@ -994,8 +1025,8 @@ const MemoryPlugin: Plugin = async ({ client, directory }, options) => {
   };
 
   const maintainIndex = async (sessionID: string) => {
-    const classifierModel = configuredClassifier ?? smallModel;
-    const extractorModel = configuredExtractor ?? classifierModel;
+    const selectionModel = classifierModel;
+    const consolidationModel = extractorModel;
     if (!(await enabled())) return;
 
     await coordinatedWrite(async () => {
@@ -1014,7 +1045,7 @@ const MemoryPlugin: Plugin = async ({ client, directory }, options) => {
       }
     });
 
-    if (!classifierModel || !extractorModel) {
+    if (!selectionModel || !consolidationModel) {
       const entries = parseIndex(await readIndex());
       if (entries.length > TOPIC_LIMIT || Buffer.byteLength(entries.map(indexLine).join("\n")) > INDEX_BYTES) {
         await log("warn", "Memory maintenance is not configured; set small_model, classifier_model, or extractor_model");
@@ -1045,7 +1076,7 @@ const MemoryPlugin: Plugin = async ({ client, directory }, options) => {
 
       let selected: IndexEntry[];
       try {
-         const decision = await runWorker(sessionID, classifierModel, CONSOLIDATION_SELECTION_SCHEMA,
+         const decision = await runWorker(sessionID, selectionModel, CONSOLIDATION_SELECTION_SCHEMA,
           CONSOLIDATION_SELECTION_PROMPT, eligible.map(indexLine).join("\n"), "maintenance") as { files?: unknown };
         if (!Array.isArray(decision?.files) || !decision.files.every((file) => typeof file === "string")) throw new Error("Invalid consolidation selection");
         const files = decision.files as string[];
@@ -1071,7 +1102,7 @@ const MemoryPlugin: Plugin = async ({ client, directory }, options) => {
 
       let extracted: ExtractorResult;
       try {
-        extracted = validateExtraction(await runWorker(sessionID, extractorModel, EXTRACTOR_SCHEMA, CONSOLIDATION_PROMPT, topics, "maintenance"));
+        extracted = validateExtraction(await runWorker(sessionID, consolidationModel, EXTRACTOR_SCHEMA, CONSOLIDATION_PROMPT, topics, "maintenance"));
       } catch (error) {
         await log("warn", "Memory consolidation failed", { error: error instanceof Error ? error.message : String(error) });
         return;
@@ -1190,12 +1221,12 @@ const MemoryPlugin: Plugin = async ({ client, directory }, options) => {
   const refuseDream = async (
     input: { trigger: "auto" | "manual"; requestID: string | null; runID: string },
     reason: string,
-    details: { model?: string; sessionID?: string; startedAt?: string } = {},
+    details: { model?: WorkerModel; sessionID?: string; startedAt?: string } = {},
   ) => {
     const finishedAt = new Date().toISOString();
     await writeDreamManifest(input.runID, {
       trigger: input.trigger,
-      model: details.model ?? null,
+      ...dreamModelFields(details.model),
       sessionID: details.sessionID ?? null,
       startedAt: details.startedAt ?? finishedAt,
       finishedAt,
@@ -1239,16 +1270,15 @@ const MemoryPlugin: Plugin = async ({ client, directory }, options) => {
 
   const executeDream = async (input: { trigger: "auto" | "manual"; requestID: string | null; runID: string; sessionID: string }) => {
     const startedAt = new Date().toISOString();
-    const model = configuredDream ?? configuredExtractor ?? (configuredClassifier ?? smallModel);
+    const model = dreamModel;
     if (!model) {
       await refuseDream(input, "no memory dream model is configured", { sessionID: input.sessionID, startedAt });
       return;
     }
-    const modelString = `${model.providerID}/${model.modelID}`;
     // Dreaming respects the master auto-memory switch for both triggers; a
     // manual request on a disabled store fails loudly instead of mutating.
     if (!(await enabled())) {
-      await refuseDream(input, "memory is disabled", { model: modelString, sessionID: input.sessionID, startedAt });
+      await refuseDream(input, "memory is disabled", { model, sessionID: input.sessionID, startedAt });
       return;
     }
     // Concurrent ordinary saves during this long run must survive completion:
@@ -1432,7 +1462,7 @@ const MemoryPlugin: Plugin = async ({ client, directory }, options) => {
       await log("warn", "Memory dream ended early", { reason: abortReason, applied: actions.length });
       await writeDreamManifest(input.runID, {
         trigger: input.trigger,
-        model: modelString,
+        ...dreamModelFields(model),
         sessionID: input.sessionID,
         startedAt,
         finishedAt,
@@ -1464,7 +1494,7 @@ const MemoryPlugin: Plugin = async ({ client, directory }, options) => {
     });
     await writeDreamManifest(input.runID, {
       trigger: input.trigger,
-      model: modelString,
+      ...dreamModelFields(model),
       sessionID: input.sessionID,
       startedAt,
       finishedAt,
@@ -1491,11 +1521,11 @@ const MemoryPlugin: Plugin = async ({ client, directory }, options) => {
       if (input.consumeRequest) await rm(dreamRequestPath, { force: true });
       const sessionID = input.sessionID ?? mostRecentLiveSession();
       if (!sessionID) {
-        const model = configuredDream ?? configuredExtractor ?? (configuredClassifier ?? smallModel);
+        const model = dreamModel;
         await refuseDream(
           { trigger: input.trigger, requestID: input.requestID ?? null, runID },
           "no active session",
-          { model: model ? `${model.providerID}/${model.modelID}` : undefined, startedAt },
+          { model, startedAt },
         );
         return true;
       }
@@ -1509,10 +1539,10 @@ const MemoryPlugin: Plugin = async ({ client, directory }, options) => {
       }).catch(() => {});
       const manifest = Bun.file(join(dreamsDirectory, `${runID}.json`));
       if (!(await manifest.exists())) {
-        const model = configuredDream ?? configuredExtractor ?? (configuredClassifier ?? smallModel);
+        const model = dreamModel;
         await writeDreamManifest(runID, {
           trigger: input.trigger,
-          model: model ? `${model.providerID}/${model.modelID}` : null,
+          ...dreamModelFields(model),
           sessionID: input.sessionID ?? null,
           startedAt,
           finishedAt: new Date().toISOString(),
@@ -1647,7 +1677,7 @@ const MemoryPlugin: Plugin = async ({ client, directory }, options) => {
   dreamTimer.unref?.();
 
   const launchSaveClassification = (sessionID: string, state: SessionState, snapshot: SourceSnapshot, index: string) => {
-    const model = configuredClassifier ?? smallModel;
+    const model = classifierModel;
     if (!model) {
       state.saveInFlight = false;
       restoreSnapshot(state, snapshot);
@@ -1694,7 +1724,10 @@ const MemoryPlugin: Plugin = async ({ client, directory }, options) => {
 
   return {
     config: async (config: Config) => {
-      smallModel = parseModel(config.small_model);
+      const smallModel = parseModel(config.small_model);
+      classifierModel = resolveWorkerModel(configuredClassifier, classifierVariant, smallModel);
+      extractorModel = resolveWorkerModel(configuredExtractor, extractorVariant, classifierModel);
+      dreamModel = resolveWorkerModel(configuredDream, dreamVariant, extractorModel);
       config.agent ??= {};
       config.agent[WORKER_AGENT] = {
         description: "Internal project-memory worker",

@@ -17,26 +17,39 @@ afterEach(() => {
   else process.env.XDG_DATA_HOME = originalDataHome;
 });
 
-type WorkerCall = { parentID: string; system: string; prompt: string };
+type WorkerCall = { parentID: string; system: string; prompt: string; variant?: string; sessionVariant?: string };
 type FakeMessage = { info: { id: string; sessionID: string; role: string }; parts: Array<{ type?: string; id?: string; synthetic?: boolean; text: string }> };
 
 async function fixture(
   directory: string,
   respond: (call: WorkerCall) => unknown,
-  options: { interval?: number; idle_delay_ms?: number; dream_interval_hours?: number; dream_min_additions?: number } = {},
+  options: {
+    classifier_model?: string;
+    classifier_variant?: string;
+    extractor_model?: string;
+    extractor_variant?: string;
+    dream_model?: string;
+    dream_variant?: string;
+    interval?: number;
+    idle_delay_ms?: number;
+    dream_interval_hours?: number;
+    dream_min_additions?: number;
+  } = {},
 ) {
   const calls: WorkerCall[] = [];
   const creations: unknown[] = [];
   let parentID = "";
+  let sessionVariant: string | undefined;
   const client = {
     session: {
-      create: async (options: { body: { parentID: string; metadata?: unknown } }) => {
+      create: async (options: { body: { parentID: string; metadata?: unknown; model?: { variant?: string } } }) => {
         parentID = options.body.parentID;
+        sessionVariant = options.body.model?.variant;
         creations.push(options.body.metadata ?? null);
         return { data: { id: crypto.randomUUID() } };
       },
-      prompt: async (options: { body: { system: string; parts: { text: string }[] } }) => {
-        const call = { parentID, system: options.body.system, prompt: options.body.parts[0]!.text };
+      prompt: async (options: { body: { system: string; parts: { text: string }[]; variant?: string } }) => {
+        const call = { parentID, system: options.body.system, prompt: options.body.parts[0]!.text, variant: options.body.variant, sessionVariant };
         calls.push(call);
         return { data: { info: { structured: await respond(call) } } };
       },
@@ -174,6 +187,31 @@ describe("memory index lines", () => {
 });
 
 describe("memory persistence", () => {
+  test.serial("sends configured variants with classifier and extractor worker calls", async () => {
+    const dataHome = await mkdtemp("/tmp/opencode-memory-variants-");
+    process.env.XDG_DATA_HOME = dataHome;
+    const directory = "/tmp/memory-variant-project";
+    const app = await fixture(directory, ({ system }) =>
+      system.includes("classifier")
+        ? saveDecisions(createDecision("the completed parser migration"))
+        : memoryExtraction(), {
+      classifier_variant: "fast",
+      extractor_variant: "thorough",
+    });
+
+    await app.message("ses_variants", "The parser migration is complete.");
+    await app.message("ses_variants", "The focused tests pass.");
+    await app.message("ses_variants", "Continue.");
+    await until(() => app.calls.length >= 2);
+    await app.hooks.dispose!();
+
+    expect(app.calls[0]!.variant).toBe("fast");
+    expect(app.calls[0]!.sessionVariant).toBe("fast");
+    expect(app.calls[1]!.variant).toBe("thorough");
+    expect(app.calls[1]!.sessionVariant).toBe("thorough");
+    await rm(dataHome, { recursive: true, force: true });
+  });
+
   test.serial("creates typed memory with the originating session as last writer", async () => {
     const dataHome = await mkdtemp("/tmp/opencode-memory-test-");
     process.env.XDG_DATA_HOME = dataHome;
@@ -1183,7 +1221,11 @@ describe("memory manual dreaming", () => {
       { file: "x.md", title: "X", content: seededTopic("abc1111", "X body") },
       { file: "y.md", title: "Y", content: seededTopic("def2222", "Y body") },
     ]);
-    const app = await fixture(directory, ({ system }) => isDreamSelector(system) ? { action: "none" } : saveDecisions());
+    const app = await fixture(
+      directory,
+      ({ system }) => isDreamSelector(system) ? { action: "none" } : saveDecisions(),
+      { dream_variant: "deep" },
+    );
     await app.message("ses_watch", "Initialize the session.");
     await settle();
 
@@ -1192,7 +1234,14 @@ describe("memory manual dreaming", () => {
       const file = Bun.file(join(path, ".dream.status"));
       return await file.exists() && (await file.json() as { requestID?: string }).requestID === "req-watch";
     });
-    expect(app.calls.filter(isDreamSelector)).toHaveLength(1);
+    const dreamCall = app.calls.filter(isDreamSelector);
+    expect(dreamCall).toHaveLength(1);
+    expect(dreamCall[0]!.variant).toBe("deep");
+    expect(dreamCall[0]!.sessionVariant).toBe("deep");
+
+    const status = await Bun.file(join(path, ".dream.status")).json();
+    const manifest = await Bun.file(join(path, ".dreams", `${status.runID}.json`)).json();
+    expect(manifest.variant).toBe("deep");
 
     await app.hooks.dispose!();
     await rm(dataHome, { recursive: true, force: true });
