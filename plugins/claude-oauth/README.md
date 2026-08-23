@@ -19,11 +19,11 @@ ordered HTTP/1.1 headers, beta profiles, billing/system fingerprints,
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
 | `spoofingProfile` | `"cli" \| "cowork" \| "sdk-cli"` | `"cli"` | Selects the complete client wire profile. |
-| `attributionHeader` | `boolean` | `true` | Controls the billing header and `cch`; profile identity remains enabled when false. |
+| `attributionHeader` | `boolean` | `true` | Controls the billing header and `cch`, plus CLI request-chain fields. Profile identity remains enabled when false. |
 
 ### Spoofing profiles
 
-`spoofingProfile` selects one coherent wire identity. It defaults to `"cli"`.
+Each value selects one coherent wire identity:
 
 | Value | Reference | Version / entrypoint | CCH and request chain |
 | --- | --- | --- | --- |
@@ -47,6 +47,23 @@ header order observed in genuine Claude CLI captures; Cowork uses OMP's
 desktop-agent order. Direct HTTPS uses HTTP/1.1 and preserves header casing and
 order. A configured proxy intentionally falls back to the runtime fetch so the
 proxy is honored, which means exact transport ordering is not retained there.
+
+### Billing attribution
+
+Billing attribution is enabled by default. To omit the
+`x-anthropic-billing-header` and its `cch` while retaining OAuth authentication
+and the selected profile identity:
+
+```json
+{
+  "plugin": [
+    ["@jiafuei/opencode-claude-oauth", { "attributionHeader": false }]
+  ]
+}
+```
+
+In CLI mode this also disables `cc_prev_req` and `cc_prompt_id` generation and
+persistence. Cowork and SDK CLI never emit those request-chain fields.
 
 ### AI SDK request options
 
@@ -80,18 +97,6 @@ This setting is optional for the default CLI profile, which removes the
 SDK-generated `eager_input_streaming` field at the wire boundary. Cowork and
 SDK CLI preserve the Agent SDK field.
 
-Billing attribution is enabled by default. To omit the
-`x-anthropic-billing-header` and its `cch`, `cc_prev_req`, and `cc_prompt_id`
-fields while retaining OAuth authentication and the selected profile identity:
-
-```json
-{
-  "plugin": [
-    ["@jiafuei/opencode-claude-oauth", { "attributionHeader": false }]
-  ]
-}
-```
-
 Requires OpenCode ≥ 1.18.20 and [Bun](https://bun.sh) (OpenCode's runtime,
 used for `Bun.hash.xxHash64`). Then run `opencode auth login`, pick
 **Anthropic**, and choose:
@@ -119,7 +124,7 @@ endpoint:
   `X-Claude-Code-Session-Id` per session; OpenCode's internal session-routing
   headers are stripped before dispatch
 - The selected client's beta profile, chosen per request shape (utility vs
-  agent profile);
+  agent profile).
   SDK/caller-supplied betas are preserved and deduplicated after it, except
   `fine-grained-tool-streaming-2025-05-14` (absent from Claude Code's profile),
   the SDK's obsolete `structured-outputs-2025-11-13` tool beta, and
@@ -141,9 +146,9 @@ endpoint:
     schemas are closed with top-level `additionalProperties:false`.
 - The selected `cch` algorithm from the profile table, patched over the
   `cch=00000` placeholder as five lowercase hex characters.
-- In CLI mode, billing state follows a conversation: `cc_prompt_id` remains stable for the
-  same OpenCode message, and the next successful request includes the prior
-  Anthropic `request-id` as `cc_prev_req`. Request chains persist across
+- In CLI mode, billing state follows a conversation: `cc_prompt_id` remains
+  stable for the same OpenCode message, and the next successful request includes
+  the prior Anthropic `request-id` as `cc_prev_req`. Request chains persist across
   OpenCode restarts and are shared safely by concurrent processes; generation
   fencing prevents late responses from restoring state cleared by compaction,
   deletion, or an auth transition. If SQLite is unavailable, inference
