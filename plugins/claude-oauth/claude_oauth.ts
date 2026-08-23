@@ -1,4 +1,5 @@
 import type { Hooks, Plugin, PluginInput, PluginOptions } from "@opencode-ai/plugin";
+import { Database } from "bun:sqlite";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
@@ -458,6 +459,192 @@ interface RefreshedCredential {
 
 function opencodeDataDir(): string {
   return path.join(process.env.XDG_DATA_HOME ?? path.join(os.homedir(), ".local", "share"), "opencode");
+}
+
+function claudeOAuthDatabaseFile(): string {
+  return process.env.NODE_ENV === "test" ? ":memory:" : path.join(opencodeDataDir(), "claude-oauth", "claude-oauth.db");
+}
+
+function requestChainCredentialKey(refreshToken: string, accountId?: string): string {
+  return createHash("sha256")
+    .update(accountId ? `account\0${accountId}` : `refresh\0${refreshToken}`)
+    .digest("hex");
+}
+
+interface RequestChainState {
+  requestId?: string;
+  generation: number;
+  sequence: number;
+  completedSequence: number;
+}
+
+// A row is established when a request starts. Completion only updates the
+// generation it observed, so compaction/auth invalidation fences late writers
+// across both plugin instances and processes.
+class ClaudeOAuthDatabase {
+  private readonly db: Database;
+
+  constructor(file: string) {
+    if (file !== ":memory:") {
+      const dir = path.dirname(file);
+      mkdirSync(dir, { recursive: true, mode: 0o700 });
+      chmodSync(dir, 0o700);
+      writeFileSync(file, "", { flag: "a", mode: 0o600 });
+      chmodSync(file, 0o600);
+    }
+    this.db = new Database(file, { create: true });
+    try {
+      this.db.exec("PRAGMA busy_timeout = 5000; PRAGMA foreign_keys = ON;");
+      this.db.exec("BEGIN EXCLUSIVE");
+      const version = (this.db.query("PRAGMA user_version").get() as { user_version: number }).user_version;
+      if (version !== 0 && version !== 1) throw new Error(`Unsupported claude-oauth.db schema version ${version}`);
+      this.db.exec(
+        "CREATE TABLE IF NOT EXISTS sessions (session_id TEXT NOT NULL, credential_key TEXT NOT NULL, previous_request_id TEXT, generation INTEGER NOT NULL DEFAULT 0, request_sequence INTEGER NOT NULL DEFAULT 0, completed_sequence INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, deleted_at INTEGER, PRIMARY KEY (session_id, credential_key)) WITHOUT ROWID; CREATE INDEX IF NOT EXISTS sessions_by_credential ON sessions (credential_key); CREATE TABLE IF NOT EXISTS requests (session_id TEXT NOT NULL, credential_key TEXT NOT NULL, logical_request_id TEXT NOT NULL, generation INTEGER NOT NULL, sequence INTEGER NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY (session_id, credential_key, logical_request_id), FOREIGN KEY (session_id, credential_key) REFERENCES sessions (session_id, credential_key) ON DELETE CASCADE) WITHOUT ROWID; CREATE INDEX IF NOT EXISTS requests_by_credential ON requests (credential_key); CREATE INDEX IF NOT EXISTS requests_by_created_at ON requests (created_at); PRAGMA user_version = 1; COMMIT;",
+      );
+    } catch (error) {
+      try {
+        this.db.exec("ROLLBACK");
+      } catch {}
+      this.db.close();
+      throw error;
+    }
+  }
+
+  startRequest(sessionId: string, credentialKey: string, logicalRequestId: string): RequestChainState {
+    const now = Date.now();
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.db.query("DELETE FROM requests WHERE created_at < ?").run(now - 24 * 60 * 60 * 1000);
+      this.db
+        .query(
+          "INSERT INTO sessions (session_id, credential_key, previous_request_id, generation, request_sequence, completed_sequence, created_at, updated_at, deleted_at) VALUES (?, ?, NULL, 0, 0, 0, ?, ?, NULL) ON CONFLICT (session_id, credential_key) DO UPDATE SET updated_at = excluded.updated_at, deleted_at = NULL",
+        )
+        .run(sessionId, credentialKey, now, now);
+      const row = this.db
+        .query(
+          "SELECT previous_request_id, generation, request_sequence, completed_sequence FROM sessions WHERE session_id = ? AND credential_key = ?",
+        )
+        .get(sessionId, credentialKey) as {
+        previous_request_id: string | null;
+        generation: number;
+        request_sequence: number;
+        completed_sequence: number;
+      };
+      const existing = this.db
+        .query(
+          "SELECT generation, sequence FROM requests WHERE session_id = ? AND credential_key = ? AND logical_request_id = ?",
+        )
+        .get(sessionId, credentialKey, logicalRequestId) as { generation: number; sequence: number } | null;
+      let sequence = existing?.generation === row.generation ? existing.sequence : row.request_sequence + 1;
+      if (!existing || existing.generation !== row.generation) {
+        this.db
+          .query(
+            "UPDATE sessions SET request_sequence = ?, updated_at = ? WHERE session_id = ? AND credential_key = ?",
+          )
+          .run(sequence, now, sessionId, credentialKey);
+        this.db
+          .query(
+            "INSERT INTO requests (session_id, credential_key, logical_request_id, generation, sequence, created_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (session_id, credential_key, logical_request_id) DO UPDATE SET generation = excluded.generation, sequence = excluded.sequence, created_at = excluded.created_at",
+          )
+          .run(sessionId, credentialKey, logicalRequestId, row.generation, sequence, now);
+      }
+      this.db.exec("COMMIT");
+      return {
+        requestId: row.previous_request_id ?? undefined,
+        generation: row.generation,
+        sequence,
+        completedSequence: row.completed_sequence,
+      };
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  complete(
+    sessionId: string,
+    credentialKey: string,
+    logicalRequestId: string,
+    generation: number,
+    sequence: number,
+    requestId: string,
+  ): boolean {
+    let completed = false;
+    this.transaction(() => {
+      completed =
+        this.db
+          .query(
+            "UPDATE sessions SET previous_request_id = ?, completed_sequence = ?, updated_at = ? WHERE session_id = ? AND credential_key = ? AND generation = ? AND completed_sequence < ?",
+          )
+          .run(requestId, sequence, Date.now(), sessionId, credentialKey, generation, sequence).changes === 1;
+      this.db
+        .query(
+          "DELETE FROM requests WHERE session_id = ? AND credential_key = ? AND logical_request_id = ? AND generation = ?",
+        )
+        .run(sessionId, credentialKey, logicalRequestId, generation);
+    });
+    return completed;
+  }
+
+  resetSession(sessionId: string): void {
+    this.transaction(() => {
+      this.db
+        .query(
+          "UPDATE sessions SET previous_request_id = NULL, generation = generation + 1, request_sequence = 0, completed_sequence = 0, updated_at = ?, deleted_at = NULL WHERE session_id = ?",
+        )
+        .run(Date.now(), sessionId);
+      this.db.query("DELETE FROM requests WHERE session_id = ?").run(sessionId);
+    });
+  }
+
+  deleteSession(sessionId: string): void {
+    this.transaction(() => {
+      const now = Date.now();
+      this.db
+        .query(
+          "UPDATE sessions SET previous_request_id = NULL, generation = generation + 1, request_sequence = 0, completed_sequence = 0, updated_at = ?, deleted_at = ? WHERE session_id = ?",
+        )
+        .run(now, now, sessionId);
+      this.db.query("DELETE FROM requests WHERE session_id = ?").run(sessionId);
+    });
+  }
+
+  resetCredential(credentialKey: string): void {
+    this.transaction(() => {
+      this.db
+        .query(
+          "UPDATE sessions SET previous_request_id = NULL, generation = generation + 1, request_sequence = 0, completed_sequence = 0, updated_at = ? WHERE credential_key = ?",
+        )
+        .run(Date.now(), credentialKey);
+      this.db.query("DELETE FROM requests WHERE credential_key = ?").run(credentialKey);
+    });
+  }
+
+  resetAll(): void {
+    this.transaction(() => {
+      this.db
+        .query(
+          "UPDATE sessions SET previous_request_id = NULL, generation = generation + 1, request_sequence = 0, completed_sequence = 0, updated_at = ?",
+        )
+        .run(Date.now());
+      this.db.query("DELETE FROM requests").run();
+    });
+  }
+
+  close(): void {
+    this.db.close();
+  }
+
+  private transaction(work: () => void): void {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      work();
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
 }
 
 // A lease holder that crashed mid-refresh is stolen after this long. Must
@@ -1270,10 +1457,14 @@ const SSE_EVENT_BUFFER_LIMIT = 1024 * 1024;
  * ever buffered — never the full stream. A partial event that exceeds the
  * assembly cap fails the stream with a clear error.
  */
-export function createSseToolNameTransform(onComplete?: () => void): TransformStream<Uint8Array, Uint8Array> {
+export function createSseToolNameTransform(
+  onComplete?: () => void | Promise<void>,
+): TransformStream<Uint8Array, Uint8Array> {
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
   let pending = "";
+  let messageCompleted = false;
+  let streamFailed = false;
   // Lines of the event being assembled: text without its terminator, plus the
   // exact terminator bytes that followed it ("\n" or "\r\n"). The terminating
   // blank line is included, so re-emitting the list reproduces the raw bytes.
@@ -1312,6 +1503,8 @@ export function createSseToolNameTransform(onComplete?: () => void): TransformSt
       try {
         parsed = JSON.parse(dataValues.join("\n"));
       } catch {}
+      if ((parsed as { type?: unknown } | undefined)?.type === "message_stop") messageCompleted = true;
+      if ((parsed as { type?: unknown } | undefined)?.type === "error") streamFailed = true;
       const next = uncloak(parsed);
       if (next !== undefined) {
         // Re-emit the event verbatim except for its data lines: the first
@@ -1375,7 +1568,7 @@ export function createSseToolNameTransform(onComplete?: () => void): TransformSt
         pending = "";
       }
       dispatch(controller);
-      onComplete?.();
+      if (messageCompleted && !streamFailed) return onComplete?.();
     },
   });
 }
@@ -1622,12 +1815,196 @@ export interface ClaudeOAuthOptions {
   attributionHeader?: boolean;
 }
 
+type ClaudeOAuthInternalOptions = ClaudeOAuthOptions & { databasePath?: string };
+
 export const ClaudeOAuthPlugin: Plugin = async (input: PluginInput, options?: PluginOptions | ClaudeOAuthOptions) => {
-  const attributionHeader = (options as ClaudeOAuthOptions | undefined)?.attributionHeader !== false;
-  const previousRequestIds = new Map<string, string>();
+  const pluginOptions = options as ClaudeOAuthInternalOptions | undefined;
+  const attributionHeader = pluginOptions?.attributionHeader !== false;
+  const previousRequestIds = new Map<string, RequestChainState>();
+  const logicalRequestSequences = new Map<
+    string,
+    { credentialKey: string; sessionId: string; generation: number; sequence: number }
+  >();
   const promptIds = new Map<string, Map<string, string>>();
-  let previousRequestCredential: string | undefined;
+  let database: ClaudeOAuthDatabase | undefined;
+  let databaseUnavailable = false;
+  let activeRequestCredential: string | undefined;
+  let previousAccessFingerprint: string | undefined;
   let requestStateGeneration = 0;
+
+  function getDatabase(): ClaudeOAuthDatabase | undefined {
+    if (databaseUnavailable) return undefined;
+    try {
+      return (database ??= new ClaudeOAuthDatabase(
+        pluginOptions?.databasePath ?? claudeOAuthDatabaseFile(),
+      ));
+    } catch {
+      databaseUnavailable = true;
+      return undefined;
+    }
+  }
+
+  function disableDatabase(): void {
+    try {
+      database?.close();
+    } catch {}
+    database = undefined;
+    databaseUnavailable = true;
+  }
+
+  function requestChainMapKey(credentialKey: string, sessionId: string): string {
+    return `${credentialKey}\0${sessionId}`;
+  }
+
+  function readRequestChain(credentialKey: string, sessionId: string, logicalRequestId: string): RequestChainState {
+    const memoryKey = requestChainMapKey(credentialKey, sessionId);
+    const logicalKey = `${memoryKey}\0${logicalRequestId}`;
+    const store = getDatabase();
+    if (store) {
+      try {
+        const state = store.startRequest(sessionId, credentialKey, logicalRequestId);
+        previousRequestIds.set(memoryKey, state);
+        logicalRequestSequences.set(logicalKey, {
+          credentialKey,
+          sessionId,
+          generation: state.generation,
+          sequence: state.sequence,
+        });
+        return state;
+      } catch {
+        disableDatabase();
+      }
+    }
+    const current = previousRequestIds.get(memoryKey) ?? {
+      generation: 0,
+      sequence: 0,
+      completedSequence: 0,
+    };
+    const existing = logicalRequestSequences.get(logicalKey);
+    const sequence = existing?.generation === current.generation ? existing.sequence : current.sequence + 1;
+    const state = { ...current, sequence: Math.max(current.sequence, sequence) };
+    previousRequestIds.set(memoryKey, state);
+    logicalRequestSequences.set(logicalKey, {
+      credentialKey,
+      sessionId,
+      generation: state.generation,
+      sequence,
+    });
+    return { ...state, sequence };
+  }
+
+  function completeRequestChain(
+    credentialKey: string,
+    sessionId: string,
+    logicalRequestId: string,
+    generation: number,
+    sequence: number,
+    requestId: string,
+  ): void {
+    const memoryKey = requestChainMapKey(credentialKey, sessionId);
+    const logicalKey = `${memoryKey}\0${logicalRequestId}`;
+    const store = getDatabase();
+    if (store) {
+      try {
+        if (store.complete(sessionId, credentialKey, logicalRequestId, generation, sequence, requestId)) {
+          const current = previousRequestIds.get(memoryKey);
+          previousRequestIds.set(memoryKey, {
+            requestId,
+            generation,
+            sequence: Math.max(current?.sequence ?? sequence, sequence),
+            completedSequence: sequence,
+          });
+        } else {
+          previousRequestIds.delete(memoryKey);
+        }
+        logicalRequestSequences.delete(logicalKey);
+        return;
+      } catch {
+        disableDatabase();
+      }
+    }
+    const current = previousRequestIds.get(memoryKey);
+    if (current?.generation === generation && current.completedSequence < sequence) {
+      previousRequestIds.set(memoryKey, { ...current, requestId, completedSequence: sequence });
+    }
+    logicalRequestSequences.delete(logicalKey);
+  }
+
+  function resetPreviousRequestsForSession(sessionId: string): void {
+    for (const [key, state] of previousRequestIds) {
+      if (key.endsWith(`\0${sessionId}`)) {
+        previousRequestIds.set(key, {
+          generation: state.generation + 1,
+          sequence: 0,
+          completedSequence: 0,
+        });
+      }
+    }
+    for (const [key, request] of logicalRequestSequences) {
+      if (request.sessionId === sessionId) logicalRequestSequences.delete(key);
+    }
+    try {
+      getDatabase()?.resetSession(sessionId);
+    } catch {
+      disableDatabase();
+    }
+  }
+
+  function deletePreviousRequestsForSession(sessionId: string): void {
+    for (const [key, state] of previousRequestIds) {
+      if (key.endsWith(`\0${sessionId}`)) {
+        previousRequestIds.set(key, {
+          generation: state.generation + 1,
+          sequence: 0,
+          completedSequence: 0,
+        });
+      }
+    }
+    for (const [key, request] of logicalRequestSequences) {
+      if (request.sessionId === sessionId) logicalRequestSequences.delete(key);
+    }
+    try {
+      getDatabase()?.deleteSession(sessionId);
+    } catch {
+      disableDatabase();
+    }
+  }
+
+  function resetPreviousRequestsForCredential(credentialKey: string): void {
+    for (const [key, state] of previousRequestIds) {
+      if (key.startsWith(`${credentialKey}\0`)) {
+        previousRequestIds.set(key, {
+          generation: state.generation + 1,
+          sequence: 0,
+          completedSequence: 0,
+        });
+      }
+    }
+    for (const [key, request] of logicalRequestSequences) {
+      if (request.credentialKey === credentialKey) logicalRequestSequences.delete(key);
+    }
+    try {
+      getDatabase()?.resetCredential(credentialKey);
+    } catch {
+      disableDatabase();
+    }
+  }
+
+  function resetAllPreviousRequests(): void {
+    for (const [key, state] of previousRequestIds) {
+      previousRequestIds.set(key, {
+        generation: state.generation + 1,
+        sequence: 0,
+        completedSequence: 0,
+      });
+    }
+    logicalRequestSequences.clear();
+    try {
+      getDatabase()?.resetAll();
+    } catch {
+      disableDatabase();
+    }
+  }
   // Persist rotated tokens during background refreshes. Login results are
   // persisted by core directly.
   const persist = async (tokens: RefreshedCredential) => {
@@ -1766,16 +2143,18 @@ export const ClaudeOAuthPlugin: Plugin = async (input: PluginInput, options?: Pl
 
             // Single dispatch boundary: route on the latest classified state.
             if (auth.kind === "missing") {
-              previousRequestIds.clear();
-              previousRequestCredential = undefined;
+              if (activeRequestCredential) resetPreviousRequestsForCredential(activeRequestCredential);
+              activeRequestCredential = undefined;
+              previousAccessFingerprint = undefined;
               requestStateGeneration++;
               throw new Error(
                 "Anthropic credentials are missing (logged out?) - run `opencode auth login`, pick Anthropic, then choose a Claude Pro/Max method.",
               );
             }
             if (auth.kind === "unsupported") {
-              previousRequestIds.clear();
-              previousRequestCredential = undefined;
+              if (activeRequestCredential) resetPreviousRequestsForCredential(activeRequestCredential);
+              activeRequestCredential = undefined;
+              previousAccessFingerprint = undefined;
               requestStateGeneration++;
               throw new Error(
                 `Unsupported Anthropic auth type "${auth.authType}" - run \`opencode auth login\`, pick Anthropic, then choose a Claude Pro/Max method.`,
@@ -1783,8 +2162,9 @@ export const ClaudeOAuthPlugin: Plugin = async (input: PluginInput, options?: Pl
             }
 
             if (auth.kind === "api") {
-              previousRequestIds.clear();
-              previousRequestCredential = undefined;
+              if (activeRequestCredential) resetPreviousRequestsForCredential(activeRequestCredential);
+              activeRequestCredential = undefined;
+              previousAccessFingerprint = undefined;
               requestStateGeneration++;
               // Ordinary Anthropic API-key request: replace the dummy
               // x-api-key with the real one and drop OAuth-only mutations.
@@ -1808,10 +2188,11 @@ export const ClaudeOAuthPlugin: Plugin = async (input: PluginInput, options?: Pl
             const access = auth.access
             const accountId = auth.accountId
             const headers = new Headers(init?.headers)
-            const requestCredential = createHash("sha256").update(access).digest("hex")
-            if (requestCredential !== previousRequestCredential) {
-              previousRequestIds.clear()
-              previousRequestCredential = requestCredential
+            const requestCredential = requestChainCredentialKey(auth.refresh, accountId)
+            const accessFingerprint = createHash("sha256").update(access).digest("hex")
+            activeRequestCredential = requestCredential
+            if (accessFingerprint !== previousAccessFingerprint) {
+              previousAccessFingerprint = accessFingerprint
               requestStateGeneration++
             }
             const requestGeneration = requestStateGeneration
@@ -1824,6 +2205,7 @@ export const ClaudeOAuthPlugin: Plugin = async (input: PluginInput, options?: Pl
             // fresh UUID is minted at dispatch below.
             const hookRequestId = headers.get(REQUEST_ID_HEADER) ?? undefined
             headers.delete(REQUEST_ID_HEADER)
+            const logicalRequestId = hookRequestId ?? randomUUID()
             const promptId = headers.get(PROMPT_ID_HEADER) ?? undefined
             headers.delete(PROMPT_ID_HEADER)
 
@@ -1835,6 +2217,9 @@ export const ClaudeOAuthPlugin: Plugin = async (input: PluginInput, options?: Pl
             const hookSessionId = headers.get(SESSION_ID_HEADER) ?? undefined
             let sessionId = hookSessionId
             let body: RequestInit["body"] = init?.body
+            let requestChainSessionId: string | undefined
+            let requestChainGeneration: number | undefined
+            let requestChainSequence: number | undefined
             const isMessages = url.pathname === "/v1/messages"
             const isCountTokens = url.pathname === "/v1/messages/count_tokens"
             const isMessagesApi = isMessages || isCountTokens
@@ -1848,14 +2233,27 @@ export const ClaudeOAuthPlugin: Plugin = async (input: PluginInput, options?: Pl
             if (isMessages && typeof body === "string" && body.startsWith("{")) {
               const incomingUserId = (JSON.parse(body) as Record<string, any>).metadata?.user_id
               const attributedSessionId = typeof incomingUserId === "string" ? extractUserIdSessionId(incomingUserId) : undefined
+              requestChainSessionId = hookSessionId ?? attributedSessionId
+              const requestChain =
+                attributionHeader && requestChainSessionId
+                  ? readRequestChain(requestCredential, requestChainSessionId, logicalRequestId)
+                  : undefined
+              requestChainGeneration = requestChain?.generation
+              requestChainSequence = requestChain?.sequence
               const { json, thinking, hasTools, sessionId: rewrittenSessionId } = rewriteBody(body, {
                 sessionId: hookSessionId,
                 accountId,
                 attributionHeader,
-                previousRequestId: previousRequestIds.get(attributedSessionId ?? hookSessionId ?? ""),
+                previousRequestId: requestChain?.requestId,
                 promptId,
               })
               sessionId = rewrittenSessionId
+              requestChainSessionId ??= sessionId
+              if (attributionHeader && requestChainSessionId && requestChainGeneration === undefined) {
+                const state = readRequestChain(requestCredential, requestChainSessionId, logicalRequestId)
+                requestChainGeneration = state.generation
+                requestChainSequence = state.sequence
+              }
               body = json
               // Headers.get is case-insensitive, so SDK betas arrive regardless
               // of the caller's key casing.
@@ -1886,7 +2284,7 @@ export const ClaudeOAuthPlugin: Plugin = async (input: PluginInput, options?: Pl
               headers.set("Accept-Encoding", "gzip, deflate, br, zstd")
               // Retry-stable across SDK retries of this invocation (they reuse
               // the prepared headers), fresh per logical invocation.
-              headers.set("x-client-request-id", hookRequestId ?? randomUUID())
+              headers.set("x-client-request-id", logicalRequestId)
               for (const [key, value] of Object.entries(STAINLESS_HEADERS)) {
                 if (!isCountTokens || key !== "X-Stainless-Timeout") headers.set(key, value)
               }
@@ -1898,10 +2296,35 @@ export const ClaudeOAuthPlugin: Plugin = async (input: PluginInput, options?: Pl
             if (!isMessages) return response
             const responseRequestId = response.headers.get("request-id")
             const recordPreviousRequest =
-              response.ok && sessionId && responseRequestId && /^req_[A-Za-z0-9_-]{1,36}$/.test(responseRequestId)
-                ? () => {
+              attributionHeader && response.ok && requestChainSessionId && requestChainGeneration !== undefined && requestChainSequence !== undefined && responseRequestId && /^req_[A-Za-z0-9_-]{1,36}$/.test(responseRequestId)
+                ? async () => {
+                    let latest: AuthSnapshot;
+                    try {
+                      latest = await readAuth()
+                    } catch {
+                      return
+                    }
+                    if (latest.kind !== "oauth") {
+                      resetPreviousRequestsForCredential(requestCredential)
+                      requestStateGeneration++
+                      return
+                    }
+                    const latestCredential = requestChainCredentialKey(latest.refresh, latest.accountId)
+                    if (latestCredential !== requestCredential) {
+                      resetPreviousRequestsForCredential(requestCredential)
+                      requestStateGeneration++
+                      return
+                    }
+                    if (createHash("sha256").update(latest.access).digest("hex") !== accessFingerprint) return
                     if (requestStateGeneration === requestGeneration) {
-                      previousRequestIds.set(sessionId, responseRequestId)
+                      completeRequestChain(
+                        requestCredential,
+                        requestChainSessionId,
+                        logicalRequestId,
+                        requestChainGeneration,
+                        requestChainSequence,
+                        responseRequestId,
+                      )
                     }
                   }
                 : undefined
@@ -1921,24 +2344,16 @@ export const ClaudeOAuthPlugin: Plugin = async (input: PluginInput, options?: Pl
             if (contentType.includes("application/json")) {
               const text = await readBoundedJsonText(response)
               const transformed = transformJsonToolUseNames(text)
-              recordPreviousRequest?.()
+              try {
+                if ((JSON.parse(text) as { type?: unknown }).type === "message") await recordPreviousRequest?.()
+              } catch {}
               return new Response(transformed, {
                 status: response.status,
                 statusText: response.statusText,
                 headers: uncloakedResponseHeaders(response),
               })
             }
-            if (!response.body) return response
-            return new Response(
-              response.body.pipeThrough(
-                new TransformStream<Uint8Array, Uint8Array>({
-                  flush() {
-                    recordPreviousRequest?.()
-                  },
-                }),
-              ),
-              { status: response.status, statusText: response.statusText, headers: response.headers },
-            )
+            return response
           },
         }
       },
@@ -1972,6 +2387,7 @@ export const ClaudeOAuthPlugin: Plugin = async (input: PluginInput, options?: Pl
                   // flows remain.
                   const code = await codePromise
                   const tokens = await exchangeCode(code, state, pkce.verifier, redirectUri)
+                  resetAllPreviousRequests()
                   recordAuthorizedAt(tokens.refresh, tokens.accountId)
                   return { type: "success" as const, ...tokens }
                 },
@@ -2044,6 +2460,7 @@ export const ClaudeOAuthPlugin: Plugin = async (input: PluginInput, options?: Pl
                     return failed("the pasted state does not match this login session")
                   }
                   const tokens = await exchangeCode(code, state, pkce.verifier, redirectUri)
+                  resetAllPreviousRequests()
                   recordAuthorizedAt(tokens.refresh, tokens.accountId)
                   return { type: "success" as const, ...tokens }
                 } catch {
@@ -2089,21 +2506,23 @@ export const ClaudeOAuthPlugin: Plugin = async (input: PluginInput, options?: Pl
     },
 
     event: async ({ event }) => {
-      const sessionId =
-        event.type === "session.deleted"
-          ? event.properties.info.id
-          : event.type === "session.compacted"
-            ? event.properties.sessionID
-            : undefined
-      if (!sessionId) return
-      previousRequestIds.delete(sessionId)
-      promptIds.delete(sessionId)
-      requestStateGeneration++
+      if (event.type === "session.deleted") {
+        const sessionId = event.properties.info.id
+        deletePreviousRequestsForSession(sessionId)
+        promptIds.delete(sessionId)
+      }
+      if (event.type === "session.compacted") {
+        const sessionId = event.properties.sessionID
+        resetPreviousRequestsForSession(sessionId)
+        promptIds.delete(sessionId)
+      }
     },
 
     dispose: async () => {
       previousRequestIds.clear()
+      logicalRequestSequences.clear()
       promptIds.clear()
+      database?.close()
       disposeOAuth()
     },
   }

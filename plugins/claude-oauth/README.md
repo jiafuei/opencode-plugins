@@ -79,7 +79,12 @@ endpoint:
   over the `cch=00000` placeholder
 - Billing state follows a conversation: `cc_prompt_id` remains stable for the
   same OpenCode message, and the next successful request includes the prior
-  Anthropic `request-id` as `cc_prev_req`
+  Anthropic `request-id` as `cc_prev_req`. Request chains persist across
+  OpenCode restarts and are shared safely by concurrent processes; generation
+  fencing prevents late responses from restoring state cleared by compaction,
+  deletion, or an auth transition. If SQLite is unavailable, inference
+  continues with process-local tracking but restart/cross-process continuity is
+  temporarily unavailable
 - Token-count requests use Claude Code's dedicated beta profile and header set,
   omit `X-Stainless-Timeout`, preserve their body shape apart from tool-name
   cloaking, and are not response-rewritten
@@ -142,6 +147,10 @@ files written with mode 0600:
 
 - `claude-oauth-install-id` — stable random install ID feeding the device ID
 - `claude-oauth/grants.json` — authorization timestamps only (never tokens)
+- `claude-oauth/claude-oauth.db` — SQLite session state for durable
+  `cc_prev_req` chains; stores OpenCode session IDs, hashed credential keys,
+  Anthropic request IDs, and generation/sequence/timestamp metadata, never
+  tokens
 - `claude-oauth/grants.lock/` — transient cross-process sidecar lock
 - `claude-oauth/refresh-lease/<hash>/` — transient cross-process refresh lease
 

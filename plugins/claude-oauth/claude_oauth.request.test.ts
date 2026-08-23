@@ -1,4 +1,8 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
+import { mkdtempSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { createAnthropic } from "@ai-sdk/anthropic";
 import { generateText, streamText } from "ai";
 import { ClaudeOAuthPlugin, mapStainlessArch } from "./claude_oauth.ts";
@@ -490,7 +494,7 @@ describe("request capture: x-client-request-id per-invocation semantics", () => 
       const headers: Record<string, string> = {};
       new Headers(init?.headers).forEach((value, key) => (headers[key] = value));
       captured.push({ url: String(input), method: init?.method, headers, bodyText: init?.body as string });
-      return new Response("{}", {
+      return new Response('{"type":"message"}', {
         status: 200,
         headers: { "content-type": "application/json", "request-id": captured.length === 1 ? "req_first" : "req_second" },
       });
@@ -542,7 +546,7 @@ describe("request capture: x-client-request-id per-invocation semantics", () => 
     const originalFetch = globalThis.fetch;
     globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
       bodies.push(init?.body as string);
-      return new Response("{}", {
+      return new Response('{"type":"message"}', {
         status: 200,
         headers: { "content-type": "application/json", "request-id": bodies.length === 1 ? "req_account_a" : "req_account_b" },
       });
@@ -566,6 +570,294 @@ describe("request capture: x-client-request-id per-invocation semantics", () => 
     expect(secondBilling).not.toContain("cc_prev_req=req_account_a");
   });
 
+  test("request chains resume from claude-oauth.db and compaction clears them", async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "claude-oauth-request-chain-"));
+    const databasePath = path.join(dir, "claude-oauth.db");
+    const bodies: string[] = [];
+    const plugins: Array<Awaited<ReturnType<typeof ClaudeOAuthPlugin>>> = [];
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+      bodies.push(init?.body as string);
+      return new Response('{"type":"message"}', {
+        status: 200,
+        headers: {
+          "content-type": "application/json",
+          ...(bodies.length === 1 ? { "request-id": "req_durable" } : {}),
+        },
+      });
+    }) as typeof fetch;
+    const createPlugin = async () => {
+      const plugin = await ClaudeOAuthPlugin(
+        { client: { auth: { set: async () => {} } } } as never,
+        { databasePath },
+      );
+      plugins.push(plugin);
+      return {
+        plugin,
+        options: await plugin.auth!.loader!(async () => OAUTH_AUTH as never, {} as never),
+      };
+    };
+    const send = (options: Record<string, any>) =>
+      options.fetch!("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: { "content-type": "application/json", "X-Claude-Code-Session-Id": "ses_durable" },
+        body: JSON.stringify({
+          model: "claude-sonnet-4-6",
+          messages: [{ role: "user", content: "hi" }],
+          metadata: { user_id: JSON.stringify({ device_id: "dev", session_id: "body-attribution" }) },
+          max_tokens: 1,
+        }),
+      });
+    try {
+      const first = await createPlugin();
+      await send(first.options);
+      await first.plugin.dispose!();
+      const completed = new Database(databasePath, { readonly: true });
+      expect((completed.query("SELECT COUNT(*) AS count FROM requests").get() as { count: number }).count).toBe(0);
+      completed.close();
+
+      const resumed = await createPlugin();
+      await send(resumed.options);
+      const resumedBilling = JSON.parse(bodies[1]!).system.find((block: { text?: string }) =>
+        block.text?.startsWith("x-anthropic-billing-header:"),
+      ).text as string;
+      expect(resumedBilling).toContain("cc_prev_req=req_durable");
+
+      await resumed.plugin.event!({
+        event: { type: "session.compacted", properties: { sessionID: "ses_durable" } },
+      } as never);
+      await resumed.plugin.dispose!();
+
+      const afterCompaction = await createPlugin();
+      await send(afterCompaction.options);
+      const compactedBilling = JSON.parse(bodies[2]!).system.find((block: { text?: string }) =>
+        block.text?.startsWith("x-anthropic-billing-header:"),
+      ).text as string;
+      expect(compactedBilling).not.toContain("cc_prev_req=");
+      await afterCompaction.plugin.dispose!();
+
+      const db = new Database(databasePath, { readonly: true });
+      try {
+        const row = db.query("SELECT * FROM sessions").get() as Record<string, unknown>;
+        expect(row.session_id).toBe("ses_durable");
+        expect(row.credential_key).toMatch(/^[0-9a-f]{64}$/);
+        expect(JSON.stringify(row)).not.toContain(OAUTH_AUTH.accountId);
+        expect(row.previous_request_id).toBeNull();
+        expect(row.generation).toBe(1);
+        expect((db.query("PRAGMA user_version").get() as { user_version: number }).user_version).toBe(1);
+        expect(
+          (db.query("PRAGMA index_list(sessions)").all() as Array<{ name: string }>).some(
+            (index) => index.name === "sessions_by_credential",
+          ),
+        ).toBe(true);
+        const requestIndexes = (db.query("PRAGMA index_list(requests)").all() as Array<{ name: string }>).map(
+          (index) => index.name,
+        );
+        expect(requestIndexes).toContain("requests_by_credential");
+        expect(requestIndexes).toContain("requests_by_created_at");
+      } finally {
+        db.close();
+      }
+      expect(statSync(databasePath).mode & 0o777).toBe(0o600);
+      expect(readdirSync(dir)).toEqual(["claude-oauth.db"]);
+    } finally {
+      for (const plugin of plugins) {
+        try {
+          await plugin.dispose!();
+        } catch {}
+      }
+      globalThis.fetch = originalFetch;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("SQLite generation fencing rejects a late response after deletion and row reactivation", async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "claude-oauth-request-fence-"));
+    const databasePath = path.join(dir, "claude-oauth.db");
+    const plugins: Array<Awaited<ReturnType<typeof ClaudeOAuthPlugin>>> = [];
+    const bodies: string[] = [];
+    let closeStream: (() => void) | undefined;
+    let closeResumedStream: (() => void) | undefined;
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+      bodies.push(init?.body as string);
+      if (bodies.length === 1) {
+        const stream = new ReadableStream<Uint8Array>({
+          start(controller) {
+            closeStream = () => controller.close();
+            controller.enqueue(
+              new TextEncoder().encode(
+                'event: message_start\ndata: {"type":"message_start"}\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n',
+              ),
+            );
+          },
+        });
+        return new Response(stream, {
+          status: 200,
+          headers: { "content-type": "text/event-stream", "request-id": "req_before_compaction" },
+        });
+      }
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          closeResumedStream = () => controller.close();
+          controller.enqueue(
+            new TextEncoder().encode('event: message_stop\ndata: {"type":"message_stop"}\n\n'),
+          );
+        },
+      });
+      return new Response(stream, {
+        status: 200,
+        headers: { "content-type": "text/event-stream", "request-id": "req_after_compaction" },
+      });
+    }) as typeof fetch;
+    const createPlugin = async () => {
+      const plugin = await ClaudeOAuthPlugin(
+        { client: { auth: { set: async () => {} } } } as never,
+        { databasePath },
+      );
+      plugins.push(plugin);
+      return {
+        plugin,
+        options: await plugin.auth!.loader!(async () => OAUTH_AUTH as never, {} as never),
+      };
+    };
+    const send = (options: Record<string, any>) =>
+      options.fetch!("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: { "content-type": "application/json", "X-Claude-Code-Session-Id": "ses_fenced" },
+        body: JSON.stringify({ model: "claude-sonnet-4-6", messages: [{ role: "user", content: "hi" }], max_tokens: 1 }),
+      });
+    try {
+      const requester = await createPlugin();
+      const staleResponse = await send(requester.options);
+      const deleter = await createPlugin();
+      await deleter.plugin.event!({
+        event: { type: "session.deleted", properties: { info: { id: "ses_fenced" } } },
+      } as never);
+
+      const resumed = await createPlugin();
+      const resumedResponse = await send(resumed.options);
+      closeStream!();
+      await staleResponse.text();
+      closeResumedStream!();
+      await resumedResponse.text();
+      const billing = JSON.parse(bodies[1]!).system.find((block: { text?: string }) =>
+        block.text?.startsWith("x-anthropic-billing-header:"),
+      ).text as string;
+      expect(billing).not.toContain("cc_prev_req=req_before_compaction");
+    } finally {
+      for (const plugin of plugins) {
+        try {
+          await plugin.dispose!();
+        } catch {}
+      }
+      globalThis.fetch = originalFetch;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("SQLite request sequencing prevents an earlier logical request from winning when it finishes last", async () => {
+    const plugin = await ClaudeOAuthPlugin({ client: { auth: { set: async () => {} } } } as never);
+    const options = await plugin.auth!.loader!(async () => OAUTH_AUTH as never, {} as never);
+    const bodies: string[] = [];
+    let resolveFirst: ((response: Response) => void) | undefined;
+    let resolveSecond: ((response: Response) => void) | undefined;
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+      bodies.push(init?.body as string);
+      if (bodies.length === 1) return new Promise<Response>((resolve) => (resolveFirst = resolve));
+      if (bodies.length === 2) return new Promise<Response>((resolve) => (resolveSecond = resolve));
+      if (bodies.length === 3) {
+        return new Response('{"type":"message"}', {
+          status: 200,
+          headers: { "content-type": "application/json", "request-id": "req_logical_first_retry" },
+        });
+      }
+      return new Response('{"type":"message"}', { status: 200, headers: { "content-type": "application/json" } });
+    }) as typeof fetch;
+    const send = (logicalRequestId: string) =>
+      options.fetch!("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "X-Claude-Code-Session-Id": "ses_ordered",
+          [REQUEST_ID_HEADER]: logicalRequestId,
+        },
+        body: JSON.stringify({ model: "claude-sonnet-4-6", messages: [{ role: "user", content: "hi" }], max_tokens: 1 }),
+      });
+    try {
+      const first = send("11111111-1111-4111-8111-111111111111");
+      const second = send("22222222-2222-4222-8222-222222222222");
+      while (!resolveFirst || !resolveSecond) await Bun.sleep(1);
+      resolveSecond(
+        new Response('{"type":"message"}', {
+          status: 200,
+          headers: { "content-type": "application/json", "request-id": "req_logical_second" },
+        }),
+      );
+      await second;
+      await send("11111111-1111-4111-8111-111111111111");
+      resolveFirst(
+        new Response('{"type":"message"}', {
+          status: 200,
+          headers: { "content-type": "application/json", "request-id": "req_logical_first" },
+        }),
+      );
+      await first;
+      await send("33333333-3333-4333-8333-333333333333");
+      const billing = JSON.parse(bodies[3]!).system.find((block: { text?: string }) =>
+        block.text?.startsWith("x-anthropic-billing-header:"),
+      ).text as string;
+      expect(billing).toContain("cc_prev_req=req_logical_second");
+      expect(billing).not.toContain("cc_prev_req=req_logical_first");
+      expect(billing).not.toContain("cc_prev_req=req_logical_first_retry");
+    } finally {
+      await plugin.dispose!();
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("an unavailable database falls back to process-local request chaining", async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "claude-oauth-request-fallback-"));
+    const blocker = path.join(dir, "not-a-directory");
+    writeFileSync(blocker, "x");
+    const plugin = await ClaudeOAuthPlugin(
+      { client: { auth: { set: async () => {} } } } as never,
+      { databasePath: path.join(blocker, "claude-oauth.db") },
+    );
+    const options = await plugin.auth!.loader!(async () => OAUTH_AUTH as never, {} as never);
+    const bodies: string[] = [];
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+      bodies.push(init?.body as string);
+      return new Response('{"type":"message"}', {
+        status: 200,
+        headers: {
+          "content-type": "application/json",
+          ...(bodies.length === 1 ? { "request-id": "req_memory_fallback" } : {}),
+        },
+      });
+    }) as typeof fetch;
+    const send = () =>
+      options.fetch!("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: { "content-type": "application/json", "X-Claude-Code-Session-Id": "ses_memory_fallback" },
+        body: JSON.stringify({ model: "claude-sonnet-4-6", messages: [{ role: "user", content: "hi" }], max_tokens: 1 }),
+      });
+    try {
+      await send();
+      await send();
+      const billing = JSON.parse(bodies[1]!).system.find((block: { text?: string }) =>
+        block.text?.startsWith("x-anthropic-billing-header:"),
+      ).text as string;
+      expect(billing).toContain("cc_prev_req=req_memory_fallback");
+    } finally {
+      await plugin.dispose!();
+      globalThis.fetch = originalFetch;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   test("a late response cannot restore stale state after an A-B-A credential cycle", async () => {
     const plugin = await ClaudeOAuthPlugin({ client: { auth: { set: async () => {} } } } as never);
     let auth = { ...OAUTH_AUTH, access: "account-a-token", accountId: "account-a" };
@@ -579,7 +871,11 @@ describe("request capture: x-client-request-id per-invocation semantics", () => 
         const stream = new ReadableStream<Uint8Array>({
           start(controller) {
             closeFirstStream = () => controller.close();
-            controller.enqueue(new TextEncoder().encode('event: message_start\ndata: {"type":"message_start"}\n\n'));
+            controller.enqueue(
+              new TextEncoder().encode(
+                'event: message_start\ndata: {"type":"message_start"}\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n',
+              ),
+            );
           },
         });
         return new Response(stream, {
@@ -588,7 +884,7 @@ describe("request capture: x-client-request-id per-invocation semantics", () => 
         });
       }
       const requestId = bodies.length === 2 ? "req_account_b" : bodies.length === 3 ? "req_new_a" : "req_final_a";
-      return new Response("{}", {
+      return new Response('{"type":"message"}', {
         status: 200,
         headers: { "content-type": "application/json", "request-id": requestId },
       });
@@ -656,6 +952,38 @@ describe("request capture: x-client-request-id per-invocation semantics", () => 
       block.text?.startsWith("x-anthropic-billing-header:"),
     ).text as string;
     expect(secondBilling).not.toContain("cc_prev_req=req_incomplete");
+  });
+
+  test("a cleanly truncated SSE response without message_stop does not advance the chain", async () => {
+    const options = await makeLoaderFetch();
+    const bodies: string[] = [];
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+      bodies.push(init?.body as string);
+      if (bodies.length === 1) {
+        return new Response('event: message_start\ndata: {"type":"message_start"}\n\n', {
+          status: 200,
+          headers: { "content-type": "text/event-stream", "request-id": "req_truncated" },
+        });
+      }
+      return new Response('{"type":"message"}', { status: 200, headers: { "content-type": "application/json" } });
+    }) as typeof fetch;
+    const send = () =>
+      options.fetch!("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: { "content-type": "application/json", "X-Claude-Code-Session-Id": "truncated-session" },
+        body: JSON.stringify({ model: "claude-sonnet-4-6", messages: [{ role: "user", content: "hi" }], max_tokens: 1 }),
+      });
+    try {
+      expect(await (await send()).text()).toContain("message_start");
+      await send();
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+    const billing = JSON.parse(bodies[1]!).system.find((block: { text?: string }) =>
+      block.text?.startsWith("x-anthropic-billing-header:"),
+    ).text as string;
+    expect(billing).not.toContain("cc_prev_req=req_truncated");
   });
 
   test("attributionHeader false suppresses billing and prompt markers through the plugin", async () => {
