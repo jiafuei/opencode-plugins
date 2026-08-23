@@ -51,7 +51,7 @@ describe("rewriteBody", () => {
     expect(Array.isArray(out.system)).toBe(true);
     expect(out.system[0].text).toContain(BILLING_PREFIX);
     expect(out.system[0].text).toContain(`cc_version=2.1.228.${expectedVersionSuffix(firstUserText)}`);
-    expect(out.system[1].text).toBe("You are a Claude agent, built on Anthropic's Claude Agent SDK.");
+    expect(out.system[1].text).toBe("You are Claude Code, Anthropic's official CLI for Claude.");
     expect(out.system[2].text).toBe("You are a coding agent.");
   });
 
@@ -59,7 +59,7 @@ describe("rewriteBody", () => {
     const body = baseBody.replace("claude-sonnet-4-6", "claude-3-5-haiku-20241022");
     const out = parse(rewriteBody(body, {}).json);
     expect(JSON.stringify(out.system)).not.toContain(BILLING_PREFIX);
-    expect(JSON.stringify(out.system)).not.toContain("Claude Agent SDK");
+    expect(JSON.stringify(out.system)).not.toContain("Claude Code, Anthropic's official CLI");
   });
 
   test("clamps max_tokens to 64000", () => {
@@ -92,8 +92,8 @@ describe("rewriteBody", () => {
     expect(out.system[0].text).toContain(`cc_version=2.1.228.${expectedVersionSuffix("abcdefgh")}`);
   });
 
-  test("does not duplicate billing/SDK injection when a billing block already exists", () => {
-    const existing = `${BILLING_PREFIX} cc_version=2.1.228.abc; cc_entrypoint=claude-desktop; cch=00000;`;
+  test("does not duplicate an existing billing block", () => {
+    const existing = `${BILLING_PREFIX} cc_version=2.1.228.abc; cc_entrypoint=cli; cch=00000;`;
     const body = JSON.stringify({
       model: "claude-sonnet-4-6",
       messages: [{ role: "user", content: "hi" }],
@@ -101,9 +101,19 @@ describe("rewriteBody", () => {
       max_tokens: 100,
     });
     const out = parse(rewriteBody(body, {}).json);
-    expect(out.system).toHaveLength(2);
+    expect(out.system).toHaveLength(3);
     expect(out.system.filter((b: any) => b.text.startsWith(BILLING_PREFIX))).toHaveLength(1);
-    expect(JSON.stringify(out.system)).not.toContain("Claude Agent SDK");
+    expect(out.system[0].text).toBe("You are Claude Code, Anthropic's official CLI for Claude.");
+  });
+
+  test("attributionHeader false removes billing metadata but keeps the CLI identity", () => {
+    const body = JSON.stringify({
+      ...parse(baseBody),
+      system: [{ type: "text", text: `${BILLING_PREFIX} cc_version=old; cch=abcde;` }],
+    });
+    const out = parse(rewriteBody(body, { attributionHeader: false }).json);
+    expect(JSON.stringify(out.system)).not.toContain(BILLING_PREFIX);
+    expect(out.system[0].text).toBe("You are Claude Code, Anthropic's official CLI for Claude.");
   });
 
   test("inserts an empty tools array for OAuth when the SDK omits tools", () => {
@@ -253,13 +263,13 @@ describe("rewriteBody", () => {
       "metadata",
       "max_tokens",
       "thinking",
+      "temperature",
       "output_config",
       "fallbacks",
       // Known keys first (stream last of them), then remaining keys in their
       // original relative order.
       "stream",
       "tool_choice",
-      "temperature",
     ]);
   });
 
@@ -273,7 +283,7 @@ describe("rewriteBody", () => {
     const out = parse(rewriteBody(body, {}).json);
     expect(out.system.map((b: any) => b.text)).toEqual([
       expect.stringContaining(BILLING_PREFIX),
-      "You are a Claude agent, built on Anthropic's Claude Agent SDK.",
+      "You are Claude Code, Anthropic's official CLI for Claude.",
       "Be terse.",
     ]);
   });
@@ -281,7 +291,9 @@ describe("rewriteBody", () => {
 
 describe("buildBetas", () => {
   const UTILITY = [
+    "oauth-2025-04-20",
     "interleaved-thinking-2025-05-14",
+    "redact-thinking-2026-02-12",
     "thinking-token-count-2026-05-13",
     "context-management-2025-06-27",
     "prompt-caching-scope-2026-01-05",
@@ -289,7 +301,9 @@ describe("buildBetas", () => {
   ];
   const AGENT_BASE = [
     "claude-code-20250219",
+    "oauth-2025-04-20",
     "interleaved-thinking-2025-05-14",
+    "redact-thinking-2026-02-12",
     "thinking-token-count-2026-05-13",
     "context-management-2025-06-27",
     "prompt-caching-scope-2026-01-05",
@@ -336,8 +350,8 @@ describe("buildBetas", () => {
       "fallback-credit-2026-06-01",
     ].join(",");
     const betas = buildBetas({ type: "enabled", budget_tokens: 1024 }, true, incoming).split(",");
-    expect(betas.slice(0, 8)).toEqual([...AGENT_BASE, "effort-2025-11-24"]);
-    expect(betas.slice(8)).toEqual([
+    expect(betas.slice(0, AGENT_BASE.length + 1)).toEqual([...AGENT_BASE, "effort-2025-11-24"]);
+    expect(betas.slice(AGENT_BASE.length + 1)).toEqual([
       "fallback-credit-2026-06-01",
       "compact-2026-01-01",
       "fast-mode-2026-02-01",
@@ -393,19 +407,21 @@ describe("rewriteBody cch", () => {
   }
 
   test("matches the canonical normalized-body reference vector", () => {
-    expect(cch(body)).toBe("6f56e");
+    expect(cch(body)).toBe("07e75");
   });
 
   test("leaves an existing billing value without a placeholder unchanged", () => {
     const existing = billingHeader.replace("cch=00000", "cch=abcde");
     const out = parse(rewriteBody(JSON.stringify({ ...body, system: [{ type: "text", text: existing }] }), {}).json);
-    expect(out.system[0].text).toBe(existing);
+    expect(out.system.find((block: any) => block.text?.startsWith(BILLING_PREFIX)).text).toBe(existing);
   });
 
   test("replaces only the first placeholder in the billing block", () => {
     const repeated = billingHeader.replace(";", " cch=00000;");
     const out = parse(rewriteBody(JSON.stringify({ ...body, system: [{ type: "text", text: repeated }] }), {}).json);
-    expect(out.system[0].text).toMatch(/cch=[0-9a-f]{5} cch=00000/);
+    expect(out.system.find((block: any) => block.text?.startsWith(BILLING_PREFIX)).text).toMatch(
+      /cch=[0-9a-f]{5} cch=00000/,
+    );
   });
 });
 

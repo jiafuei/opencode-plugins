@@ -1,4 +1,4 @@
-import type { Hooks, Plugin, PluginInput } from "@opencode-ai/plugin";
+import type { Hooks, Plugin, PluginInput, PluginOptions } from "@opencode-ai/plugin";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
@@ -19,16 +19,20 @@ import path from "node:path";
 
 const CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"; // Claude Code's public OAuth client ID
 const AUTHORIZE_URL = "https://claude.ai/oauth/authorize";
-const TOKEN_URL = "https://api.anthropic.com/v1/oauth/token";
-const BOOTSTRAP_URL = "https://api.anthropic.com/api/claude_cli/bootstrap";
+const TOKEN_URL = "https://platform.claude.com/v1/oauth/token";
+const PROFILE_URL = "https://api.anthropic.com/api/oauth/profile";
+const ROLES_URL = "https://api.anthropic.com/api/oauth/claude_cli/roles";
 const CALLBACK_PORT = 54545;
 const CALLBACK_PATH = "/callback";
 const SCOPES =
   "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
+const REFRESH_SCOPES = "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
 
 const CLAUDE_CODE_VERSION = "2.1.228";
-const USER_AGENT = `claude-cli/${CLAUDE_CODE_VERSION} (external, claude-desktop)`;
-const SDK_INSTRUCTION = "You are a Claude agent, built on Anthropic's Claude Agent SDK.";
+const USER_AGENT = `claude-cli/${CLAUDE_CODE_VERSION} (external, cli)`;
+const SDK_INSTRUCTION = "You are Claude Code, Anthropic's official CLI for Claude.";
+const AXIOS_USER_AGENT = "axios/1.15.2";
+const AXIOS_ACCEPT = "application/json, text/plain, */*";
 const MAX_OUTPUT_TOKENS = 64000;
 const OAUTH_DUMMY_KEY = "opencode-oauth-dummy-key";
 const BILLING_SALT = "59cf53e54c78";
@@ -38,9 +42,12 @@ const SESSION_ID_HEADER = "x-claude-code-session-id";
 // chat.headers into the auth fetch. Like the session marker, it is stripped
 // before anything hits the wire.
 const REQUEST_ID_HEADER = "x-claude-oauth-request-id";
+const PROMPT_ID_HEADER = "x-claude-oauth-prompt-id";
 
 const UTILITY_PROFILE_BETAS = [
+  "oauth-2025-04-20",
   "interleaved-thinking-2025-05-14",
+  "redact-thinking-2026-02-12",
   "thinking-token-count-2026-05-13",
   "context-management-2025-06-27",
   "prompt-caching-scope-2026-01-05",
@@ -49,13 +56,23 @@ const UTILITY_PROFILE_BETAS = [
 
 const AGENT_PROFILE_BETAS = [
   "claude-code-20250219",
+  "oauth-2025-04-20",
   "interleaved-thinking-2025-05-14",
+  "redact-thinking-2026-02-12",
   "thinking-token-count-2026-05-13",
   "context-management-2025-06-27",
   "prompt-caching-scope-2026-01-05",
   "mid-conversation-system-2026-04-07",
   "advanced-tool-use-2025-11-20",
 ];
+
+const COUNT_TOKENS_BETAS = [
+  "claude-code-20250219",
+  "oauth-2025-04-20",
+  "interleaved-thinking-2025-05-14",
+  "context-management-2025-06-27",
+  "token-counting-2024-11-01",
+].join(",");
 
 const EFFORT_BETA = "effort-2025-11-24";
 const FALLBACK_CREDIT_BETA = "fallback-credit-2026-06-01";
@@ -114,7 +131,7 @@ const STAINLESS_HEADERS: Record<string, string> = {
   "X-Stainless-Arch": mapStainlessArch(process.arch),
   "X-Stainless-Lang": "js",
   "X-Stainless-OS": "Linux",
-  "X-Stainless-Package-Version": "0.94.0",
+  "X-Stainless-Package-Version": "0.112.1",
   "X-Stainless-Retry-Count": "0",
   "X-Stainless-Runtime": "node",
   "X-Stainless-Runtime-Version": "v26.3.0",
@@ -155,7 +172,7 @@ interface TokenResponse {
 
 /**
  * Account + organization identity slice resolved from the token response
- * and/or `/api/claude_cli/bootstrap`.
+ * and/or the OAuth profile and Claude CLI roles endpoints.
  * OpenCode's auth schema persists only `accountId`; email/org are resolved
  * transiently and clearly typed here for future use — there is deliberately
  * no second credential store.
@@ -231,8 +248,12 @@ async function postToken(
 ): Promise<TokenResponse> {
   const response = await fetch(TOKEN_URL, {
     method: "POST",
-    // No Accept header: CC omits it on OAuth token requests.
-    headers: { ...extraHeaders, "Content-Type": "application/json" },
+    headers: {
+      Accept: AXIOS_ACCEPT,
+      "User-Agent": AXIOS_USER_AGENT,
+      ...extraHeaders,
+      "Content-Type": "application/json",
+    },
     body: JSON.stringify(body),
     signal: AbortSignal.timeout(30_000),
   });
@@ -281,45 +302,59 @@ async function postToken(
 }
 
 /**
- * Identity recovery from `/api/claude_cli/bootstrap`. Throws on network
- * errors, non-OK responses, timeouts, and malformed JSON; callers treat every
- * failure as "keep whatever the token response provided" (best-effort only).
+ * Identity recovery from Claude Code's profile and roles endpoints. Profile
+ * failures are surfaced to callers; roles are optional and only enrich the
+ * organization name.
  */
-export async function fetchBootstrapIdentity(accessToken: string): Promise<OAuthIdentity> {
-  const response = await fetch(`${BOOTSTRAP_URL}?entrypoint=cli&model=claude-opus-4-8`, {
-    headers: {
-      Accept: "application/json, text/plain, */*",
-      Authorization: `Bearer ${accessToken}`,
-      "Content-Type": "application/json",
-      "User-Agent": `claude-code/${CLAUDE_CODE_VERSION}`,
-      "anthropic-beta": "oauth-2025-04-20",
-    },
-    signal: AbortSignal.timeout(30_000),
-  });
-  if (!response.ok) throw new Error(`Anthropic bootstrap request failed: ${response.status}`);
-  const data = (await response.json()) as {
-    oauth_account?: {
-      account_uuid?: string;
-      account_email?: string;
-      organization_uuid?: string;
-      organization_name?: string;
-    };
+export async function fetchOAuthIdentity(accessToken: string): Promise<OAuthIdentity> {
+  const [profileResult, rolesResult] = await Promise.allSettled([
+    fetch(PROFILE_URL, {
+      headers: {
+        Accept: AXIOS_ACCEPT,
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json",
+        "Cache-Control": "no-cache",
+        "User-Agent": AXIOS_USER_AGENT,
+      },
+      signal: AbortSignal.timeout(10_000),
+    }),
+    fetch(ROLES_URL, {
+      headers: {
+        Accept: AXIOS_ACCEPT,
+        Authorization: `Bearer ${accessToken}`,
+        "User-Agent": AXIOS_USER_AGENT,
+      },
+      signal: AbortSignal.timeout(10_000),
+    }),
+  ]);
+  if (profileResult.status === "rejected") throw profileResult.reason;
+  const profileResponse = profileResult.value;
+  if (!profileResponse.ok) throw new Error(`Anthropic profile request failed: ${profileResponse.status}`);
+  const data = (await profileResponse.json()) as {
+    account?: { uuid?: string; email?: string };
+    organization?: { uuid?: string; name?: string };
   };
+  let roles: { organization_uuid?: string; organization_name?: string } | undefined;
+  if (rolesResult.status === "fulfilled" && rolesResult.value.ok) {
+    try {
+      roles = (await rolesResult.value.json()) as typeof roles;
+    } catch {}
+  }
   return {
-    accountId: nonEmpty(data.oauth_account?.account_uuid),
-    email: nonEmpty(data.oauth_account?.account_email),
-    orgId: nonEmpty(data.oauth_account?.organization_uuid),
-    orgName: nonEmpty(data.oauth_account?.organization_name),
+    accountId: nonEmpty(data.account?.uuid),
+    email: nonEmpty(data.account?.email),
+    orgId: nonEmpty(data.organization?.uuid) ?? nonEmpty(roles?.organization_uuid),
+    orgName: nonEmpty(data.organization?.name) ?? nonEmpty(roles?.organization_name),
   };
 }
 
 /**
  * Resolve account (and optionally organization) identity for a token
- * response, merging the token response over bootstrap recovery. `includeOrg`
+ * response, merging the token response over profile recovery. `includeOrg`
  * is login-only: the org a token is scoped to is captured once when the
  * credential is created and deliberately never refreshed afterwards —
  * rewriting org identity during background refreshes could silently re-key
- * stored credentials. Every bootstrap failure (network, non-OK, timeout,
+ * stored credentials. Every profile recovery failure (network, non-OK, timeout,
  * invalid JSON) is swallowed so identity recovery never invalidates an
  * otherwise successful token exchange or refresh.
  */
@@ -331,12 +366,12 @@ export async function resolveIdentity(
   const orgSatisfied = !options?.includeOrg || identity.orgId !== undefined;
   if (identity.accountId && identity.email && orgSatisfied) return identity;
   try {
-    const bootstrap = await fetchBootstrapIdentity(data.access_token);
+    const recovered = await fetchOAuthIdentity(data.access_token);
     return {
-      accountId: identity.accountId ?? bootstrap.accountId,
-      email: identity.email ?? bootstrap.email,
-      orgId: identity.orgId ?? bootstrap.orgId,
-      orgName: identity.orgName ?? bootstrap.orgName,
+      accountId: identity.accountId ?? recovered.accountId,
+      email: identity.email ?? recovered.email,
+      orgId: identity.orgId ?? recovered.orgId,
+      orgName: identity.orgName ?? recovered.orgName,
     };
   } catch {
     return identity;
@@ -368,7 +403,7 @@ async function exchangeCode(
     code_verifier: verifier,
   });
 
-  // Login captures the full identity once: bootstrap runs whenever account
+  // Login captures the full identity once: profile recovery runs whenever account
   // identity (uuid/email) or org identity is incomplete. Only accountId is
   // returned/persisted through OpenCode; email/org stay transient.
   const identity = await resolveIdentity(data, { includeOrg: true });
@@ -389,12 +424,9 @@ async function refreshTokens(refreshToken: string): Promise<TokenResponse> {
       grant_type: "refresh_token",
       client_id: CLIENT_ID,
       refresh_token: refreshToken,
+      scope: REFRESH_SCOPES,
     },
-    {
-      // CC sends these on refresh but not on the initial code exchange.
-      "anthropic-beta": "oauth-2025-04-20",
-      "User-Agent": "anthropic-sdk-typescript/0.94.0 userOAuthProvider",
-    },
+    undefined,
     false,
   );
 }
@@ -430,7 +462,7 @@ function opencodeDataDir(): string {
 
 // A lease holder that crashed mid-refresh is stolen after this long. Must
 // safely exceed the worst-case in-lease work: one token refresh (30s timeout)
-// plus bootstrap identity recovery (30s timeout) — doubled so a slow-but-live
+// plus profile/roles recovery (10s timeout), with ample room so a slow-but-live
 // holder is never stolen mid-flight.
 const REFRESH_LEASE_TTL_MS = 120_000;
 const REFRESH_LEASE_POLL_MS = 100;
@@ -1112,7 +1144,7 @@ function readMetadataAccountId(metadata: unknown): string | undefined {
 // Request spoofing: billing header + cch attestation
 // ---------------------------------------------------------------------------
 
-function createBillingHeader(firstUserMessageText: string): string {
+function createBillingHeader(firstUserMessageText: string, previousRequestId?: string, promptId?: string): string {
   // Fingerprint: SHA256(salt + msg[4] + msg[7] + msg[20] + version)[:3],
   // chars taken from the first user message (not the system prompt).
   const k = [4, 7, 20]
@@ -1123,7 +1155,15 @@ function createBillingHeader(firstUserMessageText: string): string {
     .digest("hex")
     .slice(0, 3);
   // cch=00000 is replaced after the complete request object is assembled.
-  return `${BILLING_HEADER_PREFIX} cc_version=${CLAUDE_CODE_VERSION}.${versionSuffix}; cc_entrypoint=claude-desktop; cch=00000;`;
+  return (
+    `${BILLING_HEADER_PREFIX} cc_version=${CLAUDE_CODE_VERSION}.${versionSuffix}; cc_entrypoint=cli; cch=00000;` +
+    (previousRequestId && /^req_[A-Za-z0-9_-]{1,36}$/.test(previousRequestId)
+      ? ` cc_prev_req=${previousRequestId};`
+      : "") +
+    (promptId && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(promptId)
+      ? ` cc_prompt_id=${promptId};`
+      : "")
+  );
 }
 
 // cch attestation: XXHash64(body_with_placeholder, seed) low-20-bits as 5 hex chars.
@@ -1230,7 +1270,7 @@ const SSE_EVENT_BUFFER_LIMIT = 1024 * 1024;
  * ever buffered — never the full stream. A partial event that exceeds the
  * assembly cap fails the stream with a clear error.
  */
-export function createSseToolNameTransform(): TransformStream<Uint8Array, Uint8Array> {
+export function createSseToolNameTransform(onComplete?: () => void): TransformStream<Uint8Array, Uint8Array> {
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
   let pending = "";
@@ -1335,6 +1375,7 @@ export function createSseToolNameTransform(): TransformStream<Uint8Array, Uint8A
         pending = "";
       }
       dispatch(controller);
+      onComplete?.();
     },
   });
 }
@@ -1418,6 +1459,7 @@ const CANONICAL_BODY_KEYS = [
   "max_tokens",
   "thinking",
   "context_management",
+  "temperature",
   "output_config",
   "fallbacks",
   "stream",
@@ -1425,7 +1467,7 @@ const CANONICAL_BODY_KEYS = [
 
 /**
  * Rewrite a /v1/messages body into Claude Code shape:
- * - system[0] billing header (+ system[1] Agent SDK instruction)
+ * - system[0] billing header (+ system[1] Claude CLI instruction)
  * - metadata.user_id in the CC attribution envelope
  * - max_tokens clamped to <= 64000
  * - context_management merged: incoming edits are preserved; active thinking
@@ -1436,7 +1478,13 @@ const CANONICAL_BODY_KEYS = [
  */
 export function rewriteBody(
   body: string,
-  ctx: { sessionId?: string; accountId?: string },
+  ctx: {
+    sessionId?: string;
+    accountId?: string;
+    attributionHeader?: boolean;
+    previousRequestId?: string;
+    promptId?: string;
+  },
 ): { json: string; thinking: unknown; hasTools: boolean; sessionId?: string } {
   const params = JSON.parse(body) as Record<string, any>;
   // Cloak custom tool names before anything else, so cch hashes the
@@ -1452,7 +1500,7 @@ export function rewriteBody(
   // including caller fields like cache_control). Skip injection entirely when a
   // billing block already exists so rewrites never stack duplicate fingerprints.
   const incomingSystem = params.system;
-  const systemBlocks: ContentBlock[] =
+  let systemBlocks: ContentBlock[] =
     typeof incomingSystem === "string"
       ? [{ type: "text", text: incomingSystem }]
       : Array.isArray(incomingSystem)
@@ -1462,13 +1510,21 @@ export function rewriteBody(
     (typeof incomingSystem === "string" && incomingSystem.startsWith(BILLING_HEADER_PREFIX)) ||
     systemBlocks.some((block) => typeof block?.text === "string" && block.text.startsWith(BILLING_HEADER_PREFIX));
 
-  const fingerprintBlocks: ContentBlock[] =
-    injectFingerprint && !hasBillingBlock
-      ? [
-          { type: "text", text: createBillingHeader(extractFirstUserText(params.messages)) },
-          { type: "text", text: SDK_INSTRUCTION },
-        ]
-      : [];
+  if (ctx.attributionHeader === false) {
+    systemBlocks = systemBlocks.filter(
+      (block) => typeof block?.text !== "string" || !block.text.startsWith(BILLING_HEADER_PREFIX),
+    );
+  }
+
+  const hasIdentityBlock = systemBlocks.some((block) => block?.text === SDK_INSTRUCTION);
+  const fingerprintBlocks: ContentBlock[] = [];
+  if (injectFingerprint && ctx.attributionHeader !== false && !hasBillingBlock) {
+    fingerprintBlocks.push({
+      type: "text",
+      text: createBillingHeader(extractFirstUserText(params.messages), ctx.previousRequestId, ctx.promptId),
+    });
+  }
+  if (injectFingerprint && !hasIdentityBlock) fingerprintBlocks.push({ type: "text", text: SDK_INSTRUCTION });
   const system = [...fingerprintBlocks, ...systemBlocks];
 
   // metadata.user_id: preserve valid CC attribution verbatim — the legacy
@@ -1487,9 +1543,9 @@ export function rewriteBody(
     const accountId = readMetadataAccountId(params.metadata) ?? ctx.accountId;
     const envelope: Record<string, string> = {
       device_id: deriveDeviceId(accountId),
-      session_id: ctx.sessionId ?? randomUUID().toLowerCase(),
     };
     if (accountId) envelope.account_uuid = accountId;
+    envelope.session_id = ctx.sessionId ?? randomUUID().toLowerCase();
     userId = JSON.stringify(envelope);
   }
   const sessionId = extractUserIdSessionId(userId);
@@ -1562,7 +1618,16 @@ export function rewriteBody(
   return { json: JSON.stringify(rewritten), thinking, hasTools, sessionId };
 }
 
-export const ClaudeOAuthPlugin: Plugin = async (input: PluginInput) => {
+export interface ClaudeOAuthOptions {
+  attributionHeader?: boolean;
+}
+
+export const ClaudeOAuthPlugin: Plugin = async (input: PluginInput, options?: PluginOptions | ClaudeOAuthOptions) => {
+  const attributionHeader = (options as ClaudeOAuthOptions | undefined)?.attributionHeader !== false;
+  const previousRequestIds = new Map<string, string>();
+  const promptIds = new Map<string, Map<string, string>>();
+  let previousRequestCredential: string | undefined;
+  let requestStateGeneration = 0;
   // Persist rotated tokens during background refreshes. Login results are
   // persisted by core directly.
   const persist = async (tokens: RefreshedCredential) => {
@@ -1701,17 +1766,26 @@ export const ClaudeOAuthPlugin: Plugin = async (input: PluginInput) => {
 
             // Single dispatch boundary: route on the latest classified state.
             if (auth.kind === "missing") {
+              previousRequestIds.clear();
+              previousRequestCredential = undefined;
+              requestStateGeneration++;
               throw new Error(
                 "Anthropic credentials are missing (logged out?) - run `opencode auth login`, pick Anthropic, then choose a Claude Pro/Max method.",
               );
             }
             if (auth.kind === "unsupported") {
+              previousRequestIds.clear();
+              previousRequestCredential = undefined;
+              requestStateGeneration++;
               throw new Error(
                 `Unsupported Anthropic auth type "${auth.authType}" - run \`opencode auth login\`, pick Anthropic, then choose a Claude Pro/Max method.`,
               );
             }
 
             if (auth.kind === "api") {
+              previousRequestIds.clear();
+              previousRequestCredential = undefined;
+              requestStateGeneration++;
               // Ordinary Anthropic API-key request: replace the dummy
               // x-api-key with the real one and drop OAuth-only mutations.
               // No fingerprinting, body rewrite, cch, tool cloaking, or
@@ -1725,6 +1799,7 @@ export const ClaudeOAuthPlugin: Plugin = async (input: PluginInput) => {
               headers.delete("Authorization");
               headers.delete(SESSION_ID_HEADER);
               headers.delete(REQUEST_ID_HEADER);
+              headers.delete(PROMPT_ID_HEADER);
               headers.set("x-api-key", auth.key);
               return fetch(requestInput, { ...init, headers });
             }
@@ -1733,6 +1808,13 @@ export const ClaudeOAuthPlugin: Plugin = async (input: PluginInput) => {
             const access = auth.access
             const accountId = auth.accountId
             const headers = new Headers(init?.headers)
+            const requestCredential = createHash("sha256").update(access).digest("hex")
+            if (requestCredential !== previousRequestCredential) {
+              previousRequestIds.clear()
+              previousRequestCredential = requestCredential
+              requestStateGeneration++
+            }
+            const requestGeneration = requestStateGeneration
 
             // Per-invocation request id from chat.headers. Read once, then
             // removed: it is a plugin-only transport marker and must never
@@ -1742,6 +1824,8 @@ export const ClaudeOAuthPlugin: Plugin = async (input: PluginInput) => {
             // fresh UUID is minted at dispatch below.
             const hookRequestId = headers.get(REQUEST_ID_HEADER) ?? undefined
             headers.delete(REQUEST_ID_HEADER)
+            const promptId = headers.get(PROMPT_ID_HEADER) ?? undefined
+            headers.delete(PROMPT_ID_HEADER)
 
             // The session header must always match the body's metadata
             // user_id session. rewriteBody returns the effective session
@@ -1752,30 +1836,42 @@ export const ClaudeOAuthPlugin: Plugin = async (input: PluginInput) => {
             let sessionId = hookSessionId
             let body: RequestInit["body"] = init?.body
             const isMessages = url.pathname === "/v1/messages"
+            const isCountTokens = url.pathname === "/v1/messages/count_tokens"
+            const isMessagesApi = isMessages || isCountTokens
             let requestTarget: typeof requestInput = requestInput
             // Claude Code hits the official API with ?beta=true on /messages;
             // existing query params are preserved.
-            if (isMessages && url.hostname === "api.anthropic.com") {
+            if (isMessagesApi && url.hostname === "api.anthropic.com") {
               url.searchParams.set("beta", "true")
               requestTarget = url
             }
             if (isMessages && typeof body === "string" && body.startsWith("{")) {
-              const { json, thinking, hasTools, sessionId: bodySessionId } = rewriteBody(body, {
+              const incomingUserId = (JSON.parse(body) as Record<string, any>).metadata?.user_id
+              const attributedSessionId = typeof incomingUserId === "string" ? extractUserIdSessionId(incomingUserId) : undefined
+              const { json, thinking, hasTools, sessionId: rewrittenSessionId } = rewriteBody(body, {
                 sessionId: hookSessionId,
                 accountId,
+                attributionHeader,
+                previousRequestId: previousRequestIds.get(attributedSessionId ?? hookSessionId ?? ""),
+                promptId,
               })
-              sessionId = bodySessionId
+              sessionId = rewrittenSessionId
               body = json
               // Headers.get is case-insensitive, so SDK betas arrive regardless
               // of the caller's key casing.
               headers.set("anthropic-beta", buildBetas(thinking, hasTools, headers.get("anthropic-beta")))
+            } else if (isCountTokens && typeof body === "string" && body.startsWith("{")) {
+              const params = JSON.parse(body) as Record<string, any>
+              prefixRequestToolNames(params)
+              body = JSON.stringify(params)
+              headers.set("anthropic-beta", COUNT_TOKENS_BETAS)
             }
 
             headers.delete("x-api-key")
             headers.set("Authorization", `Bearer ${access}`)
-            if (isMessages) {
+            if (isMessagesApi) {
               // Preserve genuine claude-cli callers; everything else gets the
-              // fixed cowork UA (case-insensitive prefix check).
+              // fixed Claude CLI UA (case-insensitive prefix check).
               const incomingUserAgent = headers.get("User-Agent")
               headers.set(
                 "User-Agent",
@@ -1791,12 +1887,24 @@ export const ClaudeOAuthPlugin: Plugin = async (input: PluginInput) => {
               // Retry-stable across SDK retries of this invocation (they reuse
               // the prepared headers), fresh per logical invocation.
               headers.set("x-client-request-id", hookRequestId ?? randomUUID())
-              for (const [key, value] of Object.entries(STAINLESS_HEADERS)) headers.set(key, value)
+              for (const [key, value] of Object.entries(STAINLESS_HEADERS)) {
+                if (!isCountTokens || key !== "X-Stainless-Timeout") headers.set(key, value)
+              }
+              if (isCountTokens) headers.delete("X-Stainless-Timeout")
             }
             if (sessionId) headers.set("X-Claude-Code-Session-Id", sessionId)
 
             const response = await fetch(requestTarget, { ...init, headers, body })
             if (!isMessages) return response
+            const responseRequestId = response.headers.get("request-id")
+            const recordPreviousRequest =
+              response.ok && sessionId && responseRequestId && /^req_[A-Za-z0-9_-]{1,36}$/.test(responseRequestId)
+                ? () => {
+                    if (requestStateGeneration === requestGeneration) {
+                      previousRequestIds.set(sessionId, responseRequestId)
+                    }
+                  }
+                : undefined
             // Uncloak custom tool names on the way back. Streaming responses are
             // rewritten incrementally (no full buffering); non-streaming JSON
             // bodies are transformed whole within a bounded read. Rewritten
@@ -1804,7 +1912,7 @@ export const ClaudeOAuthPlugin: Plugin = async (input: PluginInput) => {
             const contentType = response.headers.get("content-type") ?? ""
             if (contentType.includes("text/event-stream")) {
               if (!response.body) return response
-              return new Response(response.body.pipeThrough(createSseToolNameTransform()), {
+              return new Response(response.body.pipeThrough(createSseToolNameTransform(recordPreviousRequest)), {
                 status: response.status,
                 statusText: response.statusText,
                 headers: uncloakedResponseHeaders(response),
@@ -1812,13 +1920,25 @@ export const ClaudeOAuthPlugin: Plugin = async (input: PluginInput) => {
             }
             if (contentType.includes("application/json")) {
               const text = await readBoundedJsonText(response)
-              return new Response(transformJsonToolUseNames(text), {
+              const transformed = transformJsonToolUseNames(text)
+              recordPreviousRequest?.()
+              return new Response(transformed, {
                 status: response.status,
                 statusText: response.statusText,
                 headers: uncloakedResponseHeaders(response),
               })
             }
-            return response
+            if (!response.body) return response
+            return new Response(
+              response.body.pipeThrough(
+                new TransformStream<Uint8Array, Uint8Array>({
+                  flush() {
+                    recordPreviousRequest?.()
+                  },
+                }),
+              ),
+              { status: response.status, statusText: response.statusText, headers: response.headers },
+            )
           },
         }
       },
@@ -1953,9 +2073,37 @@ export const ClaudeOAuthPlugin: Plugin = async (input: PluginInput) => {
       // fetch. SDK retries reuse the prepared headers — and therefore this id;
       // a separate identical invocation runs this hook again and gets a new one.
       output.headers[REQUEST_ID_HEADER] = randomUUID()
+      if (attributionHeader) {
+        let sessionPrompts = promptIds.get(input.sessionID)
+        if (!sessionPrompts) {
+          sessionPrompts = new Map()
+          promptIds.set(input.sessionID, sessionPrompts)
+        }
+        let promptId = sessionPrompts.get(input.message.id)
+        if (!promptId) {
+          promptId = randomUUID()
+          sessionPrompts.set(input.message.id, promptId)
+        }
+        output.headers[PROMPT_ID_HEADER] = promptId
+      }
+    },
+
+    event: async ({ event }) => {
+      const sessionId =
+        event.type === "session.deleted"
+          ? event.properties.info.id
+          : event.type === "session.compacted"
+            ? event.properties.sessionID
+            : undefined
+      if (!sessionId) return
+      previousRequestIds.delete(sessionId)
+      promptIds.delete(sessionId)
+      requestStateGeneration++
     },
 
     dispose: async () => {
+      previousRequestIds.clear()
+      promptIds.clear()
       disposeOAuth()
     },
   }

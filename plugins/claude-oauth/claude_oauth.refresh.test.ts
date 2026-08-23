@@ -140,6 +140,27 @@ function callFetch(options: Record<string, any>): Promise<Response> {
 }
 
 describe("shared refresh coordination", () => {
+  serialTest("refresh uses the platform endpoint, Axios headers, and inference scopes", async () => {
+    const data = useDataDir();
+    const h = await makeHarness();
+    const mock = mockFetch((url) => (isTokenCall(url) ? tokenResponse() : jsonResponse({ id: "msg" })));
+    try {
+      await callFetch(h.options);
+      const tokenCall = mock.calls.find((call) => isTokenCall(call.url))!;
+      expect(tokenCall.url).toBe("https://platform.claude.com/v1/oauth/token");
+      const headers = new Headers(tokenCall.init!.headers);
+      expect(headers.get("accept")).toBe("application/json, text/plain, */*");
+      expect(headers.get("content-type")).toBe("application/json");
+      expect(headers.get("user-agent")).toBe("axios/1.15.2");
+      const body = JSON.parse(tokenCall.init!.body as string);
+      expect(body.scope).toBe("user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload");
+      expect(body.scope).not.toContain("org:create_api_key");
+    } finally {
+      mock.restore();
+      data.restore();
+    }
+  });
+
   serialTest("two loader instances share a single refresh network call", async () => {
     const data = useDataDir();
     let tokenCalls = 0;
@@ -239,7 +260,7 @@ describe("shared refresh coordination", () => {
     const h = await makeHarness();
     const mock = mockFetch((url) => {
       if (isTokenCall(url)) return tokenResponse();
-      if (!url.includes("/bootstrap")) h.events.push("request");
+      if (!url.includes("/api/oauth/")) h.events.push("request");
       return jsonResponse({ id: "msg" });
     });
     try {

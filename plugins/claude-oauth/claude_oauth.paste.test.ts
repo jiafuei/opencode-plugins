@@ -24,7 +24,7 @@ async function makePasteHarness(): Promise<Harness> {
   const originalFetch = globalThis.fetch;
   globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
     const url = String(input instanceof Request ? input.url : input);
-    if (url.includes("api.anthropic.com/v1/oauth/token")) {
+    if (url.includes("platform.claude.com/v1/oauth/token")) {
       tokenCalls.push({ body: JSON.parse(String(init?.body)) });
       return new Response(
         JSON.stringify({

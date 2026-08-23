@@ -4,15 +4,27 @@ Claude Pro/Max subscription login for OpenCode. Adds OAuth auth methods to the
 built-in `anthropic` provider and rewrites requests to carry Claude Code
 (`claude-cli`) subscription traffic characteristics — headers, beta profile,
 billing/system fingerprint, `metadata.user_id` attribution, and the `cch`
-attestation — mirroring [oh-my-pi](https://github.com/can1357/oh-my-pi)'s
-Cowork transport. Parity with that transport is what's tested here; byte-for-
-byte equivalence with any particular Claude Code build is not claimed.
+attestation. The application-layer behavior is matched against Claude Code
+2.1.228; byte-for-byte equivalence is not claimed because Bun owns the HTTP
+transport and header serialization.
 
 ## Install
 
 ```json
 {
   "plugin": ["@jiafuei/opencode-claude-oauth"]
+}
+```
+
+Billing attribution is enabled by default. To omit the
+`x-anthropic-billing-header` and its `cch`, `cc_prev_req`, and `cc_prompt_id`
+fields while retaining OAuth authentication and the Claude CLI identity:
+
+```json
+{
+  "plugin": [
+    ["@jiafuei/opencode-claude-oauth", { "attributionHeader": false }]
+  ]
 }
 ```
 
@@ -34,24 +46,26 @@ provider, so do not start multiple Anthropic login attempts concurrently.
 ## What it does
 
 When the stored anthropic credential is an OAuth grant, the plugin's auth
-loader installs a custom fetch that rewrites every `/v1/messages` call toward
-the official `api.anthropic.com` endpoint (that scope is what's supported and
-tested):
+loader installs a custom fetch for `/v1/messages` and
+`/v1/messages/count_tokens` calls to the official `api.anthropic.com`
+endpoint:
 
 - `Authorization: Bearer sk-ant-oat01-…` (never `x-api-key`) and
   `?beta=true` on `/v1/messages`
-- `User-Agent: claude-cli/2.1.228 (external, claude-desktop)`, `x-app: cli`,
+- `User-Agent: claude-cli/2.1.228 (external, cli)`, `x-app: cli`,
   a per-invocation `x-client-request-id` (stable across SDK retries of the
   same request, fresh per logical invocation), the Stainless header set, and
   `X-Claude-Code-Session-Id` per session
-- The Claude Code beta profile (`claude-code-20250219`, interleaved thinking,
-  context management, …), chosen per request shape (utility vs agent profile);
+- The Claude Code beta profile (`oauth-2025-04-20`, interleaved thinking,
+  redacted thinking, context management, and related features), chosen per
+  request shape (utility vs agent profile);
   SDK/caller-supplied betas are preserved and deduplicated after it.
   `context-1m-2025-08-07` is always stripped — subscription credentials get
   hard-429'd on beta-gated 1M requests.
 - Body rewrite:
   - `system[0]` = `x-anthropic-billing-header` with the CC version fingerprint,
-    `system[1]` = the Agent SDK instruction (both skipped for claude-3-5-haiku)
+    `system[1]` = `You are Claude Code, Anthropic's official CLI for Claude.`
+    (both skipped for claude-3-5-haiku)
   - `metadata.user_id` = `{device_id, session_id, account_uuid}` JSON envelope
     with a stable per-install device ID; existing valid CC attribution is
     preserved verbatim
@@ -63,6 +77,12 @@ tested):
   model values and omitting `fallbacks`, `fallback_credit_token`, and
   `max_tokens` (seed `0x4d659218e32a3268`, low 20 bits as 5 hex chars), patched
   over the `cch=00000` placeholder
+- Billing state follows a conversation: `cc_prompt_id` remains stable for the
+  same OpenCode message, and the next successful request includes the prior
+  Anthropic `request-id` as `cc_prev_req`
+- Token-count requests use Claude Code's dedicated beta profile and header set,
+  omit `X-Stainless-Timeout`, preserve their body shape apart from tool-name
+  cloaking, and are not response-rewritten
 - Custom tool names are cloaked with a `_` prefix on the way out (definitions,
   `tool_choice`, historical `tool_use` blocks) and stripped back on the way in
   through both streaming SSE (`content_block_start`) and non-streaming JSON
@@ -81,6 +101,10 @@ persisting, the refresh re-checks that the stored
 credential is still the grant it refreshed, so a concurrent logout or new
 login is never overwritten. Rotation means only one winner per credential.
 Rotated tokens are persisted back into OpenCode's auth store before use.
+Token exchanges and refreshes use `https://platform.claude.com/v1/oauth/token`
+with Claude Code's Axios-style headers. Refresh scope excludes
+`org:create_api_key`; login retains it. Missing login identity is recovered
+best-effort from the OAuth profile and Claude CLI roles endpoints.
 
 Auth transitions are handled live: switching to API-key auth or logging out
 while a session runs switches the request path accordingly (no OAuth
@@ -129,14 +153,14 @@ transient only — there is deliberately no second credential store.
 
 - **Best-effort application-layer parity.** The plugin mirrors the headers,
   payload, beta profile, tool-name transport, and `cch` behavior tested against
-  the current oh-my-pi Cowork implementation. It does not reproduce Claude
-  Code's TLS handshake, ALPN, HTTP stack, or every future client release. The
-  pinned Claude Code version/fingerprint constants will need updates as the
-  upstream client changes.
+  Claude Code 2.1.228. It does not reproduce Claude Code's TLS handshake, ALPN,
+  HTTP stack, exact header order, or every future client release. The pinned
+  version and fingerprint constants will need updates as the upstream client
+  changes.
 - **Official endpoint only.** Subscription OAuth cannot be used through custom
   base URLs, enterprise gateways, or signing proxies. Those configurations
   must use API-key auth.
-- **OpenCode owns retry policy.** The plugin does not copy oh-my-pi's custom
+- **OpenCode owns retry policy.** The plugin does not copy Claude Code's custom
   first-event/idle watchdogs, pre-content retry loop, or strict-tool,
   invalid-thinking-signature, and fast-mode recovery paths. Requests use
   OpenCode and the Anthropic SDK's normal retry/error behavior.

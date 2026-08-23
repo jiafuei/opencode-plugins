@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
   ClaudeOAuthPlugin,
   extractIdentity,
-  fetchBootstrapIdentity,
+  fetchOAuthIdentity,
   resolveIdentity,
 } from "./claude_oauth.ts";
 
@@ -12,14 +12,12 @@ const TOKEN_BODY = {
   expires_in: 3600,
 };
 
-const BOOTSTRAP_IDENTITY = {
-  oauth_account: {
-    account_uuid: "bootstrap-account",
-    account_email: "user@example.com",
-    organization_uuid: "bootstrap-org",
-    organization_name: "Acme workspace",
-  },
+const PROFILE_IDENTITY = {
+  account: { uuid: "profile-account", email: "user@example.com" },
+  organization: { uuid: "profile-org" },
 };
+
+const ROLES_IDENTITY = { organization_name: "Acme workspace", organization_role: "admin" };
 
 interface Call {
   url: string;
@@ -39,7 +37,7 @@ function serialTest(name: string, fn: () => Promise<void> | void) {
   });
 }
 
-/** Mock global fetch, routing token vs bootstrap endpoints; returns captured calls. */
+/** Mock global fetch and return captured calls. */
 function mockFetch(responder: (url: string) => Response | Promise<Response>): { calls: Call[]; restore: () => void } {
   const calls: Call[] = [];
   const original = globalThis.fetch;
@@ -56,6 +54,10 @@ function jsonResponse(body: unknown, status = 200): Response {
     status,
     headers: { "content-type": "application/json" },
   });
+}
+
+function identityResponse(url: string): Response {
+  return jsonResponse(url.includes("/roles") ? ROLES_IDENTITY : PROFILE_IDENTITY);
 }
 
 describe("extractIdentity normalization", () => {
@@ -89,44 +91,70 @@ describe("extractIdentity normalization", () => {
 // Serialized: these suites mock globalThis.fetch and drive stateful plugin
 // loaders, so interleaved async tests would see each other's mocks.
 describe("resolveIdentity (login semantics)", () => {
-  serialTest("missing account block: recovers full identity from bootstrap", async () => {
-    const { calls, restore } = mockFetch(() => jsonResponse(BOOTSTRAP_IDENTITY));
+  serialTest("missing account block: recovers full identity from profile and roles", async () => {
+    const { calls, restore } = mockFetch(identityResponse);
     try {
       const identity = await resolveIdentity({ ...TOKEN_BODY }, { includeOrg: true });
       expect(identity).toEqual({
-        accountId: "bootstrap-account",
+        accountId: "profile-account",
         email: "user@example.com",
-        orgId: "bootstrap-org",
+        orgId: "profile-org",
         orgName: "Acme workspace",
       });
-      expect(calls).toHaveLength(1);
-      expect(calls[0]!.url).toBe("https://api.anthropic.com/api/claude_cli/bootstrap?entrypoint=cli&model=claude-opus-4-8");
+      expect(calls.map((call) => call.url)).toEqual([
+        "https://api.anthropic.com/api/oauth/profile",
+        "https://api.anthropic.com/api/oauth/claude_cli/roles",
+      ]);
+      const profileHeaders = new Headers(calls[0]!.init!.headers);
+      expect(profileHeaders.get("authorization")).toBe("Bearer access-1");
+      expect(profileHeaders.get("content-type")).toBe("application/json");
+      expect(profileHeaders.get("cache-control")).toBe("no-cache");
+      expect(profileHeaders.get("accept")).toBe("application/json, text/plain, */*");
+      expect(profileHeaders.get("user-agent")).toBe("axios/1.15.2");
+      const rolesHeaders = new Headers(calls[1]!.init!.headers);
+      expect(rolesHeaders.get("authorization")).toBe("Bearer access-1");
+      expect(rolesHeaders.get("accept")).toBe("application/json, text/plain, */*");
+      expect(rolesHeaders.get("user-agent")).toBe("axios/1.15.2");
     } finally {
       restore();
     }
   });
 
-  serialTest("partial account (uuid present, email missing): bootstrap fills email without touching the token's account id", async () => {
-    const { calls, restore } = mockFetch(() => jsonResponse(BOOTSTRAP_IDENTITY));
+  serialTest("roles failure does not discard a valid profile identity", async () => {
+    const { restore } = mockFetch((url) =>
+      url.includes("/roles") ? Promise.reject(new Error("roles unavailable")) : jsonResponse(PROFILE_IDENTITY),
+    );
+    try {
+      expect(await resolveIdentity({ ...TOKEN_BODY }, { includeOrg: true })).toEqual({
+        accountId: "profile-account",
+        email: "user@example.com",
+        orgId: "profile-org",
+        orgName: undefined,
+      });
+    } finally {
+      restore();
+    }
+  });
+
+  serialTest("partial account: profile fills email without touching the token's account id", async () => {
+    const { calls, restore } = mockFetch(identityResponse);
     try {
       const identity = await resolveIdentity(
         { ...TOKEN_BODY, account: { uuid: "token-account", email_address: "" } },
         { includeOrg: true },
       );
-      // Token response fields win over bootstrap fields.
+      // Token response fields win over profile fields.
       expect(identity.accountId).toBe("token-account");
       expect(identity.email).toBe("user@example.com");
-      expect(identity.orgId).toBe("bootstrap-org");
-      expect(calls).toHaveLength(1);
+      expect(identity.orgId).toBe("profile-org");
+      expect(calls).toHaveLength(2);
     } finally {
       restore();
     }
   });
 
-  serialTest("complete account but missing org: bootstrap is still consulted on login", async () => {
-    const { calls, restore } = mockFetch((url) =>
-      url.includes("/bootstrap") ? jsonResponse(BOOTSTRAP_IDENTITY) : jsonResponse({}),
-    );
+  serialTest("complete account but missing org: profile and roles are still consulted on login", async () => {
+    const { calls, restore } = mockFetch(identityResponse);
     try {
       const identity = await resolveIdentity(
         {
@@ -137,18 +165,17 @@ describe("resolveIdentity (login semantics)", () => {
       );
       expect(identity.accountId).toBe("token-account");
       expect(identity.email).toBe("token@example.com");
-      expect(identity.orgId).toBe("bootstrap-org");
+      expect(identity.orgId).toBe("profile-org");
       expect(identity.orgName).toBe("Acme workspace");
-      expect(calls).toHaveLength(1);
-      expect(calls[0]!.url).toContain("/api/claude_cli/bootstrap");
+      expect(calls).toHaveLength(2);
     } finally {
       restore();
     }
   });
 
-  serialTest("full token identity short-circuits: no bootstrap call at all", async () => {
+  serialTest("full token identity short-circuits: no profile call at all", async () => {
     const { calls, restore } = mockFetch(() => {
-      throw new Error("bootstrap must not be called");
+      throw new Error("profile must not be called");
     });
     try {
       const identity = await resolveIdentity(
@@ -166,8 +193,8 @@ describe("resolveIdentity (login semantics)", () => {
     }
   });
 
-  serialTest("empty-string fields count as incomplete and trigger bootstrap; token values still win", async () => {
-    const { calls, restore } = mockFetch(() => jsonResponse(BOOTSTRAP_IDENTITY));
+  serialTest("empty-string fields trigger profile recovery; token values still win", async () => {
+    const { calls, restore } = mockFetch(identityResponse);
     try {
       const identity = await resolveIdentity(
         {
@@ -177,13 +204,13 @@ describe("resolveIdentity (login semantics)", () => {
         },
         { includeOrg: true },
       );
-      // Empty org uuid makes login incomplete → bootstrap runs; the token
-      // response's non-empty fields (uuid, name "x") still win over bootstrap.
-      expect(calls).toHaveLength(1);
+      // Empty org uuid makes login incomplete, but the token response's
+      // non-empty fields (uuid, name "x") still win over profile recovery.
+      expect(calls).toHaveLength(2);
       expect(identity).toEqual({
         accountId: "token-account",
         email: "user@example.com",
-        orgId: "bootstrap-org",
+        orgId: "profile-org",
         orgName: "x",
       });
     } finally {
@@ -191,14 +218,14 @@ describe("resolveIdentity (login semantics)", () => {
     }
   });
 
-  const bootstrapFailures: [label: string, responder: (url: string) => Response | Promise<Response>][] = [
+  const identityFailures: [label: string, responder: (url: string) => Response | Promise<Response>][] = [
     ["network failure", () => Promise.reject(new Error("ECONNREFUSED"))],
     ["non-OK response", () => jsonResponse({ error: "nope" }, 403)],
     ["malformed JSON", () => jsonResponse("<html>gateway error</html>")],
     ["timeout abort", () => Promise.reject(new DOMException("The operation timed out.", "TimeoutError"))],
   ];
-  for (const [label, responder] of bootstrapFailures) {
-    serialTest(`bootstrap ${label} is strictly best-effort: token-derived identity survives`, async () => {
+  for (const [label, responder] of identityFailures) {
+    serialTest(`profile ${label} is strictly best-effort: token-derived identity survives`, async () => {
       const { calls, restore } = mockFetch(responder);
       try {
         const identity = await resolveIdentity(
@@ -211,15 +238,15 @@ describe("resolveIdentity (login semantics)", () => {
           orgId: undefined,
           orgName: undefined,
         });
-        expect(calls).toHaveLength(1); // bootstrap attempted exactly once
+        expect(calls).toHaveLength(2);
       } finally {
         restore();
       }
     });
   }
 
-  serialTest("bootstrap returning an all-empty oauth_account yields undefined fields, not a crash", async () => {
-    const { restore } = mockFetch(() => jsonResponse({ oauth_account: {} }));
+  serialTest("empty profile and roles responses yield undefined fields, not a crash", async () => {
+    const { restore } = mockFetch(() => jsonResponse({}));
     try {
       const identity = await resolveIdentity({ ...TOKEN_BODY }, { includeOrg: true });
       expect(identity).toEqual({ accountId: undefined, email: undefined, orgId: undefined, orgName: undefined });
@@ -228,11 +255,11 @@ describe("resolveIdentity (login semantics)", () => {
     }
   });
 
-  serialTest("fetchBootstrapIdentity surfaces non-OK and invalid JSON to callers (which swallow them)", async () => {
+  serialTest("fetchOAuthIdentity surfaces profile errors to callers (which swallow them)", async () => {
     {
       const { restore } = mockFetch(() => jsonResponse({}, 500));
       try {
-        await expect(fetchBootstrapIdentity("tok")).rejects.toThrow("500");
+        await expect(fetchOAuthIdentity("tok")).rejects.toThrow("500");
       } finally {
         restore();
       }
@@ -240,16 +267,16 @@ describe("resolveIdentity (login semantics)", () => {
     {
       const { restore } = mockFetch(() => jsonResponse("not json"));
       try {
-        await expect(fetchBootstrapIdentity("tok")).rejects.toThrow();
+        await expect(fetchOAuthIdentity("tok")).rejects.toThrow();
       } finally {
         restore();
       }
     }
   });
 
-  serialTest("refresh path (includeOrg unset): missing org alone does not trigger bootstrap", async () => {
+  serialTest("refresh path (includeOrg unset): missing org alone does not trigger profile recovery", async () => {
     const { calls, restore } = mockFetch(() => {
-      throw new Error("bootstrap must not be called");
+      throw new Error("profile must not be called");
     });
     try {
       const identity = await resolveIdentity({
@@ -322,41 +349,39 @@ describe("refresh accountId preservation", () => {
     });
   }
 
-  serialTest("refresh response with no identity preserves the stored accountId when bootstrap also fails", async () => {
+  serialTest("refresh response with no identity preserves the stored accountId when profile recovery fails", async () => {
     const { persisted, calls } = await runRefreshedFetch(EXPIRED_AUTH, (url) =>
       url.includes("/v1/oauth/token") ? tokenResponse() : jsonResponse({ error: "down" }, 500),
     );
     expect(persisted).toHaveLength(1);
     expect(persisted[0]).toMatchObject({ access: "new-access", refresh: "new-refresh", accountId: "stored-account" });
-    // Bootstrap was attempted once before falling back.
-    expect(calls.filter((c) => c.url.includes("/bootstrap"))).toHaveLength(1);
+    expect(calls.filter((c) => c.url.includes("/api/oauth/"))).toHaveLength(2);
   });
 
-  serialTest("refresh response with empty-string uuid normalizes away and bootstrap fills the gap", async () => {
+  serialTest("refresh response with empty-string uuid normalizes away and profile fills the gap", async () => {
     const { persisted } = await runRefreshedFetch(EXPIRED_AUTH, (url) =>
       url.includes("/v1/oauth/token")
         ? tokenResponse({ account: { uuid: "", email_address: "" } })
-        : jsonResponse(BOOTSTRAP_IDENTITY),
+        : identityResponse(url),
     );
-    // Empty strings normalize away; bootstrap then fills the gap (stored value absent from response).
-    expect(persisted[0]?.accountId).toBe("bootstrap-account");
+    expect(persisted[0]?.accountId).toBe("profile-account");
   });
 
-  serialTest("refresh with null identity AND failed bootstrap keeps stored accountId verbatim", async () => {
+  serialTest("refresh with null identity and failed profile recovery keeps stored accountId verbatim", async () => {
     const { persisted } = await runRefreshedFetch(EXPIRED_AUTH, (url) => {
       if (url.includes("/v1/oauth/token")) return tokenResponse({ account: { uuid: null } });
-      if (url.includes("/bootstrap")) return Promise.reject(new Error("offline"));
+      if (url.includes("/api/oauth/")) return Promise.reject(new Error("offline"));
       return jsonResponse({});
     });
     expect(persisted[0]?.accountId).toBe("stored-account");
   });
 
-  serialTest("refresh with no stored accountId resolves one from bootstrap", async () => {
+  serialTest("refresh with no stored accountId resolves one from profile", async () => {
     const { persisted } = await runRefreshedFetch(
       { type: "oauth", access: "stale-access", refresh: "stale-refresh", expires: Date.now() - 1000 },
-      (url) => (url.includes("/v1/oauth/token") ? tokenResponse() : jsonResponse(BOOTSTRAP_IDENTITY)),
+      (url) => (url.includes("/v1/oauth/token") ? tokenResponse() : identityResponse(url)),
     );
-    expect(persisted[0]?.accountId).toBe("bootstrap-account");
+    expect(persisted[0]?.accountId).toBe("profile-account");
   });
 
   serialTest("refresh response identity wins over the stored accountId when present", async () => {
@@ -367,7 +392,7 @@ describe("refresh accountId preservation", () => {
           organization: { uuid: "rotated-org", name: "New org" },
         });
       }
-      if (url.includes("/bootstrap")) return Promise.reject(new Error("bootstrap must not be called"));
+      if (url.includes("/api/oauth/")) return Promise.reject(new Error("profile must not be called"));
       return jsonResponse({});
     });
     expect(persisted[0]?.accountId).toBe("rotated-account");

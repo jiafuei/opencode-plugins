@@ -138,7 +138,7 @@ describe("origin allowlist", () => {
         expect(message).toMatch(/api[- ]key/i);
         // The bearer token must never appear in the refusal.
         expect(message).not.toContain("test-access-token");
-        // No request — not even the token endpoint or bootstrap — was made.
+        // No request, including token or identity endpoints, was made.
         expect(mock.count()).toBe(0);
       } finally {
         cleanupFetch();
@@ -242,7 +242,7 @@ describe("origin allowlist", () => {
 // ---------------------------------------------------------------------------
 
 describe("API-key transition header stripping", () => {
-  serialTest("transition branch removes session marker, private request id, stale bearer, dummy key, and emits no x-client-request-id", async () => {
+  serialTest("transition branch removes private markers, stale bearer, dummy key, and emits no x-client-request-id", async () => {
     const { authState, options } = await makeHarness();
     authState.value = { type: "api", key: "sk-ant-real-key" };
 
@@ -259,6 +259,7 @@ describe("API-key transition header stripping", () => {
           "content-type": "application/json",
           "X-Claude-Code-Session-Id": "ses-leftover",
           "x-claude-oauth-request-id": "11111111-2222-3333-4444-555555555555",
+          "x-claude-oauth-prompt-id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
           Authorization: "Bearer stale-oauth-token",
           "x-api-key": "opencode-oauth-dummy-key",
         },
@@ -267,6 +268,7 @@ describe("API-key transition header stripping", () => {
 
       expect(capturedHeaders!.get("x-claude-code-session-id")).toBeNull();
       expect(capturedHeaders!.get("x-claude-oauth-request-id")).toBeNull();
+      expect(capturedHeaders!.get("x-claude-oauth-prompt-id")).toBeNull();
       expect(capturedHeaders!.get("x-client-request-id")).toBeNull();
       expect(capturedHeaders!.get("authorization")).toBeNull();
       expect(capturedHeaders!.get("x-api-key")).toBe("sk-ant-real-key");
@@ -297,7 +299,7 @@ describe("token envelope validation", () => {
     const h = await expiredHarness();
     const mock = mockFetch((url) => {
       if (url.includes("/v1/oauth/token")) return jsonResponse({ access_token: "new-access" });
-      if (url.includes("/bootstrap")) throw new Error("bootstrap must not be called");
+      if (url.includes("/api/oauth/")) throw new Error("identity lookup must not be called");
       throw new Error("/v1/messages must not be reached");
     });
     cleanupFetch = mock.restore;
@@ -312,7 +314,7 @@ describe("token envelope validation", () => {
       expect((error as Error).message).not.toContain("new-access");
       expect(h.persisted).toHaveLength(0);
       expect(mock.calls.some((c) => c.url.includes("/v1/messages"))).toBe(false);
-      expect(mock.calls.some((c) => c.url.includes("/bootstrap"))).toBe(false);
+      expect(mock.calls.some((c) => c.url.includes("/api/oauth/"))).toBe(false);
     } finally {
       cleanupFetch();
       cleanupFetch = undefined;
@@ -360,7 +362,7 @@ describe("token envelope validation", () => {
         expect(mock.calls.length).toBe(0);
 
         // With the correct state, the exchange runs and the bad envelope fails
-        // the login. Only the token endpoint was contacted; no identity/bootstrap follow-up.
+        // the login. Only the token endpoint was contacted; no identity follow-up.
         expect(await flow.callback(`some-code#${state}`)).toMatchObject({ type: "failed" });
         expect(mock.calls.length).toBe(1);
         expect(mock.calls[0]!.url).toContain("/v1/oauth/token");
@@ -373,13 +375,13 @@ describe("token envelope validation", () => {
 
   serialTest("login exchange succeeds with a complete envelope", async () => {
     const data = useDataDir();
-    const mock = mockFetch((url) =>
-      url.includes("/bootstrap")
-        ? jsonResponse({
-            oauth_account: { account_uuid: "acct-boot", account_email: "e@x.co", organization_uuid: "org-1", organization_name: "Org" },
-          })
-        : jsonResponse({ access_token: "acc", refresh_token: "ref", expires_in: 3600 }),
-    );
+    const mock = mockFetch((url) => {
+      if (url.includes("/v1/oauth/token")) {
+        return jsonResponse({ access_token: "acc", refresh_token: "ref", expires_in: 3600 });
+      }
+      if (url.includes("/roles")) return jsonResponse({ organization_name: "Org" });
+      return jsonResponse({ account: { uuid: "acct-profile", email: "e@x.co" }, organization: { uuid: "org-1" } });
+    });
     cleanupFetch = mock.restore;
     try {
       const plugin = await ClaudeOAuthPlugin({ client: { auth: { set: async () => {} } } } as never);
