@@ -1,8 +1,15 @@
 import { afterEach, describe, expect, jest, test } from "bun:test";
 import { mkdir, mkdtemp, readdir, rm } from "node:fs/promises";
 import { join } from "node:path";
-import MemoryModule, { indexLine, memoryProjectKey as serverProjectKey, parseIndexLine } from "./memory_server.tsx";
-import MemoryTui, { managedIndexEntries, memoryProjectKey as tuiProjectKey, topicRevision, topicSessionId } from "./memory_tui.tsx";
+import MemoryModule, {
+  dreamDue,
+  indexLine,
+  insightSources,
+  memoryProjectKey as serverProjectKey,
+  parseIndexLine,
+  validateDreamOptions,
+} from "./memory_server.tsx";
+import MemoryTui, { dreamCountsMessage, managedIndexEntries, memoryProjectKey as tuiProjectKey, toggledSettings, topicDreamRunId, topicRevision, topicSessionId } from "./memory_tui.tsx";
 
 const originalDataHome = process.env.XDG_DATA_HOME;
 afterEach(() => {
@@ -13,13 +20,19 @@ afterEach(() => {
 type WorkerCall = { parentID: string; system: string; prompt: string };
 type FakeMessage = { info: { id: string; sessionID: string; role: string }; parts: Array<{ type?: string; id?: string; synthetic?: boolean; text: string }> };
 
-async function fixture(directory: string, respond: (call: WorkerCall) => unknown, options: { interval?: number; idle_delay_ms?: number } = {}) {
+async function fixture(
+  directory: string,
+  respond: (call: WorkerCall) => unknown,
+  options: { interval?: number; idle_delay_ms?: number; dream_interval_hours?: number; dream_min_additions?: number } = {},
+) {
   const calls: WorkerCall[] = [];
+  const creations: unknown[] = [];
   let parentID = "";
   const client = {
     session: {
-      create: async (options: { body: { parentID: string } }) => {
+      create: async (options: { body: { parentID: string; metadata?: unknown } }) => {
         parentID = options.body.parentID;
+        creations.push(options.body.metadata ?? null);
         return { data: { id: crypto.randomUUID() } };
       },
       prompt: async (options: { body: { system: string; parts: { text: string }[] } }) => {
@@ -37,6 +50,7 @@ async function fixture(directory: string, respond: (call: WorkerCall) => unknown
   return {
     hooks,
     calls,
+    creations,
     message: async (sessionID: string, text: string) => {
       const output = { message: { id: crypto.randomUUID() }, parts: [{ type: "text", text }] };
       await hooks["chat.message"]!({ sessionID } as never, output as never);
@@ -78,6 +92,21 @@ const memoryExtraction = (overrides: Partial<Extraction> = {}): Extraction => ({
 const createDecision = (subject: string) => ({ action: "create", target: null, subject });
 const replaceDecision = (target: string, subject: string) => ({ action: "replace", target, subject });
 const saveDecisions = (...items: Array<ReturnType<typeof createDecision> | ReturnType<typeof replaceDecision>>) => ({ decisions: items });
+
+// Builds a seeded topic file body with plugin-owned frontmatter. Revisions
+// must satisfy the server's `[a-f0-9-]+` revision pattern to exercise real
+// parsing paths.
+const seededTopic = (revision: string, body: string, type = "recap") =>
+  `---\nrevision: "${revision}"\ntype: "${type}"\nscope: "project"\nsessionId: "ses_seed"\nupdatedAt: "2026-08-01"\n---\n\n${body}\n`;
+
+// Pre-taxonomy topic: no `type` line at all, so the effective type comes from
+// the server's frontmatter fallback rather than the index.
+const legacyTopic = (revision: string, body: string) =>
+  `---\nrevision: "${revision}"\nscope: "legacy scope"\nsessionId: "ses_seed"\nupdatedAt: "2026-08-01"\n---\n\n${body}\n`;
+
+const workerSystem = (call: WorkerCall | string) => typeof call === "string" ? call : call.system;
+const isDreamSelector = (call: WorkerCall | string) => workerSystem(call).includes("consolidation selector");
+const isDreamCurator = (call: WorkerCall | string) => workerSystem(call).includes("project-memory curator");
 
 async function until(condition: () => boolean | Promise<boolean>) {
   while (!(await condition())) await new Promise<void>((resolve) => setImmediate(resolve));
@@ -128,6 +157,11 @@ describe("memory index lines", () => {
     expect(unknown.metadata.type).toBeUndefined();
     expect(unknown.metadata.scope).toBe("scope");
     expect(unknown.summary).toBe("S");
+
+    // Insights round-trip like any other stored type.
+    const insight = parseIndexLine("- [Pattern](pattern.md) - [insight|project|2026-08-23] Derived pattern")!;
+    expect(insight.metadata).toEqual({ type: "insight", scope: "project", updated: "2026-08-23" });
+    expect(indexLine(insight)).toBe("- [Pattern](pattern.md) - [insight|project|2026-08-23] Derived pattern");
 
     expect(parseIndexLine("- [Nested](nested/e.md) - s")).toBeUndefined();
 
@@ -968,14 +1002,650 @@ describe("memory idle revision gating", () => {
   });
 });
 
+describe("memory dreaming configuration", () => {
+  test("validates dream options and applies defaults", () => {
+    expect(validateDreamOptions({})).toEqual({ intervalHours: 36, minAdditions: 7 });
+    expect(validateDreamOptions({ dream_interval_hours: 0.5, dream_min_additions: 1 })).toEqual({ intervalHours: 0.5, minAdditions: 1 });
+    for (const bad of [
+      { dream_interval_hours: 0 },
+      { dream_interval_hours: -1 },
+      { dream_interval_hours: Number.POSITIVE_INFINITY },
+      { dream_interval_hours: Number.NaN },
+    ]) {
+      expect(() => validateDreamOptions(bad as never)).toThrow("dream_interval_hours");
+    }
+    for (const bad of [{ dream_min_additions: 0 }, { dream_min_additions: -2 }, { dream_min_additions: 1.5 }]) {
+      expect(() => validateDreamOptions(bad as never)).toThrow("dream_min_additions");
+    }
+  });
+
+  test("gates auto dreaming on both the interval window and the minimum additions", () => {
+    const now = 1_000_000_000_000;
+    const options = { intervalHours: 36, minAdditions: 7 };
+    expect(dreamDue(now, { additions: 7, since: now - 36 * 3_600_000 }, options)).toBe(true);
+    // Interval elapsed but too few additions.
+    expect(dreamDue(now, { additions: 6, since: now - 40 * 3_600_000 }, options)).toBe(false);
+    // Enough additions but the window is fresh.
+    expect(dreamDue(now, { additions: 9, since: now - 1 * 3_600_000 }, options)).toBe(false);
+    // A recent failure backs off an otherwise-due run; old failures expire.
+    expect(dreamDue(now, { additions: 9, since: now - 40 * 3_600_000, failAt: now - 60_000 }, options)).toBe(false);
+    expect(dreamDue(now, { additions: 9, since: now - 40 * 3_600_000, failAt: now - 16 * 60_000 }, options)).toBe(true);
+  });
+
+  test("parses insight source fingerprints", () => {
+    const content = '---\nrevision: "r"\ntype: "insight"\nscope: "project"\nsessionId: "s"\nupdatedAt: "2026-08-23"\nsources: ["a.md@rev1","b.md@rev2"]\n---\n\nbody';
+    expect(insightSources(content)).toEqual(["a.md@rev1", "b.md@rev2"]);
+    expect(insightSources('---\nrevision: "r"\n---\nbody')).toEqual([]);
+    expect(insightSources("---\nsources: [broken\n---\n")).toEqual([]);
+  });
+});
+
+describe("memory dream accounting", () => {
+  test.serial("counts ordinary creates and replacements toward dream additions", async () => {
+    const dataHome = await mkdtemp("/tmp/opencode-memory-dream-count-");
+    process.env.XDG_DATA_HOME = dataHome;
+    const directory = "/tmp/memory-dream-count-project";
+    let classifications = 0;
+    const app = await fixture(directory, ({ system }) => {
+      if (system.includes("classifier")) {
+        classifications += 1;
+        return classifications === 1
+          ? saveDecisions(createDecision("a brand new durable rule"))
+          : saveDecisions(replaceDecision("legacy.md", "the established rule"));
+      }
+      return memoryExtraction();
+    });
+    const path = await store(dataHome, directory, [
+      { file: "legacy.md", title: "Legacy", content: seededTopic("deadbee1", "Old body") },
+    ]);
+    await app.message("ses_count", "Load memory.");
+    await app.message("ses_count", "Remember a brand new durable rule.");
+    await app.message("ses_count", "Continue.");
+    await until(() => app.calls.length >= 2);
+    await Bun.sleep(50);
+    await app.message("ses_count", "Apply the update.");
+    await app.message("ses_count", "Make it durable.");
+    const statePath = join(path, ".dream.json");
+    await until(async () => {
+      try {
+        return (await Bun.file(statePath).json() as { additions?: number }).additions === 2;
+      } catch {
+        return false;
+      }
+    });
+    await app.hooks.dispose!();
+
+    const state = await Bun.file(statePath).json();
+    expect(state).toMatchObject({ additions: 2 });
+    await rm(dataHome, { recursive: true, force: true });
+  });
+});
+
+describe("memory auto dreaming", () => {
+  test.serial("initializes additions from the indexed topic count when auto is first enabled", async () => {
+    const dataHome = await mkdtemp("/tmp/opencode-memory-dream-init-");
+    process.env.XDG_DATA_HOME = dataHome;
+    const directory = "/tmp/memory-dream-init-project";
+    const path = await store(dataHome, directory, [
+      { file: "one.md", title: "One", content: seededTopic("aaa1111", "One body") },
+      { file: "two.md", title: "Two", content: seededTopic("bbb2222", "Two body") },
+      { file: "three.md", title: "Three", content: seededTopic("ccc3333", "Three body") },
+    ]);
+    await Bun.write(join(path, "settings.json"), JSON.stringify({ dream_auto: true }));
+    const app = await fixture(directory, () => saveDecisions());
+    await app.message("ses_auto_init", "Use memory.");
+    const statePath = join(path, ".dream.json");
+    await until(async () => Bun.file(statePath).exists());
+    await app.hooks.dispose!();
+
+    const state = await Bun.file(statePath).json();
+    expect(state).toMatchObject({ auto: true, additions: 3 });
+    expect(state.lastRunAt).toBeUndefined();
+    // A fresh window means the very first evaluation never dreams.
+    expect(app.calls.filter(isDreamSelector)).toHaveLength(0);
+    await rm(dataHome, { recursive: true, force: true });
+  });
+
+  test.serial("runs only when both gate conditions hold, and a no-op run resets the counters", async () => {
+    const dataHome = await mkdtemp("/tmp/opencode-memory-dream-gate-");
+    process.env.XDG_DATA_HOME = dataHome;
+    const directory = "/tmp/memory-dream-gate-project";
+    const path = await store(dataHome, directory, [
+      { file: "one.md", title: "One", content: seededTopic("aaa1111", "One body") },
+      { file: "two.md", title: "Two", content: seededTopic("bbb2222", "Two body") },
+    ]);
+    const statePath = join(path, ".dream.json");
+    const statusPath = join(path, ".dream.status");
+    await Bun.write(join(path, "settings.json"), JSON.stringify({ dream_auto: true }));
+    const writeState = (state: Record<string, unknown>) => Bun.write(statePath, JSON.stringify(state));
+    const selectorCalls = (app: Awaited<ReturnType<typeof fixture>>) => app.calls.filter(isDreamSelector).length;
+
+    // Fresh window with enough additions: no run.
+    let app = await fixture(directory, () => saveDecisions());
+    await writeState({ auto: true, additions: 9, since: Date.now() });
+    await app.message("ses_gate_a", "Use memory.");
+    await Bun.sleep(150);
+    expect(selectorCalls(app)).toBe(0);
+    await app.hooks.dispose!();
+
+    // Stale window with too few additions: still no run.
+    app = await fixture(directory, () => saveDecisions());
+    await writeState({ auto: true, additions: 6, since: Date.now() - 40 * 3_600_000 });
+    await app.message("ses_gate_b", "Use memory.");
+    await Bun.sleep(150);
+    expect(selectorCalls(app)).toBe(0);
+    await app.hooks.dispose!();
+
+    // Auto-memory master switch disabled: no run even when due.
+    app = await fixture(directory, () => saveDecisions());
+    await Bun.write(join(path, "settings.json"), JSON.stringify({ enabled: false, dream_auto: true }));
+    await writeState({ auto: true, additions: 9, since: Date.now() - 40 * 3_600_000 });
+    await app.message("ses_gate_c", "Use memory.");
+    await Bun.sleep(150);
+    expect(selectorCalls(app)).toBe(0);
+    await app.hooks.dispose!();
+
+    // Both conditions met: the run happens; a selector "none" is a successful
+    // no-op that resets additions and stamps lastRunAt.
+    app = await fixture(directory, ({ system }) => (isDreamSelector(system) ? { action: "none" } : saveDecisions()));
+    await Bun.write(join(path, "settings.json"), JSON.stringify({ dream_auto: true }));
+    await writeState({ auto: true, additions: 7, since: Date.now() - 37 * 3_600_000 });
+    await app.message("ses_gate_d", "Use memory.");
+    await until(async () => {
+      try {
+        return (await Bun.file(statusPath).json() as { state?: string }).state === "noop";
+      } catch {
+        return false;
+      }
+    });
+    await app.hooks.dispose!();
+
+    const status = await Bun.file(statusPath).json();
+    expect(status.state).toBe("noop");
+    // Decision-only manifests live under .dreams/ keyed by run ID, including
+    // no-op runs.
+    const manifest = await Bun.file(join(path, ".dreams", `${status.runID}.json`)).json();
+    expect(manifest).toMatchObject({ trigger: "auto", model: "test/small", state: "noop", changed: false, actions: [] });
+    const state = await Bun.file(statePath).json();
+    expect(state.additions).toBe(0);
+    expect(typeof state.lastRunAt).toBe("number");
+    expect(selectorCalls(app)).toBe(1);
+    await rm(dataHome, { recursive: true, force: true });
+  });
+});
+
+describe("memory manual dreaming", () => {
+  test.serial("handles a request written after startup without another message", async () => {
+    const dataHome = await mkdtemp("/tmp/opencode-memory-dream-watch-");
+    process.env.XDG_DATA_HOME = dataHome;
+    const directory = "/tmp/memory-dream-watch-project";
+    const path = await store(dataHome, directory, [
+      { file: "x.md", title: "X", content: seededTopic("abc1111", "X body") },
+      { file: "y.md", title: "Y", content: seededTopic("def2222", "Y body") },
+    ]);
+    const app = await fixture(directory, ({ system }) => isDreamSelector(system) ? { action: "none" } : saveDecisions());
+    await app.message("ses_watch", "Initialize the session.");
+    await settle();
+
+    await Bun.write(join(path, ".dream.request"), JSON.stringify({ requestID: "req-watch", sessionID: "ses_watch" }));
+    await until(async () => {
+      const file = Bun.file(join(path, ".dream.status"));
+      return await file.exists() && (await file.json() as { requestID?: string }).requestID === "req-watch";
+    });
+    expect(app.calls.filter(isDreamSelector)).toHaveLength(1);
+
+    await app.hooks.dispose!();
+    await rm(dataHome, { recursive: true, force: true });
+  });
+
+  test.serial("merges, supersedes, and synthesizes across iterations with a decision-only manifest", async () => {
+    const dataHome = await mkdtemp("/tmp/opencode-memory-dream-run-");
+    process.env.XDG_DATA_HOME = dataHome;
+    const directory = "/tmp/memory-dream-run-project";
+    const path = await store(dataHome, directory, [
+      { file: "a.md", title: "Alpha plan", summary: "[recap|project|2026-08-01] Alpha summary", content: seededTopic("aaaa1111", "ALPHA_BODY_ONE shared duplicate fact") },
+      { file: "b.md", title: "Alpha variant", summary: "[recap|project|2026-08-01] Alpha variant summary", content: seededTopic("bbbb2222", "ALPHA_BODY_TWO shared duplicate fact") },
+      { file: "c.md", title: "Gamma outcome", summary: "[recap|project|2026-08-01] Gamma summary", content: seededTopic("cccc3333", "GAMMA_BODY outdated claim") },
+      { file: "d.md", title: "Delta note", summary: "[recap|project|2026-08-01] Delta summary", content: seededTopic("dddd4444", "DELTA_BODY stable note") },
+    ]);
+    await Bun.write(join(path, ".dream.request"), JSON.stringify({ requestID: "req-big", sessionID: "ses_dreamer" }));
+
+    const findPrefix = async (prefix: string) => (await readdir(path)).find((name) => name.startsWith(prefix))!;
+    const selectorPrompts: string[] = [];
+    const curatorPrompts: string[] = [];
+    let selections = 0;
+    let curations = 0;
+    const app = await fixture(directory, async ({ system, prompt }) => {
+      if (isDreamSelector(system)) {
+        selectorPrompts.push(prompt);
+        selections += 1;
+        if (selections === 1) return { action: "merge", files: ["a.md", "b.md"], reason: "duplicate alpha recaps" };
+        if (selections === 2) return { action: "supersede", files: [await findPrefix("merged-alpha-"), "c.md"], reason: "corrected gamma outcome" };
+        if (selections === 3) return { action: "synthesize", files: [await findPrefix("superseding-gamma-"), "d.md"], reason: "shared stable pattern" };
+        return { action: "none" };
+      }
+      if (isDreamCurator(system)) {
+        curatorPrompts.push(prompt);
+        curations += 1;
+        if (curations === 1) return memoryExtraction({ title: "Merged alpha" });
+        if (curations === 2) return memoryExtraction({ title: "Superseding gamma" });
+        return memoryExtraction({ title: "Cross-topic insight" });
+      }
+      return saveDecisions();
+    });
+
+    await app.message("ses_witness", "Start dreaming.");
+    await until(async () => {
+      try {
+        return (await Bun.file(join(path, ".dream.status")).json() as { state?: string }).state === "changed";
+      } catch {
+        return false;
+      }
+    });
+    await app.hooks.dispose!();
+
+    const status = await Bun.file(join(path, ".dream.status")).json();
+    const manifest = await Bun.file(join(path, ".dreams", `${status.runID}.json`)).json();
+    const merged = manifest.actions[0].output.file as string;
+    const superseded = manifest.actions[1].output.file as string;
+    const insight = manifest.actions[2].output.file as string;
+    const names = await readdir(path);
+    expect(superseded && insight).toBeTruthy();
+    // Merge and supersede removed their sources; synthesis kept d.md.
+    for (const gone of ["a.md", "b.md", "c.md"]) expect(names).not.toContain(gone);
+    expect(names).toContain("d.md");
+
+    const index = await Bun.file(join(path, "index.md")).text();
+    expect(index).toContain("(d.md)");
+    expect(index).not.toContain(`(${merged})`);
+    expect(index).toContain(`(${superseded})`);
+    expect(index).toContain(`(${insight})`);
+    for (const gone of ["(a.md)", "(b.md)", "(c.md)"]) expect(index).not.toContain(gone);
+    expect(index).toMatch(new RegExp(`- \\[Cross-topic insight\\]\\(${insight}\\) - \\[insight\\|project\\|\\d{4}-\\d{2}-\\d{2}\\] A durable project outcome\\.`));
+
+    const insightContent = await Bun.file(join(path, insight)).text();
+    expect(insightContent).toContain('type: "insight"');
+    expect(insightContent).toContain('sessionId: "ses_dreamer"');
+    // Dream outputs carry the plugin-owned run marker used by the TUI.
+    expect(topicDreamRunId(insightContent)).toMatch(/^[0-9a-f-]{20,}$/);
+    const sources = insightSources(insightContent);
+    expect(sources).toEqual([
+      `${superseded}@${(await Bun.file(join(path, superseded)).text()).match(/revision: "([^"]+)"/)![1]!}`,
+      "d.md@dddd4444",
+    ]);
+
+    // The manifest records trigger, model, timestamps, per-action sources with
+    // revisions, output metadata, and the model's reason. No old content.
+    expect(status.requestID).toBe("req-big");
+    expect(status.state).toBe("changed");
+    expect(status.counts).toEqual({ merge: 1, supersede: 1, synthesize: 1 });
+    expect(manifest.trigger).toBe("manual");
+    expect(manifest.model).toBe("test/small");
+    expect(manifest.sessionID).toBe("ses_dreamer");
+    expect(manifest.state).toBe("changed");
+    expect(manifest.changed).toBe(true);
+    expect(manifest.startedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+    expect(manifest.finishedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+    expect(manifest.actions).toHaveLength(3);
+    expect(manifest.actions[0]).toEqual({
+      action: "merge",
+      reason: "duplicate alpha recaps",
+      sources: [{ file: "a.md", revision: "aaaa1111" }, { file: "b.md", revision: "bbbb2222" }],
+      output: { file: merged, revision: expect.any(String), title: "Merged alpha", type: "recap" },
+    });
+    expect(manifest.actions[1].action).toBe("supersede");
+    expect(manifest.actions[1].sources).toEqual([{ file: merged, revision: manifest.actions[0].output.revision }, { file: "c.md", revision: "cccc3333" }]);
+    expect(manifest.actions[2]).toEqual({
+      action: "synthesize",
+      reason: "shared stable pattern",
+      sources: [{ file: superseded, revision: manifest.actions[1].output.revision }, { file: "d.md", revision: "dddd4444" }],
+      output: { file: insight, revision: expect.any(String), title: "Cross-topic insight", type: "insight" },
+    });
+    expect(JSON.stringify(manifest)).not.toContain("ALPHA_BODY");
+
+    expect(await Bun.file(join(path, ".dream.request")).exists()).toBe(false);
+
+    // A successful run keeps additions added during the run and stamps
+    // lastRunAt; dream writes themselves never counted.
+    const state = await Bun.file(join(path, ".dream.json")).json();
+    expect(state.additions).toBe(0);
+    expect(typeof state.lastRunAt).toBe("number");
+
+    // All dream workers carry the dream activity marker.
+    for (const metadata of app.creations) {
+      expect(metadata).toEqual({ memoryWorker: true, memoryActivity: "dream" });
+    }
+
+    // The selector receives the complete candidate index inside its untrusted
+    // framing, evolving across iterations as transformations are applied.
+    expect(selectorPrompts[0]).toContain("(a.md)");
+    expect(selectorPrompts[0]).toContain("<candidate_index>\n");
+    expect(selectorPrompts[0].endsWith("</candidate_index>")).toBe(true);
+    expect(selectorPrompts[0]).toContain("untrusted data");
+    expect(selectorPrompts[0]).toContain("Age or recency alone never justifies an action");
+    expect(selectorPrompts[1]).toContain(`(${merged})`);
+    expect(selectorPrompts[1]).toContain("(c.md)");
+    expect(selectorPrompts[1]).not.toContain("(a.md)");
+    expect(selectorPrompts[1]).not.toContain("(b.md)");
+    expect(selectorPrompts[1]).not.toContain("ALPHA_BODY");
+    expect(selectorPrompts[2]).toContain(`(${superseded})`);
+    expect(selectorPrompts[2]).toContain("(d.md)");
+    expect(selectorPrompts[2]).not.toContain(`(${merged})`);
+
+    // The curator receives the operation prompt plus the complete selected
+    // topic files.
+    expect(curatorPrompts[0]).toContain("Combine the supplied memory topics");
+    expect(curatorPrompts[0]).toContain('<memory_file path="a.md">');
+    expect(curatorPrompts[0]).toContain('<memory_file path="b.md">');
+    expect(curatorPrompts[0]).toContain("ALPHA_BODY_ONE");
+    expect(curatorPrompts[0]).toContain("</memory_file>");
+    expect(curatorPrompts[1]).toContain("Replace the supplied memory topics");
+    expect(curatorPrompts[2]).toContain("Derive exactly one new concise insight");
+    expect(curatorPrompts[2]).toContain("The parser migration shipped and the focused suite passes.");
+    expect(curatorPrompts[2]).toContain("DELTA_BODY");
+    expect(curatorPrompts[2]).toContain("non-authoritative");
+    await rm(dataHome, { recursive: true, force: true });
+  });
+
+  test.serial("aborts a stale run without resetting the counters but keeps its manifest", async () => {
+    const dataHome = await mkdtemp("/tmp/opencode-memory-dream-stale-");
+    process.env.XDG_DATA_HOME = dataHome;
+    const directory = "/tmp/memory-dream-stale-project";
+    const path = await store(dataHome, directory, [
+      { file: "x.md", title: "X topic", summary: "[recap|project|2026-08-01] X summary", content: seededTopic("abc1234", "X_SHARED_BODY") },
+      { file: "y.md", title: "Y topic", summary: "[recap|project|2026-08-01] Y summary", content: seededTopic("def5678", "Y_SHARED_BODY") },
+    ]);
+    await Bun.write(join(path, ".dream.request"), JSON.stringify({ requestID: "req-stale", sessionID: "ses_dreamer" }));
+    await Bun.write(join(path, ".dream.json"), JSON.stringify({ auto: true, additions: 3, since: Date.now() }));
+
+    const started = Promise.withResolvers<void>();
+    const gate = Promise.withResolvers<Extraction>();
+    const app = await fixture(directory, ({ system }) => {
+      if (isDreamSelector(system)) return { action: "merge", files: ["x.md", "y.md"], reason: "duplicate topics" };
+      if (isDreamCurator(system)) {
+        started.resolve();
+        return gate.promise;
+      }
+      return saveDecisions();
+    });
+
+    await app.message("ses_stale", "Start dreaming.");
+    await started.promise;
+    // One source mutates on disk while the executor runs: the commit must
+    // detect the stale snapshot and abort the whole run.
+    await Bun.write(join(path, "x.md"), seededTopic("abc4567", "X_MUTATED_BODY"));
+    gate.resolve(memoryExtraction({ title: "Merged xy" }));
+    const statusPath = join(path, ".dream.status");
+    await until(async () => {
+      try {
+        return (await Bun.file(statusPath).json() as { state?: string }).state === "failed";
+      } catch {
+        return false;
+      }
+    });
+    await app.hooks.dispose!();
+
+    const status = await Bun.file(statusPath).json();
+    expect(status.requestID).toBe("req-stale");
+    expect(status.message).toContain("changed");
+    // Failed runs still get a decision-only audit manifest with no actions.
+    const manifest = await Bun.file(join(path, ".dreams", `${status.runID}.json`)).json();
+    expect(manifest.state).toBe("failed");
+    expect(manifest.changed).toBe(false);
+    expect(manifest.actions).toEqual([]);
+    expect(manifest.error).toContain("changed");
+    expect(await Bun.file(join(path, "x.md")).text()).toContain("X_MUTATED_BODY");
+    expect(await Bun.file(join(path, "y.md")).text()).toContain("Y_SHARED_BODY");
+    const index = await Bun.file(join(path, "index.md")).text();
+    expect(index).toContain("(x.md)");
+    expect(index).toContain("(y.md)");
+    // Failed runs keep their progress and record a backoff timestamp instead.
+    const state = await Bun.file(join(path, ".dream.json")).json();
+    expect(state.additions).toBe(3);
+    expect(state.lastRunAt).toBeUndefined();
+    expect(typeof state.failAt).toBe("number");
+    expect(await Bun.file(join(path, ".dream.request")).exists()).toBe(false);
+    await rm(dataHome, { recursive: true, force: true });
+  });
+
+  test.serial("serializes concurrent instances through the separate dream lock", async () => {
+    const dataHome = await mkdtemp("/tmp/opencode-memory-dream-lock-");
+    process.env.XDG_DATA_HOME = dataHome;
+    const directory = "/tmp/memory-dream-lock-project";
+    const path = await store(dataHome, directory, [
+      { file: "x.md", title: "X topic", summary: "[recap|project|2026-08-01] X summary", content: seededTopic("abc1111", "X_LOCK_BODY") },
+      { file: "y.md", title: "Y topic", summary: "[recap|project|2026-08-01] Y summary", content: seededTopic("def2222", "Y_LOCK_BODY") },
+    ]);
+    const statusPath = join(path, ".dream.status");
+    const readStatus = async () => {
+      const file = Bun.file(statusPath);
+      return await file.exists() ? file.json() : undefined;
+    };
+
+    const started = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const first = await fixture(directory, ({ system }) => {
+      if (isDreamSelector(system)) {
+        started.resolve();
+        return release.promise.then(() => ({ action: "none" }));
+      }
+      return saveDecisions();
+    });
+    const second = await fixture(directory, ({ system }) => {
+      if (isDreamSelector(system)) return { action: "none" };
+      return saveDecisions();
+    });
+
+    await Bun.write(join(path, ".dream.request"), JSON.stringify({ requestID: "req-lock-1", sessionID: "ses_lock" }));
+    await first.message("ses_first", "Go.");
+    await started.promise;
+
+    // A second server process must skip while the dream lock is held, leaving
+    // the request file untouched for a later tick.
+    await Bun.write(join(path, ".dream.request"), JSON.stringify({ requestID: "req-lock-2", sessionID: "ses_lock" }));
+    await second.message("ses_second", "Go.");
+    await Bun.sleep(150);
+    expect(second.calls.filter(isDreamSelector)).toHaveLength(0);
+    expect(await Bun.file(join(path, ".dream.request")).exists()).toBe(true);
+
+    release.resolve();
+    // The first instance rechecks after releasing its run, so the request that
+    // arrived while locked is handled promptly without another message.
+    await until(async () => (await readStatus())?.requestID === "req-lock-2");
+    expect(first.calls.filter(isDreamSelector).length + second.calls.filter(isDreamSelector).length).toBe(2);
+    await Promise.all([first.hooks.dispose!(), second.hooks.dispose!()]);
+    await rm(dataHome, { recursive: true, force: true });
+  });
+
+  test.serial("broadcasts upsert and tombstone deltas to all live sessions", async () => {
+    const dataHome = await mkdtemp("/tmp/opencode-memory-delta-dream-");
+    process.env.XDG_DATA_HOME = dataHome;
+    const directory = "/tmp/memory-dream-delta-project";
+    const path = await store(dataHome, directory, [
+      { file: "x.md", title: "X topic", summary: "[recap|project|2026-08-01] X summary", content: seededTopic("abc1111", "X_DELTA_BODY") },
+      { file: "y.md", title: "Y topic", summary: "[recap|project|2026-08-01] Y summary", content: seededTopic("def2222", "Y_DELTA_BODY") },
+    ]);
+    const app = await fixture(directory, ({ system }) => {
+      if (isDreamSelector(system)) return { action: "merge", files: ["x.md", "y.md"], reason: "duplicate topics" };
+      if (isDreamCurator(system)) return memoryExtraction({ title: "Unified story" });
+      return saveDecisions();
+    });
+
+    // Two live sessions first, so their delta queues exist before the dream.
+    await app.message("ses_one", "One.");
+    await app.message("ses_two", "Two.");
+    await Bun.write(join(path, ".dream.request"), JSON.stringify({ requestID: "req-broadcast", sessionID: "ses_three" }));
+    await app.message("ses_three", "Three.");
+    await until(async () => {
+      try {
+        return (await Bun.file(join(path, ".dream.status")).json() as { state?: string }).state === "changed";
+      } catch {
+        return false;
+      }
+    });
+    await app.hooks.dispose!();
+
+    const transform = (messages: FakeMessage[]) => app.hooks["experimental.chat.messages.transform"]!({} as never, { messages } as never);
+    for (const sessionID of ["ses_one", "ses_two", "ses_three"]) {
+      const message: FakeMessage = { info: { id: `msg-${sessionID}`, sessionID, role: "user" }, parts: [{ type: "text", text: "next" }] };
+      await transform([message]);
+      expect(message.parts).toHaveLength(2);
+      const part = message.parts[1]!;
+      expect(part.synthetic).toBe(true);
+      expect(part.text).toContain("- [Unified story](");
+      expect(part.text).toContain("Removed topics: x.md, y.md");
+      expect(part.text).toContain("Discard any cached references");
+    }
+    await rm(dataHome, { recursive: true, force: true });
+  });
+
+  test.serial("cleans up legacy same-type topics using frontmatter types without promotion", async () => {
+    const dataHome = await mkdtemp("/tmp/opencode-memory-dream-legacy-");
+    process.env.XDG_DATA_HOME = dataHome;
+    const directory = "/tmp/memory-dream-legacy-project";
+    // Untyped frontmatter and untyped index lines: the effective type comes
+    // from the topic bodies (defaulting to project), not index metadata.
+    const path = await store(dataHome, directory, [
+      { file: "old-a.md", title: "Old A", summary: "Old A summary", content: legacyTopic("aaa9999", "OLD_A_BODY stale variant") },
+      { file: "old-b.md", title: "Old B", summary: "Old B summary", content: legacyTopic("bbb8888", "OLD_B_BODY stale variant") },
+    ]);
+    await Bun.write(join(path, ".dream.request"), JSON.stringify({ requestID: "req-legacy", sessionID: "ses_dreamer" }));
+    const app = await fixture(directory, ({ system }) => {
+      if (isDreamSelector(system)) return { action: "merge", files: ["old-a.md", "old-b.md"], reason: "legacy duplicates" };
+      if (isDreamCurator(system)) return memoryExtraction({ title: "Merged legacy" });
+      return saveDecisions();
+    });
+
+    await app.message("ses_legacy", "Start dreaming.");
+    await until(async () => {
+      try {
+        return (await Bun.file(join(path, ".dream.status")).json() as { state?: string }).state === "changed";
+      } catch {
+        return false;
+      }
+    });
+    await app.hooks.dispose!();
+
+    const names = await readdir(path);
+    for (const gone of ["old-a.md", "old-b.md"]) expect(names).not.toContain(gone);
+    const merged = names.find((name) => name.startsWith("merged-legacy-"))!;
+    const mergedContent = await Bun.file(join(path, merged)).text();
+    // The retired type is preserved as-is, never promoted.
+    expect(mergedContent).toContain('type: "project"');
+    const manifest = await Bun.file(join(path, ".dreams", `${(await Bun.file(join(path, ".dream.status")).json()).runID}.json`)).json();
+    expect(manifest.actions[0].output.type).toBe("project");
+    // The selector saw the effective types rendered for legacy entries.
+    expect(app.calls.find(isDreamSelector)!.prompt).toContain("[project|project|2026-08-01]");
+    await rm(dataHome, { recursive: true, force: true });
+  });
+
+  test.serial("keeps additions recorded while a dream was running", async () => {
+    const dataHome = await mkdtemp("/tmp/opencode-memory-dream-keep-");
+    process.env.XDG_DATA_HOME = dataHome;
+    const directory = "/tmp/memory-dream-keep-project";
+    const path = await store(dataHome, directory, [
+      { file: "x.md", title: "X topic", summary: "[recap|project|2026-08-01] X summary", content: seededTopic("abc1111", "X_KEEP_BODY") },
+      { file: "y.md", title: "Y topic", summary: "[recap|project|2026-08-01] Y summary", content: seededTopic("def2222", "Y_KEEP_BODY") },
+    ]);
+    await Bun.write(join(path, ".dream.request"), JSON.stringify({ requestID: "req-keep", sessionID: "ses_dreamer" }));
+    await Bun.write(join(path, ".dream.json"), JSON.stringify({ auto: true, additions: 4, since: Date.now() }));
+
+    const curatorGate = Promise.withResolvers<Extraction>();
+    const curatorStarted = Promise.withResolvers<void>();
+    let classifications = 0;
+    const app = await fixture(directory, ({ system }) => {
+      if (isDreamSelector(system)) return { action: "merge", files: ["x.md", "y.md"], reason: "duplicate topics" };
+      if (isDreamCurator(system)) {
+        curatorStarted.resolve();
+        return curatorGate.promise;
+      }
+      if (system.includes("classifier")) {
+        classifications += 1;
+        return saveDecisions(createDecision("a rule saved during the dream"));
+      }
+      return memoryExtraction();
+    });
+
+    await app.message("ses_keep", "Start dreaming.");
+    await curatorStarted.promise;
+    // An ordinary checkpoint save commits while the dream is parked mid-run.
+    await app.message("ses_keep", "Remember something during the dream.");
+    await app.message("ses_keep", "Second turn.");
+    await until(() => classifications >= 1);
+    await until(async () => {
+      try {
+        return ((await Bun.file(join(path, ".dream.json")).json()) as { additions?: number }).additions === 5;
+      } catch {
+        return false;
+      }
+    });
+    curatorGate.resolve(memoryExtraction({ title: "Merged keep" }));
+    await until(async () => {
+      try {
+        return (await Bun.file(join(path, ".dream.status")).json() as { state?: string }).state === "changed";
+      } catch {
+        return false;
+      }
+    });
+    await app.hooks.dispose!();
+
+    // Only the pre-dream baseline (4) is subtracted; the concurrent save (+1)
+    // survives completion.
+    const state = await Bun.file(join(path, ".dream.json")).json();
+    expect(state.additions).toBe(1);
+    expect(typeof state.lastRunAt).toBe("number");
+    await rm(dataHome, { recursive: true, force: true });
+  });
+
+  test.serial("fails a manual request while memory is disabled and stays silent for auto", async () => {
+    const dataHome = await mkdtemp("/tmp/opencode-memory-dream-off-");
+    process.env.XDG_DATA_HOME = dataHome;
+    const directory = "/tmp/memory-dream-off-project";
+    const path = await store(dataHome, directory, [
+      { file: "x.md", title: "X topic", summary: "[recap|project|2026-08-01] X summary", content: seededTopic("abc1111", "X_OFF_BODY") },
+      { file: "y.md", title: "Y topic", summary: "[recap|project|2026-08-01] Y summary", content: seededTopic("def2222", "Y_OFF_BODY") },
+    ]);
+    await Bun.write(join(path, "settings.json"), JSON.stringify({ enabled: false }));
+    const app = await fixture(directory, () => saveDecisions());
+
+    // Manual: explicit failure status naming the disabled store; no mutation.
+    await Bun.write(join(path, ".dream.request"), JSON.stringify({ requestID: "req-off", sessionID: "ses_off" }));
+    await app.message("ses_off", "Trigger manual dream.");
+    await until(async () => {
+      try {
+        return (await Bun.file(join(path, ".dream.status")).json() as { state?: string }).state === "failed";
+      } catch {
+        return false;
+      }
+    });
+    const status = await Bun.file(join(path, ".dream.status")).json();
+    expect(status.message).toContain("disabled");
+    expect(await Bun.file(join(path, "x.md")).exists()).toBe(true);
+    expect(await Bun.file(join(path, ".dream.request")).exists()).toBe(false);
+    await app.hooks.dispose!();
+    await rm(dataHome, { recursive: true, force: true });
+  });
+});
+
 type Toast = { variant?: string; title?: string; message: string };
 
-async function tuiFixture(directory: string) {
+async function tuiFixture(
+  directory: string,
+  options: { route?: { name: string; params?: Record<string, unknown> } } = {},
+) {
   const toasts: Toast[] = [];
   const handlers = new Map<string, Array<(event: never) => void>>();
   const disposers: Array<() => void | Promise<void>> = [];
+  const layers: Array<{ commands: Array<Record<string, unknown>> }> = [];
+  let dialogSelect: { options?: unknown; onSelect?: (option: { value: unknown }) => void } | undefined;
+  const route = options.route ?? { name: "home" };
   const api = {
-    keymap: { registerLayer: () => {} },
+    keymap: { registerLayer: (layer: { commands: Array<Record<string, unknown>> }) => layers.push(layer) },
+    route: {
+      get current() {
+        return route;
+      },
+    },
     event: {
       on: (type: string, handler: (event: never) => void) => {
         const list = handlers.get(type) ?? handlers.set(type, []).get(type)!;
@@ -992,12 +1662,33 @@ async function tuiFixture(directory: string) {
         return () => {};
       },
     },
-    ui: { toast: (toast: Toast) => toasts.push(toast) },
+    ui: {
+      DialogSelect: (props: { options?: unknown; onSelect?: (option: { value: unknown }) => void }) => {
+        dialogSelect = props;
+        return props;
+      },
+      dialog: {
+        replace: (render: () => { options?: unknown; onSelect?: (option: { value: unknown }) => void }) => {
+          dialogSelect = render();
+        },
+      },
+      toast: (toast: Toast) => toasts.push(toast),
+    },
     state: { path: { directory } },
   };
   await MemoryTui.tui(api as never, undefined as never, {} as never);
   return {
     toasts,
+    layers,
+    command: (slashName: string) => {
+      const command = layers.flatMap((layer) => layer.commands).find((item) => item.slashName === slashName) as { run?: () => void } | undefined;
+      command?.run?.();
+    },
+    select: (value: unknown) => {
+      if (!dialogSelect?.onSelect) return false;
+      dialogSelect.onSelect({ value });
+      return true;
+    },
     sessionCreated: (info: { id: string; parentID?: string; metadata?: Record<string, unknown> }) => {
       for (const handler of [...handlers.get("session.created") ?? []]) {
         handler({ properties: { sessionID: info.id, info } } as never);
@@ -1022,10 +1713,103 @@ describe("memory tui parsing helpers", () => {
     expect(topicSessionId("no frontmatter")).toBeUndefined();
     expect(topicRevision('---\nrevision: "abc123"\nsessionId: "ses_x"\n---\n')).toBe("abc123");
     expect(topicRevision("no frontmatter")).toBeUndefined();
+    expect(topicDreamRunId('---\ndreamRunId: "run-1"\n---\n')).toBe("run-1");
+    expect(topicDreamRunId("no frontmatter")).toBeUndefined();
+
+    expect(JSON.parse(toggledSettings({ enabled: true, custom: 3 }, "dream_auto"))).toEqual({ enabled: true, custom: 3, dream_auto: true });
+    expect(JSON.parse(toggledSettings({ enabled: false, dream_auto: true }, "enabled"))).toEqual({ enabled: true, dream_auto: true });
+    expect(dreamCountsMessage({ merge: 1, supersede: 2, synthesize: 1 })).toBe("1 merged, 2 superseded, 1 insight");
   });
 });
 
 describe("memory tui notifications", () => {
+  test.serial("registers /dream and writes a session-scoped request", async () => {
+    const dataHome = await mkdtemp("/tmp/opencode-memory-tui-dream-command-");
+    process.env.XDG_DATA_HOME = dataHome;
+    const directory = "/tmp/memory-tui-dream-command";
+    const memoryDirectory = join(dataHome, "opencode", "memory", tuiProjectKey(directory));
+    const app = await tuiFixture(directory, { route: { name: "session", params: { sessionID: "ses_manual" } } });
+
+    app.command("dream");
+    const requestPath = join(memoryDirectory, ".dream.request");
+    await until(async () => Bun.file(requestPath).exists());
+    const request = await Bun.file(requestPath).json();
+    expect(request.sessionID).toBe("ses_manual");
+    expect(typeof request.requestID).toBe("string");
+    expect(app.toasts.some((toast) => toast.message === "Dreaming...")).toBe(true);
+
+    await app.dispose();
+    await rm(dataHome, { recursive: true, force: true });
+  });
+
+  test.serial("preserves settings when automatic dreaming is toggled", async () => {
+    const dataHome = await mkdtemp("/tmp/opencode-memory-tui-dream-toggle-");
+    process.env.XDG_DATA_HOME = dataHome;
+    const directory = "/tmp/memory-tui-dream-toggle";
+    const memoryDirectory = join(dataHome, "opencode", "memory", tuiProjectKey(directory));
+    await mkdir(memoryDirectory, { recursive: true });
+    const settingsPath = join(memoryDirectory, "settings.json");
+    await Bun.write(settingsPath, JSON.stringify({ enabled: false, custom: "keep" }));
+    const app = await tuiFixture(directory);
+
+    app.command("memory");
+    await until(() => app.select({ type: "dreamToggle", enabled: false }));
+    await until(async () => (await Bun.file(settingsPath).json() as { dream_auto?: boolean }).dream_auto === true);
+    expect(await Bun.file(settingsPath).json()).toEqual({ enabled: false, custom: "keep", dream_auto: true });
+
+    await app.dispose();
+    await rm(dataHome, { recursive: true, force: true });
+  });
+
+  test.serial("toasts one changed dream and suppresses its per-topic save", async () => {
+    const dataHome = await mkdtemp("/tmp/opencode-memory-tui-dream-status-");
+    process.env.XDG_DATA_HOME = dataHome;
+    const directory = "/tmp/memory-tui-dream-status";
+    const memoryDirectory = join(dataHome, "opencode", "memory", tuiProjectKey(directory));
+    await mkdir(memoryDirectory, { recursive: true });
+    await Bun.write(join(memoryDirectory, "index.md"), "# Project memory\n");
+    const app = await tuiFixture(directory, { route: { name: "session", params: { sessionID: "ses_parent" } } });
+    app.command("dream");
+    const requestPath = join(memoryDirectory, ".dream.request");
+    await until(async () => Bun.file(requestPath).exists());
+    const request = await Bun.file(requestPath).json();
+    app.sessionCreated({ id: "ses_dream_worker", parentID: "ses_parent", metadata: { memoryWorker: true, memoryActivity: "dream" } });
+
+    await Bun.write(join(memoryDirectory, "dreamed.md"), '---\nrevision: "abc123"\nsessionId: "ses_parent"\ndreamRunId: "run-new"\n---\n\nbody\n');
+    await Bun.write(join(memoryDirectory, "index.md"), "# Project memory\n\n- [Dreamed](dreamed.md) - Dreamed summary\n");
+    await Bun.write(join(memoryDirectory, ".dream.status"), JSON.stringify({
+      requestID: request.requestID,
+      runID: "run-new",
+      state: "changed",
+      counts: { merge: 1, supersede: 0, synthesize: 0 },
+    }));
+    await until(() => app.toasts.some((toast) => toast.message === "Dream complete: 1 merged"));
+    await Bun.sleep(400);
+    expect(app.toasts.some((toast) => toast.message === "Saved: Dreamed")).toBe(false);
+    expect(app.toasts.filter((toast) => toast.message.startsWith("Dream complete:"))).toHaveLength(1);
+
+    await app.dispose();
+    await rm(dataHome, { recursive: true, force: true });
+  });
+
+  test.serial("does not replay a persisted dream status in a new TUI", async () => {
+    const dataHome = await mkdtemp("/tmp/opencode-memory-tui-dream-stale-status-");
+    process.env.XDG_DATA_HOME = dataHome;
+    const directory = "/tmp/memory-tui-dream-stale-status";
+    const memoryDirectory = join(dataHome, "opencode", "memory", tuiProjectKey(directory));
+    await mkdir(memoryDirectory, { recursive: true });
+    await Bun.write(join(memoryDirectory, "index.md"), "# Project memory\n");
+    await Bun.write(join(memoryDirectory, ".dream.status"), JSON.stringify({ runID: "old-run", state: "changed", counts: { merge: 1 } }));
+    const app = await tuiFixture(directory);
+
+    await Bun.write(join(memoryDirectory, "index.md"), "# Project memory\n\n");
+    await Bun.sleep(500);
+    expect(app.toasts.some((toast) => toast.message.startsWith("Dream complete:"))).toBe(false);
+
+    await app.dispose();
+    await rm(dataHome, { recursive: true, force: true });
+  });
+
   test.serial("toasts one review per classifier and saves only for observed worker parents", async () => {
     const dataHome = await mkdtemp("/tmp/opencode-memory-tui-");
     process.env.XDG_DATA_HOME = dataHome;
