@@ -155,6 +155,7 @@ describe("memory persistence", () => {
     ];
     let worker = 0;
     const workerPrompts: string[] = [];
+    const workerSystems: string[] = [];
     const workerMetadata: unknown[] = [];
     const client = {
       session: {
@@ -162,7 +163,8 @@ describe("memory persistence", () => {
           workerMetadata.push(options.body.metadata);
           return { data: { id: `worker-${worker}` } };
         },
-        prompt: async (options: { body: { parts: { text: string }[] } }) => {
+        prompt: async (options: { body: { system: string; parts: { text: string }[] } }) => {
+          workerSystems.push(options.body.system);
           workerPrompts.push(options.body.parts[0]!.text);
           return { data: { info: { structured: structured[worker++] } } };
         },
@@ -219,9 +221,12 @@ describe("memory persistence", () => {
     expect(workerPrompts[0]).not.toContain("SUCCESS_EVIDENCE");
     expect(workerPrompts[0]).not.toContain("READ_EVIDENCE");
     expect(workerPrompts[0]).not.toContain("FAILED_EVIDENCE");
+    expect(workerPrompts[0]).toContain("Recaps are only for completed tasks.");
+    expect(workerPrompts[0]).toContain("questions and answers");
     // Extraction is constrained to the decision subject.
     expect(workerPrompts[1]).toContain("<subject>");
     expect(workerPrompts[1]).toContain("confirmed focused test approach");
+    expect(workerSystems[1]).toContain("concretely completed task");
     expect(workerMetadata[0]).toEqual({ memoryWorker: true, memoryActivity: "classification" });
     expect(workerMetadata[1]).toEqual({ memoryWorker: true, memoryActivity: "extraction" });
     await rm(dataHome, { recursive: true, force: true });
@@ -427,6 +432,8 @@ describe("memory persistence", () => {
     // Typed index lines round-trip with their metadata prefix intact.
     expect(output.system[0]).toContain("[Typed](third.md) - [reference|editor|2026-08-01] Typed reference summary");
     expect(output.system[0]).toContain("normal read tool");
+    expect(output.system[0]).toContain("Memories are hints only, not authoritative facts.");
+    expect(output.system[0]).toContain("Verify relevant details against the current conversation, project state, or primary sources");
     expect(app.hooks.tool).toBeUndefined();
 
     await Bun.write(join(path, "index.md"), "# Project memory\n\n- [Third](third.md) - Third summary\n");
@@ -584,6 +591,8 @@ describe("memory persistence", () => {
     expect(part.synthetic).toBe(true);
     expect(part.text.startsWith("<memory_update>")).toBe(true);
     expect(part.text).toContain("supersedes");
+    expect(part.text).toContain("Memories are hints only, not authoritative facts.");
+    expect(part.text).toContain("Verify relevant details against the current conversation, project state, or primary sources");
     expect(part.text).toContain("- [Concise replies](");
     expect(part.text).toMatch(/\[preference\|editor\|\d{4}-\d{2}-\d{2}\]/);
     // Only delta index lines: no full index repetition and no topic bodies.

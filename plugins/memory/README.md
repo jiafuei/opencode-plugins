@@ -5,8 +5,8 @@ Project-scoped automatic memory with a Claude Code-like `/memory` browser. The s
 ## Behavior
 
 - On the first main-model request in a session, a `<memory>` system block snapshots the absolute memory directory and complete current managed index. The snapshot is cached and stays immutable for the rest of that session without rereading the index, which keeps the request prefix stable for provider prompt caches. This initial local file read does not call a model.
-- Memory saved after that snapshot reaches the originating session as a compact synthetic `<memory_update>` text part injected onto the next genuine user message by `experimental.chat.messages.transform`. The part is marked untrusted, lists only the added or updated index lines (never topic bodies or the full index), and states that it supersedes matching entries in the initial snapshot. Deltas are frozen per user message at its first transform: saves committing later in the same tool loop defer to the following user turn, every historical user message keeps its own frozen assignment and part across transforms (transforms are not persisted), assignments are pruned as messages leave the model history, and all delta state is cleared when the session is deleted.
-- When prior preferences, instructions, recaps, or references may matter, the model uses the normal `read` tool with the directory and an exact indexed filename. Index summaries are not substitutes for topic contents, and both index and topic data are marked untrusted and potentially stale.
+- Memory saved after that snapshot reaches the originating session as a compact synthetic `<memory_update>` text part injected onto the next genuine user message by `experimental.chat.messages.transform`. The part is marked untrusted and non-authoritative, lists only the added or updated index lines (never topic bodies or the full index), and states that it supersedes matching entries in the initial snapshot. Deltas are frozen per user message at its first transform: saves committing later in the same tool loop defer to the following user turn, every historical user message keeps its own frozen assignment and part across transforms (transforms are not persisted), assignments are pruned as messages leave the model history, and all delta state is cleared when the session is deleted.
+- When prior preferences, instructions, recaps, or references may matter, the model uses the normal `read` tool with the directory and an exact indexed filename. Memories are hints only, not authoritative facts, and relevant details must be verified against the current conversation, project state, or primary sources before use. Index summaries are not substitutes for topic contents, and both index and topic data are marked untrusted and potentially stale.
 - External-directory permission asks are automatically allowed only for exact indexed topic files that resolve inside this project’s memory directory. Unindexed, symlink-escaped, sibling, and unrelated paths retain their normal permission handling.
 - Checkpoints capture only previously completed turns. When a new real user message arrives and `interval` turns have completed since the last checkpoint, the buffered prompts, completed assistant outputs, and tool activity are snapshotted before the new prompt is buffered — the triggering prompt is never classified. A save classification returns up to three atomic decisions, each a narrow subject describing exactly one thing to remember, and extraction is constrained to that subject. Everything runs in the background and does not delay that user message or later messages.
 - An idle timer saves the final pending turns from short sessions that do not reach a periodic checkpoint. A checkpoint whose classification or extraction fails restores its buffered source unchanged, and that buffer is not offered for review again until new conversation content is collected.
@@ -16,7 +16,7 @@ Project-scoped automatic memory with a Claude Code-like `/memory` browser. The s
 - `/memory` no longer creates the per-project directory just by being opened; it shows the normal selector with an empty memory list when storage does not exist yet. The directory is created lazily at true write boundaries: toggling auto-memory, opening the folder or a topic file from `/memory`, or the server's first coordinated write. The shared memory root may be created by the TUI's save watcher.
 - Maintenance runs when the managed index exceeds 32 KiB or 200 topics. A worker may consolidate only 2–8 semantically related duplicates, overlaps, or stale variants; unrelated topics are left over the soft cap. Complete selected files must fit the dedicated maintenance input cap, and source revisions/content are rechecked before commit.
 - Workers receive user prompts, completed agent text output, and compact tool activity, never tool output bodies: `read`, `grep`, `glob`, and `list` contribute only their tool name and display title; qualifying test/check/build shell commands do the same only when their exit status is zero. Workers never receive tool-call structures, and activity lines are labeled hints rather than verified evidence. Agent output is supporting context rather than an authoritative source.
-- Prompts reject current task requests, future plans, procedural task instructions, repository-obvious detail, transient state such as uncommitted work or test counts, guesses, and secrets.
+- Prompts reject current task requests, future plans, procedural task instructions, repository-obvious detail, transient state such as uncommitted work or test counts, guesses, and secrets. Recaps require a concrete completed task outcome; ongoing work, questions and answers, advice, explanations, discussions, and casual conversation do not qualify.
 - Memory is disabled per project from `/memory`. Disabling stops new collection, system context, and persistence checks; an already-running worker request is not canceled and completes before its child session is deleted.
 
 Worker model calls use hidden child sessions with executable tools denied. The sessions are deleted after each call. Worker failures are logged and do not fail the main prompt.
@@ -41,7 +41,7 @@ Different paths, including Git worktrees, use separate memory directories. Exist
 - [Legacy topic](legacy-a1b2c3d4.md) - One-line summary
 ```
 
-Topics are classified as `preference` (durable general preferences stated by the user), `instruction` (scoped general instructions that apply to future work), `recap` (concise completed-work and durable progress summaries), or `reference` (lasting external material). Bodies are a few concise lines of natural prose with per-type length caps, no mandatory Why/How formatting, and no absolute dates in the body — the plugin records timing metadata itself. Existing topics classified as the retired `feedback` and `project` types stay readable; they are reclassified only when next replaced or consolidated.
+Topics are classified as `preference` (durable general preferences stated by the user), `instruction` (scoped general instructions that apply to future work), `recap` (concise outcomes of concretely completed tasks), or `reference` (lasting external material). Bodies are a few concise lines of natural prose with per-type length caps, no mandatory Why/How formatting, and no absolute dates in the body — the plugin records timing metadata itself. Existing topics classified as the retired `feedback` and `project` types stay readable; they are reclassified only when next replaced or consolidated.
 
 Topic files carry plugin-owned metadata. `sessionId` is the last writer: the originating session for creation/replacement and the maintenance session for consolidation. `scope` names where the memory applies, and `updatedAt` is the plugin-owned ISO write date.
 
@@ -79,8 +79,8 @@ To customize the server plugin, edit its entry in `opencode.json`:
     ["@jiafuei/opencode-memory", {
       "classifier_model": "anthropic/claude-haiku-4-5",
       "extractor_model": "anthropic/claude-sonnet-4-6",
-      "interval": 3,
-      "idle_delay_ms": 90000
+      "interval": 6,
+      "idle_delay_ms": 300000
     }]
   ]
 }
@@ -92,8 +92,8 @@ Options:
 | --- | --- | --- |
 | `classifier_model` | `small_model` | Background save classification and maintenance selection model |
 | `extractor_model` | classifier model | Background extraction and consolidation model |
-| `interval` | `3` | User turns between periodic checkpoints; minimum `2` |
-| `idle_delay_ms` | `90000` | Delay before pending short-session turns are classified |
+| `interval` | `6` | User turns between periodic checkpoints; minimum `2` |
+| `idle_delay_ms` | `300000` | Delay before pending short-session turns are classified |
 
 Set `small_model` or `classifier_model` to enable save classification. Reading memory uses the normal local `read` tool and does not require a model worker.
 
