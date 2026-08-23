@@ -366,7 +366,7 @@ describe("buildBetas", () => {
 });
 
 describe("mapStainlessArch", () => {
-  test("maps oh-my-pi's Stainless arch values", () => {
+  test("maps Stainless arch values", () => {
     expect(mapStainlessArch("x64")).toBe("x64");
     expect(mapStainlessArch("amd64")).toBe("x64");
     expect(mapStainlessArch("arm64")).toBe("arm64");
@@ -418,10 +418,6 @@ describe("patchCch", () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// Step 6: oh-my-pi-style custom tool name cloaking
-// ---------------------------------------------------------------------------
-
 describe("tool name prefix helpers", () => {
   test("round-trips logical names through apply/strip exactly once", () => {
     for (const name of ["get_weather", "_secret_tool", "__double", "a"]) {
@@ -439,7 +435,6 @@ describe("tool name prefix helpers", () => {
       expect(applyClaudeToolPrefix(name)).toBe(name);
       expect(stripClaudeToolPrefix(name)).toBe(name);
     }
-    // Case-insensitive, matching oh-my-pi.
     expect(applyClaudeToolPrefix("WEB_SEARCH")).toBe("WEB_SEARCH");
   });
 });
@@ -486,7 +481,6 @@ describe("rewriteBody tool name cloaking", () => {
     expect(out.tools.map((t: any) => t.name)).toEqual([
       "_get_weather",
       "__secret",
-      // Built-in base name on a custom-shaped def is left alone (oh-my-pi behavior).
       "web_search",
       // Versioned server tools keep their SDK-assigned names.
       "web_search",

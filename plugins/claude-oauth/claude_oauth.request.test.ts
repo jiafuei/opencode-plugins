@@ -175,7 +175,6 @@ describe("request capture: normal streaming request", () => {
     expect(req.headers["x-client-request-id"]).toMatch(/^[0-9a-f-]{36}$/);
     expect(req.headers["connection"]).toBe("keep-alive");
     expect(req.headers["accept-encoding"]).toBe("gzip, deflate, br, zstd");
-    // Stainless arch uses oh-my-pi's mapping of the host arch.
     expect(req.headers["x-stainless-arch"]).toBe(mapStainlessArch(process.arch));
     expect(req.headers["x-stainless-retry-count"]).toBe("0");
     expect(req.headers["x-claude-code-session-id"]).toBe("session-test-1");

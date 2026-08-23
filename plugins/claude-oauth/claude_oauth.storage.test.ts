@@ -95,7 +95,7 @@ describe("install id (stable local identity)", () => {
       // Identity unchanged: derived deterministically from the stored value.
       const { createHash } = await import("node:crypto");
       const expected = createHash("sha256")
-        .update("omp-claude-device-id-v1:")
+        .update("claude-oauth-device-id-v1:")
         .update("b".repeat(32))
         .digest("hex");
       expect(deviceId).toBe(expected);

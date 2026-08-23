@@ -39,9 +39,6 @@ const SESSION_ID_HEADER = "x-claude-code-session-id";
 // before anything hits the wire.
 const REQUEST_ID_HEADER = "x-claude-oauth-request-id";
 
-// Beta profiles mirror oh-my-pi's buildCoworkBetas (the current CC request
-// fingerprint): the utility profile for requests with neither tools nor active
-// thinking, the agent profile for tools or enabled/adaptive thinking.
 const UTILITY_PROFILE_BETAS = [
   "interleaved-thinking-2025-05-14",
   "thinking-token-count-2026-05-13",
@@ -158,7 +155,7 @@ interface TokenResponse {
 
 /**
  * Account + organization identity slice resolved from the token response
- * and/or `/api/claude_cli/bootstrap` (mirrors oh-my-pi's AnthropicIdentity).
+ * and/or `/api/claude_cli/bootstrap`.
  * OpenCode's auth schema persists only `accountId`; email/org are resolved
  * transiently and clearly typed here for future use — there is deliberately
  * no second credential store.
@@ -1070,9 +1067,9 @@ function ensureOwnerOnly(file: string): void {
 function deriveDeviceId(accountId?: string): string {
   const hash = createHash("sha256");
   if (accountId) {
-    return hash.update("omp-claude-device-id-v2\0").update(getInstallId()).update("\0").update(accountId).digest("hex");
+    return hash.update("claude-oauth-device-id-v2\0").update(getInstallId()).update("\0").update(accountId).digest("hex");
   }
-  return hash.update("omp-claude-device-id-v1:").update(getInstallId()).digest("hex");
+  return hash.update("claude-oauth-device-id-v1:").update(getInstallId()).digest("hex");
 }
 
 // Valid legacy cloaking id: user_<64 hex>_account_<uuid>_session_<uuid>.
@@ -1166,7 +1163,7 @@ export function patchCch(body: Uint8Array): CchPatchResult {
 }
 
 // ---------------------------------------------------------------------------
-// Custom tool name cloaking (oh-my-pi applyClaudeToolPrefix/stripClaudeToolPrefix)
+// Custom tool name cloaking
 // ---------------------------------------------------------------------------
 
 const TOOL_PREFIX = "_";
@@ -1433,8 +1430,6 @@ function extractFirstUserText(messages: unknown): string {
     if (m.role !== "user") continue;
     if (typeof m.content === "string") return m.content;
     if (Array.isArray(m.content)) {
-      // Only the first text block of the first user message seeds the
-      // fingerprint (matches oh-my-pi's extractClaudeCodeFirstUserMessageText).
       const first = m.content.find(
         (b): b is ContentBlock => !!b && typeof b === "object" && (b as ContentBlock).type === "text",
       );
@@ -1445,8 +1440,6 @@ function extractFirstUserText(messages: unknown): string {
   return "";
 }
 
-// Canonical oh-my-pi request key order; remaining keys are appended after in
-// their original relative order.
 const CANONICAL_BODY_KEYS = [
   "model",
   "messages",
@@ -1468,8 +1461,8 @@ const CANONICAL_BODY_KEYS = [
  * - max_tokens clamped to <= 64000
  * - context_management merged: incoming edits are preserved; active thinking
  *   additionally guarantees exactly one clear_thinking_20251015 keep-all edit
- * - known keys rebuilt in the oh-my-pi canonical order (incl. output_config /
- *   fallbacks), remaining keys appended in their original relative order;
+ * - known keys rebuilt in canonical order (incl. output_config / fallbacks),
+ *   remaining keys appended in their original relative order;
  *   incoming `stream` is preserved as-is
  */
 export function rewriteBody(
