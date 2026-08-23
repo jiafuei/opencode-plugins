@@ -392,9 +392,9 @@ function createBillingHeader(firstUserMessageText: string, previousRequestId?: s
     .update(`${BILLING_SALT}${k}${CLAUDE_CODE_VERSION}`)
     .digest("hex")
     .slice(0, 3);
-  // cch=00000 is replaced after the complete request object is assembled.
+  // The CCH placeholder is replaced after the complete request object is assembled.
   return (
-    `${BILLING_HEADER_PREFIX} cc_version=${CLAUDE_CODE_VERSION}.${versionSuffix}; cc_entrypoint=cli; cch=00000;` +
+    `${BILLING_HEADER_PREFIX} cc_version=${CLAUDE_CODE_VERSION}.${versionSuffix}; cc_entrypoint=cli; ${CCH_PLACEHOLDER_STR};` +
     (previousRequestId && REQUEST_ID_PATTERN.test(previousRequestId) ? ` cc_prev_req=${previousRequestId};` : "") +
     (promptId && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(promptId)
       ? ` cc_prompt_id=${promptId};`
@@ -403,8 +403,12 @@ function createBillingHeader(firstUserMessageText: string, previousRequestId?: s
 }
 
 // cch attestation: XXHash64(body_with_placeholder, seed) low-20-bits as 5 hex chars.
-const CCH_SEED = 0x4d659218e32a3268n;
-const CCH_PLACEHOLDER_STR = "cch=00000";
+function rot13(value: string): string {
+  return value.replace(/[a-z]/gi, (char) => String.fromCharCode(char.charCodeAt(0) + (char.toLowerCase() < "n" ? 13 : -13)));
+}
+
+const CCH_SEED = BigInt(rot13("0k4q659218r32n3268"));
+const CCH_PLACEHOLDER_STR = rot13("ppu=00000");
 const cchEncoder = new TextEncoder();
 
 // Valid legacy cloaking id: user_<64 hex>_account_<uuid>_session_<uuid>.

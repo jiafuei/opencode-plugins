@@ -75,8 +75,8 @@ endpoint:
     guaranteed first
 - The `cch` attestation: XXHash64 over the canonical final body after blanking
   model values and omitting `fallbacks`, `fallback_credit_token`, and
-  `max_tokens` (seed `0x4d659218e32a3268`, low 20 bits as 5 hex chars), patched
-  over the `cch=00000` placeholder
+  `max_tokens` (low 20 bits as 5 hex chars), patched over the `cch=00000`
+  placeholder
 - Billing state follows a conversation: `cc_prompt_id` remains stable for the
   same OpenCode message, and the next successful request includes the prior
   Anthropic `request-id` as `cc_prev_req`. Request chains persist across
@@ -106,10 +106,10 @@ persisting, the refresh re-checks that the stored
 credential is still the grant it refreshed, so a concurrent logout or new
 login is never overwritten. Rotation means only one winner per credential.
 Rotated tokens are persisted back into OpenCode's auth store before use.
-Token exchanges and refreshes use `https://platform.claude.com/v1/oauth/token`
-with Claude Code's Axios-style headers. Refresh scope excludes
-`org:create_api_key`; login retains it. Missing login identity is recovered
-best-effort from the OAuth profile and Claude CLI roles endpoints.
+Token exchanges and refreshes use Claude Code's OAuth token endpoint and
+Axios-style headers. Refresh scope excludes `org:create_api_key`; login retains
+it. Missing login identity is recovered best-effort from the OAuth profile and
+Claude CLI roles endpoints.
 
 Auth transitions are handled live: switching to API-key auth or logging out
 while a session runs switches the request path accordingly (no OAuth

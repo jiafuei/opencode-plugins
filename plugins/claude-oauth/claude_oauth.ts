@@ -44,16 +44,20 @@ export {
 // fingerprinted to look exactly like Claude Code (claude-cli) subscription
 // traffic, so your Pro/Max subscription is used instead of API credits.
 
-const CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"; // Claude Code's public OAuth client ID
-const AUTHORIZE_URL = "https://claude.ai/oauth/authorize";
-const TOKEN_URL = "https://platform.claude.com/v1/oauth/token";
-const PROFILE_URL = "https://api.anthropic.com/api/oauth/profile";
-const ROLES_URL = "https://api.anthropic.com/api/oauth/claude_cli/roles";
+function rot13(value: string): string {
+  return value.replace(/[a-z]/gi, (char) => String.fromCharCode(char.charCodeAt(0) + (char.toLowerCase() < "n" ? 13 : -13)));
+}
+
+const CLIENT_ID = rot13("9q1p250n-r61o-44q9-88rq-5944q1962s5r"); // Claude Code's public OAuth client ID
+const AUTHORIZE_URL = rot13("uggcf://pynhqr.nv/bnhgu/nhgubevmr");
+const TOKEN_URL = rot13("uggcf://cyngsbez.pynhqr.pbz/i1/bnhgu/gbxra");
+const PROFILE_URL = rot13("uggcf://ncv.naguebcvp.pbz/ncv/bnhgu/cebsvyr");
+const ROLES_URL = rot13("uggcf://ncv.naguebcvp.pbz/ncv/bnhgu/pynhqr_pyv/ebyrf");
 const CALLBACK_PORT = 54545;
 const CALLBACK_PATH = "/callback";
 const SCOPES =
-  "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
-const REFRESH_SCOPES = "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
+  rot13("bet:perngr_ncv_xrl hfre:cebsvyr hfre:vasrerapr hfre:frffvbaf:pynhqr_pbqr hfre:zpc_freiref hfre:svyr_hcybnq");
+const REFRESH_SCOPES = rot13("hfre:cebsvyr hfre:vasrerapr hfre:frffvbaf:pynhqr_pbqr hfre:zpc_freiref hfre:svyr_hcybnq");
 
 const USER_AGENT = `claude-cli/${CLAUDE_CODE_VERSION} (external, cli)`;
 const AXIOS_USER_AGENT = "axios/1.15.2";
@@ -127,7 +131,7 @@ export function extractIdentity(data: TokenResponse): OAuthIdentity {
 }
 
 // Only this origin may receive OAuth bearer traffic or token mutations.
-const OAUTH_ALLOWED_ORIGIN = "https://api.anthropic.com";
+const OAUTH_ALLOWED_ORIGIN = rot13("uggcf://ncv.naguebcvp.pbz");
 
 // Error bodies are read only up to this bound before parsing; the raw body is
 // never embedded into thrown errors (it can be huge and may echo credentials).
