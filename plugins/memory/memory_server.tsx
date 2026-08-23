@@ -67,6 +67,11 @@ type SessionState = {
   turnsSinceSave: number;
   saveInFlight: boolean;
   source: SourceSnapshot;
+  // Monotonic count of nonempty items ever collected into `source`. A checkpoint
+  // marks the current value as reviewed; restoring a failed snapshot never
+  // rewinds or re-marks it, so unchanged buffers are never reviewed twice.
+  sourceRevision: number;
+  reviewedRevision: number;
   // Index updates queued for the session's next genuine user message (keyed
   // by filename), and per-message frozen sets already shown in model history.
   pending: Map<string, IndexEntry>;
@@ -191,11 +196,12 @@ function limitText(value: string, bytes: number): string {
   return buffer.length <= bytes ? value : buffer.subarray(0, bytes).toString("utf8");
 }
 
-function pushBounded(items: string[], value: string, bytes: number): void {
+function pushBounded(items: string[], value: string, bytes: number): boolean {
   const text = limitText(value.trim(), bytes);
-  if (!text) return;
+  if (!text) return false;
   items.push(text);
   while (items.length > 1 && Buffer.byteLength(items.join("\n\n")) > bytes) items.shift();
+  return true;
 }
 
 export function parseIndexLine(line: string): IndexEntry | undefined {
@@ -535,6 +541,8 @@ const MemoryPlugin: Plugin = async ({ client, directory }, options) => {
         turnsSinceSave: 0,
         saveInFlight: false,
         source: { prompts: [], activity: [], agentOutputs: [] },
+        sourceRevision: 0,
+        reviewedRevision: 0,
         pending: new Map(),
         frozen: new Map(),
         activityGeneration: 0,
@@ -548,12 +556,16 @@ const MemoryPlugin: Plugin = async ({ client, directory }, options) => {
   const resetState = (state: SessionState) => {
     state.source = { prompts: [], activity: [], agentOutputs: [] };
     state.turnsSinceSave = 0;
+    state.reviewedRevision = state.sourceRevision;
   };
 
-  // Atomically detach the buffered conversation source for a checkpoint.
+  // Atomically detach the buffered conversation source for a checkpoint. The
+  // detached revision counts as reviewed; only content collected after this
+  // point makes the session reviewable again.
   const takeSnapshot = (state: SessionState): SourceSnapshot => {
     const snapshot = state.source;
     state.source = { prompts: [], activity: [], agentOutputs: [] };
+    state.reviewedRevision = state.sourceRevision;
     return snapshot;
   };
 
@@ -1048,13 +1060,14 @@ const MemoryPlugin: Plugin = async ({ client, directory }, options) => {
           // Checkpoint the PREVIOUSLY buffered turns (excluding this new
           // prompt) when interval is due, then buffer the new prompt. A turn
           // count of at least `interval` always has buffered prompts, since
-          // every counted turn pushed one and resets clear both together.
-          if (state.turnsSinceSave >= interval && !state.saveInFlight) {
+          // every counted turn pushed one and resets clear both together; the
+          // revision check additionally requires unreviewed source.
+          if (state.turnsSinceSave >= interval && !state.saveInFlight && state.sourceRevision > state.reviewedRevision) {
             state.saveInFlight = true;
             checkpoint = { snapshot: takeSnapshot(state), index: await indexContext() };
             state.turnsSinceSave = 0;
           }
-          pushBounded(state.source.prompts, prompt, PROMPT_BYTES);
+          if (pushBounded(state.source.prompts, prompt, PROMPT_BYTES)) state.sourceRevision += 1;
           state.turnsSinceSave += 1;
         });
         if (checkpoint) launchSaveClassification(input.sessionID, state, checkpoint.snapshot, checkpoint.index);
@@ -1067,7 +1080,10 @@ const MemoryPlugin: Plugin = async ({ client, directory }, options) => {
         const state = states.get(input.sessionID);
         if (!state) return;
         await serializeSession(state, async () => {
-          if (!disposed && !state.deleted && await enabled()) pushBounded(state.source.agentOutputs, output.text, AGENT_OUTPUT_BYTES);
+          if (!disposed && !state.deleted && await enabled() &&
+            pushBounded(state.source.agentOutputs, output.text, AGENT_OUTPUT_BYTES)) {
+            state.sourceRevision += 1;
+          }
         });
       });
     },
@@ -1084,8 +1100,9 @@ const MemoryPlugin: Plugin = async ({ client, directory }, options) => {
           if ((output.metadata as { exit?: unknown }).exit !== 0) return;
         }
         await serializeSession(state, async () => {
-          if (!disposed && !state.deleted && await enabled()) {
-            pushBounded(state.source.activity, activity, ACTIVITY_BYTES);
+          if (!disposed && !state.deleted && await enabled() &&
+            pushBounded(state.source.activity, activity, ACTIVITY_BYTES)) {
+            state.sourceRevision += 1;
           }
         });
       });
@@ -1108,7 +1125,7 @@ const MemoryPlugin: Plugin = async ({ client, directory }, options) => {
         const state = states.get(sessionID);
         if (!state) return;
         await serializeSession(state, async () => {
-          if (disposed || state.deleted || states.get(sessionID) !== state || state.source.prompts.length === 0) return;
+          if (disposed || state.deleted || states.get(sessionID) !== state || state.sourceRevision <= state.reviewedRevision) return;
           clearTimeout(state.idleTimer);
           const generation = state.activityGeneration;
           state.idleTimer = setTimeout(async () => {
@@ -1116,7 +1133,7 @@ const MemoryPlugin: Plugin = async ({ client, directory }, options) => {
             if (disposed || state.deleted || states.get(sessionID) !== state || state.activityGeneration !== generation) return;
             let checkpoint: { snapshot: SourceSnapshot; index: string } | undefined;
             const job = serializeSession(state, async () => {
-              if (disposed || state.deleted || states.get(sessionID) !== state || state.activityGeneration !== generation || state.saveInFlight || state.source.prompts.length === 0 || !(await enabled())) return;
+              if (disposed || state.deleted || states.get(sessionID) !== state || state.activityGeneration !== generation || state.saveInFlight || state.sourceRevision <= state.reviewedRevision || !(await enabled())) return;
               state.saveInFlight = true;
               state.turnsSinceSave = 0;
               checkpoint = { snapshot: takeSnapshot(state), index: await indexContext() };

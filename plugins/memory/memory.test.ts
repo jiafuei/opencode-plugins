@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, jest, test } from "bun:test";
 import { mkdir, mkdtemp, readdir, rm } from "node:fs/promises";
 import { join } from "node:path";
 import MemoryModule, { indexLine, memoryProjectKey as serverProjectKey, parseIndexLine } from "./memory_server.tsx";
@@ -13,7 +13,7 @@ afterEach(() => {
 type WorkerCall = { parentID: string; system: string; prompt: string };
 type FakeMessage = { info: { id: string; sessionID: string; role: string }; parts: Array<{ type?: string; id?: string; synthetic?: boolean; text: string }> };
 
-async function fixture(directory: string, respond: (call: WorkerCall) => unknown) {
+async function fixture(directory: string, respond: (call: WorkerCall) => unknown, options: { interval?: number; idle_delay_ms?: number } = {}) {
   const calls: WorkerCall[] = [];
   let parentID = "";
   const client = {
@@ -32,7 +32,7 @@ async function fixture(directory: string, respond: (call: WorkerCall) => unknown
     },
     app: { log: async () => ({}) },
   };
-  const hooks = await MemoryModule.server!({ client, directory } as never, { interval: 2 } as never);
+  const hooks = await MemoryModule.server!({ client, directory } as never, { interval: 2, ...options } as never);
   await hooks.config!({ small_model: "test/small" } as never);
   return {
     hooks,
@@ -81,6 +81,12 @@ const saveDecisions = (...items: Array<ReturnType<typeof createDecision> | Retur
 
 async function until(condition: () => boolean | Promise<boolean>) {
   while (!(await condition())) await new Promise<void>((resolve) => setImmediate(resolve));
+}
+
+// Flush pending microtask and filesystem callbacks without waiting on real
+// time (safe under fake timers), so background restore/cleanup work settles.
+async function settle() {
+  for (let i = 0; i < 25; i++) await new Promise<void>((resolve) => setImmediate(resolve));
 }
 
 describe("memory project directory keys", () => {
@@ -838,6 +844,116 @@ describe("memory persistence", () => {
     expect(next.parts).toHaveLength(2);
     expect(next.parts[1]!.id).toBe("memory-update-msg_after_synth");
     expect(next.parts[1]!.text).toContain("First rule");
+    await app.hooks.dispose!();
+    await rm(dataHome, { recursive: true, force: true });
+  });
+});
+
+describe("memory idle revision gating", () => {
+  // Drives the idle checkpoint with fake timers: idle_delay_ms is advanced
+  // synchronously instead of waiting real seconds.
+  const armIdle = (app: Awaited<ReturnType<typeof fixture>>, sessionID: string) =>
+    app.hooks.event!({ event: { type: "session.idle", properties: { sessionID } } } as never);
+
+  test.serial("does not relaunch review for restored source until new content is collected", async () => {
+    const dataHome = await mkdtemp("/tmp/opencode-memory-idle-gate-");
+    process.env.XDG_DATA_HOME = dataHome;
+    const directory = "/tmp/memory-idle-gate-project";
+    const failedClassification = Promise.withResolvers<unknown>();
+    let classifications = 0;
+    const app = await fixture(directory, ({ system }) => {
+      if (system.includes("classifier")) {
+        classifications += 1;
+        return classifications === 1 ? failedClassification.promise : saveDecisions();
+      }
+      return memoryExtraction();
+    }, { idle_delay_ms: 1000 });
+    const idle = () => armIdle(app, "ses_idle_gate");
+
+    try {
+      jest.useFakeTimers();
+      await app.message("ses_idle_gate", "Alpha one.");
+      await app.message("ses_idle_gate", "Beta two.");
+      await idle();
+      jest.advanceTimersByTime(1000);
+      await until(() => app.calls.length === 1);
+      expect(classifications).toBe(1);
+
+      // Malformed classifier response: the checkpoint fails and its snapshot
+      // is restored unchanged.
+      failedClassification.resolve({});
+      await settle();
+
+      // A repeated idle event with nothing newly collected must not launch
+      // another review of the restored buffer.
+      await idle();
+      jest.advanceTimersByTime(1000);
+      await settle();
+      expect(app.calls).toHaveLength(1);
+      expect(classifications).toBe(1);
+
+      // A new genuine prompt makes the source reviewable again; the second
+      // review sees the restored turns merged with the new one.
+      await app.message("ses_idle_gate", "Gamma three.");
+      await idle();
+      jest.advanceTimersByTime(1000);
+      await until(() => app.calls.length === 2);
+      expect(app.calls[1]!.prompt).toContain("Alpha one.");
+      expect(app.calls[1]!.prompt).toContain("Beta two.");
+      expect(app.calls[1]!.prompt).toContain("Gamma three.");
+      await settle();
+    } finally {
+      jest.useRealTimers();
+    }
+    await app.hooks.dispose!();
+    await rm(dataHome, { recursive: true, force: true });
+  });
+
+  test.serial("re-arms idle review on assistant output and tool activity but not blank collection", async () => {
+    const dataHome = await mkdtemp("/tmp/opencode-memory-idle-collect-");
+    process.env.XDG_DATA_HOME = dataHome;
+    const directory = "/tmp/memory-idle-collect-project";
+    const app = await fixture(directory, ({ system }) => {
+      if (system.includes("classifier")) return saveDecisions();
+      return memoryExtraction();
+    }, { idle_delay_ms: 1000 });
+    const idle = () => armIdle(app, "ses_idle_collect");
+
+    try {
+      jest.useFakeTimers();
+      await app.message("ses_idle_collect", "Only turn.");
+      await idle();
+      jest.advanceTimersByTime(1000);
+      await until(() => app.calls.length === 1);
+      await settle();
+
+      // Blank assistant output collects nothing: no re-review of the already
+      // consumed source.
+      await app.agentOutput("ses_idle_collect", "   \n");
+      await idle();
+      jest.advanceTimersByTime(1000);
+      await settle();
+      expect(app.calls).toHaveLength(1);
+
+      // Completed assistant output is collected and reviewed on the next idle.
+      await app.agentOutput("ses_idle_collect", "Wrapped up the parser migration.");
+      await idle();
+      jest.advanceTimersByTime(1000);
+      await until(() => app.calls.length === 2);
+      expect(app.calls[1]!.prompt).toContain("Wrapped up the parser migration.");
+      await settle();
+
+      // Qualifying tool activity likewise makes a later idle event reviewable.
+      await app.hooks["tool.execute.after"]!({ sessionID: "ses_idle_collect", tool: "bash", args: { command: "bun test plugins/memory" } } as never,
+        { title: "passed", metadata: { exit: 0 } } as never);
+      await idle();
+      jest.advanceTimersByTime(1000);
+      await until(() => app.calls.length === 3);
+      expect(app.calls[2]!.prompt).toContain("bash: passed");
+      await settle();
+    } finally {
+      jest.useRealTimers();
+    }
     await app.hooks.dispose!();
     await rm(dataHome, { recursive: true, force: true });
   });
