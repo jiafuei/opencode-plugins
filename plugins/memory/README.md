@@ -85,8 +85,8 @@ To customize the server plugin, edit its entry in `opencode.json`:
     ["@jiafuei/opencode-memory", {
        "classifier_model": "anthropic/claude-haiku-4-5",
        "classifier_variant": "low",
-       "extractor_model": "anthropic/claude-sonnet-4-6",
-       "extractor_variant": "high",
+       "extractor_model": "openai/gpt-5.6-luna",
+       "extractor_variant": "xhigh",
        "dream_model": "anthropic/claude-sonnet-4-6",
        "dream_variant": "high",
        "interval": 6,
@@ -94,7 +94,13 @@ To customize the server plugin, edit its entry in `opencode.json`:
        "dream_interval_hours": 36,
        "dream_min_additions": 7
     }]
-  ]
+  ],
+  "references": {
+    "memory": {
+      "path": "~/.local/share/opencode/memory",
+      "description": "OpenCode memory directory"
+    }
+  }
 }
 ```
 

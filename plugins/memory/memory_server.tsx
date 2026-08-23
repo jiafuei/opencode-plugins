@@ -1224,6 +1224,13 @@ const MemoryPlugin: Plugin = async ({ client, directory }, options) => {
     details: { model?: WorkerModel; sessionID?: string; startedAt?: string } = {},
   ) => {
     const finishedAt = new Date().toISOString();
+    await log(input.trigger === "manual" ? "warn" : "info", input.trigger === "manual" ? "Memory dream refused" : "Memory dream skipped", {
+      runID: input.runID,
+      trigger: input.trigger,
+      reason,
+      sessionID: details.sessionID ?? null,
+      ...dreamModelFields(details.model),
+    });
     await writeDreamManifest(input.runID, {
       trigger: input.trigger,
       ...dreamModelFields(details.model),
@@ -1237,8 +1244,6 @@ const MemoryPlugin: Plugin = async ({ client, directory }, options) => {
     });
     if (input.trigger === "manual") {
       await writeDreamStatus({ requestID: input.requestID, runID: input.runID, state: "failed", finishedAt, message: reason });
-    } else {
-      await log("info", `Memory dream skipped; ${reason}`);
     }
   };
 
@@ -1248,24 +1253,37 @@ const MemoryPlugin: Plugin = async ({ client, directory }, options) => {
   const evaluateAutoDream = async (): Promise<boolean> => {
     const settings = await readSettings();
     if (settings.dream_auto !== true || !(await enabled())) {
-      await coordinatedWrite(async () => {
+      const stopped = await coordinatedWrite(async () => {
         const stale = await readDreamState();
-        if (stale?.auto === true) await writeDreamState({ ...stale, auto: false });
+        if (stale?.auto !== true) return false;
+        await writeDreamState({ ...stale, auto: false });
+        return true;
       });
+      if (stopped) await log("info", "Memory automatic dreaming disabled");
       return false;
     }
-    return coordinatedWrite(async () => {
+    let initializedAdditions: number | undefined;
+    const due = await coordinatedWrite(async () => {
       const state = await readDreamState();
       if (!state || state.auto !== true) {
+        initializedAdditions = parseIndex(await readIndex()).length;
         await writeDreamState({
           auto: true,
-          additions: parseIndex(await readIndex()).length,
+          additions: initializedAdditions,
           since: Date.now(),
         });
         return false;
       }
       return dreamDue(Date.now(), state, dreamOptions);
     });
+    if (initializedAdditions !== undefined) {
+      await log("info", "Memory automatic dreaming initialized", {
+        additions: initializedAdditions,
+        intervalHours: dreamOptions.intervalHours,
+        minAdditions: dreamOptions.minAdditions,
+      });
+    }
+    return due;
   };
 
   const executeDream = async (input: { trigger: "auto" | "manual"; requestID: string | null; runID: string; sessionID: string }) => {
@@ -1284,6 +1302,13 @@ const MemoryPlugin: Plugin = async ({ client, directory }, options) => {
     // Concurrent ordinary saves during this long run must survive completion:
     // only the counter captured here is subtracted at the end.
     const baselineAdditions = Math.max(0, (await readDreamState())?.additions ?? 0);
+    await log("info", "Memory dream started", {
+      runID: input.runID,
+      trigger: input.trigger,
+      sessionID: input.sessionID,
+      ...dreamModelFields(model),
+      additions: baselineAdditions,
+    });
 
     // Immutable snapshot evidence: index entries plus complete topic contents,
     // captured in one short commit transaction. Workers receive selected full
@@ -1314,6 +1339,12 @@ const MemoryPlugin: Plugin = async ({ client, directory }, options) => {
       source.type !== "insight" &&
       !covered.has(`${source.entry.file}@${source.revision}`)
     ));
+    await log("debug", "Memory dream snapshot ready", {
+      runID: input.runID,
+      topics: snapshot.size,
+      candidates: candidates.size,
+      coveredSources: covered.size,
+    });
 
     // Selector metadata renders the effective frontmatter type even when the
     // index line predates typed entries.
@@ -1353,6 +1384,12 @@ const MemoryPlugin: Plugin = async ({ client, directory }, options) => {
       }
       if (!selection) break;
       const chosen = selection;
+      await log("debug", "Memory dream action selected", {
+        runID: input.runID,
+        iteration: iteration + 1,
+        action: chosen.action,
+        sources: chosen.files,
+      });
 
       const sources = chosen.files.map((file) => snapshot.get(file)!);
       const topics = sources.map((source) => `<memory_file path="${source.entry.file}">\n${source.content}\n</memory_file>`).join("\n");
@@ -1430,6 +1467,12 @@ const MemoryPlugin: Plugin = async ({ client, directory }, options) => {
         sources: sources.map((source) => ({ file: source.entry.file, revision: source.revision })),
         output: { file: committed.file, revision: committed.revision, title: extracted.title, type: extracted.type },
       });
+      await log("info", "Memory dream action applied", {
+        runID: input.runID,
+        action: selection.action,
+        sources: chosen.files,
+        output: committed.file,
+      });
       deltas.push([committed.file, committed.entry]);
 
       // Keep the candidate view current so later iterations cannot repeat a
@@ -1459,7 +1502,14 @@ const MemoryPlugin: Plugin = async ({ client, directory }, options) => {
         const state = await readDreamState();
         await writeDreamState({ ...state, additions: state?.additions ?? 0, since: state?.since ?? Date.now(), failAt: Date.now() });
       });
-      await log("warn", "Memory dream ended early", { reason: abortReason, applied: actions.length });
+      await log("warn", "Memory dream ended early", {
+        runID: input.runID,
+        trigger: input.trigger,
+        reason: abortReason,
+        applied: actions.length,
+        counts,
+        durationMs: Date.now() - Date.parse(startedAt),
+      });
       await writeDreamManifest(input.runID, {
         trigger: input.trigger,
         ...dreamModelFields(model),
@@ -1503,6 +1553,13 @@ const MemoryPlugin: Plugin = async ({ client, directory }, options) => {
       actions,
     });
     await writeDreamStatus({ requestID: input.requestID, runID: input.runID, state: changed ? "changed" : "noop", finishedAt, counts });
+    await log("info", "Memory dream completed", {
+      runID: input.runID,
+      trigger: input.trigger,
+      state: changed ? "changed" : "noop",
+      counts,
+      durationMs: Date.now() - Date.parse(startedAt),
+    });
   };
 
   const runDream = async (input: { trigger: "auto" | "manual"; sessionID?: string; requestID?: string; consumeRequest?: boolean }) => {
@@ -1511,7 +1568,10 @@ const MemoryPlugin: Plugin = async ({ client, directory }, options) => {
     // quiet skip, leaving any request file in place for a later tick.
     const release = await acquireLock(dreamLockPath, false);
     if (!release) {
-      await log("info", "Memory dream skipped; another process holds the dream lock");
+      await log("info", "Memory dream skipped; another process holds the dream lock", {
+        trigger: input.trigger,
+        requestID: input.requestID ?? null,
+      });
       return false;
     }
     const runID = crypto.randomUUID();
@@ -1532,7 +1592,12 @@ const MemoryPlugin: Plugin = async ({ client, directory }, options) => {
       await executeDream({ trigger: input.trigger, requestID: input.requestID ?? null, runID, sessionID });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      await log("warn", "Memory dream failed", { error: message });
+      await log("warn", "Memory dream failed", {
+        runID,
+        trigger: input.trigger,
+        error: message,
+        durationMs: Date.now() - Date.parse(startedAt),
+      });
       await coordinatedWrite(async () => {
         const state = await readDreamState();
         await writeDreamState({ ...state, additions: state?.additions ?? 0, since: state?.since ?? Date.now(), failAt: Date.now() });

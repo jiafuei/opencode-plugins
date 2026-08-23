@@ -19,6 +19,7 @@ afterEach(() => {
 
 type WorkerCall = { parentID: string; system: string; prompt: string; variant?: string; sessionVariant?: string };
 type FakeMessage = { info: { id: string; sessionID: string; role: string }; parts: Array<{ type?: string; id?: string; synthetic?: boolean; text: string }> };
+type LogCall = { service: string; level: string; message: string; extra?: Record<string, unknown> };
 
 async function fixture(
   directory: string,
@@ -38,6 +39,7 @@ async function fixture(
 ) {
   const calls: WorkerCall[] = [];
   const creations: unknown[] = [];
+  const logs: LogCall[] = [];
   let parentID = "";
   let sessionVariant: string | undefined;
   const client = {
@@ -56,7 +58,12 @@ async function fixture(
       abort: async () => ({ data: true }),
       delete: async () => ({ data: true }),
     },
-    app: { log: async () => ({}) },
+    app: {
+      log: async (options: { body: LogCall }) => {
+        logs.push(options.body);
+        return {};
+      },
+    },
   };
   const hooks = await MemoryModule.server!({ client, directory } as never, { interval: 2, ...options } as never);
   await hooks.config!({ small_model: "test/small" } as never);
@@ -64,6 +71,7 @@ async function fixture(
     hooks,
     calls,
     creations,
+    logs,
     message: async (sessionID: string, text: string) => {
       const output = { message: { id: crypto.randomUUID() }, parts: [{ type: "text", text }] };
       await hooks["chat.message"]!({ sessionID } as never, output as never);
@@ -1139,6 +1147,12 @@ describe("memory auto dreaming", () => {
     const state = await Bun.file(statePath).json();
     expect(state).toMatchObject({ auto: true, additions: 3 });
     expect(state.lastRunAt).toBeUndefined();
+    expect(app.logs).toContainEqual({
+      service: "memory",
+      level: "info",
+      message: "Memory automatic dreaming initialized",
+      extra: { additions: 3, intervalHours: 36, minAdditions: 7 },
+    });
     // A fresh window means the very first evaluation never dreams.
     expect(app.calls.filter(isDreamSelector)).toHaveLength(0);
     await rm(dataHome, { recursive: true, force: true });
@@ -1351,6 +1365,24 @@ describe("memory manual dreaming", () => {
       output: { file: insight, revision: expect.any(String), title: "Cross-topic insight", type: "insight" },
     });
     expect(JSON.stringify(manifest)).not.toContain("ALPHA_BODY");
+
+    const dreamLogs = app.logs.filter((entry) => entry.message.startsWith("Memory dream"));
+    expect(dreamLogs[0]).toMatchObject({
+      level: "info",
+      message: "Memory dream started",
+      extra: { runID: status.runID, trigger: "manual", sessionID: "ses_dreamer", model: "test/small", additions: 0 },
+    });
+    expect(dreamLogs.filter((entry) => entry.message === "Memory dream action selected")).toHaveLength(3);
+    expect(dreamLogs.filter((entry) => entry.message === "Memory dream action applied").map((entry) => entry.extra?.action)).toEqual([
+      "merge",
+      "supersede",
+      "synthesize",
+    ]);
+    expect(dreamLogs.at(-1)).toMatchObject({
+      level: "info",
+      message: "Memory dream completed",
+      extra: { runID: status.runID, trigger: "manual", state: "changed", counts: { merge: 1, supersede: 1, synthesize: 1 } },
+    });
 
     expect(await Bun.file(join(path, ".dream.request")).exists()).toBe(false);
 
@@ -1669,6 +1701,12 @@ describe("memory manual dreaming", () => {
     });
     const status = await Bun.file(join(path, ".dream.status")).json();
     expect(status.message).toContain("disabled");
+    expect(app.logs).toContainEqual({
+      service: "memory",
+      level: "warn",
+      message: "Memory dream refused",
+      extra: expect.objectContaining({ trigger: "manual", reason: "memory is disabled", sessionID: "ses_off" }),
+    });
     expect(await Bun.file(join(path, "x.md")).exists()).toBe(true);
     expect(await Bun.file(join(path, ".dream.request")).exists()).toBe(false);
     await app.hooks.dispose!();
