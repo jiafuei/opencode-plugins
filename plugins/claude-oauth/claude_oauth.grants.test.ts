@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { AnthropicReauthRequiredError, ClaudeOAuthPlugin, grantTestSeam } from "./claude_oauth.ts";
@@ -406,6 +406,73 @@ describe("grant key migration (refresh-hash → accountId)", () => {
       expect(h.warnings).toHaveLength(0);
       // Both entries are preserved untouched (no migration clobbered account-a).
       expect(readGrantsFile()).toEqual({ [hashKey("refresh-a")]: T0 - 40 * DAY_MS, "account-a": T0 - 5 * DAY_MS });
+    } finally {
+      env.restore();
+    }
+  });
+});
+
+describe("grants lock ownership", () => {
+  serialTest("a dead holder is quarantined before a replacement is installed", () => {
+    const env = useGrantsEnv();
+    try {
+      const dir = grantTestSeam.grantsLockDir();
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(
+        path.join(dir, "owner"),
+        JSON.stringify({ owner: "dead-holder", pid: 2_147_483_647, at: Date.now() }),
+      );
+
+      const ownerId = grantTestSeam.acquireGrantsLock();
+      expect(grantTestSeam.readGrantsLockOwner(dir)?.owner).toBe(ownerId);
+      expect(existsSync(`${dir}.stale-dead-holder`)).toBe(true);
+      grantTestSeam.releaseGrantsLock(ownerId);
+      expect(existsSync(dir)).toBe(false);
+    } finally {
+      env.restore();
+    }
+  });
+
+  serialTest("an old holder cannot delete a replacement holder's lock", () => {
+    const env = useGrantsEnv();
+    try {
+      const dir = grantTestSeam.grantsLockDir();
+      const staleOwner = grantTestSeam.acquireGrantsLock();
+      expect(staleOwner).toMatch(/^[0-9a-f]{32}$/);
+      expect(grantTestSeam.readGrantsLockOwner(dir)?.owner).toBe(staleOwner);
+
+      // A replacement takes over the directory — as a TTL stealer would —
+      // and installs its own owner token.
+      writeFileSync(
+        path.join(dir, "owner"),
+        JSON.stringify({ owner: "replacement-holder", pid: 424242, at: Date.now() }),
+      );
+
+      // The dispossessed holder's release must be a no-op...
+      grantTestSeam.releaseGrantsLock(staleOwner);
+      expect(existsSync(dir)).toBe(true);
+      expect(grantTestSeam.readGrantsLockOwner(dir)?.owner).toBe("replacement-holder");
+
+      // ...while the real holder releases cleanly.
+      grantTestSeam.releaseGrantsLock("replacement-holder");
+      expect(existsSync(dir)).toBe(false);
+    } finally {
+      env.restore();
+    }
+  });
+
+  serialTest("release never deletes a lock whose owner record is unreadable", () => {
+    const env = useGrantsEnv();
+    try {
+      const dir = grantTestSeam.grantsLockDir();
+      const ownerId = grantTestSeam.acquireGrantsLock();
+      // A stealer emptied the directory and is mid-reinstallation: with no
+      // readable owner record, release cannot prove ownership and must keep
+      // the directory rather than destroy the in-progress lock.
+      rmSync(path.join(dir, "owner"));
+      grantTestSeam.releaseGrantsLock(ownerId);
+      expect(existsSync(dir)).toBe(true);
+      expect(grantTestSeam.readGrantsLockOwner(dir)).toBeUndefined();
     } finally {
       env.restore();
     }

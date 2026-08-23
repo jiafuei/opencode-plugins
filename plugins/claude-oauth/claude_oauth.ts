@@ -1,11 +1,37 @@
 import type { Hooks, Plugin, PluginInput, PluginOptions } from "@opencode-ai/plugin";
-import { Database } from "bun:sqlite";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { chmodSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
-import os from "node:os";
+import { mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
+import {
+  buildBetas,
+  CLAUDE_CODE_VERSION,
+  COUNT_TOKENS_BETAS,
+  createSseToolNameTransform,
+  extractUserIdSessionId,
+  prefixRequestToolNames,
+  readBoundedJsonText,
+  REQUEST_ID_PATTERN,
+  rewriteBody,
+  STAINLESS_HEADERS,
+  transformJsonToolUseNames,
+  uncloakedResponseHeaders,
+} from "./wire_format.ts";
+import { RequestChainTracker, requestChainCredentialKey } from "./request_chain.ts";
+import { opencodeDataDir } from "./local_storage.ts";
+
+// Preserve the historical public API: tests and package consumers import these
+// from the plugin entry.
+export {
+  applyClaudeToolPrefix,
+  buildBetas,
+  createSseToolNameTransform,
+  mapStainlessArch,
+  rewriteBody,
+  stripClaudeToolPrefix,
+  transformJsonToolUseNames,
+} from "./wire_format.ts";
 
 // Configure in `opencode.json` like:
 //
@@ -29,115 +55,16 @@ const SCOPES =
   "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
 const REFRESH_SCOPES = "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
 
-const CLAUDE_CODE_VERSION = "2.1.228";
 const USER_AGENT = `claude-cli/${CLAUDE_CODE_VERSION} (external, cli)`;
-const SDK_INSTRUCTION = "You are Claude Code, Anthropic's official CLI for Claude.";
 const AXIOS_USER_AGENT = "axios/1.15.2";
 const AXIOS_ACCEPT = "application/json, text/plain, */*";
-const MAX_OUTPUT_TOKENS = 64000;
 const OAUTH_DUMMY_KEY = "opencode-oauth-dummy-key";
-const BILLING_SALT = "59cf53e54c78";
-const BILLING_HEADER_PREFIX = "x-anthropic-billing-header:";
 const SESSION_ID_HEADER = "x-claude-code-session-id";
 // Plugin-only transport header: carries the per-invocation request id from
 // chat.headers into the auth fetch. Like the session marker, it is stripped
 // before anything hits the wire.
 const REQUEST_ID_HEADER = "x-claude-oauth-request-id";
 const PROMPT_ID_HEADER = "x-claude-oauth-prompt-id";
-
-const UTILITY_PROFILE_BETAS = [
-  "oauth-2025-04-20",
-  "interleaved-thinking-2025-05-14",
-  "redact-thinking-2026-02-12",
-  "thinking-token-count-2026-05-13",
-  "context-management-2025-06-27",
-  "prompt-caching-scope-2026-01-05",
-  "structured-outputs-2025-12-15",
-];
-
-const AGENT_PROFILE_BETAS = [
-  "claude-code-20250219",
-  "oauth-2025-04-20",
-  "interleaved-thinking-2025-05-14",
-  "redact-thinking-2026-02-12",
-  "thinking-token-count-2026-05-13",
-  "context-management-2025-06-27",
-  "prompt-caching-scope-2026-01-05",
-  "mid-conversation-system-2026-04-07",
-  "advanced-tool-use-2025-11-20",
-];
-
-const COUNT_TOKENS_BETAS = [
-  "claude-code-20250219",
-  "oauth-2025-04-20",
-  "interleaved-thinking-2025-05-14",
-  "context-management-2025-06-27",
-  "token-counting-2024-11-01",
-].join(",");
-
-const EFFORT_BETA = "effort-2025-11-24";
-const FALLBACK_CREDIT_BETA = "fallback-credit-2026-06-01";
-// context-1m-2025-08-07 is intentionally never sent: OAuth subscription
-// credentials get hard-429'd on beta-gated 1M requests regardless of prompt
-// size, so it is stripped even from SDK/caller-supplied betas.
-const CONTEXT_1M_BETA = "context-1m-2025-08-07";
-
-function isActiveThinking(thinking: unknown): boolean {
-  const type = (thinking as { type?: unknown } | undefined)?.type;
-  return type === "enabled" || type === "adaptive";
-}
-
-/**
- * Build the final anthropic-beta header: the Claude profile first, then
- * deduplicated SDK/caller extras (compact, PDF, MCP, skills/files, fast mode,
- * task budgets, fallback, ...). `incoming` is the request's existing
- * anthropic-beta header value, if any.
- */
-export function buildBetas(thinking: unknown, hasTools: boolean, incoming?: string | null): string {
-  const agent = hasTools || isActiveThinking(thinking);
-  const betas = [...(agent ? AGENT_PROFILE_BETAS : UTILITY_PROFILE_BETAS)];
-  if (agent && isActiveThinking(thinking)) betas.push(EFFORT_BETA);
-  if (agent) betas.push(FALLBACK_CREDIT_BETA);
-  const seen = new Set(betas);
-  if (incoming) {
-    for (const raw of incoming.split(",")) {
-      const beta = raw.trim();
-      if (!beta || seen.has(beta) || beta === CONTEXT_1M_BETA) continue;
-      seen.add(beta);
-      betas.push(beta);
-    }
-  }
-  return betas.join(",");
-}
-
-export function mapStainlessArch(arch: string): "x64" | "arm64" | "x86" | `other::${string}` {
-  switch (arch.toLowerCase()) {
-    case "amd64":
-    case "x64":
-      return "x64";
-    case "arm64":
-    case "aarch64":
-      return "arm64";
-    case "386":
-    case "x86":
-    case "ia32":
-      return "x86";
-    default:
-      return `other::${arch.toLowerCase()}`;
-  }
-}
-
-// Static Stainless headers emitted by the Claude runtime.
-const STAINLESS_HEADERS: Record<string, string> = {
-  "X-Stainless-Arch": mapStainlessArch(process.arch),
-  "X-Stainless-Lang": "js",
-  "X-Stainless-OS": "Linux",
-  "X-Stainless-Package-Version": "0.112.1",
-  "X-Stainless-Retry-Count": "0",
-  "X-Stainless-Runtime": "node",
-  "X-Stainless-Runtime-Version": "v26.3.0",
-  "X-Stainless-Timeout": "600",
-};
 
 // ---------------------------------------------------------------------------
 // PKCE + token plumbing
@@ -457,194 +384,8 @@ interface RefreshedCredential {
   accountId?: string;
 }
 
-function opencodeDataDir(): string {
-  return path.join(process.env.XDG_DATA_HOME ?? path.join(os.homedir(), ".local", "share"), "opencode");
-}
-
 function claudeOAuthDatabaseFile(): string {
   return process.env.NODE_ENV === "test" ? ":memory:" : path.join(opencodeDataDir(), "claude-oauth", "claude-oauth.db");
-}
-
-function requestChainCredentialKey(refreshToken: string, accountId?: string): string {
-  return createHash("sha256")
-    .update(accountId ? `account\0${accountId}` : `refresh\0${refreshToken}`)
-    .digest("hex");
-}
-
-interface RequestChainState {
-  requestId?: string;
-  generation: number;
-  sequence: number;
-  completedSequence: number;
-}
-
-// A row is established when a request starts. Completion only updates the
-// generation it observed, so compaction/auth invalidation fences late writers
-// across both plugin instances and processes.
-class ClaudeOAuthDatabase {
-  private readonly db: Database;
-
-  constructor(file: string) {
-    if (file !== ":memory:") {
-      const dir = path.dirname(file);
-      mkdirSync(dir, { recursive: true, mode: 0o700 });
-      chmodSync(dir, 0o700);
-      writeFileSync(file, "", { flag: "a", mode: 0o600 });
-      chmodSync(file, 0o600);
-    }
-    this.db = new Database(file, { create: true });
-    try {
-      this.db.exec("PRAGMA busy_timeout = 5000; PRAGMA foreign_keys = ON;");
-      this.db.exec("BEGIN EXCLUSIVE");
-      const version = (this.db.query("PRAGMA user_version").get() as { user_version: number }).user_version;
-      if (version !== 0 && version !== 1) throw new Error(`Unsupported claude-oauth.db schema version ${version}`);
-      this.db.exec(
-        "CREATE TABLE IF NOT EXISTS sessions (session_id TEXT NOT NULL, credential_key TEXT NOT NULL, previous_request_id TEXT, generation INTEGER NOT NULL DEFAULT 0, request_sequence INTEGER NOT NULL DEFAULT 0, completed_sequence INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, deleted_at INTEGER, PRIMARY KEY (session_id, credential_key)) WITHOUT ROWID; CREATE INDEX IF NOT EXISTS sessions_by_credential ON sessions (credential_key); CREATE TABLE IF NOT EXISTS requests (session_id TEXT NOT NULL, credential_key TEXT NOT NULL, logical_request_id TEXT NOT NULL, generation INTEGER NOT NULL, sequence INTEGER NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY (session_id, credential_key, logical_request_id), FOREIGN KEY (session_id, credential_key) REFERENCES sessions (session_id, credential_key) ON DELETE CASCADE) WITHOUT ROWID; CREATE INDEX IF NOT EXISTS requests_by_credential ON requests (credential_key); CREATE INDEX IF NOT EXISTS requests_by_created_at ON requests (created_at); PRAGMA user_version = 1; COMMIT;",
-      );
-    } catch (error) {
-      try {
-        this.db.exec("ROLLBACK");
-      } catch {}
-      this.db.close();
-      throw error;
-    }
-  }
-
-  startRequest(sessionId: string, credentialKey: string, logicalRequestId: string): RequestChainState {
-    const now = Date.now();
-    this.db.exec("BEGIN IMMEDIATE");
-    try {
-      this.db.query("DELETE FROM requests WHERE created_at < ?").run(now - 24 * 60 * 60 * 1000);
-      this.db
-        .query(
-          "INSERT INTO sessions (session_id, credential_key, previous_request_id, generation, request_sequence, completed_sequence, created_at, updated_at, deleted_at) VALUES (?, ?, NULL, 0, 0, 0, ?, ?, NULL) ON CONFLICT (session_id, credential_key) DO UPDATE SET updated_at = excluded.updated_at, deleted_at = NULL",
-        )
-        .run(sessionId, credentialKey, now, now);
-      const row = this.db
-        .query(
-          "SELECT previous_request_id, generation, request_sequence, completed_sequence FROM sessions WHERE session_id = ? AND credential_key = ?",
-        )
-        .get(sessionId, credentialKey) as {
-        previous_request_id: string | null;
-        generation: number;
-        request_sequence: number;
-        completed_sequence: number;
-      };
-      const existing = this.db
-        .query(
-          "SELECT generation, sequence FROM requests WHERE session_id = ? AND credential_key = ? AND logical_request_id = ?",
-        )
-        .get(sessionId, credentialKey, logicalRequestId) as { generation: number; sequence: number } | null;
-      let sequence = existing?.generation === row.generation ? existing.sequence : row.request_sequence + 1;
-      if (!existing || existing.generation !== row.generation) {
-        this.db
-          .query(
-            "UPDATE sessions SET request_sequence = ?, updated_at = ? WHERE session_id = ? AND credential_key = ?",
-          )
-          .run(sequence, now, sessionId, credentialKey);
-        this.db
-          .query(
-            "INSERT INTO requests (session_id, credential_key, logical_request_id, generation, sequence, created_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (session_id, credential_key, logical_request_id) DO UPDATE SET generation = excluded.generation, sequence = excluded.sequence, created_at = excluded.created_at",
-          )
-          .run(sessionId, credentialKey, logicalRequestId, row.generation, sequence, now);
-      }
-      this.db.exec("COMMIT");
-      return {
-        requestId: row.previous_request_id ?? undefined,
-        generation: row.generation,
-        sequence,
-        completedSequence: row.completed_sequence,
-      };
-    } catch (error) {
-      this.db.exec("ROLLBACK");
-      throw error;
-    }
-  }
-
-  complete(
-    sessionId: string,
-    credentialKey: string,
-    logicalRequestId: string,
-    generation: number,
-    sequence: number,
-    requestId: string,
-  ): boolean {
-    let completed = false;
-    this.transaction(() => {
-      completed =
-        this.db
-          .query(
-            "UPDATE sessions SET previous_request_id = ?, completed_sequence = ?, updated_at = ? WHERE session_id = ? AND credential_key = ? AND generation = ? AND completed_sequence < ?",
-          )
-          .run(requestId, sequence, Date.now(), sessionId, credentialKey, generation, sequence).changes === 1;
-      this.db
-        .query(
-          "DELETE FROM requests WHERE session_id = ? AND credential_key = ? AND logical_request_id = ? AND generation = ?",
-        )
-        .run(sessionId, credentialKey, logicalRequestId, generation);
-    });
-    return completed;
-  }
-
-  resetSession(sessionId: string): void {
-    this.transaction(() => {
-      this.db
-        .query(
-          "UPDATE sessions SET previous_request_id = NULL, generation = generation + 1, request_sequence = 0, completed_sequence = 0, updated_at = ?, deleted_at = NULL WHERE session_id = ?",
-        )
-        .run(Date.now(), sessionId);
-      this.db.query("DELETE FROM requests WHERE session_id = ?").run(sessionId);
-    });
-  }
-
-  deleteSession(sessionId: string): void {
-    this.transaction(() => {
-      const now = Date.now();
-      this.db
-        .query(
-          "UPDATE sessions SET previous_request_id = NULL, generation = generation + 1, request_sequence = 0, completed_sequence = 0, updated_at = ?, deleted_at = ? WHERE session_id = ?",
-        )
-        .run(now, now, sessionId);
-      this.db.query("DELETE FROM requests WHERE session_id = ?").run(sessionId);
-    });
-  }
-
-  resetCredential(credentialKey: string): void {
-    this.transaction(() => {
-      this.db
-        .query(
-          "UPDATE sessions SET previous_request_id = NULL, generation = generation + 1, request_sequence = 0, completed_sequence = 0, updated_at = ? WHERE credential_key = ?",
-        )
-        .run(Date.now(), credentialKey);
-      this.db.query("DELETE FROM requests WHERE credential_key = ?").run(credentialKey);
-    });
-  }
-
-  resetAll(): void {
-    this.transaction(() => {
-      this.db
-        .query(
-          "UPDATE sessions SET previous_request_id = NULL, generation = generation + 1, request_sequence = 0, completed_sequence = 0, updated_at = ?",
-        )
-        .run(Date.now());
-      this.db.query("DELETE FROM requests").run();
-    });
-  }
-
-  close(): void {
-    this.db.close();
-  }
-
-  private transaction(work: () => void): void {
-    this.db.exec("BEGIN IMMEDIATE");
-    try {
-      work();
-      this.db.exec("COMMIT");
-    } catch (error) {
-      this.db.exec("ROLLBACK");
-      throw error;
-    }
-  }
 }
 
 // A lease holder that crashed mid-refresh is stolen after this long. Must
@@ -889,6 +630,10 @@ const GRANT_WARN_AGE_MS = 28 * DAY_MS;
 export const grantTestSeam = {
   clock: { now: () => Date.now() },
   warnedGrantKeys: new Set<string>(),
+  grantsLockDir,
+  acquireGrantsLock,
+  releaseGrantsLock,
+  readGrantsLockOwner,
 };
 
 function grantsFile(): string {
@@ -935,40 +680,94 @@ function writeGrants(grants: Record<string, number>): void {
 
 // Cross-process mutual exclusion for grants.json read-modify-write cycles, so
 // concurrent logins in parallel opencode processes cannot lose each other's
-// updates. A holder that crashed mid-update is taken over after this TTL; the
-// critical section is a single synchronous read-modify-write, so live holders
-// are only ever waited on for milliseconds.
-const GRANT_LOCK_TTL_MS = 10_000;
+// updates. The critical section is synchronous and normally lasts only
+// milliseconds; a live holder is never stolen, while a dead holder's exact
+// lock directory is atomically quarantined before a replacement is installed.
+const GRANT_LOCK_WAIT_MS = 10_000;
 
 function grantsLockDir(): string {
   return path.join(opencodeDataDir(), "claude-oauth", "grants.lock");
 }
 
-function acquireGrantsLock(): void {
-  const dir = grantsLockDir();
-  mkdirSync(path.dirname(dir), { recursive: true, mode: 0o700 });
-  for (;;) {
-    try {
-      mkdirSync(dir);
-      return;
-    } catch {
-      let stale = true;
-      try {
-        stale = Date.now() - statSync(dir).mtimeMs >= GRANT_LOCK_TTL_MS;
-      } catch {}
-      if (!stale) {
-        Bun.sleepSync(2);
-        continue;
-      }
-      // Holder crashed mid-update: take over. Concurrent stealers re-race on
-      // the mkdir below.
-      rmSync(dir, { recursive: true, force: true });
+interface GrantsLockOwner {
+  owner: string;
+  pid: number;
+  at: number;
+}
+
+/** Read and validate the recorded lock owner; undefined when missing/malformed. */
+function readGrantsLockOwner(dir: string): GrantsLockOwner | undefined {
+  try {
+    const parsed = JSON.parse(readFileSync(path.join(dir, "owner"), "utf8")) as Partial<GrantsLockOwner>;
+    if (typeof parsed.owner === "string" && parsed.owner.length > 0 && typeof parsed.at === "number") {
+      return {
+        owner: parsed.owner,
+        pid: typeof parsed.pid === "number" ? parsed.pid : -1,
+        at: parsed.at,
+      };
     }
+  } catch {}
+  return undefined;
+}
+
+function processIsAlive(pid: number): boolean {
+  if (pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
   }
 }
 
-function releaseGrantsLock(): void {
-  rmSync(grantsLockDir(), { recursive: true, force: true });
+/** Atomically install a prepared owner directory; returns its owner token. */
+function acquireGrantsLock(): string {
+  const dir = grantsLockDir();
+  mkdirSync(path.dirname(dir), { recursive: true, mode: 0o700 });
+  const ownerId = randomBytes(16).toString("hex");
+  const claim = `${dir}.claim-${ownerId}`;
+  const deadline = Date.now() + GRANT_LOCK_WAIT_MS;
+  mkdirSync(claim);
+  try {
+    writeFileSync(
+      path.join(claim, "owner"),
+      JSON.stringify({ owner: ownerId, pid: process.pid, at: Date.now() } satisfies GrantsLockOwner),
+      { mode: 0o600 },
+    );
+    for (;;) {
+      try {
+        renameSync(claim, dir);
+        return ownerId;
+      } catch {
+        const current = readGrantsLockOwner(dir);
+        if (current && !processIsAlive(current.pid)) {
+          // The destination includes the observed owner's random token and is
+          // intentionally retained. Only one waiter can quarantine this exact
+          // dead lock; lagging waiters cannot rename a replacement over it.
+          try {
+            renameSync(dir, `${dir}.stale-${current.owner}`);
+          } catch {}
+          continue;
+        }
+        if (Date.now() >= deadline) throw new Error("Timed out waiting for the grants lock");
+        Bun.sleepSync(2);
+      }
+    }
+  } catch (error) {
+    rmSync(claim, { recursive: true, force: true });
+    throw error;
+  }
+}
+
+/**
+ * Release only the lock we still own — never a replacement installed by a
+ * stale-takeover stealer or another process. Without a readable owner record
+ * ownership cannot be proven, so the directory is left alone.
+ */
+function releaseGrantsLock(ownerId: string): void {
+  const dir = grantsLockDir();
+  if (readGrantsLockOwner(dir)?.owner !== ownerId) return;
+  rmSync(dir, { recursive: true, force: true });
 }
 
 /**
@@ -978,13 +777,13 @@ function releaseGrantsLock(): void {
  */
 export function recordAuthorizedAt(refreshToken: string, accountId?: string): void {
   try {
-    acquireGrantsLock();
+    const ownerId = acquireGrantsLock();
     try {
       const grants = readGrants();
       grants[grantKey(refreshToken, accountId)] = grantTestSeam.clock.now();
       writeGrants(grants);
     } finally {
-      releaseGrantsLock();
+      releaseGrantsLock(ownerId);
     }
   } catch {}
 }
@@ -1001,7 +800,7 @@ function migrateGrantAuthorizedAt(refreshToken: string, accountId?: string): voi
   const legacyKey = grantKey(refreshToken);
   if (accountKey === legacyKey) return;
   try {
-    acquireGrantsLock();
+    const ownerId = acquireGrantsLock();
     try {
       const grants = readGrants();
       if (grants[accountKey] !== undefined || grants[legacyKey] === undefined) return;
@@ -1009,7 +808,7 @@ function migrateGrantAuthorizedAt(refreshToken: string, accountId?: string): voi
       delete grants[legacyKey];
       writeGrants(grants);
     } finally {
-      releaseGrantsLock();
+      releaseGrantsLock(ownerId);
     }
   } catch {}
 }
@@ -1237,580 +1036,6 @@ function buildAuthorizeUrl(redirectUri: string, pkce: PkceCodes, state: string):
   return `${AUTHORIZE_URL}?${params.toString()}`;
 }
 
-// ---------------------------------------------------------------------------
-// Device ID (stable attribution across restarts)
-// ---------------------------------------------------------------------------
-
-function getInstallId(): string {
-  const dir = opencodeDataDir();
-  // 0700 where practical: with recursive mkdir the mode applies to leaves it
-  // creates; pre-existing directories keep their mode.
-  mkdirSync(dir, { recursive: true, mode: 0o700 });
-  const file = path.join(dir, "claude-oauth-install-id");
-  let existing = "";
-  try {
-    existing = readFileSync(file, "utf8").trim();
-  } catch {}
-  if (existing) {
-    ensureOwnerOnly(file);
-    return existing;
-  }
-  const id = randomBytes(16).toString("hex");
-  try {
-    // Exclusive creation so concurrent processes converge on exactly one
-    // winner identity.
-    writeFileSync(file, id, { mode: 0o600, flag: "wx" });
-    return id;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-    // Another process won the race: adopt its identity unchanged. The file
-    // may exist for a few microseconds before the winner's content lands,
-    // so poll briefly for a nonempty value.
-    for (let attempt = 0; attempt < 50; attempt++) {
-      Bun.sleepSync(5);
-      const winner = readFileSync(file, "utf8").trim();
-      if (winner) {
-        chmodSync(file, 0o600);
-        return winner;
-      }
-    }
-    throw new Error("claude-oauth install id file was created but never populated");
-  }
-}
-
-/** Tighten a legacy install-id file to owner-only permissions if needed. */
-function ensureOwnerOnly(file: string): void {
-  if ((statSync(file).mode & 0o777) !== 0o600) chmodSync(file, 0o600);
-}
-
-function deriveDeviceId(accountId?: string): string {
-  const hash = createHash("sha256");
-  if (accountId) {
-    return hash.update("claude-oauth-device-id-v2\0").update(getInstallId()).update("\0").update(accountId).digest("hex");
-  }
-  return hash.update("claude-oauth-device-id-v1:").update(getInstallId()).digest("hex");
-}
-
-// Valid legacy cloaking id: user_<64 hex>_account_<uuid>_session_<uuid>.
-const CLOAKING_USER_ID_REGEX =
-  /^user_[0-9a-fA-F]{64}_account_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}_session_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
-
-function isClaudeJsonUserId(userId: string): boolean {
-  if (userId.length === 0 || userId[0] !== "{") return false;
-  try {
-    const parsed = JSON.parse(userId) as Record<string, unknown>;
-    return typeof parsed.session_id === "string" && parsed.session_id.length > 0;
-  } catch {
-    return false;
-  }
-}
-
-function extractUserIdSessionId(userId: string): string | undefined {
-  if (CLOAKING_USER_ID_REGEX.test(userId)) return userId.slice(userId.lastIndexOf("_session_") + "_session_".length);
-  if (userId.startsWith("{")) {
-    try {
-      const sessionId = (JSON.parse(userId) as Record<string, unknown>).session_id;
-      if (typeof sessionId === "string" && sessionId.length > 0) return sessionId;
-    } catch {}
-  }
-  return undefined;
-}
-
-// Generated user ids prefer an account already present in metadata over the
-// auth-derived one.
-function readMetadataAccountId(metadata: unknown): string | undefined {
-  if (!metadata || typeof metadata !== "object") return undefined;
-  for (const key of ["account_uuid", "accountId", "account_id"]) {
-    const value = (metadata as Record<string, unknown>)[key];
-    if (typeof value === "string" && value.length > 0) return value;
-  }
-  return undefined;
-}
-
-// ---------------------------------------------------------------------------
-// Request spoofing: billing header + cch attestation
-// ---------------------------------------------------------------------------
-
-function createBillingHeader(firstUserMessageText: string, previousRequestId?: string, promptId?: string): string {
-  // Fingerprint: SHA256(salt + msg[4] + msg[7] + msg[20] + version)[:3],
-  // chars taken from the first user message (not the system prompt).
-  const k = [4, 7, 20]
-    .map((i) => firstUserMessageText[i] ?? "0")
-    .join("");
-  const versionSuffix = createHash("sha256")
-    .update(`${BILLING_SALT}${k}${CLAUDE_CODE_VERSION}`)
-    .digest("hex")
-    .slice(0, 3);
-  // cch=00000 is replaced after the complete request object is assembled.
-  return (
-    `${BILLING_HEADER_PREFIX} cc_version=${CLAUDE_CODE_VERSION}.${versionSuffix}; cc_entrypoint=cli; cch=00000;` +
-    (previousRequestId && /^req_[A-Za-z0-9_-]{1,36}$/.test(previousRequestId)
-      ? ` cc_prev_req=${previousRequestId};`
-      : "") +
-    (promptId && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(promptId)
-      ? ` cc_prompt_id=${promptId};`
-      : "")
-  );
-}
-
-// cch attestation: XXHash64(body_with_placeholder, seed) low-20-bits as 5 hex chars.
-const CCH_SEED = 0x4d659218e32a3268n;
-const CCH_PLACEHOLDER_STR = "cch=00000";
-const cchEncoder = new TextEncoder();
-
-// ---------------------------------------------------------------------------
-// Custom tool name cloaking
-// ---------------------------------------------------------------------------
-
-const TOOL_PREFIX = "_";
-
-// Anthropic built-in tool names are never prefixed or stripped. Server tools
-// from the pinned @ai-sdk/anthropic additionally carry versioned `type` fields
-// (web_search_20250305, text_editor_20250429, computer_20250124,
-// code_execution_20250522, ...) on their definitions; any tool definition with
-// a string `type` is a provider tool and is left untouched.
-const BUILTIN_TOOL_NAMES = new Set(["web_search", "code_execution", "text_editor", "computer"]);
-
-function isBuiltinToolName(name: string): boolean {
-  return BUILTIN_TOOL_NAMES.has(name.toLowerCase());
-}
-
-export function applyClaudeToolPrefix(name: string): string {
-  if (isBuiltinToolName(name)) return name;
-  // Always prepend — even when the logical name already starts with "_" — so
-  // stripping exactly one prefix on the way back round-trips (`_foo` →
-  // `__foo` → `_foo`, never `_foo` → wire `_foo` → strip → `foo`).
-  return `${TOOL_PREFIX}${name}`;
-}
-
-export function stripClaudeToolPrefix(name: string): string {
-  if (!name.startsWith(TOOL_PREFIX)) return name;
-  return name.slice(TOOL_PREFIX.length);
-}
-
-/**
- * Prefix every custom tool name carried by an Anthropic request body, in place:
- * custom tool definitions (no versioned `type`), `tool_choice.name`, and
- * historical assistant `tool_use` blocks. IDs and `tool_result` blocks are
- * preserved verbatim.
- */
-function prefixRequestToolNames(params: Record<string, any>): void {
-  if (Array.isArray(params.tools)) {
-    for (const tool of params.tools) {
-      // Provider/server tools are identified by a versioned `type`
-      // (web_search_20250305, computer_20250124, ...); custom function tools
-      // have no `type` at all.
-      if (!tool || typeof tool !== "object" || typeof tool.type === "string") continue;
-      if (typeof tool.name === "string") tool.name = applyClaudeToolPrefix(tool.name);
-    }
-  }
-  const toolChoice = params.tool_choice;
-  if (
-    toolChoice &&
-    typeof toolChoice === "object" &&
-    toolChoice.type === "tool" &&
-    typeof toolChoice.name === "string"
-  ) {
-    toolChoice.name = applyClaudeToolPrefix(toolChoice.name);
-  }
-  if (Array.isArray(params.messages)) {
-    for (const message of params.messages) {
-      if (!message || typeof message !== "object" || !Array.isArray(message.content)) continue;
-      for (const block of message.content) {
-        if (block?.type === "tool_use" && typeof block.name === "string") {
-          block.name = applyClaudeToolPrefix(block.name);
-        }
-      }
-    }
-  }
-}
-
-/** Strip the cloaking prefix from `content[].type === "tool_use"` names in a non-streaming JSON response body. */
-export function transformJsonToolUseNames(body: string): string {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(body);
-  } catch {
-    return body;
-  }
-  if (!parsed || typeof parsed !== "object" || !Array.isArray((parsed as Record<string, any>).content)) return body;
-  for (const block of (parsed as Record<string, any>).content) {
-    if (block?.type === "tool_use" && typeof block.name === "string") {
-      block.name = stripClaudeToolPrefix(block.name);
-    }
-  }
-  return JSON.stringify(parsed);
-}
-
-// One complete SSE event may be buffered while it is assembled across chunks.
-// Anthropic messages events sit far below this; exceeding it means the stream
-// is not well-formed SSE and buffering further would be unbounded.
-const SSE_EVENT_BUFFER_LIMIT = 1024 * 1024;
-
-/**
- * Incremental SSE transformer that strips exactly one cloaking prefix from
- * tool_use names inside content_block_start events and in any
- * message_start.message.content tool_use blocks. Complete SSE event records
- * are parsed across arbitrary chunk boundaries (CRLF/LF), joining multiple
- * `data:` lines per the SSE rules before JSON parsing. Events that need no
- * rewrite pass through byte-for-byte, and only the current partial event is
- * ever buffered — never the full stream. A partial event that exceeds the
- * assembly cap fails the stream with a clear error.
- */
-export function createSseToolNameTransform(
-  onComplete?: () => void | Promise<void>,
-): TransformStream<Uint8Array, Uint8Array> {
-  const decoder = new TextDecoder();
-  const encoder = new TextEncoder();
-  let pending = "";
-  let messageCompleted = false;
-  let streamFailed = false;
-  // Lines of the event being assembled: text without its terminator, plus the
-  // exact terminator bytes that followed it ("\n" or "\r\n"). The terminating
-  // blank line is included, so re-emitting the list reproduces the raw bytes.
-  let eventLines: Array<{ text: string; eol: string }> = [];
-  let eventBytes = 0;
-
-  function uncloak(event: any): any | undefined {
-    if (event?.type === "content_block_start") {
-      const block = event.content_block;
-      if (block?.type === "tool_use" && typeof block.name === "string") {
-        return { ...event, content_block: { ...block, name: stripClaudeToolPrefix(block.name) } };
-      }
-      return undefined;
-    }
-    if (event?.type === "message_start" && Array.isArray(event.message?.content)) {
-      let changed = false;
-      const content = event.message.content.map((block: any) => {
-        if (block?.type !== "tool_use" || typeof block.name !== "string") return block;
-        changed = true;
-        return { ...block, name: stripClaudeToolPrefix(block.name) };
-      });
-      return changed ? { ...event, message: { ...event.message, content } } : undefined;
-    }
-    return undefined;
-  }
-
-  /** Emit one completed event: rewritten only when its data payload carried a cloaked name. */
-  function dispatch(controller: TransformStreamDefaultController<Uint8Array>): void {
-    if (eventLines.length === 0) return;
-    let rebuilt: string[] | undefined;
-    const dataValues = eventLines
-      .filter((line) => line.text.startsWith("data:"))
-      .map((line) => (line.text.slice(5).startsWith(" ") ? line.text.slice(6) : line.text.slice(5)));
-    if (dataValues.length > 0) {
-      let parsed: unknown;
-      try {
-        parsed = JSON.parse(dataValues.join("\n"));
-      } catch {}
-      if ((parsed as { type?: unknown } | undefined)?.type === "message_stop") messageCompleted = true;
-      if ((parsed as { type?: unknown } | undefined)?.type === "error") streamFailed = true;
-      const next = uncloak(parsed);
-      if (next !== undefined) {
-        // Re-emit the event verbatim except for its data lines: the first
-        // carries the rewritten JSON, any additional ones are folded into it.
-        const newData = `data: ${JSON.stringify(next)}`;
-        rebuilt = [];
-        let replaced = false;
-        for (const line of eventLines) {
-          if (line.text.startsWith("data:")) {
-            if (!replaced) {
-              rebuilt.push(`${newData}${line.eol}`);
-              replaced = true;
-            }
-          } else {
-            rebuilt.push(`${line.text}${line.eol}`);
-          }
-        }
-      }
-    }
-    controller.enqueue(
-      encoder.encode(rebuilt ? rebuilt.join("") : eventLines.map((line) => `${line.text}${line.eol}`).join("")),
-    );
-    eventLines = [];
-    eventBytes = 0;
-  }
-
-  return new TransformStream({
-    transform(chunk, controller) {
-      pending += decoder.decode(chunk, { stream: true });
-      for (;;) {
-        const newlineIdx = pending.indexOf("\n");
-        if (newlineIdx === -1) break;
-        let text = pending.slice(0, newlineIdx);
-        pending = pending.slice(newlineIdx + 1);
-        let eol = "\n";
-        if (text.endsWith("\r")) {
-          text = text.slice(0, -1);
-          eol = "\r\n";
-        }
-        eventBytes += text.length + eol.length;
-        if (eventBytes > SSE_EVENT_BUFFER_LIMIT) {
-          throw new Error(
-            `claude-oauth: buffered SSE event exceeded ${SSE_EVENT_BUFFER_LIMIT} bytes without a record boundary; aborting the response stream`,
-          );
-        }
-        eventLines.push({ text, eol });
-        // A blank line terminates the SSE event record.
-        if (text === "") dispatch(controller);
-      }
-      if (eventBytes + pending.length > SSE_EVENT_BUFFER_LIMIT) {
-        throw new Error(
-          `claude-oauth: buffered SSE event exceeded ${SSE_EVENT_BUFFER_LIMIT} bytes without a record boundary; aborting the response stream`,
-        );
-      }
-    },
-    flush(controller) {
-      pending += decoder.decode();
-      if (pending.length > 0) {
-        // A final line without a terminator completes the last event.
-        eventLines.push({ text: pending, eol: "" });
-        pending = "";
-      }
-      dispatch(controller);
-      if (messageCompleted && !streamFailed) return onComplete?.();
-    },
-  });
-}
-
-// Non-streaming JSON bodies are read whole but bounded: a legitimate message
-// response stays far below this; anything larger is a protocol error, not
-// something to buffer indefinitely.
-const MAX_JSON_RESPONSE_CHARS = 64 * 1024 * 1024;
-
-async function readBoundedJsonText(response: Response): Promise<string> {
-  const reader = response.body?.getReader();
-  if (!reader) return "";
-  const decoder = new TextDecoder();
-  let text = "";
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    text += decoder.decode(value, { stream: true });
-    if (text.length > MAX_JSON_RESPONSE_CHARS) {
-      reader.cancel().catch(() => {});
-      throw new Error(
-        `claude-oauth: non-streaming JSON response exceeds the ${MAX_JSON_RESPONSE_CHARS}-character uncloaking bound`,
-      );
-    }
-  }
-  return text;
-}
-
-/**
- * Headers for a rewritten Response: cloned from the upstream response with
- * stale entity headers removed — they describe bytes we replaced, not the
- * transformed body. Status/statusText/content-type are preserved by the caller.
- */
-function uncloakedResponseHeaders(response: Response): Headers {
-  const headers = new Headers(response.headers);
-  for (const key of [...headers.keys()]) {
-    const lower = key.toLowerCase();
-    if (
-      lower === "content-length" ||
-      lower === "content-encoding" ||
-      lower === "etag" ||
-      lower === "content-md5" ||
-      lower.includes("checksum")
-    ) {
-      headers.delete(key);
-    }
-  }
-  return headers;
-}
-
-// ---------------------------------------------------------------------------
-// Body rewrite
-// ---------------------------------------------------------------------------
-
-type ContentBlock = { type?: string; text?: string };
-
-function extractFirstUserText(messages: unknown): string {
-  if (!Array.isArray(messages)) return "";
-  for (const message of messages) {
-    if (!message || typeof message !== "object") continue;
-    const m = message as { role?: string; content?: unknown };
-    if (m.role !== "user") continue;
-    if (typeof m.content === "string") return m.content;
-    if (Array.isArray(m.content)) {
-      const first = m.content.find(
-        (b): b is ContentBlock => !!b && typeof b === "object" && (b as ContentBlock).type === "text",
-      );
-      return first?.text ?? "";
-    }
-    return "";
-  }
-  return "";
-}
-
-const CANONICAL_BODY_KEYS = [
-  "model",
-  "messages",
-  "system",
-  "tools",
-  "metadata",
-  "max_tokens",
-  "thinking",
-  "context_management",
-  "temperature",
-  "output_config",
-  "fallbacks",
-  "stream",
-];
-
-/**
- * Rewrite a /v1/messages body into Claude Code shape:
- * - system[0] billing header (+ system[1] Claude CLI instruction)
- * - metadata.user_id in the CC attribution envelope
- * - max_tokens clamped to <= 64000
- * - context_management merged: incoming edits are preserved; active thinking
- *   additionally guarantees exactly one clear_thinking_20251015 keep-all edit
- * - known keys rebuilt in canonical order (incl. output_config / fallbacks),
- *   remaining keys appended in their original relative order;
- *   incoming `stream` is preserved as-is
- */
-export function rewriteBody(
-  body: string,
-  ctx: {
-    sessionId?: string;
-    accountId?: string;
-    attributionHeader?: boolean;
-    previousRequestId?: string;
-    promptId?: string;
-  },
-): { json: string; thinking: unknown; hasTools: boolean; sessionId?: string } {
-  const params = JSON.parse(body) as Record<string, any>;
-  // Cloak custom tool names before anything else, so cch hashes the
-  // already-prefixed final body.
-  prefixRequestToolNames(params);
-  const hasTools = Array.isArray(params.tools) && params.tools.length > 0;
-
-  const modelId: string = params.model ?? "";
-  // Like CC: neither the billing header nor the SDK instruction goes to haiku.
-  const injectFingerprint = !modelId.startsWith("claude-3-5-haiku");
-
-  // Normalize incoming system content (string → text block, array kept as-is,
-  // including caller fields like cache_control). Skip injection entirely when a
-  // billing block already exists so rewrites never stack duplicate fingerprints.
-  const incomingSystem = params.system;
-  let systemBlocks: ContentBlock[] =
-    typeof incomingSystem === "string"
-      ? [{ type: "text", text: incomingSystem }]
-      : Array.isArray(incomingSystem)
-        ? incomingSystem
-        : [];
-  const hasBillingBlock =
-    (typeof incomingSystem === "string" && incomingSystem.startsWith(BILLING_HEADER_PREFIX)) ||
-    systemBlocks.some((block) => typeof block?.text === "string" && block.text.startsWith(BILLING_HEADER_PREFIX));
-
-  if (ctx.attributionHeader === false) {
-    systemBlocks = systemBlocks.filter(
-      (block) => typeof block?.text !== "string" || !block.text.startsWith(BILLING_HEADER_PREFIX),
-    );
-  }
-
-  const hasIdentityBlock = systemBlocks.some((block) => block?.text === SDK_INSTRUCTION);
-  const fingerprintBlocks: ContentBlock[] = [];
-  if (injectFingerprint && ctx.attributionHeader !== false && !hasBillingBlock) {
-    fingerprintBlocks.push({
-      type: "text",
-      text: createBillingHeader(extractFirstUserText(params.messages), ctx.previousRequestId, ctx.promptId),
-    });
-  }
-  if (injectFingerprint && !hasIdentityBlock) fingerprintBlocks.push({ type: "text", text: SDK_INSTRUCTION });
-  const system = [...fingerprintBlocks, ...systemBlocks];
-
-  // metadata.user_id: preserve valid CC attribution verbatim — the legacy
-  // cloaking id or the `{device_id, session_id, ...}` JSON envelope with a
-  // nonempty session_id. Anything else gets a freshly generated envelope whose
-  // session matches the header-provided sessionId so Step 5 can keep header and
-  // body attribution consistent.
-  const incomingUserId = params.metadata?.user_id;
-  let userId: string;
-  if (
-    typeof incomingUserId === "string" &&
-    (CLOAKING_USER_ID_REGEX.test(incomingUserId) || isClaudeJsonUserId(incomingUserId))
-  ) {
-    userId = incomingUserId;
-  } else {
-    const accountId = readMetadataAccountId(params.metadata) ?? ctx.accountId;
-    const envelope: Record<string, string> = {
-      device_id: deriveDeviceId(accountId),
-    };
-    if (accountId) envelope.account_uuid = accountId;
-    envelope.session_id = ctx.sessionId ?? randomUUID().toLowerCase();
-    userId = JSON.stringify(envelope);
-  }
-  const sessionId = extractUserIdSessionId(userId);
-  const metadata = { ...params.metadata, user_id: userId };
-
-  const thinking = params.thinking;
-  // Merge, don't replace: keep any incoming context_management intact
-  // (compact_20260112, clear_tool_uses_20250919, unknown future edits) and
-  // only guarantee the clear-thinking edit when thinking is active. Incoming
-  // objects are copied, never mutated.
-  const incomingContextManagement = params.context_management;
-  let contextManagement: Record<string, any> | undefined;
-  if (isActiveThinking(thinking)) {
-    contextManagement = {
-      ...incomingContextManagement,
-      edits: [
-        { type: "clear_thinking_20251015", keep: "all" },
-        ...((incomingContextManagement?.edits ?? []).filter(
-          (edit: { type?: unknown }) => edit?.type !== "clear_thinking_20251015",
-        )),
-      ],
-    };
-  } else if (incomingContextManagement) {
-    contextManagement = incomingContextManagement;
-  }
-
-  const overrides: Record<string, any> = {
-    model: params.model,
-    messages: params.messages,
-    ...(system.length > 0 && { system }),
-    // OAuth requests always carry a tools array, even an empty one (CC does).
-    tools: Array.isArray(params.tools) ? params.tools : [],
-    metadata,
-    max_tokens: Math.min(MAX_OUTPUT_TOKENS, params.max_tokens ?? MAX_OUTPUT_TOKENS),
-    ...(thinking && { thinking }),
-    ...(contextManagement && { context_management: contextManagement }),
-  };
-  const merged = { ...params, ...overrides };
-
-  // Rebuild known keys in canonical order, then append every remaining key in
-  // its original relative order. Incoming `stream` is preserved as-is (the
-  // normal SDK path sends true); undefined values drop out on stringify.
-  const rewritten: Record<string, any> = {};
-  for (const key of CANONICAL_BODY_KEYS) {
-    if (merged[key] !== undefined) rewritten[key] = merged[key];
-  }
-  for (const [key, value] of Object.entries(params)) {
-    if (!(key in rewritten) && value !== undefined) rewritten[key] = value;
-  }
-
-  const billingBlock = system.find(
-    (block) =>
-      typeof block?.text === "string" &&
-      block.text.startsWith(BILLING_HEADER_PREFIX) &&
-      block.text.includes(CCH_PLACEHOLDER_STR),
-  );
-  if (billingBlock?.text) {
-    const normalized = JSON.stringify(rewritten, (key, value) => {
-      if (key === "model" && typeof value === "string") return "";
-      if (key === "fallbacks" && Array.isArray(value)) return undefined;
-      if (key === "fallback_credit_token" && typeof value === "string") return undefined;
-      if (key === "max_tokens" && typeof value === "number") return undefined;
-      return value;
-    });
-    const hash = Bun.hash.xxHash64(cchEncoder.encode(normalized), CCH_SEED);
-    const cch = (hash & 0xfffffn).toString(16).padStart(5, "0");
-    billingBlock.text = billingBlock.text.replace(CCH_PLACEHOLDER_STR, `cch=${cch}`);
-  }
-
-  return { json: JSON.stringify(rewritten), thinking, hasTools, sessionId };
-}
-
 export interface ClaudeOAuthOptions {
   attributionHeader?: boolean;
 }
@@ -1820,191 +1045,24 @@ type ClaudeOAuthInternalOptions = ClaudeOAuthOptions & { databasePath?: string }
 export const ClaudeOAuthPlugin: Plugin = async (input: PluginInput, options?: PluginOptions | ClaudeOAuthOptions) => {
   const pluginOptions = options as ClaudeOAuthInternalOptions | undefined;
   const attributionHeader = pluginOptions?.attributionHeader !== false;
-  const previousRequestIds = new Map<string, RequestChainState>();
-  const logicalRequestSequences = new Map<
-    string,
-    { credentialKey: string; sessionId: string; generation: number; sequence: number }
-  >();
   const promptIds = new Map<string, Map<string, string>>();
-  let database: ClaudeOAuthDatabase | undefined;
-  let databaseUnavailable = false;
+  // Owns SQLite persistence, the process-local fallback, and every
+  // generation/retry-sequencing, reset, delete, and close operation.
+  const requestChains = new RequestChainTracker(pluginOptions?.databasePath ?? claudeOAuthDatabaseFile());
   let activeRequestCredential: string | undefined;
   let previousAccessFingerprint: string | undefined;
   let requestStateGeneration = 0;
 
-  function getDatabase(): ClaudeOAuthDatabase | undefined {
-    if (databaseUnavailable) return undefined;
-    try {
-      return (database ??= new ClaudeOAuthDatabase(
-        pluginOptions?.databasePath ?? claudeOAuthDatabaseFile(),
-      ));
-    } catch {
-      databaseUnavailable = true;
-      return undefined;
-    }
-  }
+  // Shared login-success tail for both authorize methods: exchange the code,
+  // invalidate every previous-request chain (a fresh login must not inherit
+  // prior attribution), and record the grant timestamp.
+  const finishLogin = async (code: string, state: string, verifier: string, redirectUri: string) => {
+    const tokens = await exchangeCode(code, state, verifier, redirectUri);
+    requestChains.resetAll();
+    recordAuthorizedAt(tokens.refresh, tokens.accountId);
+    return { type: "success" as const, ...tokens };
+  };
 
-  function disableDatabase(): void {
-    try {
-      database?.close();
-    } catch {}
-    database = undefined;
-    databaseUnavailable = true;
-  }
-
-  function requestChainMapKey(credentialKey: string, sessionId: string): string {
-    return `${credentialKey}\0${sessionId}`;
-  }
-
-  function readRequestChain(credentialKey: string, sessionId: string, logicalRequestId: string): RequestChainState {
-    const memoryKey = requestChainMapKey(credentialKey, sessionId);
-    const logicalKey = `${memoryKey}\0${logicalRequestId}`;
-    const store = getDatabase();
-    if (store) {
-      try {
-        const state = store.startRequest(sessionId, credentialKey, logicalRequestId);
-        previousRequestIds.set(memoryKey, state);
-        logicalRequestSequences.set(logicalKey, {
-          credentialKey,
-          sessionId,
-          generation: state.generation,
-          sequence: state.sequence,
-        });
-        return state;
-      } catch {
-        disableDatabase();
-      }
-    }
-    const current = previousRequestIds.get(memoryKey) ?? {
-      generation: 0,
-      sequence: 0,
-      completedSequence: 0,
-    };
-    const existing = logicalRequestSequences.get(logicalKey);
-    const sequence = existing?.generation === current.generation ? existing.sequence : current.sequence + 1;
-    const state = { ...current, sequence: Math.max(current.sequence, sequence) };
-    previousRequestIds.set(memoryKey, state);
-    logicalRequestSequences.set(logicalKey, {
-      credentialKey,
-      sessionId,
-      generation: state.generation,
-      sequence,
-    });
-    return { ...state, sequence };
-  }
-
-  function completeRequestChain(
-    credentialKey: string,
-    sessionId: string,
-    logicalRequestId: string,
-    generation: number,
-    sequence: number,
-    requestId: string,
-  ): void {
-    const memoryKey = requestChainMapKey(credentialKey, sessionId);
-    const logicalKey = `${memoryKey}\0${logicalRequestId}`;
-    const store = getDatabase();
-    if (store) {
-      try {
-        if (store.complete(sessionId, credentialKey, logicalRequestId, generation, sequence, requestId)) {
-          const current = previousRequestIds.get(memoryKey);
-          previousRequestIds.set(memoryKey, {
-            requestId,
-            generation,
-            sequence: Math.max(current?.sequence ?? sequence, sequence),
-            completedSequence: sequence,
-          });
-        } else {
-          previousRequestIds.delete(memoryKey);
-        }
-        logicalRequestSequences.delete(logicalKey);
-        return;
-      } catch {
-        disableDatabase();
-      }
-    }
-    const current = previousRequestIds.get(memoryKey);
-    if (current?.generation === generation && current.completedSequence < sequence) {
-      previousRequestIds.set(memoryKey, { ...current, requestId, completedSequence: sequence });
-    }
-    logicalRequestSequences.delete(logicalKey);
-  }
-
-  function resetPreviousRequestsForSession(sessionId: string): void {
-    for (const [key, state] of previousRequestIds) {
-      if (key.endsWith(`\0${sessionId}`)) {
-        previousRequestIds.set(key, {
-          generation: state.generation + 1,
-          sequence: 0,
-          completedSequence: 0,
-        });
-      }
-    }
-    for (const [key, request] of logicalRequestSequences) {
-      if (request.sessionId === sessionId) logicalRequestSequences.delete(key);
-    }
-    try {
-      getDatabase()?.resetSession(sessionId);
-    } catch {
-      disableDatabase();
-    }
-  }
-
-  function deletePreviousRequestsForSession(sessionId: string): void {
-    for (const [key, state] of previousRequestIds) {
-      if (key.endsWith(`\0${sessionId}`)) {
-        previousRequestIds.set(key, {
-          generation: state.generation + 1,
-          sequence: 0,
-          completedSequence: 0,
-        });
-      }
-    }
-    for (const [key, request] of logicalRequestSequences) {
-      if (request.sessionId === sessionId) logicalRequestSequences.delete(key);
-    }
-    try {
-      getDatabase()?.deleteSession(sessionId);
-    } catch {
-      disableDatabase();
-    }
-  }
-
-  function resetPreviousRequestsForCredential(credentialKey: string): void {
-    for (const [key, state] of previousRequestIds) {
-      if (key.startsWith(`${credentialKey}\0`)) {
-        previousRequestIds.set(key, {
-          generation: state.generation + 1,
-          sequence: 0,
-          completedSequence: 0,
-        });
-      }
-    }
-    for (const [key, request] of logicalRequestSequences) {
-      if (request.credentialKey === credentialKey) logicalRequestSequences.delete(key);
-    }
-    try {
-      getDatabase()?.resetCredential(credentialKey);
-    } catch {
-      disableDatabase();
-    }
-  }
-
-  function resetAllPreviousRequests(): void {
-    for (const [key, state] of previousRequestIds) {
-      previousRequestIds.set(key, {
-        generation: state.generation + 1,
-        sequence: 0,
-        completedSequence: 0,
-      });
-    }
-    logicalRequestSequences.clear();
-    try {
-      getDatabase()?.resetAll();
-    } catch {
-      disableDatabase();
-    }
-  }
   // Persist rotated tokens during background refreshes. Login results are
   // persisted by core directly.
   const persist = async (tokens: RefreshedCredential) => {
@@ -2142,46 +1200,38 @@ export const ClaudeOAuthPlugin: Plugin = async (input: PluginInput, options?: Pl
             }
 
             // Single dispatch boundary: route on the latest classified state.
-            if (auth.kind === "missing") {
-              if (activeRequestCredential) resetPreviousRequestsForCredential(activeRequestCredential);
+            // Every non-OAuth outcome first tears down the request chain of
+            // the previously active credential — leaving OAuth (logout,
+            // unsupported type, or an ordinary API key) must not leave stale
+            // prev-request state behind.
+            if (auth.kind !== "oauth") {
+              if (activeRequestCredential) requestChains.resetCredential(activeRequestCredential);
               activeRequestCredential = undefined;
               previousAccessFingerprint = undefined;
               requestStateGeneration++;
+              if (auth.kind === "api") {
+                // Ordinary Anthropic API-key request: replace the dummy
+                // x-api-key with the real one and drop OAuth-only mutations.
+                // No fingerprinting, body rewrite, cch, tool cloaking, or
+                // response uncloaking on this path — and no x-client-request-id:
+                // that id is an OAuth-fingerprint field. This is not OAuth wire
+                // traffic, so plugin-only transport markers (session id header,
+                // private request id, stale bearer) are stripped too —
+                // chat.headers can still emit the markers while the cached
+                // claudeOAuth flag lingers.
+                const headers = new Headers(init?.headers);
+                headers.delete("Authorization");
+                headers.delete(SESSION_ID_HEADER);
+                headers.delete(REQUEST_ID_HEADER);
+                headers.delete(PROMPT_ID_HEADER);
+                headers.set("x-api-key", auth.key);
+                return fetch(requestInput, { ...init, headers });
+              }
               throw new Error(
-                "Anthropic credentials are missing (logged out?) - run `opencode auth login`, pick Anthropic, then choose a Claude Pro/Max method.",
+                auth.kind === "missing"
+                  ? "Anthropic credentials are missing (logged out?) - run `opencode auth login`, pick Anthropic, then choose a Claude Pro/Max method."
+                  : `Unsupported Anthropic auth type "${auth.authType}" - run \`opencode auth login\`, pick Anthropic, then choose a Claude Pro/Max method.`,
               );
-            }
-            if (auth.kind === "unsupported") {
-              if (activeRequestCredential) resetPreviousRequestsForCredential(activeRequestCredential);
-              activeRequestCredential = undefined;
-              previousAccessFingerprint = undefined;
-              requestStateGeneration++;
-              throw new Error(
-                `Unsupported Anthropic auth type "${auth.authType}" - run \`opencode auth login\`, pick Anthropic, then choose a Claude Pro/Max method.`,
-              );
-            }
-
-            if (auth.kind === "api") {
-              if (activeRequestCredential) resetPreviousRequestsForCredential(activeRequestCredential);
-              activeRequestCredential = undefined;
-              previousAccessFingerprint = undefined;
-              requestStateGeneration++;
-              // Ordinary Anthropic API-key request: replace the dummy
-              // x-api-key with the real one and drop OAuth-only mutations.
-              // No fingerprinting, body rewrite, cch, tool cloaking, or
-              // response uncloaking on this path — and no x-client-request-id:
-              // that id is an OAuth-fingerprint field. This is not OAuth wire
-              // traffic, so plugin-only transport markers (session id header,
-              // private request id, stale bearer) are stripped too —
-              // chat.headers can still emit the markers while the cached
-              // claudeOAuth flag lingers.
-              const headers = new Headers(init?.headers);
-              headers.delete("Authorization");
-              headers.delete(SESSION_ID_HEADER);
-              headers.delete(REQUEST_ID_HEADER);
-              headers.delete(PROMPT_ID_HEADER);
-              headers.set("x-api-key", auth.key);
-              return fetch(requestInput, { ...init, headers });
             }
 
             const url = requestInput instanceof URL ? requestInput : new URL(typeof requestInput === "string" ? requestInput : requestInput.url);
@@ -2236,7 +1286,7 @@ export const ClaudeOAuthPlugin: Plugin = async (input: PluginInput, options?: Pl
               requestChainSessionId = hookSessionId ?? attributedSessionId
               const requestChain =
                 attributionHeader && requestChainSessionId
-                  ? readRequestChain(requestCredential, requestChainSessionId, logicalRequestId)
+                  ? requestChains.startRequest(requestCredential, requestChainSessionId, logicalRequestId)
                   : undefined
               requestChainGeneration = requestChain?.generation
               requestChainSequence = requestChain?.sequence
@@ -2250,7 +1300,7 @@ export const ClaudeOAuthPlugin: Plugin = async (input: PluginInput, options?: Pl
               sessionId = rewrittenSessionId
               requestChainSessionId ??= sessionId
               if (attributionHeader && requestChainSessionId && requestChainGeneration === undefined) {
-                const state = readRequestChain(requestCredential, requestChainSessionId, logicalRequestId)
+                const state = requestChains.startRequest(requestCredential, requestChainSessionId, logicalRequestId)
                 requestChainGeneration = state.generation
                 requestChainSequence = state.sequence
               }
@@ -2296,7 +1346,7 @@ export const ClaudeOAuthPlugin: Plugin = async (input: PluginInput, options?: Pl
             if (!isMessages) return response
             const responseRequestId = response.headers.get("request-id")
             const recordPreviousRequest =
-              attributionHeader && response.ok && requestChainSessionId && requestChainGeneration !== undefined && requestChainSequence !== undefined && responseRequestId && /^req_[A-Za-z0-9_-]{1,36}$/.test(responseRequestId)
+              attributionHeader && response.ok && requestChainSessionId && requestChainGeneration !== undefined && requestChainSequence !== undefined && responseRequestId && REQUEST_ID_PATTERN.test(responseRequestId)
                 ? async () => {
                     let latest: AuthSnapshot;
                     try {
@@ -2305,19 +1355,19 @@ export const ClaudeOAuthPlugin: Plugin = async (input: PluginInput, options?: Pl
                       return
                     }
                     if (latest.kind !== "oauth") {
-                      resetPreviousRequestsForCredential(requestCredential)
+                      requestChains.resetCredential(requestCredential)
                       requestStateGeneration++
                       return
                     }
                     const latestCredential = requestChainCredentialKey(latest.refresh, latest.accountId)
                     if (latestCredential !== requestCredential) {
-                      resetPreviousRequestsForCredential(requestCredential)
+                      requestChains.resetCredential(requestCredential)
                       requestStateGeneration++
                       return
                     }
                     if (createHash("sha256").update(latest.access).digest("hex") !== accessFingerprint) return
                     if (requestStateGeneration === requestGeneration) {
-                      completeRequestChain(
+                      requestChains.completeRequest(
                         requestCredential,
                         requestChainSessionId,
                         logicalRequestId,
@@ -2382,14 +1432,10 @@ export const ClaudeOAuthPlugin: Plugin = async (input: PluginInput, options?: Pl
                 method: "auto" as const,
                 callback: async () => {
                   // The flow settles (and cleans itself up) via the callback
-                  // server, its timeout, or disposal; success/failure/timeout all
-                  // remove it from the pending map and stop the server when no
-                  // flows remain.
+                  // server, its timeout, or disposal; once no flows remain the
+                  // server stops.
                   const code = await codePromise
-                  const tokens = await exchangeCode(code, state, pkce.verifier, redirectUri)
-                  resetAllPreviousRequests()
-                  recordAuthorizedAt(tokens.refresh, tokens.accountId)
-                  return { type: "success" as const, ...tokens }
+                  return finishLogin(code, state, pkce.verifier, redirectUri)
                 },
               }
             } catch (error) {
@@ -2459,10 +1505,8 @@ export const ClaudeOAuthPlugin: Plugin = async (input: PluginInput, options?: Pl
                   if (pastedState.length > 0 && pastedState !== state) {
                     return failed("the pasted state does not match this login session")
                   }
-                  const tokens = await exchangeCode(code, state, pkce.verifier, redirectUri)
-                  resetAllPreviousRequests()
-                  recordAuthorizedAt(tokens.refresh, tokens.accountId)
-                  return { type: "success" as const, ...tokens }
+                  const tokens = await finishLogin(code, state, pkce.verifier, redirectUri)
+                  return tokens
                 } catch {
                   // Never surface the pasted code/state or raw endpoint errors.
                   return failed("the authorization code was rejected")
@@ -2508,21 +1552,19 @@ export const ClaudeOAuthPlugin: Plugin = async (input: PluginInput, options?: Pl
     event: async ({ event }) => {
       if (event.type === "session.deleted") {
         const sessionId = event.properties.info.id
-        deletePreviousRequestsForSession(sessionId)
+        requestChains.deleteSession(sessionId)
         promptIds.delete(sessionId)
       }
       if (event.type === "session.compacted") {
         const sessionId = event.properties.sessionID
-        resetPreviousRequestsForSession(sessionId)
+        requestChains.resetSession(sessionId)
         promptIds.delete(sessionId)
       }
     },
 
     dispose: async () => {
-      previousRequestIds.clear()
-      logicalRequestSequences.clear()
       promptIds.clear()
-      database?.close()
+      requestChains.close()
       disposeOAuth()
     },
   }

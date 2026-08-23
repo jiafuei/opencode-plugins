@@ -8,6 +8,9 @@
   },
   "files": [
     "claude_oauth.ts",
+    "wire_format.ts",
+    "request_chain.ts",
+    "local_storage.ts",
     "README.md"
   ],
   "keywords": [
