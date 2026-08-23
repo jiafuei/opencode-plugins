@@ -61,6 +61,7 @@ const AXIOS_USER_AGENT = "axios/1.15.2";
 const AXIOS_ACCEPT = "application/json, text/plain, */*";
 const OAUTH_DUMMY_KEY = "opencode-oauth-dummy-key";
 const SESSION_ID_HEADER = "x-claude-code-session-id";
+const OPENCODE_SESSION_ID_HEADER = "x-claude-oauth-session-id";
 // Plugin-only transport header: carries the per-invocation request id from
 // chat.headers into the auth fetch. Like the session marker, it is stripped
 // before anything hits the wire.
@@ -1097,6 +1098,8 @@ export const ClaudeOAuthPlugin: Plugin = async (input: PluginInput, options?: Pl
             // (hook-provided, preserved from a valid incoming user_id, or
             // synthesized), so the header is set from it below — never the
             // other way around.
+            const opencodeSessionId = headers.get(OPENCODE_SESSION_ID_HEADER) ?? undefined
+            headers.delete(OPENCODE_SESSION_ID_HEADER)
             const hookSessionId = headers.get(SESSION_ID_HEADER) ?? undefined
             let sessionId = hookSessionId
             let body: RequestInit["body"] = init?.body
@@ -1116,7 +1119,7 @@ export const ClaudeOAuthPlugin: Plugin = async (input: PluginInput, options?: Pl
             if (isMessages && typeof body === "string" && body.startsWith("{")) {
               const incomingUserId = (JSON.parse(body) as Record<string, any>).metadata?.user_id
               const attributedSessionId = typeof incomingUserId === "string" ? extractUserIdSessionId(incomingUserId) : undefined
-              const initialChainSessionId = hookSessionId ?? attributedSessionId
+              const initialChainSessionId = opencodeSessionId ?? hookSessionId ?? attributedSessionId
               if (attributionHeader && initialChainSessionId) {
                 requestChain = {
                   sessionId: initialChainSessionId,
@@ -1317,7 +1320,8 @@ export const ClaudeOAuthPlugin: Plugin = async (input: PluginInput, options?: Pl
       // markers. Marker-based so provider config apiKey merging (which replaces
       // the dummy key) cannot disable stable session propagation.
       if ((input.provider.options as Record<string, unknown>).claudeOAuth !== true) return
-      output.headers["X-Claude-Code-Session-Id"] = input.sessionID
+      output.headers["X-Claude-Code-Session-Id"] = requestChains.claudeSessionId(input.sessionID)
+      output.headers[OPENCODE_SESSION_ID_HEADER] = input.sessionID
       // Fresh UUID per logical OpenCode LLM invocation, transported in the
       // private plugin header and emitted as x-client-request-id by the auth
       // fetch. SDK retries reuse the prepared headers — and therefore this id;

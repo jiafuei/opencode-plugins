@@ -517,7 +517,6 @@ describe("request capture: x-client-request-id per-invocation semantics", () => 
           body: JSON.stringify({
             model: "claude-sonnet-4-6",
             messages: [{ role: "user", content: "hi" }],
-            metadata: { user_id: JSON.stringify({ device_id: "dev", session_id: "body-session" }) },
             max_tokens: 1,
           }),
         });
@@ -534,8 +533,12 @@ describe("request capture: x-client-request-id per-invocation semantics", () => 
     expect(billing[1]).toContain(`cc_prompt_id=${promptId};`);
     expect(billing[0]).not.toContain("cc_prev_req=");
     expect(billing[1]).toContain("cc_prev_req=req_first;");
-    expect(captured[1]!.headers["x-claude-code-session-id"]).toBe("body-session");
+    const sessionIds = captured.map((request) => JSON.parse(JSON.parse(request.bodyText).metadata.user_id).session_id);
+    expect(sessionIds[0]).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+    expect(sessionIds[1]).toBe(sessionIds[0]);
+    expect(captured[1]!.headers["x-claude-code-session-id"]).toBe(sessionIds[0]);
     expect(captured.every((request) => request.headers["x-claude-oauth-prompt-id"] === undefined)).toBe(true);
+    expect(captured.every((request) => request.headers["x-claude-oauth-session-id"] === undefined)).toBe(true);
   });
 
   test("previous request state does not cross OAuth credentials", async () => {
@@ -568,6 +571,52 @@ describe("request capture: x-client-request-id per-invocation semantics", () => 
       block.text?.startsWith("x-anthropic-billing-header:"),
     ).text as string;
     expect(secondBilling).not.toContain("cc_prev_req=req_account_a");
+  });
+
+  test("Claude session UUIDv4 persists across restarts and rotates after session deletion", async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "claude-oauth-session-id-"));
+    const databasePath = path.join(dir, "claude-oauth.db");
+    const legacy = new Database(databasePath, { create: true });
+    legacy.exec("PRAGMA user_version = 1");
+    legacy.close();
+    const sessionId = async (plugin: Awaited<ReturnType<typeof ClaudeOAuthPlugin>>) => {
+      const output = { headers: {} as Record<string, string> };
+      await plugin["chat.headers"]!(
+        {
+          model: { providerID: "anthropic" },
+          provider: { options: { claudeOAuth: true } },
+          sessionID: "ses_persisted",
+          message: { id: "msg_1" },
+        } as never,
+        output as never,
+      );
+      return output.headers["X-Claude-Code-Session-Id"]!;
+    };
+    try {
+      const firstPlugin = await ClaudeOAuthPlugin({} as never, { databasePath });
+      const first = await sessionId(firstPlugin);
+      expect(first).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+      await firstPlugin.dispose!();
+
+      const resumedPlugin = await ClaudeOAuthPlugin({} as never, { databasePath });
+      expect(await sessionId(resumedPlugin)).toBe(first);
+      await resumedPlugin.event!({
+        event: { type: "session.deleted", properties: { info: { id: "ses_persisted" } } },
+      } as never);
+      expect(await sessionId(resumedPlugin)).not.toBe(first);
+      await resumedPlugin.dispose!();
+
+      const db = new Database(databasePath, { readonly: true });
+      expect((db.query("PRAGMA user_version").get() as { user_version: number }).user_version).toBe(2);
+      expect(
+        (db.query("SELECT claude_session_id FROM session_ids WHERE opencode_session_id = ?").get("ses_persisted") as {
+          claude_session_id: string;
+        }).claude_session_id,
+      ).not.toBe(first);
+      db.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   test("request chains resume from claude-oauth.db and compaction clears them", async () => {
@@ -644,7 +693,7 @@ describe("request capture: x-client-request-id per-invocation semantics", () => 
         expect(JSON.stringify(row)).not.toContain(OAUTH_AUTH.accountId);
         expect(row.previous_request_id).toBeNull();
         expect(row.generation).toBe(1);
-        expect((db.query("PRAGMA user_version").get() as { user_version: number }).user_version).toBe(1);
+        expect((db.query("PRAGMA user_version").get() as { user_version: number }).user_version).toBe(2);
         expect(
           (db.query("PRAGMA index_list(sessions)").all() as Array<{ name: string }>).some(
             (index) => index.name === "sessions_by_credential",

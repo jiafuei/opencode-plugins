@@ -187,7 +187,7 @@ describe("auth transitions", () => {
 
 describe("chat.headers claudeOAuth marker", () => {
   async function runHeaders(providerOptions: Record<string, unknown>, providerID = "anthropic") {
-    const plugin = await ClaudeOAuthPlugin({} as never);
+    const plugin = await ClaudeOAuthPlugin({} as never, { databasePath: ":memory:" } as never);
     const output = { headers: {} as Record<string, string> };
     await plugin["chat.headers"]!(
       {
@@ -198,12 +198,16 @@ describe("chat.headers claudeOAuth marker", () => {
       } as never,
       output as never,
     );
+    await plugin.dispose!();
     return output.headers;
   }
 
-  test("marker propagates the stable session id and a fresh per-invocation request id", async () => {
+  test("marker maps the OpenCode session to a UUIDv4 and emits a fresh per-invocation request id", async () => {
     const headers = await runHeaders({ apiKey: "sk-user-configured-key", claudeOAuth: true });
-    expect(headers["X-Claude-Code-Session-Id"]).toBe("ses_transition-test");
+    expect(headers["X-Claude-Code-Session-Id"]).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+    );
+    expect(headers["x-claude-oauth-session-id"]).toBe("ses_transition-test");
     expect(headers["x-claude-oauth-request-id"]).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
   });
 
@@ -214,7 +218,7 @@ describe("chat.headers claudeOAuth marker", () => {
   });
 
   test("prompt ids are stable by message until session compaction", async () => {
-    const plugin = await ClaudeOAuthPlugin({} as never);
+    const plugin = await ClaudeOAuthPlugin({} as never, { databasePath: ":memory:" } as never);
     const promptId = async (messageID: string) => {
       const output = { headers: {} as Record<string, string> };
       await plugin["chat.headers"]!(

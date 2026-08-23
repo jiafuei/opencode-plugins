@@ -63,9 +63,9 @@ endpoint:
   - `system[0]` = `x-anthropic-billing-header` with the CC version fingerprint,
     `system[1]` = `You are Claude Code, Anthropic's official CLI for Claude.`
     (both skipped for claude-3-5-haiku)
-  - `metadata.user_id` = `{device_id, session_id, account_uuid}` JSON envelope
-    with a stable per-install device ID; existing valid CC attribution is
-    preserved verbatim
+  - `metadata.user_id` = `{device_id, account_uuid, session_id}` JSON envelope
+    with a stable per-install device ID and a UUIDv4 session ID persisted per
+    OpenCode conversation; existing valid CC attribution is preserved verbatim
   - `max_tokens` clamped to ≤ 64000; incoming `stream` is preserved as-is
   - `context_management`: incoming edits are preserved; when thinking is on,
     exactly one `{type:"clear_thinking_20251015", keep:"all"}` edit is

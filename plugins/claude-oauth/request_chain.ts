@@ -1,11 +1,10 @@
 import { Database } from "bun:sqlite";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
 
 // Durable request-chain state behind Claude Code's cc_prev_req billing field.
-// One owner for the whole lifecycle: the SQLite store (fresh schema is always
-// version 1 — no migrations), the process-local fallback used when the
+// One owner for the whole lifecycle: the SQLite store, the process-local fallback used when the
 // database cannot be opened or fails mid-flight, credential-key hashing, and
 // every generation/retry-sequencing, reset, delete, and close operation.
 
@@ -30,6 +29,8 @@ export function requestChainCredentialKey(refreshToken: string, accountId?: stri
     .update(accountId ? `account\0${accountId}` : `refresh\0${refreshToken}`)
     .digest("hex");
 }
+
+const processClaudeSessionIds = new Map<string, string>();
 
 interface SessionRow {
   previous_request_id: string | null;
@@ -57,9 +58,11 @@ class ClaudeOAuthDatabase {
       this.db.exec("PRAGMA busy_timeout = 5000; PRAGMA foreign_keys = ON;");
       this.db.exec("BEGIN EXCLUSIVE");
       const version = (this.db.query("PRAGMA user_version").get() as { user_version: number }).user_version;
-      if (version !== 0 && version !== 1) throw new Error(`Unsupported claude-oauth.db schema version ${version}`);
+      if (version !== 0 && version !== 1 && version !== 2) {
+        throw new Error(`Unsupported claude-oauth.db schema version ${version}`);
+      }
       this.db.exec(
-        "CREATE TABLE IF NOT EXISTS sessions (session_id TEXT NOT NULL, credential_key TEXT NOT NULL, previous_request_id TEXT, generation INTEGER NOT NULL DEFAULT 0, request_sequence INTEGER NOT NULL DEFAULT 0, completed_sequence INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, deleted_at INTEGER, PRIMARY KEY (session_id, credential_key)) WITHOUT ROWID; CREATE INDEX IF NOT EXISTS sessions_by_credential ON sessions (credential_key); CREATE TABLE IF NOT EXISTS requests (session_id TEXT NOT NULL, credential_key TEXT NOT NULL, logical_request_id TEXT NOT NULL, generation INTEGER NOT NULL, sequence INTEGER NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY (session_id, credential_key, logical_request_id), FOREIGN KEY (session_id, credential_key) REFERENCES sessions (session_id, credential_key) ON DELETE CASCADE) WITHOUT ROWID; CREATE INDEX IF NOT EXISTS requests_by_credential ON requests (credential_key); CREATE INDEX IF NOT EXISTS requests_by_created_at ON requests (created_at); PRAGMA user_version = 1; COMMIT;",
+        "CREATE TABLE IF NOT EXISTS sessions (session_id TEXT NOT NULL, credential_key TEXT NOT NULL, previous_request_id TEXT, generation INTEGER NOT NULL DEFAULT 0, request_sequence INTEGER NOT NULL DEFAULT 0, completed_sequence INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, deleted_at INTEGER, PRIMARY KEY (session_id, credential_key)) WITHOUT ROWID; CREATE INDEX IF NOT EXISTS sessions_by_credential ON sessions (credential_key); CREATE TABLE IF NOT EXISTS requests (session_id TEXT NOT NULL, credential_key TEXT NOT NULL, logical_request_id TEXT NOT NULL, generation INTEGER NOT NULL, sequence INTEGER NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY (session_id, credential_key, logical_request_id), FOREIGN KEY (session_id, credential_key) REFERENCES sessions (session_id, credential_key) ON DELETE CASCADE) WITHOUT ROWID; CREATE INDEX IF NOT EXISTS requests_by_credential ON requests (credential_key); CREATE INDEX IF NOT EXISTS requests_by_created_at ON requests (created_at); CREATE TABLE IF NOT EXISTS session_ids (opencode_session_id TEXT PRIMARY KEY, claude_session_id TEXT NOT NULL UNIQUE, created_at INTEGER NOT NULL) WITHOUT ROWID; PRAGMA user_version = 2; COMMIT;",
       );
     } catch (error) {
       try {
@@ -68,6 +71,17 @@ class ClaudeOAuthDatabase {
       this.db.close();
       throw error;
     }
+  }
+
+  claudeSessionId(opencodeSessionId: string, candidate: string): string {
+    this.db
+      .query("INSERT OR IGNORE INTO session_ids (opencode_session_id, claude_session_id, created_at) VALUES (?, ?, ?)")
+      .run(opencodeSessionId, candidate, Date.now());
+    return (
+      this.db.query("SELECT claude_session_id FROM session_ids WHERE opencode_session_id = ?").get(opencodeSessionId) as {
+        claude_session_id: string;
+      }
+    ).claude_session_id;
   }
 
   startRequest(sessionId: string, credentialKey: string, logicalRequestId: string): RequestChainState {
@@ -161,6 +175,7 @@ class ClaudeOAuthDatabase {
         )
         .run(now, now, sessionId);
       this.db.query("DELETE FROM requests WHERE session_id = ?").run(sessionId);
+      this.db.query("DELETE FROM session_ids WHERE opencode_session_id = ?").run(sessionId);
     });
   }
 
@@ -223,9 +238,22 @@ export class RequestChainTracker {
     string,
     { credentialKey: string; sessionId: string; generation: number; sequence: number }
   >();
+  private readonly claudeSessionIds = new Map<string, string>();
 
   constructor(file: string) {
     this.file = file;
+  }
+
+  /** Stable UUIDv4 used on Claude's wire for one raw OpenCode session id. */
+  claudeSessionId(opencodeSessionId: string): string {
+    const cached = this.claudeSessionIds.get(opencodeSessionId);
+    if (cached) return cached;
+    const processKey = `${this.file}\0${opencodeSessionId}`;
+    const candidate = processClaudeSessionIds.get(processKey) ?? randomUUID().toLowerCase();
+    const sessionId = this.tryStore((database) => database.claudeSessionId(opencodeSessionId, candidate)) ?? candidate;
+    this.claudeSessionIds.set(opencodeSessionId, sessionId);
+    processClaudeSessionIds.set(processKey, sessionId);
+    return sessionId;
   }
 
   /**
@@ -309,6 +337,8 @@ export class RequestChainTracker {
 
   /** Deletion: like resetSession, but tombstoned so reactivation starts fresh. */
   deleteSession(sessionId: string): void {
+    this.claudeSessionIds.delete(sessionId);
+    processClaudeSessionIds.delete(`${this.file}\0${sessionId}`);
     this.resetMemoryEntries((_credentialKey, id) => id === sessionId);
     this.tryStore((database) => database.deleteSession(sessionId));
   }
@@ -326,6 +356,7 @@ export class RequestChainTracker {
   }
 
   close(): void {
+    this.claudeSessionIds.clear();
     this.previousRequestIds.clear();
     this.logicalRequestSequences.clear();
     this.database?.close();
