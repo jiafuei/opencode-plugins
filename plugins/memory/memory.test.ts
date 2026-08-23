@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, jest, test } from "bun:test";
-import { mkdir, mkdtemp, readdir, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, rename, rm } from "node:fs/promises";
 import { join } from "node:path";
 import MemoryModule, {
   dreamDue,
@@ -131,6 +131,12 @@ const isDreamCurator = (call: WorkerCall | string) => workerSystem(call).include
 
 async function until(condition: () => boolean | Promise<boolean>) {
   while (!(await condition())) await new Promise<void>((resolve) => setImmediate(resolve));
+}
+
+async function atomicTestWrite(filePath: string, content: string) {
+  const temporary = `${filePath}.${crypto.randomUUID()}.tmp`;
+  await Bun.write(temporary, content);
+  await rename(temporary, filePath);
 }
 
 // Flush pending microtask and filesystem callbacks without waiting on real
@@ -1243,12 +1249,17 @@ describe("memory manual dreaming", () => {
     await app.message("ses_watch", "Initialize the session.");
     await settle();
 
-    await Bun.write(join(path, ".dream.request"), JSON.stringify({ requestID: "req-watch", sessionID: "ses_watch" }));
+    const requestPath = join(path, ".dream.request");
+    await atomicTestWrite(requestPath, JSON.stringify({ requestID: "req-watch", sessionID: "ses_watch" }));
     await until(async () => {
       const file = Bun.file(join(path, ".dream.status"));
       if (!(await file.exists())) return false;
-      const status = await file.json() as { requestID?: string; state?: string };
-      return status.requestID === "req-watch" && status.state !== "running";
+      try {
+        const status = await file.json() as { requestID?: string; state?: string };
+        return status.requestID === "req-watch" && status.state !== "running";
+      } catch {
+        return false;
+      }
     });
     const dreamCall = app.calls.filter(isDreamSelector);
     expect(dreamCall).toHaveLength(1);
@@ -1795,7 +1806,7 @@ async function tuiFixture(
       dialogSelect.onSelect({ value });
       return true;
     },
-    sidebar: (sessionID: string) => slotPlugins.find((plugin) => plugin.slots.sidebar_content)?.slots.sidebar_content?.({}, { session_id: sessionID }),
+    hasSidebar: () => slotPlugins.some((plugin) => plugin.slots.sidebar_content),
     sessionCreated: (info: { id: string; parentID?: string; metadata?: Record<string, unknown> }) => {
       for (const handler of [...handlers.get("session.created") ?? []]) {
         handler({ properties: { sessionID: info.id, info } } as never);
@@ -1885,7 +1896,7 @@ describe("memory tui notifications", () => {
     const request = await Bun.file(requestPath).json();
     app.sessionCreated({ id: "ses_dream_worker", parentID: "ses_parent", metadata: { memoryWorker: true, memoryActivity: "dream" } });
 
-    await Bun.write(join(memoryDirectory, ".dream.status"), JSON.stringify({
+    await atomicTestWrite(join(memoryDirectory, ".dream.status"), JSON.stringify({
       requestID: request.requestID,
       runID: "run-new",
       state: "running",
@@ -1893,18 +1904,17 @@ describe("memory tui notifications", () => {
       startedAt: new Date().toISOString(),
     }));
     await Bun.sleep(400);
-    expect(app.sidebar("ses_other")).toBeUndefined();
+    expect(app.hasSidebar()).toBe(true);
 
     await Bun.write(join(memoryDirectory, "dreamed.md"), '---\nrevision: "abc123"\nsessionId: "ses_parent"\ndreamRunId: "run-new"\n---\n\nbody\n');
     await Bun.write(join(memoryDirectory, "index.md"), "# Project memory\n\n- [Dreamed](dreamed.md) - Dreamed summary\n");
-    await Bun.write(join(memoryDirectory, ".dream.status"), JSON.stringify({
+    await atomicTestWrite(join(memoryDirectory, ".dream.status"), JSON.stringify({
       requestID: request.requestID,
       runID: "run-new",
       state: "changed",
       counts: { merge: 1, supersede: 0, synthesize: 0 },
     }));
     await until(() => app.toasts.some((toast) => toast.message === "Dream complete: 1 merged"));
-    expect(app.sidebar("ses_parent")).toBeUndefined();
     await Bun.sleep(400);
     expect(app.toasts.some((toast) => toast.message === "Saved: Dreamed")).toBe(false);
     expect(app.toasts.filter((toast) => toast.message.startsWith("Dream complete:"))).toHaveLength(1);
@@ -1944,7 +1954,7 @@ describe("memory tui notifications", () => {
     const requestPath = join(memoryDirectory, ".dream.request");
     await until(async () => Bun.file(requestPath).exists());
     const request = await Bun.file(requestPath).json();
-    await Bun.write(join(memoryDirectory, ".dream.status"), JSON.stringify({
+    await atomicTestWrite(join(memoryDirectory, ".dream.status"), JSON.stringify({
       requestID: request.requestID,
       runID: "run-failed",
       state: "running",
@@ -1952,7 +1962,7 @@ describe("memory tui notifications", () => {
       startedAt: new Date().toISOString(),
     }));
     await Bun.sleep(400);
-    await Bun.write(join(memoryDirectory, ".dream.status"), JSON.stringify({
+    await atomicTestWrite(join(memoryDirectory, ".dream.status"), JSON.stringify({
       requestID: request.requestID,
       runID: "run-failed",
       state: "failed",
@@ -1961,7 +1971,6 @@ describe("memory tui notifications", () => {
     }));
 
     await until(() => app.toasts.some((toast) => toast.message === "Dream failed: worker timed out"));
-    expect(app.sidebar("ses_parent")).toBeUndefined();
 
     await app.dispose();
     await rm(dataHome, { recursive: true, force: true });

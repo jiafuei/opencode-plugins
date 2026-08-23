@@ -5,7 +5,7 @@ import { watch } from "node:fs";
 import { mkdir, readdir, rename, rm, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
-import { createSignal } from "solid-js";
+import { createSignal, Show } from "solid-js";
 
 // For manual configuration, add the package to `tui.json`:
 //
@@ -244,6 +244,20 @@ async function showMemory(api: TuiPluginApi, requestDream: () => Promise<void>):
   }
 }
 
+function DreamSidebar(props: { api: TuiPluginApi; sessionID: string; status: () => DreamStatusFile | undefined }) {
+  const theme = () => props.api.theme.current;
+  return (
+    <Show when={isDreamingForSession(props.status(), props.sessionID)}>
+      <box>
+        <text fg={theme().text}><b>Memory</b></text>
+        <text fg={theme().textMuted}>
+          <span style={{ fg: theme().warning }}>•</span> Dreaming...
+        </text>
+      </box>
+    </Show>
+  );
+}
+
 const MemoryTuiPlugin: TuiPlugin = async (api) => {
   const directory = projectDirectory(api.state.path.directory);
   const memoryRoot = dirname(directory);
@@ -275,12 +289,14 @@ const MemoryTuiPlugin: TuiPlugin = async (api) => {
     await mkdir(directory, { recursive: true });
     outstandingRequestID = crypto.randomUUID();
     const route = api.route.current;
-    const sessionID = route.name === "session" ? route.params?.sessionID : undefined;
+    const sessionID = route.name === "session" && typeof route.params?.sessionID === "string" ? route.params.sessionID : undefined;
+    const requestedAt = new Date().toISOString();
     await atomicWrite(join(directory, DREAM_REQUEST_FILE), `${JSON.stringify({
       requestID: outstandingRequestID,
       ...(sessionID ? { sessionID } : {}),
-      requestedAt: new Date().toISOString(),
+      requestedAt,
     }, null, 2)}\n`);
+    if (sessionID) setActiveDream({ requestID: outstandingRequestID, state: "running", sessionID, startedAt: requestedAt });
     api.ui.toast({ variant: "info", title: "Memory", message: "Dreaming..." });
   };
 
@@ -338,15 +354,7 @@ const MemoryTuiPlugin: TuiPlugin = async (api) => {
     order: 300,
     slots: {
       sidebar_content(_ctx, props) {
-        if (!isDreamingForSession(activeDream(), props.session_id)) return;
-        return (
-          <box>
-            <text fg={api.theme.current.text}><b>Memory</b></text>
-            <text fg={api.theme.current.textMuted}>
-              <span style={{ fg: api.theme.current.warning }}>•</span> Dreaming...
-            </text>
-          </box>
-        );
+        return <DreamSidebar api={api} sessionID={props.session_id} status={activeDream} />;
       },
     },
   });
@@ -454,7 +462,7 @@ const MemoryTuiPlugin: TuiPlugin = async (api) => {
     try {
       const watcher = watch(directory, { persistent: false }, (_eventType, filename) => {
         if (typeof filename === "string") {
-          if (filename === DREAM_STATUS_FILE) {
+          if (filename === DREAM_STATUS_FILE || filename.startsWith(`${DREAM_STATUS_FILE}.`)) {
             scheduleCheck();
             return;
           }

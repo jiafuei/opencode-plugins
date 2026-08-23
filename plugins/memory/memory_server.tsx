@@ -1728,7 +1728,8 @@ const MemoryPlugin: Plugin = async ({ client, directory }, options) => {
     if (disposed || requestWatcher) return;
     try {
       const watcher = watch(memoryDirectory, { persistent: false }, (_eventType, filename) => {
-        if (filename === ".dream.request" || filename === SETTINGS_FILE) void dreamTick();
+        if (typeof filename !== "string") return;
+        if (filename === ".dream.request" || filename.startsWith(".dream.request.") || filename === SETTINGS_FILE) void dreamTick();
       });
       watcher.on("error", () => {
         watcher.close();
