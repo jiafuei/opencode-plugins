@@ -9,7 +9,7 @@ import MemoryModule, {
   parseIndexLine,
   validateDreamOptions,
 } from "./memory_server.tsx";
-import MemoryTui, { dreamCountsMessage, managedIndexEntries, memoryProjectKey as tuiProjectKey, toggledSettings, topicDreamRunId, topicRevision, topicSessionId } from "./memory_tui.tsx";
+import MemoryTui, { dreamCountsMessage, isDreamingForSession, managedIndexEntries, memoryProjectKey as tuiProjectKey, toggledSettings, topicDreamRunId, topicRevision, topicSessionId } from "./memory_tui.tsx";
 
 const originalDataHome = process.env.XDG_DATA_HOME;
 afterEach(() => {
@@ -1246,7 +1246,9 @@ describe("memory manual dreaming", () => {
     await Bun.write(join(path, ".dream.request"), JSON.stringify({ requestID: "req-watch", sessionID: "ses_watch" }));
     await until(async () => {
       const file = Bun.file(join(path, ".dream.status"));
-      return await file.exists() && (await file.json() as { requestID?: string }).requestID === "req-watch";
+      if (!(await file.exists())) return false;
+      const status = await file.json() as { requestID?: string; state?: string };
+      return status.requestID === "req-watch" && status.state !== "running";
     });
     const dreamCall = app.calls.filter(isDreamSelector);
     expect(dreamCall).toHaveLength(1);
@@ -1452,6 +1454,12 @@ describe("memory manual dreaming", () => {
 
     await app.message("ses_stale", "Start dreaming.");
     await started.promise;
+    expect(await Bun.file(join(path, ".dream.status")).json()).toMatchObject({
+      requestID: "req-stale",
+      state: "running",
+      sessionID: "ses_dreamer",
+      startedAt: expect.any(String),
+    });
     // One source mutates on disk while the executor runs: the commit must
     // detect the stale snapshot and abort the whole run.
     await Bun.write(join(path, "x.md"), seededTopic("abc4567", "X_MUTATED_BODY"));
@@ -1500,7 +1508,12 @@ describe("memory manual dreaming", () => {
     const statusPath = join(path, ".dream.status");
     const readStatus = async () => {
       const file = Bun.file(statusPath);
-      return await file.exists() ? file.json() : undefined;
+      if (!(await file.exists())) return;
+      try {
+        return await file.json();
+      } catch {
+        return;
+      }
     };
 
     const started = Promise.withResolvers<void>();
@@ -1532,7 +1545,10 @@ describe("memory manual dreaming", () => {
     release.resolve();
     // The first instance rechecks after releasing its run, so the request that
     // arrived while locked is handled promptly without another message.
-    await until(async () => (await readStatus())?.requestID === "req-lock-2");
+    await until(async () => {
+      const status = await readStatus();
+      return status?.requestID === "req-lock-2" && status.state !== "running";
+    });
     expect(first.calls.filter(isDreamSelector).length + second.calls.filter(isDreamSelector).length).toBe(2);
     await Promise.all([first.hooks.dispose!(), second.hooks.dispose!()]);
     await rm(dataHome, { recursive: true, force: true });
@@ -1724,10 +1740,13 @@ async function tuiFixture(
   const handlers = new Map<string, Array<(event: never) => void>>();
   const disposers: Array<() => void | Promise<void>> = [];
   const layers: Array<{ commands: Array<Record<string, unknown>> }> = [];
+  const slotPlugins: Array<{ slots: { sidebar_content?: (context: unknown, props: { session_id: string }) => unknown } }> = [];
   let dialogSelect: { options?: unknown; onSelect?: (option: { value: unknown }) => void } | undefined;
   const route = options.route ?? { name: "home" };
   const api = {
     keymap: { registerLayer: (layer: { commands: Array<Record<string, unknown>> }) => layers.push(layer) },
+    slots: { register: (plugin: { slots: { sidebar_content?: (context: unknown, props: { session_id: string }) => unknown } }) => slotPlugins.push(plugin) },
+    theme: { current: { text: "white", textMuted: "gray", warning: "yellow" } },
     route: {
       get current() {
         return route;
@@ -1776,6 +1795,7 @@ async function tuiFixture(
       dialogSelect.onSelect({ value });
       return true;
     },
+    sidebar: (sessionID: string) => slotPlugins.find((plugin) => plugin.slots.sidebar_content)?.slots.sidebar_content?.({}, { session_id: sessionID }),
     sessionCreated: (info: { id: string; parentID?: string; metadata?: Record<string, unknown> }) => {
       for (const handler of [...handlers.get("session.created") ?? []]) {
         handler({ properties: { sessionID: info.id, info } } as never);
@@ -1806,6 +1826,9 @@ describe("memory tui parsing helpers", () => {
     expect(JSON.parse(toggledSettings({ enabled: true, custom: 3 }, "dream_auto"))).toEqual({ enabled: true, custom: 3, dream_auto: true });
     expect(JSON.parse(toggledSettings({ enabled: false, dream_auto: true }, "enabled"))).toEqual({ enabled: true, dream_auto: true });
     expect(dreamCountsMessage({ merge: 1, supersede: 2, synthesize: 1 })).toBe("1 merged, 2 superseded, 1 insight");
+    expect(isDreamingForSession({ state: "running", sessionID: "ses_parent" }, "ses_parent")).toBe(true);
+    expect(isDreamingForSession({ state: "running", sessionID: "ses_parent" }, "ses_other")).toBe(false);
+    expect(isDreamingForSession({ state: "failed", sessionID: "ses_parent" }, "ses_parent")).toBe(false);
   });
 });
 
@@ -1862,6 +1885,16 @@ describe("memory tui notifications", () => {
     const request = await Bun.file(requestPath).json();
     app.sessionCreated({ id: "ses_dream_worker", parentID: "ses_parent", metadata: { memoryWorker: true, memoryActivity: "dream" } });
 
+    await Bun.write(join(memoryDirectory, ".dream.status"), JSON.stringify({
+      requestID: request.requestID,
+      runID: "run-new",
+      state: "running",
+      sessionID: "ses_parent",
+      startedAt: new Date().toISOString(),
+    }));
+    await Bun.sleep(400);
+    expect(app.sidebar("ses_other")).toBeUndefined();
+
     await Bun.write(join(memoryDirectory, "dreamed.md"), '---\nrevision: "abc123"\nsessionId: "ses_parent"\ndreamRunId: "run-new"\n---\n\nbody\n');
     await Bun.write(join(memoryDirectory, "index.md"), "# Project memory\n\n- [Dreamed](dreamed.md) - Dreamed summary\n");
     await Bun.write(join(memoryDirectory, ".dream.status"), JSON.stringify({
@@ -1871,6 +1904,7 @@ describe("memory tui notifications", () => {
       counts: { merge: 1, supersede: 0, synthesize: 0 },
     }));
     await until(() => app.toasts.some((toast) => toast.message === "Dream complete: 1 merged"));
+    expect(app.sidebar("ses_parent")).toBeUndefined();
     await Bun.sleep(400);
     expect(app.toasts.some((toast) => toast.message === "Saved: Dreamed")).toBe(false);
     expect(app.toasts.filter((toast) => toast.message.startsWith("Dream complete:"))).toHaveLength(1);
@@ -1892,6 +1926,42 @@ describe("memory tui notifications", () => {
     await Bun.write(join(memoryDirectory, "index.md"), "# Project memory\n\n");
     await Bun.sleep(500);
     expect(app.toasts.some((toast) => toast.message.startsWith("Dream complete:"))).toBe(false);
+
+    await app.dispose();
+    await rm(dataHome, { recursive: true, force: true });
+  });
+
+  test.serial("clears a failed dream and warns only its manual requester", async () => {
+    const dataHome = await mkdtemp("/tmp/opencode-memory-tui-dream-failed-");
+    process.env.XDG_DATA_HOME = dataHome;
+    const directory = "/tmp/memory-tui-dream-failed";
+    const memoryDirectory = join(dataHome, "opencode", "memory", tuiProjectKey(directory));
+    await mkdir(memoryDirectory, { recursive: true });
+    await Bun.write(join(memoryDirectory, "index.md"), "# Project memory\n");
+    const app = await tuiFixture(directory, { route: { name: "session", params: { sessionID: "ses_parent" } } });
+
+    app.command("dream");
+    const requestPath = join(memoryDirectory, ".dream.request");
+    await until(async () => Bun.file(requestPath).exists());
+    const request = await Bun.file(requestPath).json();
+    await Bun.write(join(memoryDirectory, ".dream.status"), JSON.stringify({
+      requestID: request.requestID,
+      runID: "run-failed",
+      state: "running",
+      sessionID: "ses_parent",
+      startedAt: new Date().toISOString(),
+    }));
+    await Bun.sleep(400);
+    await Bun.write(join(memoryDirectory, ".dream.status"), JSON.stringify({
+      requestID: request.requestID,
+      runID: "run-failed",
+      state: "failed",
+      sessionID: "ses_parent",
+      message: "worker timed out",
+    }));
+
+    await until(() => app.toasts.some((toast) => toast.message === "Dream failed: worker timed out"));
+    expect(app.sidebar("ses_parent")).toBeUndefined();
 
     await app.dispose();
     await rm(dataHome, { recursive: true, force: true });

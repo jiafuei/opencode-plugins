@@ -1200,7 +1200,9 @@ const MemoryPlugin: Plugin = async ({ client, directory }, options) => {
   type DreamStatusFields = {
     requestID: string | null;
     runID: string;
-    state: "changed" | "noop" | "failed";
+    state: "running" | "changed" | "noop" | "failed";
+    sessionID?: string;
+    startedAt?: string;
     finishedAt?: string;
     counts?: Record<string, number>;
     message?: string;
@@ -1216,8 +1218,8 @@ const MemoryPlugin: Plugin = async ({ client, directory }, options) => {
     await atomicWrite(join(dreamsDirectory, `${runID}.json`), `${JSON.stringify(payload, null, 2)}\n`);
   };
 
-  // Auto failures stay silent; manual failures produce a matching failure
-  // status so the requesting TUI can warn.
+  // Every refusal terminates a possible running indicator. The TUI only warns
+  // when the failure matches its own manual request.
   const refuseDream = async (
     input: { trigger: "auto" | "manual"; requestID: string | null; runID: string },
     reason: string,
@@ -1242,9 +1244,15 @@ const MemoryPlugin: Plugin = async ({ client, directory }, options) => {
       error: reason,
       actions: [],
     });
-    if (input.trigger === "manual") {
-      await writeDreamStatus({ requestID: input.requestID, runID: input.runID, state: "failed", finishedAt, message: reason });
-    }
+    await writeDreamStatus({
+      requestID: input.requestID,
+      runID: input.runID,
+      state: "failed",
+      sessionID: details.sessionID,
+      startedAt: details.startedAt,
+      finishedAt,
+      message: reason,
+    });
   };
 
   // Enabling auto-dream seeds the additions counter from the current indexed
@@ -1525,6 +1533,8 @@ const MemoryPlugin: Plugin = async ({ client, directory }, options) => {
         requestID: input.requestID,
         runID: input.runID,
         state: "failed",
+        sessionID: input.sessionID,
+        startedAt,
         finishedAt,
         counts,
         message: actions.length > 0 ? `${abortReason}; ${actions.length} change(s) applied` : abortReason,
@@ -1552,7 +1562,15 @@ const MemoryPlugin: Plugin = async ({ client, directory }, options) => {
       changed,
       actions,
     });
-    await writeDreamStatus({ requestID: input.requestID, runID: input.runID, state: changed ? "changed" : "noop", finishedAt, counts });
+    await writeDreamStatus({
+      requestID: input.requestID,
+      runID: input.runID,
+      state: changed ? "changed" : "noop",
+      sessionID: input.sessionID,
+      startedAt,
+      finishedAt,
+      counts,
+    });
     await log("info", "Memory dream completed", {
       runID: input.runID,
       trigger: input.trigger,
@@ -1576,10 +1594,11 @@ const MemoryPlugin: Plugin = async ({ client, directory }, options) => {
     }
     const runID = crypto.randomUUID();
     const startedAt = new Date().toISOString();
+    let sessionID = input.sessionID;
     try {
       // Consume the request only once this run owns the lock.
       if (input.consumeRequest) await rm(dreamRequestPath, { force: true });
-      const sessionID = input.sessionID ?? mostRecentLiveSession();
+      sessionID ??= mostRecentLiveSession();
       if (!sessionID) {
         const model = dreamModel;
         await refuseDream(
@@ -1589,6 +1608,13 @@ const MemoryPlugin: Plugin = async ({ client, directory }, options) => {
         );
         return true;
       }
+      await writeDreamStatus({
+        requestID: input.requestID ?? null,
+        runID,
+        state: "running",
+        sessionID,
+        startedAt,
+      });
       await executeDream({ trigger: input.trigger, requestID: input.requestID ?? null, runID, sessionID });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -1617,9 +1643,15 @@ const MemoryPlugin: Plugin = async ({ client, directory }, options) => {
           actions: [],
         }).catch(() => {});
       }
-      if (input.trigger === "manual") {
-        await writeDreamStatus({ requestID: input.requestID ?? null, runID, state: "failed", message }).catch(() => {});
-      }
+      await writeDreamStatus({
+        requestID: input.requestID ?? null,
+        runID,
+        state: "failed",
+        sessionID,
+        startedAt,
+        finishedAt: new Date().toISOString(),
+        message,
+      }).catch(() => {});
     } finally {
       await release();
     }

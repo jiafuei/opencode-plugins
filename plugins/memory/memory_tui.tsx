@@ -1,9 +1,11 @@
+/** @jsxImportSource @opentui/solid */
 import type { FSWatcher } from "node:fs";
 import type { TuiPlugin, TuiPluginApi, TuiPluginModule } from "@opencode-ai/plugin/tui";
 import { watch } from "node:fs";
 import { mkdir, readdir, rename, rm, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
+import { createSignal } from "solid-js";
 
 // For manual configuration, add the package to `tui.json`:
 //
@@ -18,10 +20,13 @@ type Choice =
   | { type: "folder" }
   | { type: "file"; name: string };
 
-type DreamStatusFile = {
+export type DreamStatusFile = {
   requestID?: string | null;
   runID?: string;
-  state?: "changed" | "noop" | "failed";
+  state?: "running" | "changed" | "noop" | "failed";
+  sessionID?: string;
+  startedAt?: string;
+  finishedAt?: string;
   counts?: Record<string, unknown>;
   message?: string;
 };
@@ -90,6 +95,10 @@ export function dreamCountsMessage(counts: Record<string, unknown> | undefined):
     if (typeof count === "number" && count > 0) parts.push(`${count} ${count === 1 ? one : many}`);
   }
   return parts.join(", ");
+}
+
+export function isDreamingForSession(status: DreamStatusFile | undefined, sessionID: string): boolean {
+  return status?.state === "running" && status.sessionID === sessionID;
 }
 
 function projectDirectory(directory: string): string {
@@ -238,6 +247,7 @@ async function showMemory(api: TuiPluginApi, requestDream: () => Promise<void>):
 const MemoryTuiPlugin: TuiPlugin = async (api) => {
   const directory = projectDirectory(api.state.path.directory);
   const memoryRoot = dirname(directory);
+  const [activeDream, setActiveDream] = createSignal<DreamStatusFile>();
 
   // Manual dream request state: the outstanding request this instance is
   // waiting on, and the last status run already rendered (dedupe).
@@ -250,7 +260,11 @@ const MemoryTuiPlugin: TuiPlugin = async (api) => {
   if (await existingStatus.exists()) {
     try {
       const status = await existingStatus.json() as DreamStatusFile;
-      if (typeof status.runID === "string") lastStatusRunID = status.runID;
+      if (status.state === "running" && typeof status.sessionID === "string") {
+        setActiveDream(status);
+      } else if (typeof status.runID === "string") {
+        lastStatusRunID = status.runID;
+      }
     } catch {}
   }
 
@@ -279,7 +293,10 @@ const MemoryTuiPlugin: TuiPlugin = async (api) => {
     } catch {
       return;
     }
-    if (!status || typeof status.runID !== "string" || status.runID === lastStatusRunID) return;
+    if (!status || typeof status.runID !== "string") return;
+    setActiveDream(status.state === "running" && typeof status.sessionID === "string" ? status : undefined);
+    if (status.state === "running") return;
+    if (status.runID === lastStatusRunID) return;
     lastStatusRunID = status.runID;
     const matchedRequest = Boolean(status.requestID && status.requestID === outstandingRequestID);
     if (matchedRequest) outstandingRequestID = undefined;
@@ -315,6 +332,23 @@ const MemoryTuiPlugin: TuiPlugin = async (api) => {
       },
     }],
     bindings: [],
+  });
+
+  api.slots.register({
+    order: 300,
+    slots: {
+      sidebar_content(_ctx, props) {
+        if (!isDreamingForSession(activeDream(), props.session_id)) return;
+        return (
+          <box>
+            <text fg={api.theme.current.text}><b>Memory</b></text>
+            <text fg={api.theme.current.textMuted}>
+              <span style={{ fg: api.theme.current.warning }}>•</span> Dreaming...
+            </text>
+          </box>
+        );
+      },
+    },
   });
 
   // Only the shared memory root is created here; the per-project directory is
