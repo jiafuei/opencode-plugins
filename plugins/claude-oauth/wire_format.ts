@@ -28,7 +28,6 @@ const AGENT_PROFILE_BETAS = [
   "context-management-2025-06-27",
   "prompt-caching-scope-2026-01-05",
   "mid-conversation-system-2026-04-07",
-  "advanced-tool-use-2025-11-20",
 ];
 
 export const COUNT_TOKENS_BETAS = [
@@ -41,9 +40,15 @@ export const COUNT_TOKENS_BETAS = [
 
 const EFFORT_BETA = "effort-2025-11-24";
 const FALLBACK_CREDIT_BETA = "fallback-credit-2026-06-01";
+const ADVANCED_TOOL_USE_BETA = "advanced-tool-use-2025-11-20";
+const EXTENDED_CACHE_TTL_BETA = "extended-cache-ttl-2025-04-11";
 // These caller-supplied betas are absent from Claude Code's wire profile.
 // context-1m additionally hard-429s OAuth subscription requests.
-const STRIPPED_BETAS = new Set(["context-1m-2025-08-07", "fine-grained-tool-streaming-2025-05-14"]);
+const STRIPPED_BETAS = new Set([
+  "context-1m-2025-08-07",
+  "fine-grained-tool-streaming-2025-05-14",
+  "structured-outputs-2025-11-13",
+]);
 
 function isActiveThinking(thinking: unknown): boolean {
   const type = (thinking as { type?: unknown } | undefined)?.type;
@@ -56,15 +61,22 @@ function isActiveThinking(thinking: unknown): boolean {
  * task budgets, fallback, ...). `incoming` is the request's existing
  * anthropic-beta header value, if any.
  */
-export function buildBetas(thinking: unknown, hasTools: boolean, incoming?: string | null): string {
+export function buildBetas(
+  thinking: unknown,
+  hasTools: boolean,
+  hasLongCache: boolean,
+  incoming?: string | null,
+): string {
   const agent = hasTools || isActiveThinking(thinking);
   const betas = [...(agent ? AGENT_PROFILE_BETAS : UTILITY_PROFILE_BETAS)];
+  const incomingBetas = incoming?.split(",").map((beta) => beta.trim()) ?? [];
+  if (agent && incomingBetas.includes(ADVANCED_TOOL_USE_BETA)) betas.push(ADVANCED_TOOL_USE_BETA);
   if (agent && isActiveThinking(thinking)) betas.push(EFFORT_BETA);
-  if (agent) betas.push(FALLBACK_CREDIT_BETA);
+  betas.push(FALLBACK_CREDIT_BETA);
+  if (hasLongCache) betas.push(EXTENDED_CACHE_TTL_BETA);
   const seen = new Set(betas);
-  if (incoming) {
-    for (const raw of incoming.split(",")) {
-      const beta = raw.trim();
+  if (incomingBetas.length > 0) {
+    for (const beta of incomingBetas) {
       if (!beta || seen.has(beta) || STRIPPED_BETAS.has(beta)) continue;
       seen.add(beta);
       betas.push(beta);
@@ -106,7 +118,7 @@ export const STAINLESS_HEADERS: Record<string, string> = {
 // Custom tool name cloaking
 // ---------------------------------------------------------------------------
 
-const TOOL_PREFIX = "_";
+const TOOL_PREFIX = "mcp__occli__";
 
 // Anthropic built-in tool names are never prefixed or stripped. Server tools
 // from the pinned @ai-sdk/anthropic additionally carry versioned `type` fields
@@ -121,9 +133,8 @@ function isBuiltinToolName(name: string): boolean {
 
 export function applyClaudeToolPrefix(name: string): string {
   if (isBuiltinToolName(name)) return name;
-  // Always prepend — even when the logical name already starts with "_" — so
-  // stripping exactly one prefix on the way back round-trips (`_foo` →
-  // `__foo` → `_foo`, never `_foo` → wire `_foo` → strip → `foo`).
+  // Always prepend, including when a logical name already starts with the
+  // namespace, so stripping exactly one prefix always round-trips.
   return `${TOOL_PREFIX}${name}`;
 }
 
@@ -133,7 +144,8 @@ export function stripClaudeToolPrefix(name: string): string {
 }
 
 /**
- * Prefix every custom tool name carried by an Anthropic request body, in place:
+ * Remove SDK-only eager streaming flags, close top-level input schemas, and
+ * prefix every custom tool name carried by an Anthropic request body, in place:
  * custom tool definitions (no versioned `type`), `tool_choice.name`, and
  * historical assistant `tool_use` blocks. IDs and `tool_result` blocks are
  * preserved verbatim.
@@ -141,10 +153,15 @@ export function stripClaudeToolPrefix(name: string): string {
 export function prefixRequestToolNames(params: Record<string, any>): void {
   if (Array.isArray(params.tools)) {
     for (const tool of params.tools) {
+      if (!tool || typeof tool !== "object") continue;
+      delete tool.eager_input_streaming;
+      if (tool.input_schema && typeof tool.input_schema === "object" && !Array.isArray(tool.input_schema)) {
+        tool.input_schema.additionalProperties = false;
+      }
       // Provider/server tools are identified by a versioned `type`
       // (web_search_20250305, computer_20250124, ...); custom function tools
       // have no `type` at all.
-      if (!tool || typeof tool !== "object" || typeof tool.type === "string") continue;
+      if (typeof tool.type === "string") continue;
       if (typeof tool.name === "string") tool.name = applyClaudeToolPrefix(tool.name);
     }
   }
@@ -371,7 +388,11 @@ export function uncloakedResponseHeaders(response: Response): Headers {
 // Body rewrite: billing fingerprint + cch + metadata.user_id attribution
 // ---------------------------------------------------------------------------
 
-type ContentBlock = { type?: string; text?: string };
+type ContentBlock = {
+  type?: string;
+  text?: string;
+  cache_control?: { type?: unknown; ttl?: unknown; scope?: unknown; [key: string]: unknown };
+};
 
 const BILLING_SALT = "59cf53e54c78";
 const BILLING_HEADER_PREFIX = "x-anthropic-billing-header:";
@@ -479,6 +500,7 @@ const CANONICAL_BODY_KEYS = [
  * - system[0] billing header (+ system[1] Claude CLI instruction)
  * - metadata.user_id in the CC attribution envelope
  * - max_tokens clamped to <= 64000
+ * - existing ephemeral cache breakpoints upgraded to one-hour retention
  * - context_management merged: incoming edits are preserved; active thinking
  *   additionally guarantees exactly one clear_thinking_20251015 keep-all edit
  * - known keys rebuilt in canonical order (incl. output_config / fallbacks),
@@ -494,7 +516,7 @@ export function rewriteBody(
     previousRequestId?: string;
     promptId?: string;
   },
-): { json: string; thinking: unknown; hasTools: boolean; sessionId?: string } {
+): { json: string; thinking: unknown; hasTools: boolean; hasLongCache: boolean; sessionId?: string } {
   const params = JSON.parse(body) as Record<string, any>;
   // Cloak custom tool names before anything else, so cch hashes the
   // already-prefixed final body.
@@ -542,6 +564,26 @@ export function rewriteBody(
   }
   if (injectFingerprint && !hasIdentityBlock) fingerprintBlocks.push({ type: "text", text: SDK_INSTRUCTION });
   const system = [...fingerprintBlocks, ...systemBlocks];
+
+  let hasLongCache = false;
+  let hasGlobalSystemCache = false;
+  const normalizeCacheControl = (owner: any, global = false): boolean => {
+    const cacheControl = owner?.cache_control;
+    if (!cacheControl || typeof cacheControl !== "object" || cacheControl.type !== "ephemeral") return false;
+    cacheControl.ttl = "1h";
+    if (global) cacheControl.scope = "global";
+    hasLongCache = true;
+    return true;
+  };
+  for (const block of system) {
+    if (normalizeCacheControl(block, !hasGlobalSystemCache)) hasGlobalSystemCache = true;
+  }
+  for (const tool of params.tools ?? []) normalizeCacheControl(tool);
+  for (const message of params.messages ?? []) {
+    if (!Array.isArray(message?.content)) continue;
+    for (const block of message.content) normalizeCacheControl(block);
+  }
+  normalizeCacheControl(params);
 
   const incomingUserId = params.metadata?.user_id;
   // Preserve valid CC attribution verbatim — the legacy cloaking id or the
@@ -634,5 +676,5 @@ export function rewriteBody(
     billingBlock.text = billingBlock.text.replace(CCH_PLACEHOLDER_STR, `cch=${cch}`);
   }
 
-  return { json: JSON.stringify(rewritten), thinking, hasTools, sessionId };
+  return { json: JSON.stringify(rewritten), thinking, hasTools, hasLongCache, sessionId };
 }

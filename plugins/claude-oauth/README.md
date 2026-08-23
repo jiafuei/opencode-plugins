@@ -16,6 +16,37 @@ transport and header serialization.
 }
 ```
 
+### AI SDK request options
+
+`toolStreaming` is an Anthropic AI SDK request option, not a provider
+constructor option. Do not put it under `provider.anthropic.options`, where it
+is ignored. It can be set at any request-option scope:
+
+- Model: `provider.anthropic.models.<model-id>.options.toolStreaming`
+- Agent: `agent.<agent-name>.options.toolStreaming`
+- Variant: `provider.anthropic.models.<model-id>.variants.<variant-name>.toolStreaming`
+
+For example, to disable it for one model:
+
+```json
+{
+  "provider": {
+    "anthropic": {
+      "models": {
+        "claude-opus-5": {
+          "options": {
+            "toolStreaming": false
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+This setting is optional with the plugin: OAuth request rewriting removes the
+SDK-generated `eager_input_streaming` field at the wire boundary regardless.
+
 Billing attribution is enabled by default. To omit the
 `x-anthropic-billing-header` and its `cch`, `cc_prev_req`, and `cc_prompt_id`
 fields while retaining OAuth authentication and the Claude CLI identity:
@@ -58,8 +89,9 @@ endpoint:
   redacted thinking, context management, and related features), chosen per
   request shape (utility vs agent profile);
   SDK/caller-supplied betas are preserved and deduplicated after it, except
-  `fine-grained-tool-streaming-2025-05-14` (absent from Claude Code's profile)
-  and `context-1m-2025-08-07` (hard-429'd for subscription credentials).
+  `fine-grained-tool-streaming-2025-05-14` (absent from Claude Code's profile),
+  the SDK's obsolete `structured-outputs-2025-11-13` tool beta, and
+  `context-1m-2025-08-07` (hard-429'd for subscription credentials).
 - Body rewrite:
   - `system[0]` = `x-anthropic-billing-header` with the CC version fingerprint,
     `system[1]` = `You are Claude Code, Anthropic's official CLI for Claude.`
@@ -70,6 +102,10 @@ endpoint:
   - `max_tokens` clamped to ≤ 64000; incoming `stream` is preserved as-is
   - `thinking.display` and the redundant default `tool_choice:{type:"auto"}`
     are omitted; non-default tool choices and other thinking fields are kept
+  - SDK-added `eager_input_streaming` is omitted and tool input schemas are
+    closed with top-level `additionalProperties:false`; existing ephemeral cache
+    breakpoints use `ttl:"1h"`, with the first cached system block globally
+    scoped, and advertise the corresponding extended-cache beta
   - `context_management`: incoming edits are preserved; when thinking is on,
     exactly one `{type:"clear_thinking_20251015", keep:"all"}` edit is
     guaranteed first
@@ -86,13 +122,13 @@ endpoint:
   continues with process-local tracking but restart/cross-process continuity is
   temporarily unavailable
 - Token-count requests use Claude Code's dedicated beta profile and header set,
-  omit `X-Stainless-Timeout`, preserve their body shape apart from tool-name
-  cloaking, and are not response-rewritten
-- Custom tool names are cloaked with a `_` prefix on the way out (definitions,
-  `tool_choice`, historical `tool_use` blocks) and stripped back on the way in
-  through both streaming SSE (`content_block_start`) and non-streaming JSON
-  responses, so Anthropic's tool-name rules are satisfied without changing
-  OpenCode's logical tool names
+  omit `X-Stainless-Timeout`, preserve their body shape apart from tool
+  normalization, and are not response-rewritten
+- Custom tool names are cloaked under the synthetic MCP namespace
+  `mcp__occli__` on the way out (definitions, `tool_choice`, historical
+  `tool_use` blocks) and the exact prefix is stripped on the way in through both
+  streaming SSE (`content_block_start`) and non-streaming JSON responses, so
+  OpenCode's logical tool names remain unchanged
 - Model costs reported as zero while on OAuth (subscription-billed)
 
 ### Token refresh

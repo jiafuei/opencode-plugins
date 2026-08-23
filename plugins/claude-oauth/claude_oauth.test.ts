@@ -295,6 +295,43 @@ describe("rewriteBody", () => {
       "Be terse.",
     ]);
   });
+
+  test("upgrades existing cache breakpoints to Claude Code's one-hour shape", () => {
+    const body = JSON.stringify({
+      model: "claude-sonnet-4-6",
+      messages: [
+        {
+          role: "user",
+          content: [{ type: "text", text: "hi", cache_control: { type: "ephemeral" } }],
+        },
+      ],
+      system: [
+        { type: "text", text: "Primary", cache_control: { type: "ephemeral" } },
+        { type: "text", text: "Project", cache_control: { type: "ephemeral", ttl: "5m" } },
+      ],
+      tools: [
+        {
+          name: "lookup",
+          description: "Lookup",
+          input_schema: { type: "object" },
+          cache_control: { type: "ephemeral" },
+        },
+      ],
+      max_tokens: 100,
+    });
+
+    const result = rewriteBody(body, {});
+    const out = parse(result.json);
+    expect(result.hasLongCache).toBe(true);
+    expect(out.system[2].cache_control).toEqual({ type: "ephemeral", ttl: "1h", scope: "global" });
+    expect(out.system[3].cache_control).toEqual({ type: "ephemeral", ttl: "1h" });
+    expect(out.messages[0].content[0].cache_control).toEqual({ type: "ephemeral", ttl: "1h" });
+    expect(out.tools[0].cache_control).toEqual({ type: "ephemeral", ttl: "1h" });
+  });
+
+  test("reports no long cache when the request has no cache breakpoints", () => {
+    expect(rewriteBody(baseBody, {}).hasLongCache).toBe(false);
+  });
 });
 
 describe("buildBetas", () => {
@@ -306,6 +343,7 @@ describe("buildBetas", () => {
     "context-management-2025-06-27",
     "prompt-caching-scope-2026-01-05",
     "structured-outputs-2025-12-15",
+    "fallback-credit-2026-06-01",
   ];
   const AGENT_BASE = [
     "claude-code-20250219",
@@ -316,36 +354,51 @@ describe("buildBetas", () => {
     "context-management-2025-06-27",
     "prompt-caching-scope-2026-01-05",
     "mid-conversation-system-2026-04-07",
-    "advanced-tool-use-2025-11-20",
   ];
 
   test("utility profile when there are no tools and no thinking", () => {
-    expect(buildBetas(undefined, false, null)).toEqual(UTILITY.join(","));
+    expect(buildBetas(undefined, false, false, null)).toEqual(UTILITY.join(","));
   });
 
-  test("utility profile for explicitly disabled thinking (no effort, no fallback credit)", () => {
-    const betas = buildBetas({ type: "disabled" }, false, null).split(",");
+  test("utility profile for explicitly disabled thinking has no effort", () => {
+    const betas = buildBetas({ type: "disabled" }, false, false, null).split(",");
     expect(betas).toEqual(UTILITY);
     expect(betas).not.toContain("effort-2025-11-24");
-    expect(betas).not.toContain("fallback-credit-2026-06-01");
   });
 
   test("agent profile for tools without thinking: fallback credit but no effort", () => {
-    const betas = buildBetas({ type: "disabled" }, true, null).split(",");
+    const betas = buildBetas({ type: "disabled" }, true, false, null).split(",");
     expect(betas).toEqual([...AGENT_BASE, "fallback-credit-2026-06-01"]);
     expect(betas).not.toContain("effort-2025-11-24");
   });
 
   test("agent profile with effort + fallback credit for enabled thinking", () => {
-    expect(buildBetas({ type: "enabled", budget_tokens: 1024 }, false, null)).toEqual(
+    expect(buildBetas({ type: "enabled", budget_tokens: 1024 }, false, false, null)).toEqual(
       [...AGENT_BASE, "effort-2025-11-24", "fallback-credit-2026-06-01"].join(","),
     );
   });
 
   test("adaptive thinking counts as active thinking", () => {
-    const betas = buildBetas({ type: "adaptive" }, false, null).split(",");
+    const betas = buildBetas({ type: "adaptive" }, false, false, null).split(",");
     expect(betas).toContain("effort-2025-11-24");
     expect(betas).toContain("fallback-credit-2026-06-01");
+  });
+
+  test("adds advanced tool use only when the SDK requested it", () => {
+    const withoutAdvanced = buildBetas(undefined, true, false, null).split(",");
+    expect(withoutAdvanced).not.toContain("advanced-tool-use-2025-11-20");
+
+    const withAdvanced = buildBetas(undefined, true, false, "advanced-tool-use-2025-11-20").split(",");
+    expect(withAdvanced).toEqual([
+      ...AGENT_BASE,
+      "advanced-tool-use-2025-11-20",
+      "fallback-credit-2026-06-01",
+    ]);
+  });
+
+  test("adds the extended-cache beta when the rewritten body has a one-hour cache", () => {
+    const betas = buildBetas(undefined, false, true, null).split(",");
+    expect(betas).toEqual([...UTILITY, "extended-cache-ttl-2025-04-11"]);
   });
 
   test("preserves and deduplicates SDK/caller betas after the profile", () => {
@@ -357,7 +410,7 @@ describe("buildBetas", () => {
       "task-budgets-2026-03-13",
       "fallback-credit-2026-06-01",
     ].join(",");
-    const betas = buildBetas({ type: "enabled", budget_tokens: 1024 }, true, incoming).split(",");
+    const betas = buildBetas({ type: "enabled", budget_tokens: 1024 }, true, false, incoming).split(",");
     expect(betas.slice(0, AGENT_BASE.length + 1)).toEqual([...AGENT_BASE, "effort-2025-11-24"]);
     expect(betas.slice(AGENT_BASE.length + 1)).toEqual([
       "fallback-credit-2026-06-01",
@@ -368,7 +421,7 @@ describe("buildBetas", () => {
   });
 
   test("strips context-1m even when the caller supplies it", () => {
-    const betas = buildBetas(undefined, false, "context-1m-2025-08-07,pdfs-2024-09-25").split(",");
+    const betas = buildBetas(undefined, false, false, "context-1m-2025-08-07,pdfs-2024-09-25").split(",");
     expect(betas).not.toContain("context-1m-2025-08-07");
     expect(betas.slice(UTILITY.length)).toEqual(["pdfs-2024-09-25"]);
   });
@@ -377,10 +430,16 @@ describe("buildBetas", () => {
     const betas = buildBetas(
       undefined,
       false,
+      false,
       "fine-grained-tool-streaming-2025-05-14,fast-mode-2026-02-01",
     ).split(",");
     expect(betas).not.toContain("fine-grained-tool-streaming-2025-05-14");
     expect(betas.slice(UTILITY.length)).toEqual(["fast-mode-2026-02-01"]);
+  });
+
+  test("strips the SDK's obsolete structured-output beta", () => {
+    const betas = buildBetas(undefined, true, false, "structured-outputs-2025-11-13").split(",");
+    expect(betas).not.toContain("structured-outputs-2025-11-13");
   });
 });
 
@@ -445,14 +504,13 @@ describe("rewriteBody cch", () => {
 
 describe("tool name prefix helpers", () => {
   test("round-trips logical names through apply/strip exactly once", () => {
-    for (const name of ["get_weather", "_secret_tool", "__double", "a"]) {
+    for (const name of ["get_weather", "_secret_tool", "mcp__occli__nested", "a"]) {
       expect(stripClaudeToolPrefix(applyClaudeToolPrefix(name))).toBe(name);
     }
-    // Always prefixes, even when the logical name already starts with "_",
-    // so stripping one prefix restores it.
-    expect(applyClaudeToolPrefix("_secret_tool")).toBe("__secret_tool");
-    expect(stripClaudeToolPrefix("__secret_tool")).toBe("_secret_tool");
+    expect(applyClaudeToolPrefix("_secret_tool")).toBe("mcp__occli___secret_tool");
+    expect(stripClaudeToolPrefix("mcp__occli___secret_tool")).toBe("_secret_tool");
     expect(stripClaudeToolPrefix("plain")).toBe("plain");
+    expect(stripClaudeToolPrefix("_plain")).toBe("_plain");
   });
 
   test("never prefixes Anthropic built-in tool names", () => {
@@ -487,7 +545,12 @@ describe("rewriteBody tool name cloaking", () => {
       },
     ],
     tools: [
-      { name: "get_weather", description: "d", input_schema: { type: "object" } },
+      {
+        name: "get_weather",
+        description: "d",
+        input_schema: { type: "object" },
+        eager_input_streaming: true,
+      },
       { name: "_secret", description: "d", input_schema: { type: "object" } },
       { name: "web_search", description: "d", input_schema: { type: "object" } },
       // Server tools carry versioned types and must stay untouched.
@@ -505,8 +568,8 @@ describe("rewriteBody tool name cloaking", () => {
   test("prefixes custom tool definitions, tool_choice, and historical tool_use names", () => {
     const out = parse(rewriteBody(toolBody, {}).json);
     expect(out.tools.map((t: any) => t.name)).toEqual([
-      "_get_weather",
-      "__secret",
+      "mcp__occli__get_weather",
+      "mcp__occli___secret",
       "web_search",
       // Versioned server tools keep their SDK-assigned names.
       "web_search",
@@ -515,9 +578,16 @@ describe("rewriteBody tool name cloaking", () => {
       "computer",
       "bash",
     ]);
-    expect(out.tool_choice).toEqual({ type: "tool", name: "_get_weather" });
+    expect(out.tool_choice).toEqual({ type: "tool", name: "mcp__occli__get_weather" });
+    expect(out.tools.every((tool: any) => tool.eager_input_streaming === undefined)).toBe(true);
+    expect(out.tools.slice(0, 3).every((tool: any) => tool.input_schema.additionalProperties === false)).toBe(true);
     const assistant = out.messages[1].content;
-    expect(assistant[1]).toEqual({ type: "tool_use", id: "toolu_01", name: "_get_weather", input: { city: "SF" } });
+    expect(assistant[1]).toEqual({
+      type: "tool_use",
+      id: "toolu_01",
+      name: "mcp__occli__get_weather",
+      input: { city: "SF" },
+    });
     // Server/MCP tool_use blocks keep their names.
     expect(assistant[2].name).toBe("web_search");
     expect(assistant[3].name).toBe("mcp_tool");
@@ -545,7 +615,7 @@ describe("rewriteBody tool name cloaking", () => {
 
   test("cch hashes custom tool prefixes as retained request content", () => {
     const json = rewriteBody(toolBody, {}).json;
-    expect(json).toContain('"name":"_get_weather"');
+    expect(json).toContain('"name":"mcp__occli__get_weather"');
     const cch = json.match(/cch=([0-9a-f]{5})/)?.[1]!;
     const changed = rewriteBody(toolBody.replaceAll("get_weather", "other_tool"), {}).json;
     expect(changed.match(/cch=([0-9a-f]{5})/)?.[1]).not.toBe(cch);
@@ -564,10 +634,10 @@ const SSE_EVENTS = [
   'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}',
   'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"checking the weather"}}',
   'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}',
-  'event: content_block_start\ndata: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_01","name":"_get_weather","input":{}}}',
+  'event: content_block_start\ndata: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_01","name":"mcp__occli__get_weather","input":{}}}',
   'event: content_block_delta\ndata: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\\"city\\":\\"SF\\"}"}}',
   'event: content_block_stop\ndata: {"type":"content_block_stop","index":1}',
-  'event: content_block_start\ndata: {"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"toolu_02","name":"__secret","input":{}}}',
+  'event: content_block_start\ndata: {"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"toolu_02","name":"mcp__occli___secret","input":{}}}',
   'event: content_block_delta\ndata: {"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{\\"city\\":\\"NY\\"}"}}',
   'event: content_block_stop\ndata: {"type":"content_block_stop","index":2}',
   'event: content_block_start\ndata: {"type":"content_block_start","index":3,"content_block":{"type":"tool_use","id":"toolu_03","name":"web_search","input":{}}}',
@@ -583,8 +653,8 @@ const SSE_PAYLOAD = SSE_EVENTS.map((event, i) => event + (i % 3 === 1 ? "\r\n\r\
 
 // The same payload with tool_use names uncloaked — the expected output bytes.
 const SSE_EXPECTED = SSE_PAYLOAD
-  .replace('"name":"_get_weather"', '"name":"get_weather"')
-  .replace('"name":"__secret"', '"name":"_secret"');
+  .replace('"name":"mcp__occli__get_weather"', '"name":"get_weather"')
+  .replace('"name":"mcp__occli___secret"', '"name":"_secret"');
 
 async function collect(stream: ReadableStream<Uint8Array>): Promise<Uint8Array> {
   const chunks: Uint8Array[] = [];
@@ -674,7 +744,7 @@ describe("createSseToolNameTransform", () => {
   });
 
   test("flushes a final line without a trailing newline", async () => {
-    const bytes = new TextEncoder().encode('data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t","name":"_x","input":{}}}');
+    const bytes = new TextEncoder().encode('data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t","name":"mcp__occli__x","input":{}}}');
     const output = await collect(fragmentedStream(bytes, [4]).pipeThrough(createSseToolNameTransform()));
     expect(new TextDecoder().decode(output)).toBe(
       'data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t","name":"x","input":{}}}',
@@ -690,7 +760,7 @@ describe("createSseToolNameTransform", () => {
   test("joins multiple data: lines per SSE rules before JSON parsing and rewrites as one", async () => {
     const payload =
       'data: {"type":"content_block_start","index":9,\n' +
-      'data: "content_block":{"type":"tool_use","id":"toolu_09","name":"_split_name","input":{}}}\n' +
+      'data: "content_block":{"type":"tool_use","id":"toolu_09","name":"mcp__occli__split_name","input":{}}}\n' +
       "\n";
     const output = await collect(
       fragmentedStream(new TextEncoder().encode(payload), [13]).pipeThrough(createSseToolNameTransform()),
@@ -709,7 +779,7 @@ describe("createSseToolNameTransform", () => {
       'event: message_start\n' +
       'data: {"type":"message_start","message":{"id":"msg_ms","role":"assistant","content":[' +
       '{"type":"text","text":"hi"},' +
-      '{"type":"tool_use","id":"toolu_10","name":"_prefixed","input":{}}' +
+      '{"type":"tool_use","id":"toolu_10","name":"mcp__occli__prefixed","input":{}}' +
       ']}}\r\n\r\n';
     const output = await collect(
       fragmentedStream(new TextEncoder().encode(payload), [17]).pipeThrough(createSseToolNameTransform()),
@@ -748,8 +818,8 @@ describe("transformJsonToolUseNames", () => {
       role: "assistant",
       content: [
         { type: "text", text: "hi" },
-        { type: "tool_use", id: "toolu_01", name: "_get_weather", input: { city: "SF" } },
-        { type: "tool_use", id: "toolu_02", name: "__secret", input: {} },
+        { type: "tool_use", id: "toolu_01", name: "mcp__occli__get_weather", input: { city: "SF" } },
+        { type: "tool_use", id: "toolu_02", name: "mcp__occli___secret", input: {} },
         { type: "tool_use", id: "toolu_03", name: "web_search", input: {} },
       ],
       stop_reason: "tool_use",
@@ -814,8 +884,8 @@ describe("SDK integration: tool name cloaking through plugin fetch", () => {
     model: "claude-sonnet-4-6",
     content: [
       { type: "text", text: "It is sunny." },
-      { type: "tool_use", id: "toolu_01", name: "_get_weather", input: { city: "SF" } },
-      { type: "tool_use", id: "toolu_02", name: "__secret", input: {} },
+      { type: "tool_use", id: "toolu_01", name: "mcp__occli__get_weather", input: { city: "SF" } },
+      { type: "tool_use", id: "toolu_02", name: "mcp__occli___secret", input: {} },
     ],
     stop_reason: "tool_use",
     stop_sequence: null,
@@ -849,7 +919,7 @@ describe("SDK integration: tool name cloaking through plugin fetch", () => {
     execute: async () => "sunny",
   });
 
-  test("streaming: request names prefixed, streamed names restored, underscore round-trip, builtins untouched", async () => {
+  test("streaming: request names prefixed, streamed names restored, and builtins untouched", async () => {
     const captured: { url: string; body: string }[] = [];
     const { fetch: doFetch, restore } = await wrappedFetch(captured, (_url, body) =>
       body.includes('"tool_result"') ? finalTextResponse() : sseResponse(),
@@ -879,8 +949,14 @@ describe("SDK integration: tool name cloaking through plugin fetch", () => {
       // builtin-named custom tool stays unprefixed; server tools absent here
       // but custom names carry exactly one prefix.
       const first = JSON.parse(captured[0]!.body);
-      expect(first.tools.map((t: any) => t.name)).toEqual(["_get_weather", "__secret", "web_search"]);
-      expect(first.tool_choice).toEqual({ type: "tool", name: "_get_weather" });
+      expect(first.tools.map((t: any) => t.name)).toEqual([
+        "mcp__occli__get_weather",
+        "mcp__occli___secret",
+        "web_search",
+      ]);
+      expect(first.tools.every((tool: any) => tool.eager_input_streaming === undefined)).toBe(true);
+      expect(first.tools.every((tool: any) => tool.input_schema.additionalProperties === false)).toBe(true);
+      expect(first.tool_choice).toEqual({ type: "tool", name: "mcp__occli__get_weather" });
       expect(captured[0]!.url).toContain("beta=true");
 
       // Follow-up request: historical assistant tool_use names are re-prefixed,
@@ -888,7 +964,11 @@ describe("SDK integration: tool name cloaking through plugin fetch", () => {
       const second = JSON.parse(captured[1]!.body);
       const assistant = second.messages.find((m: any) => m.role === "assistant");
       const toolUses = assistant.content.filter((b: any) => b.type === "tool_use");
-      expect(toolUses.map((b: any) => b.name)).toEqual(["_get_weather", "__secret", "web_search"]);
+      expect(toolUses.map((b: any) => b.name)).toEqual([
+        "mcp__occli__get_weather",
+        "mcp__occli___secret",
+        "web_search",
+      ]);
       expect(toolUses.map((b: any) => b.id)).toEqual(["toolu_01", "toolu_02", "toolu_03"]);
       const toolUser = second.messages.find((m: any) =>
         Array.isArray(m.content) && m.content.some((b: any) => b.type === "tool_result"),
@@ -921,7 +1001,10 @@ describe("SDK integration: tool name cloaking through plugin fetch", () => {
       expect(result.toolCalls[0]!.toolCallId).toBe("toolu_01");
       expect(result.text).toBe("It is sunny.");
       // Request side was prefixed.
-      expect(JSON.parse(captured[0]!.body).tools.map((t: any) => t.name)).toEqual(["_get_weather", "__secret"]);
+      expect(JSON.parse(captured[0]!.body).tools.map((t: any) => t.name)).toEqual([
+        "mcp__occli__get_weather",
+        "mcp__occli___secret",
+      ]);
       // Non-streaming request keeps stream absent; response JSON was transformed.
       expect(JSON.parse(captured[0]!.body).stream).toBeUndefined();
     } finally {

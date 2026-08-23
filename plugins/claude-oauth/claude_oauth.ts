@@ -1132,7 +1132,7 @@ export const ClaudeOAuthPlugin: Plugin = async (input: PluginInput, options?: Pl
                   ...requestChains.startRequest(requestCredential, initialChainSessionId, logicalRequestId),
                 }
               }
-              const { json, thinking, hasTools, sessionId: rewrittenSessionId } = rewriteBody(body, {
+              const { json, thinking, hasTools, hasLongCache, sessionId: rewrittenSessionId } = rewriteBody(body, {
                 sessionId: hookSessionId,
                 accountId,
                 attributionHeader,
@@ -1149,7 +1149,7 @@ export const ClaudeOAuthPlugin: Plugin = async (input: PluginInput, options?: Pl
               body = json
               // Headers.get is case-insensitive, so SDK betas arrive regardless
               // of the caller's key casing.
-              headers.set("anthropic-beta", buildBetas(thinking, hasTools, headers.get("anthropic-beta")))
+              headers.set("anthropic-beta", buildBetas(thinking, hasTools, hasLongCache, headers.get("anthropic-beta")))
             } else if (isCountTokens && typeof body === "string" && body.startsWith("{")) {
               const params = JSON.parse(body) as Record<string, any>
               prefixRequestToolNames(params)

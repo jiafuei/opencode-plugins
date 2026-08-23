@@ -4,7 +4,8 @@ import { mkdtempSync, readdirSync, rmSync, statSync, writeFileSync } from "node:
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { createAnthropic } from "@ai-sdk/anthropic";
-import { generateText, streamText } from "ai";
+import { generateText, streamText, tool } from "ai";
+import { z } from "zod";
 import { ClaudeOAuthPlugin, mapStainlessArch } from "./claude_oauth.ts";
 
 // Integration-style request capture harness.
@@ -24,6 +25,7 @@ const UTILITY_BETAS = [
   "context-management-2025-06-27",
   "prompt-caching-scope-2026-01-05",
   "structured-outputs-2025-12-15",
+  "fallback-credit-2026-06-01",
 ];
 
 const OAUTH_AUTH = {
@@ -286,6 +288,46 @@ describe("request capture: SDK-generated beta/context-management data", () => {
     expect(JSON.parse(req.bodyText).speed).toBe("fast");
   });
 
+  test("normalizes SDK tool streaming, structured-output, and cache fields at the wire boundary", async () => {
+    const { anthropic, captured, fromSdk } = await setupHarness();
+
+    const result = streamText({
+      model: anthropic("claude-sonnet-4-6"),
+      messages: [
+        {
+          role: "system",
+          content: "Cached system prompt",
+          providerOptions: { anthropic: { cacheControl: { type: "ephemeral" } } },
+        },
+        { role: "user", content: "hi" },
+      ],
+      tools: {
+        lookup: tool({
+          description: "Lookup",
+          inputSchema: z.object({ query: z.string() }),
+        }),
+      },
+    });
+    await result.text;
+
+    const sdkReq = fromSdk[0]!;
+    const sdkBody = JSON.parse(sdkReq.bodyText);
+    expect(sdkReq.headers["anthropic-beta"]!.split(",")).toContain("structured-outputs-2025-11-13");
+    expect(sdkBody.tools[0].eager_input_streaming).toBe(true);
+    expect(sdkBody.system[0].cache_control).toEqual({ type: "ephemeral" });
+
+    const req = captured[0]!;
+    const betas = req.headers["anthropic-beta"]!.split(",");
+    const body = JSON.parse(req.bodyText);
+    expect(betas).not.toContain("structured-outputs-2025-11-13");
+    expect(betas).not.toContain("advanced-tool-use-2025-11-20");
+    expect(betas).toContain("extended-cache-ttl-2025-04-11");
+    expect(body.tools[0].name).toBe("mcp__occli__lookup");
+    expect(body.tools[0].eager_input_streaming).toBeUndefined();
+    expect(body.tools[0].input_schema.additionalProperties).toBe(false);
+    expect(body.system[2].cache_control).toEqual({ type: "ephemeral", ttl: "1h", scope: "global" });
+  });
+
 });
 
 describe("request capture: header parity", () => {
@@ -493,8 +535,9 @@ describe("request capture: x-client-request-id per-invocation semantics", () => 
     const body = JSON.parse(captured!.bodyText);
     expect(body.system).toBeUndefined();
     expect(body.metadata).toBeUndefined();
-    expect(body.tools[0].name).toBe("_get_weather");
-    expect(body.messages[0].content[0].name).toBe("_get_weather");
+    expect(body.tools[0].name).toBe("mcp__occli__get_weather");
+    expect(body.tools[0].input_schema.additionalProperties).toBe(false);
+    expect(body.messages[0].content[0].name).toBe("mcp__occli__get_weather");
   });
 
   test("prompt ids stay stable and successful request ids chain through billing metadata", async () => {
