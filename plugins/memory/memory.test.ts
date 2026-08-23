@@ -1369,7 +1369,7 @@ describe("memory manual dreaming", () => {
     // framing, evolving across iterations as transformations are applied.
     expect(selectorPrompts[0]).toContain("(a.md)");
     expect(selectorPrompts[0]).toContain("<candidate_index>\n");
-    expect(selectorPrompts[0].endsWith("</candidate_index>")).toBe(true);
+    expect(selectorPrompts[0]!.endsWith("</candidate_index>")).toBe(true);
     expect(selectorPrompts[0]).toContain("untrusted data");
     expect(selectorPrompts[0]).toContain("Age or recency alone never justifies an action");
     expect(selectorPrompts[1]).toContain(`(${merged})`);

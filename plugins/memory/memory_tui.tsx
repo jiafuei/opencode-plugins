@@ -261,7 +261,7 @@ const MemoryTuiPlugin: TuiPlugin = async (api) => {
     await mkdir(directory, { recursive: true });
     outstandingRequestID = crypto.randomUUID();
     const route = api.route.current;
-    const sessionID = route.name === "session" ? route.params.sessionID : undefined;
+    const sessionID = route.name === "session" ? route.params?.sessionID : undefined;
     await atomicWrite(join(directory, DREAM_REQUEST_FILE), `${JSON.stringify({
       requestID: outstandingRequestID,
       ...(sessionID ? { sessionID } : {}),
