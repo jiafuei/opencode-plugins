@@ -149,7 +149,12 @@ describe("request capture: normal streaming request", () => {
       system: "You are a coding agent.",
       prompt: "hello world, this is the first user message",
       maxOutputTokens: 128000,
-      headers: { "X-Claude-Code-Session-Id": "session-test-1" },
+      headers: {
+        "X-Claude-Code-Session-Id": "session-test-1",
+        "x-session-affinity": "ses_opencode",
+        "x-session-id": "ses_opencode",
+        "x-parent-session-id": "ses_parent",
+      },
     });
     expect(await result.text).toBe("Hello!");
 
@@ -161,6 +166,9 @@ describe("request capture: normal streaming request", () => {
     // OAuth bearer replaces the SDK's dummy x-api-key.
     expect(req.headers["authorization"]).toBe("Bearer test-access-token");
     expect(req.headers["x-api-key"]).toBeUndefined();
+    expect(req.headers["x-session-affinity"]).toBeUndefined();
+    expect(req.headers["x-session-id"]).toBeUndefined();
+    expect(req.headers["x-parent-session-id"]).toBeUndefined();
     expect(req.headers["user-agent"]).toBe("claude-cli/2.1.228 (external, cli)");
     expect(req.headers["accept"]).toBe("application/json");
     expect(req.headers["content-type"]).toBe("application/json");
@@ -258,7 +266,10 @@ describe("request capture: SDK-generated beta/context-management data", () => {
       prompt: "hi",
       maxOutputTokens: 1000,
       providerOptions: {
-        anthropic: { anthropicBeta: ["fast-mode-2026-02-01"], speed: "fast" },
+        anthropic: {
+          anthropicBeta: ["fine-grained-tool-streaming-2025-05-14", "fast-mode-2026-02-01"],
+          speed: "fast",
+        },
       },
     });
     await result.text;
@@ -267,6 +278,7 @@ describe("request capture: SDK-generated beta/context-management data", () => {
     // plugin preserves it, deduplicated, after the utility profile. Body
     // `speed` survives via the extras passthrough.
     const sdkReq = fromSdk[0]!;
+    expect(sdkReq.headers["anthropic-beta"]!.split(",")).toContain("fine-grained-tool-streaming-2025-05-14");
     expect(sdkReq.headers["anthropic-beta"]!.split(",")).toContain("fast-mode-2026-02-01");
 
     const req = captured[0]!;

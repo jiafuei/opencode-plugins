@@ -41,10 +41,9 @@ export const COUNT_TOKENS_BETAS = [
 
 const EFFORT_BETA = "effort-2025-11-24";
 const FALLBACK_CREDIT_BETA = "fallback-credit-2026-06-01";
-// context-1m-2025-08-07 is intentionally never sent: OAuth subscription
-// credentials get hard-429'd on beta-gated 1M requests regardless of prompt
-// size, so it is stripped even from SDK/caller-supplied betas.
-const CONTEXT_1M_BETA = "context-1m-2025-08-07";
+// These caller-supplied betas are absent from Claude Code's wire profile.
+// context-1m additionally hard-429s OAuth subscription requests.
+const STRIPPED_BETAS = new Set(["context-1m-2025-08-07", "fine-grained-tool-streaming-2025-05-14"]);
 
 function isActiveThinking(thinking: unknown): boolean {
   const type = (thinking as { type?: unknown } | undefined)?.type;
@@ -66,7 +65,7 @@ export function buildBetas(thinking: unknown, hasTools: boolean, incoming?: stri
   if (incoming) {
     for (const raw of incoming.split(",")) {
       const beta = raw.trim();
-      if (!beta || seen.has(beta) || beta === CONTEXT_1M_BETA) continue;
+      if (!beta || seen.has(beta) || STRIPPED_BETAS.has(beta)) continue;
       seen.add(beta);
       betas.push(beta);
     }
@@ -500,6 +499,13 @@ export function rewriteBody(
   // Cloak custom tool names before anything else, so cch hashes the
   // already-prefixed final body.
   prefixRequestToolNames(params);
+  if (
+    params.tool_choice?.type === "auto" &&
+    typeof params.tool_choice === "object" &&
+    Object.keys(params.tool_choice).length === 1
+  ) {
+    delete params.tool_choice;
+  }
   const hasTools = Array.isArray(params.tools) && params.tools.length > 0;
 
   const modelId: string = params.model ?? "";
@@ -561,7 +567,10 @@ export function rewriteBody(
   }
   const metadata = { ...params.metadata, user_id: userId };
 
-  const thinking = params.thinking;
+  const thinking =
+    params.thinking && typeof params.thinking === "object"
+      ? Object.fromEntries(Object.entries(params.thinking).filter(([key]) => key !== "display"))
+      : params.thinking;
   // Merge, don't replace: keep any incoming context_management intact
   // (compact_20260112, clear_tool_uses_20250919, unknown future edits) and
   // only guarantee the clear-thinking edit when thinking is active. Incoming

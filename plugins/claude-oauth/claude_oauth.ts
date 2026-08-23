@@ -1072,6 +1072,9 @@ export const ClaudeOAuthPlugin: Plugin = async (input: PluginInput, options?: Pl
             const access = auth.access
             const accountId = auth.accountId
             const headers = new Headers(init?.headers)
+            headers.delete("x-session-affinity")
+            headers.delete("x-session-id")
+            headers.delete("x-parent-session-id")
             const requestCredential = requestChainCredentialKey(auth.refresh, accountId)
             const accessFingerprint = createHash("sha256").update(access).digest("hex")
             activeRequestCredential = requestCredential
@@ -1101,6 +1104,9 @@ export const ClaudeOAuthPlugin: Plugin = async (input: PluginInput, options?: Pl
             const opencodeSessionId = headers.get(OPENCODE_SESSION_ID_HEADER) ?? undefined
             headers.delete(OPENCODE_SESSION_ID_HEADER)
             const hookSessionId = headers.get(SESSION_ID_HEADER) ?? undefined
+            // Reinsert at dispatch so Bun serializes Claude Code's title casing
+            // instead of retaining the SDK-normalized lowercase field name.
+            headers.delete(SESSION_ID_HEADER)
             let sessionId = hookSessionId
             let body: RequestInit["body"] = init?.body
             let requestChain:

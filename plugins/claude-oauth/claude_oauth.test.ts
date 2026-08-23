@@ -240,10 +240,18 @@ describe("rewriteBody", () => {
     }
   });
 
+  test("strips thinking display while preserving the active thinking configuration", () => {
+    const body = JSON.stringify({
+      ...parse(baseBody),
+      thinking: { type: "adaptive", display: "summarized", budget_tokens: 2048 },
+    });
+    expect(parse(rewriteBody(body, {}).json).thinking).toEqual({ type: "adaptive", budget_tokens: 2048 });
+  });
+
   test("rebuilds known keys in canonical order, then extras in original relative order", () => {
     const body = JSON.stringify({
       stream: true,
-      tool_choice: { type: "auto" },
+      tool_choice: { type: "auto", disable_parallel_tool_use: true },
       temperature: 1,
       max_tokens: 100,
       fallbacks: [{ model: "claude-sonnet-4-6" }],
@@ -363,6 +371,16 @@ describe("buildBetas", () => {
     const betas = buildBetas(undefined, false, "context-1m-2025-08-07,pdfs-2024-09-25").split(",");
     expect(betas).not.toContain("context-1m-2025-08-07");
     expect(betas.slice(UTILITY.length)).toEqual(["pdfs-2024-09-25"]);
+  });
+
+  test("strips fine-grained tool streaming while preserving unrelated caller betas", () => {
+    const betas = buildBetas(
+      undefined,
+      false,
+      "fine-grained-tool-streaming-2025-05-14,fast-mode-2026-02-01",
+    ).split(",");
+    expect(betas).not.toContain("fine-grained-tool-streaming-2025-05-14");
+    expect(betas.slice(UTILITY.length)).toEqual(["fast-mode-2026-02-01"]);
   });
 });
 
@@ -512,7 +530,12 @@ describe("rewriteBody tool name cloaking", () => {
     expect(stripClaudeToolPrefix(out.tools[1].name)).toBe("_secret");
   });
 
-  test("leaves auto tool_choice untouched", () => {
+  test("omits the default auto tool_choice", () => {
+    const body = JSON.stringify({ ...parse(toolBody), tool_choice: { type: "auto" } });
+    expect(parse(rewriteBody(body, {}).json).tool_choice).toBeUndefined();
+  });
+
+  test("preserves auto tool_choice with non-default behavior", () => {
     const body = JSON.stringify({ ...parse(toolBody), tool_choice: { type: "auto", disable_parallel_tool_use: true } });
     expect(parse(rewriteBody(body, {}).json).tool_choice).toEqual({
       type: "auto",

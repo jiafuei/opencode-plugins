@@ -52,13 +52,14 @@ endpoint:
 - `User-Agent: claude-cli/2.1.228 (external, cli)`, `x-app: cli`,
   a per-invocation `x-client-request-id` (stable across SDK retries of the
   same request, fresh per logical invocation), the Stainless header set, and
-  `X-Claude-Code-Session-Id` per session
+  `X-Claude-Code-Session-Id` per session; OpenCode's internal session-routing
+  headers are stripped before dispatch
 - The Claude Code beta profile (`oauth-2025-04-20`, interleaved thinking,
   redacted thinking, context management, and related features), chosen per
   request shape (utility vs agent profile);
-  SDK/caller-supplied betas are preserved and deduplicated after it.
-  `context-1m-2025-08-07` is always stripped — subscription credentials get
-  hard-429'd on beta-gated 1M requests.
+  SDK/caller-supplied betas are preserved and deduplicated after it, except
+  `fine-grained-tool-streaming-2025-05-14` (absent from Claude Code's profile)
+  and `context-1m-2025-08-07` (hard-429'd for subscription credentials).
 - Body rewrite:
   - `system[0]` = `x-anthropic-billing-header` with the CC version fingerprint,
     `system[1]` = `You are Claude Code, Anthropic's official CLI for Claude.`
@@ -67,6 +68,8 @@ endpoint:
     with a stable per-install device ID and a UUIDv4 session ID persisted per
     OpenCode conversation; existing valid CC attribution is preserved verbatim
   - `max_tokens` clamped to ≤ 64000; incoming `stream` is preserved as-is
+  - `thinking.display` and the redundant default `tool_choice:{type:"auto"}`
+    are omitted; non-default tool choices and other thinking fields are kept
   - `context_management`: incoming edits are preserved; when thinking is on,
     exactly one `{type:"clear_thinking_20251015", keep:"all"}` edit is
     guaranteed first
