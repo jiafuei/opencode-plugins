@@ -9,6 +9,7 @@
   "files": [
     "antigravity_oauth.ts",
     "oauth_flow.ts",
+    "schema.ts",
     "wire.ts",
     "README.md"
   ],

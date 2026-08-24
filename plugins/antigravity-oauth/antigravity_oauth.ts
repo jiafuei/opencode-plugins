@@ -470,11 +470,12 @@ export const AntigravityOAuthPlugin: Plugin = async (
               invocationId,
             });
 
+            // Build the native inference fingerprint from scratch. OpenCode,
+            // the AI SDK, and user-supplied tracing headers must not leak.
+            for (const name of [...headers.keys()]) headers.delete(name);
             headers.set("Authorization", `Bearer ${auth.access}`);
             headers.set("Content-Type", "application/json");
             headers.set("User-Agent", getAntigravityUserAgent());
-            headers.delete("Accept");
-            headers.delete("anthropic-beta");
             if (target.kind === "stream") headers.set("Accept", "text/event-stream");
             if (target.kind === "stream" && isClaudeModel(rewritten.wireModelId) && spec.reasoning) {
               headers.set("anthropic-beta", CLAUDE_THINKING_BETA_HEADER);

@@ -352,6 +352,7 @@ describe("auth loader fetch boundary", () => {
         "x-parent-session-id": "parent-1",
         "x-antigravity-opencode-session": "ses-1",
         "x-antigravity-opencode-invocation": "inv-1",
+        "x-custom-trace": "trace-1",
       });
       const response = await loader.fetch(target.url, target.init);
       await readStream(response);
@@ -365,6 +366,7 @@ describe("auth loader fetch boundary", () => {
         "x-parent-session-id",
         "x-antigravity-opencode-session",
         "x-antigravity-opencode-invocation",
+        "x-custom-trace",
       ]) {
         expect(headers.get(leaked)).toBeNull();
       }
@@ -394,9 +396,19 @@ describe("auth loader fetch boundary", () => {
                 description: "Read a file",
                 parametersJsonSchema: {
                   type: "object",
-                  properties: { path: { type: "string", pattern: "^/" } },
+                  properties: {
+                    path: { type: "string", pattern: "^/" },
+                    depth: { type: "integer", enum: [1, 2] },
+                  },
                   required: ["path"],
                   additionalProperties: false,
+                },
+              },
+              {
+                name: "legacy_tool",
+                parameters: {
+                  type: "object",
+                  properties: { enabled: { type: "boolean", enum: [true, false], format: "unsupported" } },
                 },
               },
             ],
@@ -411,9 +423,33 @@ describe("auth loader fetch boundary", () => {
       expect(declaration.parametersJsonSchema).toBeUndefined();
       expect(declaration.parameters).toEqual({
         type: "object",
-        properties: { path: { type: "string" } },
+        properties: {
+          path: { type: "string" },
+          depth: { type: "integer", enum: ["1", "2"] },
+        },
         required: ["path"],
       });
+      expect(wireBody.request.tools[0].functionDeclarations[1].parameters).toEqual({
+        type: "object",
+        properties: { enabled: { type: "boolean", enum: ["true", "false"] } },
+      });
+    } finally {
+      mock.restore();
+    }
+  });
+
+  test("falls back to object parameters when the SDK supplies a scalar tool root", async () => {
+    const harness = await makeHarness(OAUTH_AUTH);
+    const loader = await harness.loader();
+    const mock = mockFetch(() => sseResponse([{ response: { candidates: [] } }]));
+    try {
+      const target = streamTarget("gemini-2.5-pro", {
+        contents: [],
+        tools: [{ functionDeclarations: [{ name: "broken", parametersJsonSchema: { type: "string" } }] }],
+      });
+      await readStream(await loader.fetch(target.url, target.init));
+      const declaration = JSON.parse(String(mock.calls[0]!.init.body)).request.tools[0].functionDeclarations[0];
+      expect(declaration.parameters).toEqual({ type: "object", properties: {} });
     } finally {
       mock.restore();
     }

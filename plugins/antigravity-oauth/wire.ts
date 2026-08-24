@@ -8,6 +8,8 @@
  * routing, tool schema normalization, and SSE response unwrapping.
  */
 
+import { normalizeSchemaForCCA, normalizeToolSchemaForCCA } from "./schema.ts";
+
 // ---------------------------------------------------------------------------
 // Endpoints & captured constants
 // ---------------------------------------------------------------------------
@@ -532,117 +534,7 @@ export function advanceEnvelope(
 // Tool schema normalization (CCA subset)
 // ---------------------------------------------------------------------------
 
-/**
- * JSON Schema fields the CCA Schema proto / protojson rejects outright.
- * A pragmatic subset of OMP's full normalizer: strip rejected keywords,
- * fold combiners into `anyOf`, collapse null unions, and coerce booleans.
- */
-const STRIPPED_SCHEMA_FIELDS: Readonly<Record<string, true>> = {
-  $schema: true,
-  $ref: true,
-  $defs: true,
-  $id: true,
-  $dynamicRef: true,
-  $dynamicAnchor: true,
-  $comment: true,
-  examples: true,
-  prefixItems: true,
-  unevaluatedProperties: true,
-  unevaluatedItems: true,
-  patternProperties: true,
-  additionalProperties: true,
-  propertyNames: true,
-  minItems: true,
-  maxItems: true,
-  minLength: true,
-  maxLength: true,
-  minimum: true,
-  maximum: true,
-  exclusiveMinimum: true,
-  exclusiveMaximum: true,
-  multipleOf: true,
-  pattern: true,
-  format: true,
-  uniqueItems: true,
-  minProperties: true,
-  maxProperties: true,
-  dependencies: true,
-  dependentSchemas: true,
-  dependentRequired: true,
-  deprecated: true,
-  readOnly: true,
-  writeOnly: true,
-};
-
-/** Recursively normalize one tool parameter schema for Cloud Code Assist. */
-export function normalizeSchemaForCCA(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map((entry) => normalizeSchemaForCCA(entry));
-  // Boolean subschemas coerce to open objects (the CCA wire cannot express
-  // either boolean form).
-  if (typeof value === "boolean") return {};
-  if (typeof value !== "object" || value === null) return value;
-
-  const source = value as Record<string, unknown>;
-  if (typeof source["$ref"] === "string") return {}; // unresolvable reference: widen
-
-  const result: Record<string, unknown> = {};
-  for (const [key, entry] of Object.entries(source)) {
-    if (STRIPPED_SCHEMA_FIELDS[key] || key === "nullable" || key === "not") continue;
-    if (key === "const") continue; // folded into enum below
-    if (key === "oneOf" || key === "allOf") continue; // folded into anyOf below
-    result[key] = normalizeSchemaForCCA(entry);
-  }
-
-  // Fold oneOf/allOf into anyOf, normalizing every branch.
-  const folded = [
-    ...asArray(source["anyOf"]),
-    ...asArray(source["oneOf"]),
-    ...asArray(source["allOf"]),
-  ].map((entry) => normalizeSchemaForCCA(entry));
-  if (folded.length > 0) result["anyOf"] = folded;
-
-  // const → enum with inferred scalar type.
-  if ("const" in source) {
-    result["enum"] = [...asArray(result["enum"]), source["const"]];
-    result["type"] ??= jsonTypeOf(source["const"]);
-  }
-
-  // type arrays: drop "null", keep the first remaining type.
-  if (Array.isArray(result["type"])) {
-    const types = (result["type"] as unknown[]).filter((t): t is string => typeof t === "string");
-    result["type"] = types.find((t) => t !== "null") ?? types[0];
-  }
-
-  // Objects must carry properties.
-  if (result["type"] === "object" && typeof result["properties"] !== "object") {
-    result["properties"] = {};
-  }
-
-  // Drop empty anyOf left after folding.
-  if ("anyOf" in result && asArray(result["anyOf"]).length === 0) delete result["anyOf"];
-  if ("enum" in result && asArray(result["enum"]).length === 0) delete result["enum"];
-
-  return result;
-}
-
-function asArray(value: unknown): unknown[] {
-  return Array.isArray(value) ? value : [];
-}
-
-function jsonTypeOf(value: unknown): string {
-  if (value === null) return "null";
-  if (Array.isArray(value)) return "array";
-  switch (typeof value) {
-    case "string":
-      return "string";
-    case "number":
-      return "number";
-    case "boolean":
-      return "boolean";
-    default:
-      return "object";
-  }
-}
+export { normalizeSchemaForCCA };
 
 // ---------------------------------------------------------------------------
 // Request body rewrite
@@ -756,18 +648,17 @@ function stripEmptyRole(systemInstruction: Record<string, any>): Record<string, 
 
 /**
  * Normalize tool declarations for Cloud Code Assist exactly like OMP's
- * `normalizeAntigravityTools`: declarations already carrying the legacy
- * `parameters` field pass through untouched; otherwise the OpenAPI-style
- * `parametersJsonSchema` emitted by @ai-sdk/google 3.x is destructured off
- * and re-emitted as normalized CCA `parameters`.
+ * `normalizeAntigravityTools`: normalize both legacy `parameters` and the
+ * `parametersJsonSchema` field emitted by @ai-sdk/google 3.x, then emit only
+ * the CCA `parameters` form.
  */
 function normalizeTools(tools: Array<Record<string, any>>): Array<Record<string, any>> {
   return tools.map((tool) => ({
     ...tool,
     functionDeclarations: (tool.functionDeclarations ?? []).map((declaration: Record<string, any>) => {
-      if ("parameters" in declaration) return declaration;
-      const { parametersJsonSchema, ...rest } = declaration;
-      return { ...rest, parameters: normalizeSchemaForCCA(parametersJsonSchema) };
+      const { parameters, parametersJsonSchema, ...rest } = declaration;
+      const schema = Object.hasOwn(declaration, "parameters") ? parameters : parametersJsonSchema;
+      return { ...rest, parameters: normalizeToolSchemaForCCA(schema) };
     }),
   }));
 }
