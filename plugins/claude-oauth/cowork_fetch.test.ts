@@ -147,7 +147,7 @@ describe("buildEnforcedHeaders", () => {
   test("matches genuine Claude CLI header order and casing", () => {
     const headers = buildEnforcedHeaders(new Headers({ "x-extra": "kept" }), {
       order: "cli",
-      userAgent: "claude-cli/2.1.228 (external, cli)",
+      userAgent: "claude-cli/2.1.241 (external, cli)",
       sessionId: "session-1",
       betas: "beta-one",
       authorization: "Bearer token",

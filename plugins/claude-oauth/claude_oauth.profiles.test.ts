@@ -98,8 +98,8 @@ describe("Cowork profile constants", () => {
   });
 
   test("CLI constants are unchanged", () => {
-    expect(CLI_PROFILE.version).toBe("2.1.228");
-    expect(CLI_PROFILE.userAgent).toBe("claude-cli/2.1.228 (external, cli)");
+    expect(CLI_PROFILE.version).toBe("2.1.241");
+    expect(CLI_PROFILE.userAgent).toBe("claude-cli/2.1.241 (external, cli)");
     expect(CLI_PROFILE.toolPrefix).toBe("_");
     expect(CLI_PROFILE.stainlessPackageVersion).toBe("0.112.1");
     expect(CLI_PROFILE.cchMode).toBe("normalized");

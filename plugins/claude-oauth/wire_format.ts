@@ -7,7 +7,7 @@ import { deriveDeviceId } from "./local_storage.ts";
 // attribution). Nothing here touches OpenCode's plugin API; claude_oauth.ts
 // wires these pieces into the OAuth auth fetch.
 
-export const CLAUDE_CODE_VERSION = "2.1.228";
+export const CLAUDE_CODE_VERSION = "2.1.241";
 
 // Beta tokens shared by the profile definitions below.
 const CLAUDE_CODE_20250219_BETA = "claude-code-20250219";
@@ -27,7 +27,7 @@ const TOKEN_COUNTING_BETA = "token-counting-2024-11-01";
 
 /**
  * One client identity on the Anthropic wire. `cli` mirrors Claude Code
- * 2.1.228 (the plugin's historical default); `cowork` mirrors oh-my-pi's
+ * 2.1.241; `cowork` mirrors oh-my-pi's
  * Cowork desktop-agent profile (packages/ai/src/providers/
  * {claude-code-fingerprint,anthropic,cowork-fetch}.ts); `sdk-cli` mirrors
  * pi-black's Agent SDK CLI profile (src/claude-code-protocol.ts) without any
@@ -55,7 +55,7 @@ export interface SpoofingProfile {
   billingChain: boolean;
   /** Keep SDK-only fields (eager_input_streaming, thinking.display) on the wire. */
   preserveSdkFields: boolean;
-  /** Upgrade ephemeral cache breakpoints to ttl:"1h" (first system block globally scoped). */
+  /** Normalize cache breakpoints to the captured CLI placement and one-hour shape. */
   upgradeCaches: boolean;
   /** Active thinking replaces incoming context_management edits with the single keep-all clear-thinking edit. */
   replaceContextManagement: boolean;
@@ -144,7 +144,7 @@ export const COWORK_PROFILE: SpoofingProfile = {
  * pi-black's sdk-cli profile. Version/entrypoint/UA/system instruction mirror
  * src/claude-code-protocol.ts; betas reuse this plugin's CLI profiles
  * (pi-black's header was `claude-code-20250219,oauth-2025-04-20,…`), and the
- * Stainless baseline stays at the plugin's pinned 2.1.228-era values since
+ * Stainless baseline stays at the plugin's pinned CLI values since
  * pi-black does not pin a distinct package version. Identity is derived from
  * this plugin's install ID plus the OAuth account — never from `.claude.json`
  * or any local Claude configuration.
@@ -588,7 +588,7 @@ function createBillingHeader(
   profile: SpoofingProfile,
 ): string {
   // Fingerprint: SHA256(salt + msg[4] + msg[7] + msg[20] + version)[:3],
-  // chars taken from the first user message (not the system prompt).
+  // chars taken from the first non-meta user text block (not the system prompt).
   const k = [4, 7, 20]
     .map((i) => firstUserMessageText[i] ?? "0")
     .join("");
@@ -656,14 +656,17 @@ function extractFirstUserText(messages: unknown): string {
     if (!message || typeof message !== "object") continue;
     const m = message as { role?: string; content?: unknown };
     if (m.role !== "user") continue;
-    if (typeof m.content === "string") return m.content;
-    if (Array.isArray(m.content)) {
-      const first = m.content.find(
-        (b): b is ContentBlock => !!b && typeof b === "object" && (b as ContentBlock).type === "text",
-      );
-      return first?.text ?? "";
+    if (typeof m.content === "string") {
+      if (!m.content.startsWith("<system-reminder>")) return m.content;
+      continue;
     }
-    return "";
+    if (Array.isArray(m.content)) {
+      for (const block of m.content) {
+        if (!block || typeof block !== "object" || (block as ContentBlock).type !== "text") continue;
+        const text = (block as ContentBlock).text ?? "";
+        if (!text.startsWith("<system-reminder>")) return text;
+      }
+    }
   }
   return "";
 }
@@ -688,8 +691,9 @@ const CANONICAL_BODY_KEYS = [
  * - system[0] billing header (+ system[1] profile identity block)
  * - metadata.user_id in the CC attribution envelope
  * - max_tokens clamped to <= 64000
- * - CLI only: existing ephemeral cache breakpoints upgraded to one-hour
- *   retention; thinking.display and eager_input_streaming stripped;
+ * - CLI only: cache breakpoints normalized to the final two caller system
+ *   blocks and final message block; thinking.display and
+ *   eager_input_streaming stripped;
  *   context_management merged with the clear-thinking edit guaranteed first
  * - Cowork/SDK CLI: SDK fields preserved, caches untouched, and active
  *   thinking emits a single keep-all clear-thinking edit; their CCH modes
@@ -763,27 +767,40 @@ export function rewriteBody(
   const system = [...fingerprintBlocks, ...systemBlocks];
 
   let hasLongCache = false;
-  let hasGlobalSystemCache = false;
-  const normalizeCacheControl = (owner: any, global = false): boolean => {
-    const cacheControl = owner?.cache_control;
-    if (!cacheControl || typeof cacheControl !== "object" || cacheControl.type !== "ephemeral") return false;
-    cacheControl.ttl = "1h";
-    if (global) cacheControl.scope = "global";
-    hasLongCache = true;
-    return true;
-  };
-  // Only the CLI profile rewrites caller cache breakpoints; Cowork and SDK CLI
-  // forward them untouched and do not advertise the extended-cache beta.
+  // Only the CLI profile rewrites cache breakpoints. Captured Claude Code
+  // requests mark the final two caller system blocks (the first globally), no
+  // tools, and only the final block of the final message.
   if (profile.upgradeCaches) {
-    for (const block of system) {
-      if (normalizeCacheControl(block, !hasGlobalSystemCache)) hasGlobalSystemCache = true;
+    for (const block of systemBlocks) delete block.cache_control;
+    const cacheableSystemBlocks = systemBlocks.filter(
+      (block) =>
+        typeof block?.text === "string" &&
+        !block.text.startsWith(BILLING_HEADER_PREFIX) &&
+        block.text !== profile.systemInstruction,
+    );
+    const selectedSystemBlocks = cacheableSystemBlocks.slice(-2);
+    for (const [index, block] of selectedSystemBlocks.entries()) {
+      block.cache_control = {
+        type: "ephemeral",
+        ttl: "1h",
+        ...(index === 0 && { scope: "global" }),
+      };
+      hasLongCache = true;
     }
-    for (const tool of params.tools ?? []) normalizeCacheControl(tool);
+    for (const tool of params.tools ?? []) delete tool.cache_control;
     for (const message of params.messages ?? []) {
       if (!Array.isArray(message?.content)) continue;
-      for (const block of message.content) normalizeCacheControl(block);
+      for (const block of message.content) {
+        if (block && typeof block === "object") delete block.cache_control;
+      }
     }
-    normalizeCacheControl(params);
+    const lastMessage = params.messages?.at?.(-1);
+    const lastBlock = Array.isArray(lastMessage?.content) ? lastMessage.content.at(-1) : undefined;
+    if (lastBlock && typeof lastBlock === "object") {
+      lastBlock.cache_control = { type: "ephemeral", ttl: "1h" };
+      hasLongCache = true;
+    }
+    delete params.cache_control;
   }
 
   const incomingUserId = params.metadata?.user_id;

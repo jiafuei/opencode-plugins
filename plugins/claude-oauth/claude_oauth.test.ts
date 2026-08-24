@@ -40,7 +40,7 @@ function expectedVersionSuffix(text: string): string {
     .map((i) => text[i] ?? "0")
     .join("");
   return createHash("sha256")
-    .update(`59cf53e54c78${k}2.1.228`)
+    .update(`59cf53e54c78${k}2.1.241`)
     .digest("hex")
     .slice(0, 3);
 }
@@ -51,7 +51,7 @@ describe("rewriteBody", () => {
     const out = parse(rewriteBody(baseBody, {}).json);
     expect(Array.isArray(out.system)).toBe(true);
     expect(out.system[0].text).toContain(BILLING_PREFIX);
-    expect(out.system[0].text).toContain(`cc_version=2.1.228.${expectedVersionSuffix(firstUserText)}`);
+    expect(out.system[0].text).toContain(`cc_version=2.1.241.${expectedVersionSuffix(firstUserText)}`);
     expect(out.system[1].text).toBe("You are Claude Code, Anthropic's official CLI for Claude.");
     expect(out.system[2].text).toBe("You are a coding agent.");
   });
@@ -90,11 +90,29 @@ describe("rewriteBody", () => {
     const out = parse(rewriteBody(body, {}).json);
     // Fingerprint chars come from "abcdefgh" only ('e','h', pad '0'), not the
     // joined multi-block text.
-    expect(out.system[0].text).toContain(`cc_version=2.1.228.${expectedVersionSuffix("abcdefgh")}`);
+    expect(out.system[0].text).toContain(`cc_version=2.1.241.${expectedVersionSuffix("abcdefgh")}`);
+  });
+
+  test("billing fingerprint skips leading system-reminder text blocks", () => {
+    const body = JSON.stringify({
+      model: "claude-sonnet-4-6",
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "<system-reminder>metadata</system-reminder>" },
+            { type: "text", text: "actual user prompt" },
+          ],
+        },
+      ],
+      max_tokens: 100,
+    });
+    const out = parse(rewriteBody(body, {}).json);
+    expect(out.system[0].text).toContain(`cc_version=2.1.241.${expectedVersionSuffix("actual user prompt")}`);
   });
 
   test("does not duplicate an existing billing block", () => {
-    const existing = `${BILLING_PREFIX} cc_version=2.1.228.abc; cc_entrypoint=cli; cch=00000;`;
+    const existing = `${BILLING_PREFIX} cc_version=2.1.241.abc; cc_entrypoint=cli; cch=00000;`;
     const body = JSON.stringify({
       model: "claude-sonnet-4-6",
       messages: [{ role: "user", content: "hi" }],
@@ -297,16 +315,16 @@ describe("rewriteBody", () => {
     ]);
   });
 
-  test("upgrades existing cache breakpoints to Claude Code's one-hour shape", () => {
+  test("normalizes cache breakpoints to Claude Code's captured placement", () => {
     const body = JSON.stringify({
       model: "claude-sonnet-4-6",
       messages: [
-        {
-          role: "user",
-          content: [{ type: "text", text: "hi", cache_control: { type: "ephemeral" } }],
-        },
+        { role: "user", content: [{ type: "text", text: "first", cache_control: { type: "ephemeral" } }] },
+        { role: "assistant", content: [{ type: "text", text: "second", cache_control: { type: "ephemeral" } }] },
+        { role: "user", content: [{ type: "text", text: "third", cache_control: { type: "ephemeral" } }] },
       ],
       system: [
+        { type: "text", text: "Prelude", cache_control: { type: "ephemeral" } },
         { type: "text", text: "Primary", cache_control: { type: "ephemeral" } },
         { type: "text", text: "Project", cache_control: { type: "ephemeral", ttl: "5m" } },
       ],
@@ -324,14 +342,23 @@ describe("rewriteBody", () => {
     const result = rewriteBody(body, {});
     const out = parse(result.json);
     expect(result.hasLongCache).toBe(true);
-    expect(out.system[2].cache_control).toEqual({ type: "ephemeral", ttl: "1h", scope: "global" });
-    expect(out.system[3].cache_control).toEqual({ type: "ephemeral", ttl: "1h" });
-    expect(out.messages[0].content[0].cache_control).toEqual({ type: "ephemeral", ttl: "1h" });
-    expect(out.tools[0].cache_control).toEqual({ type: "ephemeral", ttl: "1h" });
+    expect(out.system[2].cache_control).toBeUndefined();
+    expect(out.system[3].cache_control).toEqual({ type: "ephemeral", ttl: "1h", scope: "global" });
+    expect(out.system[4].cache_control).toEqual({ type: "ephemeral", ttl: "1h" });
+    expect(out.messages[0].content[0].cache_control).toBeUndefined();
+    expect(out.messages[1].content[0].cache_control).toBeUndefined();
+    expect(out.messages[2].content[0].cache_control).toEqual({ type: "ephemeral", ttl: "1h" });
+    expect(out.tools[0].cache_control).toBeUndefined();
   });
 
-  test("reports no long cache when the request has no cache breakpoints", () => {
-    expect(rewriteBody(baseBody, {}).hasLongCache).toBe(false);
+  test("creates one system and one final-message breakpoint when the SDK supplied none", () => {
+    const result = rewriteBody(baseBody, {});
+    const out = parse(result.json);
+    expect(result.hasLongCache).toBe(true);
+    expect(out.system.filter((block: any) => block.cache_control)).toEqual([
+      expect.objectContaining({ cache_control: { type: "ephemeral", ttl: "1h", scope: "global" } }),
+    ]);
+    expect(out.messages[0].content[0].cache_control).toEqual({ type: "ephemeral", ttl: "1h" });
   });
 });
 
@@ -592,10 +619,16 @@ describe("rewriteBody tool name cloaking", () => {
     // Server/MCP tool_use blocks keep their names.
     expect(assistant[2].name).toBe("web_search");
     expect(assistant[3].name).toBe("mcp_tool");
-    // tool_result blocks and IDs untouched.
+    // Tool-result content and IDs stay untouched; only the final message block
+    // receives the captured CLI cache marker.
     expect(out.messages[2].content).toEqual([
       { type: "tool_result", tool_use_id: "toolu_01", content: "sunny" },
-      { type: "tool_result", tool_use_id: "srv_01", content: "results" },
+      {
+        type: "tool_result",
+        tool_use_id: "srv_01",
+        content: "results",
+        cache_control: { type: "ephemeral", ttl: "1h" },
+      },
     ]);
     // Leading-underscore names gain exactly one prefix and round-trip.
     expect(stripClaudeToolPrefix(out.tools[1].name)).toBe("_secret");

@@ -27,6 +27,7 @@ const UTILITY_BETAS = [
   "prompt-caching-scope-2026-01-05",
   "structured-outputs-2025-12-15",
   "fallback-credit-2026-06-01",
+  "extended-cache-ttl-2025-04-11",
 ];
 
 const OAUTH_AUTH = {
@@ -177,7 +178,7 @@ describe("request capture: normal streaming request", () => {
     expect(req.headers["x-session-affinity"]).toBeUndefined();
     expect(req.headers["x-session-id"]).toBeUndefined();
     expect(req.headers["x-parent-session-id"]).toBeUndefined();
-    expect(req.headers["user-agent"]).toBe("claude-cli/2.1.228 (external, cli)");
+    expect(req.headers["user-agent"]).toBe("claude-cli/2.1.241 (external, cli)");
     expect(req.headers["accept"]).toBe("application/json");
     expect(req.headers["content-type"]).toBe("application/json");
     expect(req.headers["anthropic-version"]).toBe("2023-06-01");
@@ -197,7 +198,16 @@ describe("request capture: normal streaming request", () => {
     expect(body.stream).toBe(true);
     expect(body.max_tokens).toBe(64000);
     expect(body.messages).toEqual([
-      { role: "user", content: [{ type: "text", text: "hello world, this is the first user message" }] },
+      {
+        role: "user",
+        content: [
+          {
+            type: "text",
+            text: "hello world, this is the first user message",
+            cache_control: { type: "ephemeral", ttl: "1h" },
+          },
+        ],
+      },
     ]);
     expect(body.system[0].text).toContain("x-anthropic-billing-header:");
     expect(body.system[0].text).toContain("cc_entrypoint=cli");
@@ -330,8 +340,10 @@ describe("request capture: SDK-generated beta/context-management data", () => {
     expect(betas).toContain("extended-cache-ttl-2025-04-11");
     expect(body.tools[0].name).toBe("_lookup");
     expect(body.tools[0].eager_input_streaming).toBeUndefined();
+    expect(body.tools[0].cache_control).toBeUndefined();
     expect(body.tools[0].input_schema.additionalProperties).toBe(false);
     expect(body.system[2].cache_control).toEqual({ type: "ephemeral", ttl: "1h", scope: "global" });
+    expect(body.messages.at(-1).content.at(-1).cache_control).toEqual({ type: "ephemeral", ttl: "1h" });
   });
 
 });
@@ -350,7 +362,7 @@ describe("request capture: header parity", () => {
       await result.text;
     }
     for (const [index] of userAgents.entries()) {
-      expect(captured[index]!.headers["user-agent"]).toBe("claude-cli/2.1.228 (external, cli)");
+      expect(captured[index]!.headers["user-agent"]).toBe("claude-cli/2.1.241 (external, cli)");
     }
   });
 
@@ -365,7 +377,7 @@ describe("request capture: header parity", () => {
     });
     await result.text;
 
-    expect(captured[0]!.headers["user-agent"]).toBe("claude-cli/2.1.228 (external, cli)");
+    expect(captured[0]!.headers["user-agent"]).toBe("claude-cli/2.1.241 (external, cli)");
   });
 
   test("synthesizes X-Claude-Code-Session-Id from metadata.user_id when no hook ran", async () => {

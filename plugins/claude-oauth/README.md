@@ -27,7 +27,7 @@ Each value selects one coherent wire identity:
 
 | Value | Reference | Version / entrypoint | CCH and request chain |
 | --- | --- | --- | --- |
-| `"cli"` | Claude Code CLI | `2.1.228` / `cli` | Claude CLI normalization; `cc_prev_req` and `cc_prompt_id` enabled |
+| `"cli"` | Claude Code CLI | `2.1.241` / `cli` | Claude CLI normalization; `cc_prev_req` and `cc_prompt_id` enabled |
 | `"cowork"` | oh-my-pi Cowork | `2.1.220` / `claude-desktop` | Raw serialized-body CCH; no billing request chain |
 | `"sdk-cli"` | pi-black Agent SDK CLI | `2.1.224` / `sdk-cli` | Top-level model/max-token normalization; no billing request chain |
 
@@ -131,17 +131,20 @@ endpoint:
   `context-1m-2025-08-07` (hard-429'd for subscription credentials).
 - Body rewrite:
   - `system[0]` = `x-anthropic-billing-header` with the selected version and
-    entrypoint; `system[1]` carries the selected CLI or Agent SDK identity.
-    CLI and Cowork skip both for claude-3-5-haiku; SDK CLI does not.
+    entrypoint; its prompt fingerprint skips leading `<system-reminder>` text
+    blocks. `system[1]` carries the selected CLI or Agent SDK identity. CLI and
+    Cowork skip both for claude-3-5-haiku; SDK CLI does not.
   - `metadata.user_id` = `{device_id, account_uuid, session_id}` JSON envelope
     with a stable per-install device ID and a UUIDv4 session ID persisted per
     OpenCode conversation; existing valid CC attribution is preserved verbatim
   - `max_tokens` clamped to ≤ 64000; incoming `stream` is preserved as-is
-  - CLI omits `thinking.display` and SDK `eager_input_streaming`, upgrades
-    ephemeral cache breakpoints to one hour, and preserves incoming context
-    edits while adding clear-thinking first. Cowork and SDK CLI preserve Agent
-    SDK fields and caches and replace active context edits with one keep-all
-    clear-thinking edit.
+  - CLI omits `thinking.display` and SDK `eager_input_streaming`, normalizes
+    one-hour cache breakpoints to the final two caller system blocks and the
+    final message block (never tools), globally scopes the first system
+    breakpoint, and preserves incoming context edits while adding
+    clear-thinking first. Cowork and SDK CLI preserve Agent SDK fields and
+    caches and replace active context edits with one keep-all clear-thinking
+    edit.
   - The redundant default `tool_choice:{type:"auto"}` is omitted and tool input
     schemas are closed with top-level `additionalProperties:false`.
 - The selected `cch` algorithm from the profile table, patched over the

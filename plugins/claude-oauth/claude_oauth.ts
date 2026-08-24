@@ -877,7 +877,7 @@ export interface ClaudeOAuthOptions {
   attributionHeader?: boolean;
   /**
    * Client identity spoofed on the Anthropic wire: "cli" (default) mirrors
-   * Claude Code 2.1.228; "cowork" mirrors oh-my-pi's Cowork desktop-agent;
+   * Claude Code 2.1.241; "cowork" mirrors oh-my-pi's Cowork desktop-agent;
    * "sdk-cli" mirrors pi-black's Agent SDK CLI identity. Every profile uses
    * the ordered HTTP/1.1 transport.
    */
