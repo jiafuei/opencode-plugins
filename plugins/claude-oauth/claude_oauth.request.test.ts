@@ -1,8 +1,4 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { Database } from "bun:sqlite";
-import { mkdtempSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import path from "node:path";
 import { createAnthropic } from "@ai-sdk/anthropic";
 import { generateText, streamText, tool } from "ai";
 import { z } from "zod";
@@ -17,8 +13,11 @@ import { coworkTransport } from "./cowork_fetch.ts";
 // Auth, client, and network are deterministic mocks; the only real code in
 // between is the SDK request builder plus the plugin's fetch override.
 
-// Plain prompt without tools/thinking selects the utility profile.
+// Plain prompt without tools/thinking selects the sdk-cli utility profile
+// plus its unconditional fallback credit (no effort/oauth-redaction-free
+// agent list).
 const UTILITY_BETAS = [
+  "claude-code-20250219",
   "oauth-2025-04-20",
   "interleaved-thinking-2025-05-14",
   "redact-thinking-2026-02-12",
@@ -27,7 +26,6 @@ const UTILITY_BETAS = [
   "prompt-caching-scope-2026-01-05",
   "structured-outputs-2025-12-15",
   "fallback-credit-2026-06-01",
-  "extended-cache-ttl-2025-04-11",
 ];
 
 const OAUTH_AUTH = {
@@ -178,7 +176,7 @@ describe("request capture: normal streaming request", () => {
     expect(req.headers["x-session-affinity"]).toBeUndefined();
     expect(req.headers["x-session-id"]).toBeUndefined();
     expect(req.headers["x-parent-session-id"]).toBeUndefined();
-    expect(req.headers["user-agent"]).toBe("claude-cli/2.1.241 (external, cli)");
+    expect(req.headers["user-agent"]).toBe("claude-cli/2.1.224 (external, sdk-cli)");
     expect(req.headers["accept"]).toBe("application/json");
     expect(req.headers["content-type"]).toBe("application/json");
     expect(req.headers["anthropic-version"]).toBe("2023-06-01");
@@ -200,23 +198,16 @@ describe("request capture: normal streaming request", () => {
     expect(body.messages).toEqual([
       {
         role: "user",
-        content: [
-          {
-            type: "text",
-            text: "hello world, this is the first user message",
-            cache_control: { type: "ephemeral", ttl: "1h" },
-          },
-        ],
+        content: [{ type: "text", text: "hello world, this is the first user message" }],
       },
     ]);
     expect(body.system[0].text).toContain("x-anthropic-billing-header:");
-    expect(body.system[0].text).toContain("cc_entrypoint=cli");
+    expect(body.system[0].text).toContain("cc_entrypoint=sdk-cli");
     // cch placeholder must be replaced with the real attestation before send.
     expect(body.system[0].text).not.toContain("cch=00000");
     expect(body.system[0].text).toMatch(/cch=[0-9a-f]{5}/);
-    expect(body.system[1].text).toBe("You are Claude Code, Anthropic's official CLI for Claude.");
-    expect(body.system[2].text).toMatch(/^\nYou are an interactive agent/);
-    expect(body.system[3].text).toBe("You are a coding agent.");
+    expect(body.system[1].text).toBe("You are a Claude agent, built on Anthropic's Claude Agent SDK.");
+    expect(body.system[2].text).toBe("You are a coding agent.");
 
     const userId = JSON.parse(body.metadata.user_id);
     expect(userId.device_id).toMatch(/^[0-9a-f]{64}$/);
@@ -337,15 +328,16 @@ describe("request capture: SDK-generated beta/context-management data", () => {
     const betas = req.headers["anthropic-beta"]!.split(",");
     const body = JSON.parse(req.bodyText);
     expect(betas).not.toContain("structured-outputs-2025-11-13");
-    expect(betas).toContain("advanced-tool-use-2025-11-20");
-    expect(betas).toContain("extended-cache-ttl-2025-04-11");
+    // sdk-cli adds advanced-tool-use only when the caller supplies it.
+    expect(betas).not.toContain("advanced-tool-use-2025-11-20");
+    expect(betas).toContain("fallback-credit-2026-06-01");
+    // Tool names are cloaked, schemas closed, and SDK streaming fields kept;
+    // cache breakpoints pass through untouched.
     expect(body.tools[0].name).toBe("_lookup");
-    expect(body.tools[0].eager_input_streaming).toBeUndefined();
+    expect(body.tools[0].eager_input_streaming).toBe(true);
     expect(body.tools[0].cache_control).toBeUndefined();
     expect(body.tools[0].input_schema.additionalProperties).toBe(false);
-    expect(body.system[2].cache_control).toEqual({ type: "ephemeral", ttl: "1h", scope: "global" });
-    expect(body.system[3].cache_control).toEqual({ type: "ephemeral", ttl: "1h" });
-    expect(body.messages.at(-1).content.at(-1).cache_control).toEqual({ type: "ephemeral", ttl: "1h" });
+    expect(JSON.stringify(body)).not.toContain('"ttl":"1h"');
   });
 
 });
@@ -364,11 +356,11 @@ describe("request capture: header parity", () => {
       await result.text;
     }
     for (const [index] of userAgents.entries()) {
-      expect(captured[index]!.headers["user-agent"]).toBe("claude-cli/2.1.241 (external, cli)");
+      expect(captured[index]!.headers["user-agent"]).toBe("claude-cli/2.1.224 (external, sdk-cli)");
     }
   });
 
-  test("replaces non-claude-cli User-Agents with the CLI UA", async () => {
+  test("replaces non-claude-cli User-Agents with the profile UA", async () => {
     const { anthropic, captured } = await setupHarness();
 
     const result = streamText({
@@ -379,7 +371,7 @@ describe("request capture: header parity", () => {
     });
     await result.text;
 
-    expect(captured[0]!.headers["user-agent"]).toBe("claude-cli/2.1.241 (external, cli)");
+    expect(captured[0]!.headers["user-agent"]).toBe("claude-cli/2.1.224 (external, sdk-cli)");
   });
 
   test("synthesizes X-Claude-Code-Session-Id from metadata.user_id when no hook ran", async () => {
@@ -512,7 +504,7 @@ describe("request capture: x-client-request-id per-invocation semantics", () => 
     expect(privateHeaderSeenOnWire).toBe(false);
   });
 
-  test("count_tokens gets its own CLI headers without messages body attribution", async () => {
+  test("count_tokens gets its own profile headers without messages body attribution", async () => {
     const options = await makeLoaderFetch();
     let captured: CapturedRequest | undefined;
     const originalFetch = globalThis.fetch;
@@ -547,7 +539,7 @@ describe("request capture: x-client-request-id per-invocation semantics", () => 
 
     expect(captured!.url).toBe("https://api.anthropic.com/v1/messages/count_tokens?source=test&beta=true");
     expect(captured!.headers["anthropic-beta"]).toBe(
-      "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,token-counting-2024-11-01",
+      "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,structured-outputs-2025-12-15,token-counting-2024-11-01",
     );
     expect(captured!.headers["x-stainless-timeout"]).toBeUndefined();
     expect(captured!.headers[REQUEST_ID_HEADER]).toBeUndefined();
@@ -560,554 +552,28 @@ describe("request capture: x-client-request-id per-invocation semantics", () => 
     expect(body.messages[0].content[0].name).toBe("_get_weather");
   });
 
-  test("prompt ids stay stable and successful request ids chain through billing metadata", async () => {
+  test("chat.headers maps each OpenCode session to a stable process-local UUIDv4, rotated on deletion", async () => {
     const plugin = await ClaudeOAuthPlugin({ client: { auth: { set: async () => {} } } } as never);
-    const options = await plugin.auth!.loader!(async () => OAUTH_AUTH as never, {} as never);
-    const captured: CapturedRequest[] = [];
-    const originalFetch = globalThis.fetch;
-    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
-      const headers: Record<string, string> = {};
-      new Headers(init?.headers).forEach((value, key) => (headers[key] = value));
-      captured.push({ url: String(input), method: init?.method, headers, bodyText: init?.body as string });
-      return new Response('{"type":"message"}', {
-        status: 200,
-        headers: { "content-type": "application/json", "request-id": captured.length === 1 ? "req_first" : "req_second" },
-      });
-    }) as typeof fetch;
-    try {
-      for (let index = 0; index < 2; index++) {
-        const output = { headers: {} as Record<string, string> };
-        await plugin["chat.headers"]!(
-          {
-            model: { providerID: "anthropic" },
-            provider: { options: { claudeOAuth: true } },
-            sessionID: "session-chain",
-            message: { id: "message-stable" },
-          } as never,
-          output as never,
-        );
-        await options.fetch!("https://api.anthropic.com/v1/messages", {
-          method: "POST",
-          headers: { "content-type": "application/json", ...output.headers },
-          body: JSON.stringify({
-            model: "claude-sonnet-4-6",
-            messages: [{ role: "user", content: "hi" }],
-            max_tokens: 1,
-          }),
-        });
-      }
-    } finally {
-      globalThis.fetch = originalFetch;
-    }
-
-    const billing = captured.map((request) =>
-      JSON.parse(request.bodyText).system.find((block: { text?: string }) => block.text?.startsWith("x-anthropic-billing-header:"))
-        .text as string,
-    );
-    const promptId = billing[0]!.match(/cc_prompt_id=([0-9a-f-]{36})/)![1]!;
-    expect(billing[1]).toContain(`cc_prompt_id=${promptId};`);
-    expect(billing[0]).not.toContain("cc_prev_req=");
-    expect(billing[1]).toContain("cc_prev_req=req_first;");
-    const sessionIds = captured.map((request) => JSON.parse(JSON.parse(request.bodyText).metadata.user_id).session_id);
-    expect(sessionIds[0]).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
-    expect(sessionIds[1]).toBe(sessionIds[0]);
-    expect(captured[1]!.headers["x-claude-code-session-id"]).toBe(sessionIds[0]);
-    expect(captured.every((request) => request.headers["x-claude-oauth-prompt-id"] === undefined)).toBe(true);
-    expect(captured.every((request) => request.headers["x-claude-oauth-session-id"] === undefined)).toBe(true);
-  });
-
-  test("previous request state does not cross OAuth credentials", async () => {
-    const plugin = await ClaudeOAuthPlugin({ client: { auth: { set: async () => {} } } } as never);
-    let auth = { ...OAUTH_AUTH, access: "account-a-token", accountId: "account-a" };
-    const options = await plugin.auth!.loader!(async () => auth as never, {} as never);
-    const bodies: string[] = [];
-    const originalFetch = globalThis.fetch;
-    globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
-      bodies.push(init?.body as string);
-      return new Response('{"type":"message"}', {
-        status: 200,
-        headers: { "content-type": "application/json", "request-id": bodies.length === 1 ? "req_account_a" : "req_account_b" },
-      });
-    }) as typeof fetch;
-    try {
-      const send = () =>
-        options.fetch!("https://api.anthropic.com/v1/messages", {
-          method: "POST",
-          headers: { "content-type": "application/json", "X-Claude-Code-Session-Id": "shared-session" },
-          body: JSON.stringify({ model: "claude-sonnet-4-6", messages: [{ role: "user", content: "hi" }], max_tokens: 1 }),
-        });
-      await send();
-      auth = { ...auth, access: "account-b-token", accountId: "account-b" };
-      await send();
-    } finally {
-      globalThis.fetch = originalFetch;
-    }
-    const secondBilling = JSON.parse(bodies[1]!).system.find((block: { text?: string }) =>
-      block.text?.startsWith("x-anthropic-billing-header:"),
-    ).text as string;
-    expect(secondBilling).not.toContain("cc_prev_req=req_account_a");
-  });
-
-  test("Claude session UUIDv4 persists across restarts and rotates after session deletion", async () => {
-    const dir = mkdtempSync(path.join(tmpdir(), "claude-oauth-session-id-"));
-    const databasePath = path.join(dir, "claude-oauth.db");
-    const legacy = new Database(databasePath, { create: true });
-    legacy.exec("PRAGMA user_version = 1");
-    legacy.close();
-    const sessionId = async (plugin: Awaited<ReturnType<typeof ClaudeOAuthPlugin>>) => {
+    const sessionId = async (sessionID: string) => {
       const output = { headers: {} as Record<string, string> };
       await plugin["chat.headers"]!(
         {
           model: { providerID: "anthropic" },
           provider: { options: { claudeOAuth: true } },
-          sessionID: "ses_persisted",
+          sessionID,
           message: { id: "msg_1" },
         } as never,
         output as never,
       );
       return output.headers["X-Claude-Code-Session-Id"]!;
     };
-    try {
-      const firstPlugin = await ClaudeOAuthPlugin({} as never, { databasePath });
-      const first = await sessionId(firstPlugin);
-      expect(first).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
-      await firstPlugin.dispose!();
-
-      const resumedPlugin = await ClaudeOAuthPlugin({} as never, { databasePath });
-      expect(await sessionId(resumedPlugin)).toBe(first);
-      await resumedPlugin.event!({
-        event: { type: "session.deleted", properties: { info: { id: "ses_persisted" } } },
-      } as never);
-      expect(await sessionId(resumedPlugin)).not.toBe(first);
-      await resumedPlugin.dispose!();
-
-      const db = new Database(databasePath, { readonly: true });
-      expect((db.query("PRAGMA user_version").get() as { user_version: number }).user_version).toBe(2);
-      expect(
-        (db.query("SELECT claude_session_id FROM session_ids WHERE opencode_session_id = ?").get("ses_persisted") as {
-          claude_session_id: string;
-        }).claude_session_id,
-      ).not.toBe(first);
-      db.close();
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  test("request chains resume from claude-oauth.db and compaction clears them", async () => {
-    const dir = mkdtempSync(path.join(tmpdir(), "claude-oauth-request-chain-"));
-    const databasePath = path.join(dir, "claude-oauth.db");
-    const bodies: string[] = [];
-    const plugins: Array<Awaited<ReturnType<typeof ClaudeOAuthPlugin>>> = [];
-    const originalFetch = globalThis.fetch;
-    globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
-      bodies.push(init?.body as string);
-      return new Response('{"type":"message"}', {
-        status: 200,
-        headers: {
-          "content-type": "application/json",
-          ...(bodies.length === 1 ? { "request-id": "req_durable" } : {}),
-        },
-      });
-    }) as typeof fetch;
-    const createPlugin = async () => {
-      const plugin = await ClaudeOAuthPlugin(
-        { client: { auth: { set: async () => {} } } } as never,
-        { databasePath },
-      );
-      plugins.push(plugin);
-      return {
-        plugin,
-        options: await plugin.auth!.loader!(async () => OAUTH_AUTH as never, {} as never),
-      };
-    };
-    const send = (options: Record<string, any>) =>
-      options.fetch!("https://api.anthropic.com/v1/messages", {
-        method: "POST",
-        headers: { "content-type": "application/json", "X-Claude-Code-Session-Id": "ses_durable" },
-        body: JSON.stringify({
-          model: "claude-sonnet-4-6",
-          messages: [{ role: "user", content: "hi" }],
-          metadata: { user_id: JSON.stringify({ device_id: "dev", session_id: "body-attribution" }) },
-          max_tokens: 1,
-        }),
-      });
-    try {
-      const first = await createPlugin();
-      await send(first.options);
-      await first.plugin.dispose!();
-      const completed = new Database(databasePath, { readonly: true });
-      expect((completed.query("SELECT COUNT(*) AS count FROM requests").get() as { count: number }).count).toBe(0);
-      completed.close();
-
-      const resumed = await createPlugin();
-      await send(resumed.options);
-      const resumedBilling = JSON.parse(bodies[1]!).system.find((block: { text?: string }) =>
-        block.text?.startsWith("x-anthropic-billing-header:"),
-      ).text as string;
-      expect(resumedBilling).toContain("cc_prev_req=req_durable");
-
-      await resumed.plugin.event!({
-        event: { type: "session.compacted", properties: { sessionID: "ses_durable" } },
-      } as never);
-      await resumed.plugin.dispose!();
-
-      const afterCompaction = await createPlugin();
-      await send(afterCompaction.options);
-      const compactedBilling = JSON.parse(bodies[2]!).system.find((block: { text?: string }) =>
-        block.text?.startsWith("x-anthropic-billing-header:"),
-      ).text as string;
-      expect(compactedBilling).not.toContain("cc_prev_req=");
-      await afterCompaction.plugin.dispose!();
-
-      const db = new Database(databasePath, { readonly: true });
-      try {
-        const row = db.query("SELECT * FROM sessions").get() as Record<string, unknown>;
-        expect(row.session_id).toBe("ses_durable");
-        expect(row.credential_key).toMatch(/^[0-9a-f]{64}$/);
-        expect(JSON.stringify(row)).not.toContain(OAUTH_AUTH.accountId);
-        expect(row.previous_request_id).toBeNull();
-        expect(row.generation).toBe(1);
-        expect((db.query("PRAGMA user_version").get() as { user_version: number }).user_version).toBe(2);
-        expect(
-          (db.query("PRAGMA index_list(sessions)").all() as Array<{ name: string }>).some(
-            (index) => index.name === "sessions_by_credential",
-          ),
-        ).toBe(true);
-        const requestIndexes = (db.query("PRAGMA index_list(requests)").all() as Array<{ name: string }>).map(
-          (index) => index.name,
-        );
-        expect(requestIndexes).toContain("requests_by_credential");
-        expect(requestIndexes).toContain("requests_by_created_at");
-      } finally {
-        db.close();
-      }
-      expect(statSync(databasePath).mode & 0o777).toBe(0o600);
-      expect(readdirSync(dir)).toEqual(["claude-oauth.db"]);
-    } finally {
-      for (const plugin of plugins) {
-        try {
-          await plugin.dispose!();
-        } catch {}
-      }
-      globalThis.fetch = originalFetch;
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  test("SQLite generation fencing rejects a late response after deletion and row reactivation", async () => {
-    const dir = mkdtempSync(path.join(tmpdir(), "claude-oauth-request-fence-"));
-    const databasePath = path.join(dir, "claude-oauth.db");
-    const plugins: Array<Awaited<ReturnType<typeof ClaudeOAuthPlugin>>> = [];
-    const bodies: string[] = [];
-    let closeStream: (() => void) | undefined;
-    let closeResumedStream: (() => void) | undefined;
-    const originalFetch = globalThis.fetch;
-    globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
-      bodies.push(init?.body as string);
-      if (bodies.length === 1) {
-        const stream = new ReadableStream<Uint8Array>({
-          start(controller) {
-            closeStream = () => controller.close();
-            controller.enqueue(
-              new TextEncoder().encode(
-                'event: message_start\ndata: {"type":"message_start"}\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n',
-              ),
-            );
-          },
-        });
-        return new Response(stream, {
-          status: 200,
-          headers: { "content-type": "text/event-stream", "request-id": "req_before_compaction" },
-        });
-      }
-      const stream = new ReadableStream<Uint8Array>({
-        start(controller) {
-          closeResumedStream = () => controller.close();
-          controller.enqueue(
-            new TextEncoder().encode('event: message_stop\ndata: {"type":"message_stop"}\n\n'),
-          );
-        },
-      });
-      return new Response(stream, {
-        status: 200,
-        headers: { "content-type": "text/event-stream", "request-id": "req_after_compaction" },
-      });
-    }) as typeof fetch;
-    const createPlugin = async () => {
-      const plugin = await ClaudeOAuthPlugin(
-        { client: { auth: { set: async () => {} } } } as never,
-        { databasePath },
-      );
-      plugins.push(plugin);
-      return {
-        plugin,
-        options: await plugin.auth!.loader!(async () => OAUTH_AUTH as never, {} as never),
-      };
-    };
-    const send = (options: Record<string, any>) =>
-      options.fetch!("https://api.anthropic.com/v1/messages", {
-        method: "POST",
-        headers: { "content-type": "application/json", "X-Claude-Code-Session-Id": "ses_fenced" },
-        body: JSON.stringify({ model: "claude-sonnet-4-6", messages: [{ role: "user", content: "hi" }], max_tokens: 1 }),
-      });
-    try {
-      const requester = await createPlugin();
-      const staleResponse = await send(requester.options);
-      const deleter = await createPlugin();
-      await deleter.plugin.event!({
-        event: { type: "session.deleted", properties: { info: { id: "ses_fenced" } } },
-      } as never);
-
-      const resumed = await createPlugin();
-      const resumedResponse = await send(resumed.options);
-      closeStream!();
-      await staleResponse.text();
-      closeResumedStream!();
-      await resumedResponse.text();
-      const billing = JSON.parse(bodies[1]!).system.find((block: { text?: string }) =>
-        block.text?.startsWith("x-anthropic-billing-header:"),
-      ).text as string;
-      expect(billing).not.toContain("cc_prev_req=req_before_compaction");
-    } finally {
-      for (const plugin of plugins) {
-        try {
-          await plugin.dispose!();
-        } catch {}
-      }
-      globalThis.fetch = originalFetch;
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  test("SQLite request sequencing prevents an earlier logical request from winning when it finishes last", async () => {
-    const plugin = await ClaudeOAuthPlugin({ client: { auth: { set: async () => {} } } } as never);
-    const options = await plugin.auth!.loader!(async () => OAUTH_AUTH as never, {} as never);
-    const bodies: string[] = [];
-    let resolveFirst: ((response: Response) => void) | undefined;
-    let resolveSecond: ((response: Response) => void) | undefined;
-    const originalFetch = globalThis.fetch;
-    globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
-      bodies.push(init?.body as string);
-      if (bodies.length === 1) return new Promise<Response>((resolve) => (resolveFirst = resolve));
-      if (bodies.length === 2) return new Promise<Response>((resolve) => (resolveSecond = resolve));
-      if (bodies.length === 3) {
-        return new Response('{"type":"message"}', {
-          status: 200,
-          headers: { "content-type": "application/json", "request-id": "req_logical_first_retry" },
-        });
-      }
-      return new Response('{"type":"message"}', { status: 200, headers: { "content-type": "application/json" } });
-    }) as typeof fetch;
-    const send = (logicalRequestId: string) =>
-      options.fetch!("https://api.anthropic.com/v1/messages", {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          "X-Claude-Code-Session-Id": "ses_ordered",
-          [REQUEST_ID_HEADER]: logicalRequestId,
-        },
-        body: JSON.stringify({ model: "claude-sonnet-4-6", messages: [{ role: "user", content: "hi" }], max_tokens: 1 }),
-      });
-    try {
-      const first = send("11111111-1111-4111-8111-111111111111");
-      const second = send("22222222-2222-4222-8222-222222222222");
-      while (!resolveFirst || !resolveSecond) await Bun.sleep(1);
-      resolveSecond(
-        new Response('{"type":"message"}', {
-          status: 200,
-          headers: { "content-type": "application/json", "request-id": "req_logical_second" },
-        }),
-      );
-      await second;
-      await send("11111111-1111-4111-8111-111111111111");
-      resolveFirst(
-        new Response('{"type":"message"}', {
-          status: 200,
-          headers: { "content-type": "application/json", "request-id": "req_logical_first" },
-        }),
-      );
-      await first;
-      await send("33333333-3333-4333-8333-333333333333");
-      const billing = JSON.parse(bodies[3]!).system.find((block: { text?: string }) =>
-        block.text?.startsWith("x-anthropic-billing-header:"),
-      ).text as string;
-      expect(billing).toContain("cc_prev_req=req_logical_second");
-      expect(billing).not.toContain("cc_prev_req=req_logical_first");
-      expect(billing).not.toContain("cc_prev_req=req_logical_first_retry");
-    } finally {
-      await plugin.dispose!();
-      globalThis.fetch = originalFetch;
-    }
-  });
-
-  test("an unavailable database falls back to process-local request chaining", async () => {
-    const dir = mkdtempSync(path.join(tmpdir(), "claude-oauth-request-fallback-"));
-    const blocker = path.join(dir, "not-a-directory");
-    writeFileSync(blocker, "x");
-    const plugin = await ClaudeOAuthPlugin(
-      { client: { auth: { set: async () => {} } } } as never,
-      { databasePath: path.join(blocker, "claude-oauth.db") },
-    );
-    const options = await plugin.auth!.loader!(async () => OAUTH_AUTH as never, {} as never);
-    const bodies: string[] = [];
-    const originalFetch = globalThis.fetch;
-    globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
-      bodies.push(init?.body as string);
-      return new Response('{"type":"message"}', {
-        status: 200,
-        headers: {
-          "content-type": "application/json",
-          ...(bodies.length === 1 ? { "request-id": "req_memory_fallback" } : {}),
-        },
-      });
-    }) as typeof fetch;
-    const send = () =>
-      options.fetch!("https://api.anthropic.com/v1/messages", {
-        method: "POST",
-        headers: { "content-type": "application/json", "X-Claude-Code-Session-Id": "ses_memory_fallback" },
-        body: JSON.stringify({ model: "claude-sonnet-4-6", messages: [{ role: "user", content: "hi" }], max_tokens: 1 }),
-      });
-    try {
-      await send();
-      await send();
-      const billing = JSON.parse(bodies[1]!).system.find((block: { text?: string }) =>
-        block.text?.startsWith("x-anthropic-billing-header:"),
-      ).text as string;
-      expect(billing).toContain("cc_prev_req=req_memory_fallback");
-    } finally {
-      await plugin.dispose!();
-      globalThis.fetch = originalFetch;
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  test("a late response cannot restore stale state after an A-B-A credential cycle", async () => {
-    const plugin = await ClaudeOAuthPlugin({ client: { auth: { set: async () => {} } } } as never);
-    let auth = { ...OAUTH_AUTH, access: "account-a-token", accountId: "account-a" };
-    const options = await plugin.auth!.loader!(async () => auth as never, {} as never);
-    const bodies: string[] = [];
-    let closeFirstStream: (() => void) | undefined;
-    const originalFetch = globalThis.fetch;
-    globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
-      bodies.push(init?.body as string);
-      if (bodies.length === 1) {
-        const stream = new ReadableStream<Uint8Array>({
-          start(controller) {
-            closeFirstStream = () => controller.close();
-            controller.enqueue(
-              new TextEncoder().encode(
-                'event: message_start\ndata: {"type":"message_start"}\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n',
-              ),
-            );
-          },
-        });
-        return new Response(stream, {
-          status: 200,
-          headers: { "content-type": "text/event-stream", "request-id": "req_stale_a" },
-        });
-      }
-      const requestId = bodies.length === 2 ? "req_account_b" : bodies.length === 3 ? "req_new_a" : "req_final_a";
-      return new Response('{"type":"message"}', {
-        status: 200,
-        headers: { "content-type": "application/json", "request-id": requestId },
-      });
-    }) as typeof fetch;
-    const send = () =>
-      options.fetch!("https://api.anthropic.com/v1/messages", {
-        method: "POST",
-        headers: { "content-type": "application/json", "X-Claude-Code-Session-Id": "cycle-session" },
-        body: JSON.stringify({ model: "claude-sonnet-4-6", messages: [{ role: "user", content: "hi" }], max_tokens: 1 }),
-      });
-    try {
-      const staleResponse = await send();
-      auth = { ...auth, access: "account-b-token", accountId: "account-b" };
-      await send();
-      auth = { ...auth, access: "account-a-new-token", accountId: "account-a" };
-      await send();
-      closeFirstStream!();
-      await staleResponse.text();
-      await send();
-    } finally {
-      globalThis.fetch = originalFetch;
-    }
-
-    const finalBilling = JSON.parse(bodies[3]!).system.find((block: { text?: string }) =>
-      block.text?.startsWith("x-anthropic-billing-header:"),
-    ).text as string;
-    expect(finalBilling).toContain("cc_prev_req=req_new_a");
-    expect(finalBilling).not.toContain("cc_prev_req=req_stale_a");
-  });
-
-  test("streaming request ids are not recorded before the response body completes", async () => {
-    const options = await makeLoaderFetch();
-    const bodies: string[] = [];
-    const originalFetch = globalThis.fetch;
-    globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
-      bodies.push(init?.body as string);
-      if (bodies.length === 1) {
-        const stream = new ReadableStream<Uint8Array>({
-          start(controller) {
-            controller.enqueue(new TextEncoder().encode('event: message_start\ndata: {"type":"message_start"}\n\n'));
-          },
-        });
-        return new Response(stream, {
-          status: 200,
-          headers: { "content-type": "text/event-stream", "request-id": "req_incomplete" },
-        });
-      }
-      return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
-    }) as typeof fetch;
-    let incomplete: Response | undefined;
-    try {
-      const send = () =>
-        options.fetch!("https://api.anthropic.com/v1/messages", {
-          method: "POST",
-          headers: { "content-type": "application/json", "X-Claude-Code-Session-Id": "stream-session" },
-          body: JSON.stringify({ model: "claude-sonnet-4-6", messages: [{ role: "user", content: "hi" }], max_tokens: 1 }),
-        });
-      incomplete = await send();
-      await send();
-    } finally {
-      await incomplete?.body?.cancel();
-      globalThis.fetch = originalFetch;
-    }
-    const secondBilling = JSON.parse(bodies[1]!).system.find((block: { text?: string }) =>
-      block.text?.startsWith("x-anthropic-billing-header:"),
-    ).text as string;
-    expect(secondBilling).not.toContain("cc_prev_req=req_incomplete");
-  });
-
-  test("a cleanly truncated SSE response without message_stop does not advance the chain", async () => {
-    const options = await makeLoaderFetch();
-    const bodies: string[] = [];
-    const originalFetch = globalThis.fetch;
-    globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
-      bodies.push(init?.body as string);
-      if (bodies.length === 1) {
-        return new Response('event: message_start\ndata: {"type":"message_start"}\n\n', {
-          status: 200,
-          headers: { "content-type": "text/event-stream", "request-id": "req_truncated" },
-        });
-      }
-      return new Response('{"type":"message"}', { status: 200, headers: { "content-type": "application/json" } });
-    }) as typeof fetch;
-    const send = () =>
-      options.fetch!("https://api.anthropic.com/v1/messages", {
-        method: "POST",
-        headers: { "content-type": "application/json", "X-Claude-Code-Session-Id": "truncated-session" },
-        body: JSON.stringify({ model: "claude-sonnet-4-6", messages: [{ role: "user", content: "hi" }], max_tokens: 1 }),
-      });
-    try {
-      expect(await (await send()).text()).toContain("message_start");
-      await send();
-    } finally {
-      globalThis.fetch = originalFetch;
-    }
-    const billing = JSON.parse(bodies[1]!).system.find((block: { text?: string }) =>
-      block.text?.startsWith("x-anthropic-billing-header:"),
-    ).text as string;
-    expect(billing).not.toContain("cc_prev_req=req_truncated");
+    const first = await sessionId("ses_stable");
+    expect(first).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+    expect(await sessionId("ses_stable")).toBe(first);
+    expect(await sessionId("ses_other")).not.toBe(first);
+    await plugin.event!({ event: { type: "session.deleted", properties: { info: { id: "ses_stable" } } } } as never);
+    expect(await sessionId("ses_stable")).not.toBe(first);
+    await plugin.dispose!();
   });
 
   test("attributionHeader false suppresses billing and prompt markers through the plugin", async () => {
@@ -1150,7 +616,7 @@ describe("request capture: x-client-request-id per-invocation semantics", () => 
     }
     const system = JSON.parse(wireBody).system as Array<{ text: string }>;
     expect(system.some((block) => block.text.startsWith("x-anthropic-billing-header:"))).toBe(false);
-    expect(system[0]!.text).toBe("You are Claude Code, Anthropic's official CLI for Claude.");
+    expect(system[0]!.text).toBe("You are a Claude agent, built on Anthropic's Claude Agent SDK.");
   });
 
   test("null-body streaming response is returned unchanged", async () => {

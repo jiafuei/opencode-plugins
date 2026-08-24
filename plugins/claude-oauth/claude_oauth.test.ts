@@ -13,6 +13,7 @@ import {
   stripClaudeToolPrefix,
   transformJsonToolUseNames,
 } from "./claude_oauth.ts";
+import { SDK_CLI_PROFILE } from "./wire_format.ts";
 import { coworkTransport } from "./cowork_fetch.ts";
 
 const BILLING_PREFIX = "x-anthropic-billing-header:";
@@ -40,30 +41,30 @@ function expectedVersionSuffix(text: string): string {
     .map((i) => text[i] ?? "0")
     .join("");
   return createHash("sha256")
-    .update(`59cf53e54c78${k}2.1.241`)
+    .update(`59cf53e54c78${k}${SDK_CLI_PROFILE.version}`)
     .digest("hex")
     .slice(0, 3);
 }
 
 describe("rewriteBody", () => {
-  test("injects billing, identity, and the globally cached Claude Code system message", () => {
+  test("injects billing and the profile identity ahead of the caller system", () => {
     const firstUserText = "hello world, this is the first user message";
     const out = parse(rewriteBody(baseBody, {}).json);
     expect(Array.isArray(out.system)).toBe(true);
     expect(out.system[0].text).toContain(BILLING_PREFIX);
-    expect(out.system[0].text).toContain(`cc_version=2.1.241.${expectedVersionSuffix(firstUserText)}`);
-    expect(out.system[1].text).toBe("You are Claude Code, Anthropic's official CLI for Claude.");
-    expect(out.system[2].text).toMatch(/^\nYou are an interactive agent/);
-    expect(out.system[2].cache_control).toEqual({ type: "ephemeral", ttl: "1h", scope: "global" });
-    expect(out.system[3].text).toBe("You are a coding agent.");
-    expect(out.system[3].cache_control).toEqual({ type: "ephemeral", ttl: "1h" });
+    expect(out.system[0].text).toContain(`cc_version=${SDK_CLI_PROFILE.version}.${expectedVersionSuffix(firstUserText)}`);
+    expect(out.system[0].text).toContain("cc_entrypoint=sdk-cli;");
+    expect(out.system[1].text).toBe(SDK_CLI_PROFILE.systemInstruction);
+    expect(out.system[2].text).toBe("You are a coding agent.");
+    // Caches pass through untouched.
+    for (const block of out.system) expect(block.cache_control).toBeUndefined();
   });
 
-  test("skips billing header and SDK instruction for claude-3-5-haiku", () => {
+  test("injects billing and identity even for claude-3-5-haiku (sdk-cli gate)", () => {
     const body = baseBody.replace("claude-sonnet-4-6", "claude-3-5-haiku-20241022");
     const out = parse(rewriteBody(body, {}).json);
-    expect(JSON.stringify(out.system)).not.toContain(BILLING_PREFIX);
-    expect(JSON.stringify(out.system)).not.toContain("Claude Code, Anthropic's official CLI");
+    expect(JSON.stringify(out.system)).toContain(BILLING_PREFIX);
+    expect(JSON.stringify(out.system)).toContain("Claude agent, built on Anthropic's Claude Agent SDK");
   });
 
   test("clamps max_tokens to 64000", () => {
@@ -93,7 +94,7 @@ describe("rewriteBody", () => {
     const out = parse(rewriteBody(body, {}).json);
     // Fingerprint chars come from "abcdefgh" only ('e','h', pad '0'), not the
     // joined multi-block text.
-    expect(out.system[0].text).toContain(`cc_version=2.1.241.${expectedVersionSuffix("abcdefgh")}`);
+    expect(out.system[0].text).toContain(`cc_version=2.1.224.${expectedVersionSuffix("abcdefgh")}`);
   });
 
   test("billing fingerprint skips leading system-reminder text blocks", () => {
@@ -111,11 +112,11 @@ describe("rewriteBody", () => {
       max_tokens: 100,
     });
     const out = parse(rewriteBody(body, {}).json);
-    expect(out.system[0].text).toContain(`cc_version=2.1.241.${expectedVersionSuffix("actual user prompt")}`);
+    expect(out.system[0].text).toContain(`cc_version=2.1.224.${expectedVersionSuffix("actual user prompt")}`);
   });
 
   test("does not duplicate an existing billing block", () => {
-    const existing = `${BILLING_PREFIX} cc_version=2.1.241.abc; cc_entrypoint=cli; cch=00000;`;
+    const existing = `${BILLING_PREFIX} cc_version=2.1.224.abc; cc_entrypoint=cli; cch=00000;`;
     const body = JSON.stringify({
       model: "claude-sonnet-4-6",
       messages: [{ role: "user", content: "hi" }],
@@ -123,19 +124,19 @@ describe("rewriteBody", () => {
       max_tokens: 100,
     });
     const out = parse(rewriteBody(body, {}).json);
-    expect(out.system).toHaveLength(4);
+    expect(out.system).toHaveLength(3);
     expect(out.system.filter((b: any) => b.text.startsWith(BILLING_PREFIX))).toHaveLength(1);
-    expect(out.system[0].text).toBe("You are Claude Code, Anthropic's official CLI for Claude.");
+    expect(out.system[0].text).toBe(SDK_CLI_PROFILE.systemInstruction);
   });
 
-  test("attributionHeader false removes billing metadata but keeps the CLI identity", () => {
+  test("attributionHeader false removes billing metadata but keeps the profile identity", () => {
     const body = JSON.stringify({
       ...parse(baseBody),
       system: [{ type: "text", text: `${BILLING_PREFIX} cc_version=old; cch=abcde;` }],
     });
     const out = parse(rewriteBody(body, { attributionHeader: false }).json);
     expect(JSON.stringify(out.system)).not.toContain(BILLING_PREFIX);
-    expect(out.system[0].text).toBe("You are Claude Code, Anthropic's official CLI for Claude.");
+    expect(out.system[0].text).toBe(SDK_CLI_PROFILE.systemInstruction);
   });
 
   test("inserts an empty tools array for OAuth when the SDK omits tools", () => {
@@ -149,12 +150,11 @@ describe("rewriteBody", () => {
   });
 
   test("sets metadata.user_id in the CC attribution envelope", () => {
-    const deviceId = "d".repeat(64);
-    const out = parse(rewriteBody(baseBody, { sessionId: "ses-123", accountId: "acct-456", deviceId }).json);
+    const out = parse(rewriteBody(baseBody, { sessionId: "ses-123", accountId: "acct-456" }).json);
     const userId = JSON.parse(out.metadata.user_id);
     expect(userId.session_id).toBe("ses-123");
     expect(userId.account_uuid).toBe("acct-456");
-    expect(userId.device_id).toBe(deviceId);
+    expect(userId.device_id).toMatch(/^[0-9a-f]{64}$/);
   });
 
   const CLOAKING_USER_ID =
@@ -226,34 +226,6 @@ describe("rewriteBody", () => {
     expect(out.context_management).toBeUndefined();
   });
 
-  test("merges the clear-thinking edit into incoming context_management and deduplicates it", () => {
-    const incomingCm = {
-      edits: [
-        { type: "compact_20260112", trigger: { type: "input_tokens", value: 100000 } },
-        { type: "clear_thinking_20251015", keep: { type: "thinking_turns", value: 2 } },
-        { type: "clear_tool_uses_20250919", trigger: { type: "tool_uses", value: 20 } },
-        { type: "some_future_edit_20270101" },
-      ],
-      custom_field: { passthrough: true },
-    };
-    const body = JSON.stringify({ ...parse(baseBody), thinking: { type: "enabled", budget_tokens: 1024 }, context_management: incomingCm });
-    const out = parse(rewriteBody(body, {}).json);
-    // Exactly one canonical clear-thinking edit (incoming variant dropped),
-    // all other edits preserved in their original order, extra fields kept.
-    expect(out.context_management).toEqual({
-      edits: [
-        { type: "clear_thinking_20251015", keep: "all" },
-        { type: "compact_20260112", trigger: { type: "input_tokens", value: 100000 } },
-        { type: "clear_tool_uses_20250919", trigger: { type: "tool_uses", value: 20 } },
-        { type: "some_future_edit_20270101" },
-      ],
-      custom_field: { passthrough: true },
-    });
-    // The parsed input object must not be mutated.
-    expect(incomingCm.edits).toHaveLength(4);
-    expect(incomingCm.edits[1]).toEqual({ type: "clear_thinking_20251015", keep: { type: "thinking_turns", value: 2 } });
-  });
-
   test("passes context_management through unchanged without active thinking", () => {
     const cm = { edits: [{ type: "compact_20260112" }, { type: "clear_tool_uses_20250919" }] };
     for (const thinking of [undefined, { type: "disabled" }]) {
@@ -263,12 +235,16 @@ describe("rewriteBody", () => {
     }
   });
 
-  test("strips thinking display while preserving the active thinking configuration", () => {
+  test("preserves thinking display and the active thinking configuration", () => {
     const body = JSON.stringify({
       ...parse(baseBody),
       thinking: { type: "adaptive", display: "summarized", budget_tokens: 2048 },
     });
-    expect(parse(rewriteBody(body, {}).json).thinking).toEqual({ type: "adaptive", budget_tokens: 2048 });
+    expect(parse(rewriteBody(body, {}).json).thinking).toEqual({
+      type: "adaptive",
+      display: "summarized",
+      budget_tokens: 2048,
+    });
   });
 
   test("rebuilds known keys in canonical order, then extras in original relative order", () => {
@@ -314,126 +290,53 @@ describe("rewriteBody", () => {
     const out = parse(rewriteBody(body, {}).json);
     expect(out.system.map((b: any) => b.text)).toEqual([
       expect.stringContaining(BILLING_PREFIX),
-      "You are Claude Code, Anthropic's official CLI for Claude.",
-      expect.stringMatching(/^\nYou are an interactive agent/),
+      SDK_CLI_PROFILE.systemInstruction,
       "Be terse.",
     ]);
-  });
-
-  test("normalizes cache breakpoints to Claude Code's captured placement", () => {
-    const body = JSON.stringify({
-      model: "claude-sonnet-4-6",
-      messages: [
-        { role: "user", content: [{ type: "text", text: "first", cache_control: { type: "ephemeral" } }] },
-        { role: "assistant", content: [{ type: "text", text: "second", cache_control: { type: "ephemeral" } }] },
-        { role: "user", content: [{ type: "text", text: "third", cache_control: { type: "ephemeral" } }] },
-      ],
-      system: [
-        { type: "text", text: "Prelude", cache_control: { type: "ephemeral" } },
-        { type: "text", text: "Primary", cache_control: { type: "ephemeral" } },
-        { type: "text", text: "Project", cache_control: { type: "ephemeral", ttl: "5m" } },
-      ],
-      tools: [
-        {
-          name: "lookup",
-          description: "Lookup",
-          input_schema: { type: "object" },
-          cache_control: { type: "ephemeral" },
-        },
-      ],
-      max_tokens: 100,
-    });
-
-    const result = rewriteBody(body, {});
-    const out = parse(result.json);
-    expect(result.hasLongCache).toBe(true);
-    expect(out.system[2].cache_control).toEqual({ type: "ephemeral", ttl: "1h", scope: "global" });
-    expect(out.system[3].cache_control).toBeUndefined();
-    expect(out.system[4].cache_control).toBeUndefined();
-    expect(out.system[5].cache_control).toEqual({ type: "ephemeral", ttl: "1h" });
-    expect(out.messages[0].content[0].cache_control).toBeUndefined();
-    expect(out.messages[1].content[0].cache_control).toBeUndefined();
-    expect(out.messages[2].content[0].cache_control).toEqual({ type: "ephemeral", ttl: "1h" });
-    expect(out.tools[0].cache_control).toBeUndefined();
-  });
-
-  test("creates Claude Code, caller-system, and final-message breakpoints", () => {
-    const result = rewriteBody(baseBody, {});
-    const out = parse(result.json);
-    expect(result.hasLongCache).toBe(true);
-    expect(out.system.filter((block: any) => block.cache_control)).toEqual([
-      expect.objectContaining({ cache_control: { type: "ephemeral", ttl: "1h", scope: "global" } }),
-      expect.objectContaining({ cache_control: { type: "ephemeral", ttl: "1h" } }),
-    ]);
-    expect(out.messages[0].content[0].cache_control).toEqual({ type: "ephemeral", ttl: "1h" });
   });
 });
 
 describe("buildBetas", () => {
-  const UTILITY = [
-    "oauth-2025-04-20",
-    "interleaved-thinking-2025-05-14",
-    "redact-thinking-2026-02-12",
-    "thinking-token-count-2026-05-13",
-    "context-management-2025-06-27",
-    "prompt-caching-scope-2026-01-05",
-    "structured-outputs-2025-12-15",
-    "fallback-credit-2026-06-01",
-  ];
-  const AGENT_BASE = [
-    "claude-code-20250219",
-    "oauth-2025-04-20",
-    "interleaved-thinking-2025-05-14",
-    "redact-thinking-2026-02-12",
-    "thinking-token-count-2026-05-13",
-    "context-management-2025-06-27",
-    "prompt-caching-scope-2026-01-05",
-    "mid-conversation-system-2026-04-07",
-  ];
+  // sdk-cli advertises fallback credit on every request, including utility.
+  const UTILITY = [...SDK_CLI_PROFILE.utilityBetas, "fallback-credit-2026-06-01"];
+  const AGENT_BASE = [...SDK_CLI_PROFILE.agentBetas];
 
   test("utility profile when there are no tools and no thinking", () => {
-    expect(buildBetas(undefined, false, false, null)).toEqual(UTILITY.join(","));
+    expect(buildBetas(undefined, false)).toEqual(UTILITY.join(","));
   });
 
-  test("utility profile for explicitly disabled thinking has no effort", () => {
-    const betas = buildBetas({ type: "disabled" }, false, false, null).split(",");
+  test("utility profile for explicitly disabled thinking has fallback credit but no effort", () => {
+    const betas = buildBetas({ type: "disabled" }, false).split(",");
     expect(betas).toEqual(UTILITY);
     expect(betas).not.toContain("effort-2025-11-24");
   });
 
   test("agent profile for tools without thinking: fallback credit but no effort", () => {
-    const betas = buildBetas({ type: "disabled" }, true, false, null).split(",");
-    expect(betas).toEqual([...AGENT_BASE, "advanced-tool-use-2025-11-20", "fallback-credit-2026-06-01"]);
+    const betas = buildBetas({ type: "disabled" }, true).split(",");
+    expect(betas).toEqual([...AGENT_BASE, "fallback-credit-2026-06-01"]);
     expect(betas).not.toContain("effort-2025-11-24");
   });
 
   test("agent profile with effort + fallback credit for enabled thinking", () => {
-    expect(buildBetas({ type: "enabled", budget_tokens: 1024 }, false, false, null)).toEqual(
+    expect(buildBetas({ type: "enabled", budget_tokens: 1024 }, false)).toEqual(
       [...AGENT_BASE, "effort-2025-11-24", "fallback-credit-2026-06-01"].join(","),
     );
   });
 
   test("adaptive thinking counts as active thinking", () => {
-    const betas = buildBetas({ type: "adaptive" }, false, false, null).split(",");
+    const betas = buildBetas({ type: "adaptive" }, false).split(",");
     expect(betas).toContain("effort-2025-11-24");
     expect(betas).toContain("fallback-credit-2026-06-01");
   });
 
-  test("adds advanced tool use whenever the CLI request has tools", () => {
-    const withoutIncomingAdvanced = buildBetas(undefined, true, false, null).split(",");
-    expect(withoutIncomingAdvanced).toContain("advanced-tool-use-2025-11-20");
-
-    const withIncomingAdvanced = buildBetas(undefined, true, false, "advanced-tool-use-2025-11-20").split(",");
+  test("advanced tool use is absent from the sdk-cli base and added once from incoming betas", () => {
+    expect(buildBetas(undefined, true)).toEqual([...AGENT_BASE, "fallback-credit-2026-06-01"].join(","));
+    const withIncomingAdvanced = buildBetas(undefined, true, "advanced-tool-use-2025-11-20").split(",");
     expect(withIncomingAdvanced).toEqual([
       ...AGENT_BASE,
       "advanced-tool-use-2025-11-20",
       "fallback-credit-2026-06-01",
     ]);
-  });
-
-  test("adds the extended-cache beta when the rewritten body has a one-hour cache", () => {
-    const betas = buildBetas(undefined, false, true, null).split(",");
-    expect(betas).toEqual([...UTILITY, "extended-cache-ttl-2025-04-11"]);
   });
 
   test("preserves and deduplicates SDK/caller betas after the profile", () => {
@@ -445,13 +348,12 @@ describe("buildBetas", () => {
       "task-budgets-2026-03-13",
       "fallback-credit-2026-06-01",
     ].join(",");
-    const betas = buildBetas({ type: "enabled", budget_tokens: 1024 }, true, false, incoming).split(",");
-    expect(betas.slice(0, AGENT_BASE.length + 2)).toEqual([
+    const betas = buildBetas({ type: "enabled", budget_tokens: 1024 }, true, incoming).split(",");
+    expect(betas.slice(0, AGENT_BASE.length + 1)).toEqual([
       ...AGENT_BASE,
-      "advanced-tool-use-2025-11-20",
       "effort-2025-11-24",
     ]);
-    expect(betas.slice(AGENT_BASE.length + 2)).toEqual([
+    expect(betas.slice(AGENT_BASE.length + 1)).toEqual([
       "fallback-credit-2026-06-01",
       "compact-2026-01-01",
       "fast-mode-2026-02-01",
@@ -460,7 +362,7 @@ describe("buildBetas", () => {
   });
 
   test("strips context-1m even when the caller supplies it", () => {
-    const betas = buildBetas(undefined, false, false, "context-1m-2025-08-07,pdfs-2024-09-25").split(",");
+    const betas = buildBetas(undefined, false, "context-1m-2025-08-07,pdfs-2024-09-25").split(",");
     expect(betas).not.toContain("context-1m-2025-08-07");
     expect(betas.slice(UTILITY.length)).toEqual(["pdfs-2024-09-25"]);
   });
@@ -469,7 +371,6 @@ describe("buildBetas", () => {
     const betas = buildBetas(
       undefined,
       false,
-      false,
       "fine-grained-tool-streaming-2025-05-14,fast-mode-2026-02-01",
     ).split(",");
     expect(betas).not.toContain("fine-grained-tool-streaming-2025-05-14");
@@ -477,7 +378,7 @@ describe("buildBetas", () => {
   });
 
   test("strips the SDK's obsolete structured-output beta", () => {
-    const betas = buildBetas(undefined, true, false, "structured-outputs-2025-11-13").split(",");
+    const betas = buildBetas(undefined, true, "structured-outputs-2025-11-13").split(",");
     expect(betas).not.toContain("structured-outputs-2025-11-13");
   });
 });
@@ -515,16 +416,6 @@ describe("rewriteBody cch", () => {
     fallbacks: [{ model: "claude-opus-4-6" }],
     stream: true,
   };
-
-  function cch(input: Record<string, any>): string {
-    const out = parse(rewriteBody(JSON.stringify(input), {}).json);
-    const text = out.system.find((block: any) => block.text?.startsWith(BILLING_PREFIX)).text;
-    return text.match(/cch=([0-9a-f]{5})/)![1]!;
-  }
-
-  test("matches the canonical normalized-body reference vector", () => {
-    expect(cch(body)).toBe("ef831");
-  });
 
   test("leaves an existing billing value without a placeholder unchanged", () => {
     const existing = billingHeader.replace("cch=00000", "cch=abcde");
@@ -618,7 +509,8 @@ describe("rewriteBody tool name cloaking", () => {
       "bash",
     ]);
     expect(out.tool_choice).toEqual({ type: "tool", name: "_get_weather" });
-    expect(out.tools.every((tool: any) => tool.eager_input_streaming === undefined)).toBe(true);
+    // SDK streaming fields survive on the custom tools that set them.
+    expect(out.tools.slice(0, 3).map((tool: any) => tool.eager_input_streaming)).toEqual([true, undefined, undefined]);
     expect(out.tools.slice(0, 3).every((tool: any) => tool.input_schema.additionalProperties === false)).toBe(true);
     const assistant = out.messages[1].content;
     expect(assistant[1]).toEqual({
@@ -627,19 +519,12 @@ describe("rewriteBody tool name cloaking", () => {
       name: "_get_weather",
       input: { city: "SF" },
     });
-    // Server/MCP tool_use blocks keep their names.
+    // Server/MCP tool_use blocks keep their names; caches pass through untouched.
     expect(assistant[2].name).toBe("web_search");
     expect(assistant[3].name).toBe("mcp_tool");
-    // Tool-result content and IDs stay untouched; only the final message block
-    // receives the captured CLI cache marker.
     expect(out.messages[2].content).toEqual([
       { type: "tool_result", tool_use_id: "toolu_01", content: "sunny" },
-      {
-        type: "tool_result",
-        tool_use_id: "srv_01",
-        content: "results",
-        cache_control: { type: "ephemeral", ttl: "1h" },
-      },
+      { type: "tool_result", tool_use_id: "srv_01", content: "results" },
     ]);
     // Leading-underscore names gain exactly one prefix and round-trip.
     expect(stripClaudeToolPrefix(out.tools[1].name)).toBe("_secret");
@@ -1002,7 +887,7 @@ describe("SDK integration: tool name cloaking through plugin fetch", () => {
         "__secret",
         "web_search",
       ]);
-      expect(first.tools.every((tool: any) => tool.eager_input_streaming === undefined)).toBe(true);
+      expect(first.tools.every((tool: any) => tool.eager_input_streaming === true)).toBe(true);
       expect(first.tools.every((tool: any) => tool.input_schema.additionalProperties === false)).toBe(true);
       expect(first.tool_choice).toEqual({ type: "tool", name: "_get_weather" });
       expect(captured[0]!.url).toContain("beta=true");

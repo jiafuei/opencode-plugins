@@ -1,9 +1,9 @@
 # @jiafuei/opencode-claude-oauth
 
 Claude Pro/Max subscription login for OpenCode. Adds OAuth auth methods to the
-built-in `anthropic` provider and rewrites requests using selectable Claude
-CLI, Meka Claude subscription, Cowork desktop-agent, or Agent SDK CLI wire
-profiles. This includes ordered HTTP/1.1 headers, beta profiles, billing/system fingerprints,
+built-in `anthropic` provider and rewrites requests using selectable Agent SDK
+CLI (default) or Cowork desktop-agent wire profiles. This includes ordered
+HTTP/1.1 headers, beta profiles, billing/system fingerprints,
 `metadata.user_id` attribution, tool-name transport, and `cch` attestation.
 
 ## Install
@@ -18,19 +18,17 @@ profiles. This includes ordered HTTP/1.1 headers, beta profiles, billing/system 
 
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
-| `spoofingProfile` | `"cli" \| "cli-meka" \| "cowork" \| "sdk-cli"` | `"cli"` | Selects the complete client wire profile. |
-| `attributionHeader` | `boolean` | `true` | Controls the billing header and `cch`, plus CLI/Meka request-chain fields. Profile identity remains enabled when false. |
+| `spoofingProfile` | `"cowork" \| "sdk-cli"` | `"sdk-cli"` | Selects the complete client wire profile. |
+| `attributionHeader` | `boolean` | `true` | Controls the billing header and `cch`. Profile identity remains enabled when false. |
 
 ### Spoofing profiles
 
 Each value selects one coherent wire identity:
 
-| Value | Reference | Version / entrypoint | CCH and request chain |
+| Value | Reference | Version / entrypoint | CCH |
 | --- | --- | --- | --- |
-| `"cli"` | Claude Code CLI | `2.1.241` / `cli` | Claude CLI normalization; `cc_prev_req` and `cc_prompt_id` enabled |
-| `"cli-meka"` | Meka Claude subscription | `2.1.241` / `cli` | Meka normalization; process-local request chain plus subagent attribution |
-| `"cowork"` | oh-my-pi Cowork | `2.1.220` / `claude-desktop` | Raw serialized-body CCH; no billing request chain |
-| `"sdk-cli"` | pi-black Agent SDK CLI | `2.1.224` / `sdk-cli` | Top-level model/max-token normalization; no billing request chain |
+| `"cowork"` | oh-my-pi Cowork | `2.1.220` / `claude-desktop` | Raw serialized-body attestation |
+| `"sdk-cli"` | pi-black Agent SDK CLI | `2.1.224` / `sdk-cli` | Top-level model/max-token normalization |
 
 ```json
 {
@@ -40,18 +38,12 @@ Each value selects one coherent wire identity:
 }
 ```
 
-The `cli-meka` profile matches Meka revision
-`326be3d98bdaf022e95fbddffd6e1974e0aae1d3`. It adopts any nonempty trimmed
-`~/.claude.json` `userID`, falling back to a stable plugin device identity, and
-uses one Claude session UUID for the plugin process. The `sdk-cli` profile
-derives identity from this plugin's stable install ID and the OAuth account. It
-never reads `~/.claude.json` or `CLAUDE_CONFIG_DIR`.
+Both profiles derive identity from this plugin's stable install ID and the
+OAuth account. Neither reads `~/.claude.json` or `CLAUDE_CONFIG_DIR`, and
+neither emits billing request-chain fields (`cc_prev_req` / `cc_prompt_id`).
 
-Meka does not implement `/v1/messages/count_tokens`; for that endpoint,
-`cli-meka` uses the compatible Claude CLI token-count beta list.
-
-All profiles use the custom ordered HTTPS transport. CLI, Meka, and SDK CLI use the
-header order observed in genuine Claude CLI captures; Cowork uses OMP's
+All profiles use the custom ordered HTTPS transport. `sdk-cli` uses the header
+order observed in genuine Claude CLI captures; `cowork` uses OMP's
 desktop-agent order. Direct HTTPS uses HTTP/1.1 and preserves header casing and
 order. A configured proxy intentionally falls back to the runtime fetch so the
 proxy is honored, which means exact transport ordering is not retained there.
@@ -69,9 +61,6 @@ and the selected profile identity:
   ]
 }
 ```
-
-In CLI and Meka modes this also disables `cc_prev_req` and `cc_prompt_id`
-generation. Cowork and SDK CLI never emit those request-chain fields.
 
 ### AI SDK request options
 
@@ -101,9 +90,8 @@ For example, to disable it for one model:
 }
 ```
 
-This setting is optional for CLI and Meka, which remove the SDK-generated
-`eager_input_streaming` field at the wire boundary. Cowork and SDK CLI preserve
-the Agent SDK field.
+This setting is optional: the plugin preserves the Agent SDK
+`eager_input_streaming` field on the wire for every profile.
 
 Requires OpenCode ≥ 1.18.20 and [Bun](https://bun.sh) (OpenCode's runtime,
 used for `Bun.hash.xxHash64`). Then run `opencode auth login`, pick
@@ -127,66 +115,42 @@ endpoint:
 - `Authorization: Bearer sk-ant-oat01-…` (never `x-api-key`) and
   `?beta=true` on `/v1/messages`
 - The selected profile's exact `User-Agent`, `x-app: cli`,
-  a per-invocation `x-client-request-id` (stable across SDK retries except in
-  Meka mode, which generates one per dispatch), the Stainless header set, and
-  `X-Claude-Code-Session-Id` per session (per plugin process in Meka mode);
-  OpenCode's internal session-routing headers are stripped before dispatch
+  a per-invocation `x-client-request-id` (stable across SDK retries), the
+  Stainless header set, and a stable per-session
+  `X-Claude-Code-Session-Id` UUID (mapped process-locally from OpenCode's
+  session id); OpenCode's internal session-routing headers are stripped before
+  dispatch
 - The selected client's beta profile, chosen per request shape (utility vs
-  agent profile).
-  Meka rebuilds its model-gated list exactly and drops caller extras. Other
-  profiles preserve and deduplicate SDK/caller betas after their list, except
-  `fine-grained-tool-streaming-2025-05-14` (absent from Claude Code's profile),
-  the SDK's obsolete `structured-outputs-2025-11-13` tool beta, and
-  `context-1m-2025-08-07` (hard-429'd for subscription credentials).
+  agent profile). Other caller betas are preserved and deduplicated after the
+  profile's list, except `fine-grained-tool-streaming-2025-05-14` (absent from
+  the profile), the SDK's obsolete `structured-outputs-2025-11-13` tool beta,
+  and `context-1m-2025-08-07` (hard-429'd for subscription credentials).
 - Body rewrite:
   - `system[0]` = `x-anthropic-billing-header` with the selected version and
     entrypoint; its prompt fingerprint skips leading `<system-reminder>` text
-    blocks except in Meka mode, which fingerprints the first user text block.
-    `system[1]` carries the selected CLI or Agent SDK identity. CLI and
-    Cowork skip both for claude-3-5-haiku; Meka and SDK CLI do not. Meka also
-    adds `cc_is_subagent=true` for OpenCode child sessions.
+    blocks. `system[1]` carries the selected Agent SDK identity. Cowork skips
+    both for claude-3-5-haiku; SDK CLI does not.
   - `metadata.user_id` = `{device_id, account_uuid, session_id}` JSON envelope.
-    CLI uses Claude Code's valid `~/.claude.json` `userID` when available and
-    otherwise falls back to a stable plugin identity; the UUIDv4 session ID is
-    persisted per OpenCode conversation. Meka replaces incoming metadata with
-    its process-session envelope. Existing valid CC attribution is preserved
-    verbatim in the other profiles.
-  - `max_tokens` clamped to ≤ 64000 in the other profiles. Meka honors
-    OpenCode's incoming limit; when absent, it defaults omitted thinking to
-    adaptive at 64000, budgeted thinking to `max(budget × 2, 32000)`, and
-    disabled thinking to 32000. Incoming `stream` is preserved as-is.
-  - CLI omits `thinking.display` and SDK `eager_input_streaming`, normalizes
-    one-hour cache breakpoints to the Claude Code system block, final caller
-    system block, and final message block (never tools), and preserves incoming
-    context edits while adding
-    clear-thinking first. Meka caches only the final caller system block
-    globally plus the final message block, removes SDK-only tool fields, and
-    applies its model-gated context-management/temperature/effort rules.
-    Cowork and SDK CLI preserve Agent SDK fields and
-    caches and replace active context edits with one keep-all clear-thinking
-    edit.
-  - The redundant default `tool_choice:{type:"auto"}` is omitted and tool input
-    schemas are closed with top-level `additionalProperties:false`. Meka omits
-    every `tool_choice` and leaves input schemas otherwise unchanged.
+    Device IDs derive deterministically from this plugin's install ID and the
+    OAuth account; existing valid CC attribution is preserved verbatim, and
+    the UUIDv4 session ID is stable per OpenCode conversation within the
+    plugin process.
+  - `max_tokens` clamped to ≤ 64000. Incoming `stream` is preserved as-is.
+  - Agent SDK fields (`thinking.display`, `eager_input_streaming`) are
+    preserved; cache breakpoints pass through untouched; active thinking emits
+    a single keep-all clear-thinking context edit replacing whatever arrived;
+    tool input schemas are closed with top-level `additionalProperties:false`.
+  - The redundant default `tool_choice:{type:"auto"}` is omitted.
 - The selected `cch` algorithm from the profile table, patched over the
   `cch=00000` placeholder as five lowercase hex characters.
-- In CLI and Meka modes, billing state follows a conversation: `cc_prompt_id` remains
-  stable for the same OpenCode message, and the next successful request includes
-  the prior Anthropic `request-id` as `cc_prev_req`. CLI request chains persist across
-  OpenCode restarts and are shared safely by concurrent processes; generation
-  fencing prevents late responses from restoring state cleared by compaction,
-  deletion, or an auth transition. If SQLite is unavailable, inference
-  continues with process-local tracking but restart/cross-process continuity is
-  temporarily unavailable. Meka keeps its chain process-local,
-  matching its provider lifecycle. Cowork and SDK CLI do not emit a request chain.
 - Token-count requests use the selected profile's beta and header set,
   omit `X-Stainless-Timeout`, preserve their body shape apart from tool
   normalization, and are not response-rewritten
-- Except in Meka mode, custom tool names are cloaked with one `_` prefix on the way out
+- Custom tool names are cloaked with one `_` prefix on the way out
   (definitions, `tool_choice`, historical
   `tool_use` blocks) and the exact prefix is stripped on the way in through both
   streaming SSE (`content_block_start`) and non-streaming JSON responses, so
-  OpenCode's logical tool names remain unchanged. Meka sends tool names unchanged.
+  OpenCode's logical tool names remain unchanged.
 - Model costs reported as zero while on OAuth (subscription-billed)
 
 ### Token refresh
@@ -240,12 +204,8 @@ age and ask you to re-login.
 Under OpenCode's data directory (`~/.local/share/opencode` by default), all
 files written with mode 0600:
 
-- `claude-oauth-install-id` — stable random install ID feeding the fallback device ID
+- `claude-oauth-install-id` — stable random install ID feeding the derived device IDs
 - `claude-oauth/grants.json` — authorization timestamps only (never tokens)
-- `claude-oauth/claude-oauth.db` — SQLite session state for durable CLI
-  `cc_prev_req` chains; stores OpenCode session IDs, hashed credential keys,
-  Anthropic request IDs, and generation/sequence/timestamp metadata, never
-  tokens
 - `claude-oauth/grants.lock/` — transient cross-process sidecar lock
 - `claude-oauth/refresh-lease/<hash>/` — transient cross-process refresh lease
 

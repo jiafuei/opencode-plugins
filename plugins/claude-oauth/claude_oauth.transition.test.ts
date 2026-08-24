@@ -190,7 +190,7 @@ describe("auth transitions", () => {
 
 describe("chat.headers claudeOAuth marker", () => {
   async function runHeaders(providerOptions: Record<string, unknown>, providerID = "anthropic") {
-    const plugin = await ClaudeOAuthPlugin({} as never, { databasePath: ":memory:" } as never);
+    const plugin = await ClaudeOAuthPlugin({} as never);
     const output = { headers: {} as Record<string, string> };
     await plugin["chat.headers"]!(
       {
@@ -218,29 +218,6 @@ describe("chat.headers claudeOAuth marker", () => {
     const first = await runHeaders({ apiKey: "k", claudeOAuth: true });
     const second = await runHeaders({ apiKey: "k", claudeOAuth: true });
     expect(first["x-claude-oauth-request-id"]).not.toBe(second["x-claude-oauth-request-id"]);
-  });
-
-  test("prompt ids are stable by message until session compaction", async () => {
-    const plugin = await ClaudeOAuthPlugin({} as never, { databasePath: ":memory:" } as never);
-    const promptId = async (messageID: string) => {
-      const output = { headers: {} as Record<string, string> };
-      await plugin["chat.headers"]!(
-        {
-          model: { providerID: "anthropic" },
-          provider: { options: { claudeOAuth: true } },
-          sessionID: "ses_prompt-state",
-          message: { id: messageID },
-        } as never,
-        output as never,
-      );
-      return output.headers["x-claude-oauth-prompt-id"]!;
-    };
-
-    const firstA = await promptId("msg_a");
-    expect(await promptId("msg_b")).not.toBe(firstA);
-    expect(await promptId("msg_a")).toBe(firstA);
-    await plugin.event!({ event: { type: "session.compacted", properties: { sessionID: "ses_prompt-state" } } } as never);
-    expect(await promptId("msg_a")).not.toBe(firstA);
   });
 
   test("dummy apiKey alone does NOT enable session propagation without the marker", async () => {

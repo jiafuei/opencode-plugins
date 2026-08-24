@@ -1,7 +1,7 @@
 {
   "name": "@jiafuei/opencode-claude-oauth",
   "version": "0.0.1",
-  "description": "Claude Pro/Max subscription auth for OpenCode with Claude CLI, Meka, Cowork, and SDK CLI wire profiles",
+  "description": "Claude Pro/Max subscription auth for OpenCode with Agent SDK CLI (default) and Cowork wire profiles",
   "type": "module",
   "exports": {
     "./server": "./claude_oauth.ts"
@@ -10,7 +10,6 @@
     "claude_oauth.ts",
     "wire_format.ts",
     "cowork_fetch.ts",
-    "request_chain.ts",
     "local_storage.ts",
     "README.md"
   ],

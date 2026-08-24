@@ -4,13 +4,10 @@ import { mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } 
 import path from "node:path";
 import {
   buildBetas,
-  CLI_PROFILE,
   countTokensBetas,
   createSseToolNameTransform,
-  extractUserIdSessionId,
   prefixRequestToolNames,
   readBoundedJsonText,
-  REQUEST_ID_PATTERN,
   resolveSpoofingProfile,
   rewriteBody,
   stainlessHeaders,
@@ -18,8 +15,7 @@ import {
   uncloakedResponseHeaders,
 } from "./wire_format.ts";
 import type { SpoofingProfile } from "./wire_format.ts";
-import { RequestChainTracker, requestChainCredentialKey } from "./request_chain.ts";
-import { deriveDeviceId, opencodeDataDir, readClaudeCodeDeviceId, readMekaDeviceId } from "./local_storage.ts";
+import { opencodeDataDir } from "./local_storage.ts";
 import { buildEnforcedHeaders, coworkTransport } from "./cowork_fetch.ts";
 
 // Preserve the historical public API: tests and package consumers import these
@@ -68,7 +64,8 @@ const SESSION_ID_HEADER = "x-claude-code-session-id";
 const OPENCODE_SESSION_ID_HEADER = "x-claude-oauth-session-id";
 // Plugin-only transport header: carries the per-invocation request id from
 // chat.headers into the auth fetch. Like the session marker, it is stripped
-// before anything hits the wire.
+// before anything hits the wire. The prompt-id marker is legacy (no profile
+// emits it anymore) but stale values are still stripped defensively.
 const REQUEST_ID_HEADER = "x-claude-oauth-request-id";
 const PROMPT_ID_HEADER = "x-claude-oauth-prompt-id";
 
@@ -375,10 +372,6 @@ interface RefreshedCredential {
   access: string;
   expires: number;
   accountId?: string;
-}
-
-function claudeOAuthDatabaseFile(): string {
-  return process.env.NODE_ENV === "test" ? ":memory:" : path.join(opencodeDataDir(), "claude-oauth", "claude-oauth.db");
 }
 
 // A lease holder that crashed mid-refresh is stolen after this long. Must
@@ -873,44 +866,27 @@ function buildAuthorizeUrl(redirectUri: string, pkce: PkceCodes, state: string):
 export interface ClaudeOAuthOptions {
   attributionHeader?: boolean;
   /**
-   * Client identity spoofed on the Anthropic wire: "cli" (default) mirrors
-   * Claude Code 2.1.241; "cli-meka" mirrors meka's Claude subscription
-   * provider; "cowork" mirrors oh-my-pi's Cowork desktop-agent; "sdk-cli"
-   * mirrors pi-black's Agent SDK CLI identity. Every profile uses the ordered
-   * HTTP/1.1 transport.
+   * Client identity spoofed on the Anthropic wire: "sdk-cli" (default) mirrors
+   * pi-black's Agent SDK CLI identity; "cowork" mirrors oh-my-pi's Cowork
+   * desktop-agent. Every profile uses the ordered HTTP/1.1 transport.
    */
   spoofingProfile?: SpoofingProfile["id"];
 }
 
-type ClaudeOAuthInternalOptions = ClaudeOAuthOptions & { databasePath?: string };
-
 export const ClaudeOAuthPlugin: Plugin = async (input: PluginInput, options?: PluginOptions | ClaudeOAuthOptions) => {
-  const pluginOptions = options as ClaudeOAuthInternalOptions | undefined;
+  const pluginOptions = options as ClaudeOAuthOptions | undefined;
   // Validated once at the option boundary; unsupported values throw here.
   const profile = resolveSpoofingProfile(pluginOptions?.spoofingProfile);
   const attributionHeader = pluginOptions?.attributionHeader !== false;
-  const deviceId = profile.id === "cli"
-    ? readClaudeCodeDeviceId()
-    : profile.id === "cli-meka"
-      ? readMekaDeviceId() ?? deriveDeviceId()
-      : undefined;
-  const profileSessionId = profile.id === "cli-meka" ? randomUUID() : undefined;
-  const promptIds = new Map<string, Map<string, string>>();
-  // Owns SQLite persistence, the process-local fallback, and every
-  // generation/retry-sequencing, reset, delete, and close operation.
-  const requestChains = new RequestChainTracker(
-    pluginOptions?.databasePath ?? (profile.id === "cli-meka" ? ":memory:" : claudeOAuthDatabaseFile()),
-  );
-  let activeRequestCredential: string | undefined;
-  let previousAccessFingerprint: string | undefined;
-  let requestStateGeneration = 0;
+  // Process-local stable mapping from raw OpenCode session ids to the UUIDv4
+  // session ids carried on the Claude wire (X-Claude-Code-Session-Id and
+  // metadata.user_id.session_id).
+  const wireSessionIds = new Map<string, string>();
 
-  // Shared login-success tail for both authorize methods: exchange the code,
-  // invalidate every previous-request chain (a fresh login must not inherit
-  // prior attribution), and record the grant timestamp.
+  // Shared login-success tail for both authorize methods: exchange the code
+  // and record the grant timestamp.
   const finishLogin = async (code: string, state: string, verifier: string, redirectUri: string) => {
     const tokens = await exchangeCode(code, state, verifier, redirectUri);
-    requestChains.resetAll();
     recordAuthorizedAt(tokens.refresh, tokens.accountId);
     return { type: "success" as const, ...tokens };
   };
@@ -1053,15 +1029,7 @@ export const ClaudeOAuthPlugin: Plugin = async (input: PluginInput, options?: Pl
             }
 
             // Single dispatch boundary: route on the latest classified state.
-            // Every non-OAuth outcome first tears down the request chain of
-            // the previously active credential — leaving OAuth (logout,
-            // unsupported type, or an ordinary API key) must not leave stale
-            // prev-request state behind.
             if (auth.kind !== "oauth") {
-              if (activeRequestCredential) requestChains.resetCredential(activeRequestCredential);
-              activeRequestCredential = undefined;
-              previousAccessFingerprint = undefined;
-              requestStateGeneration++;
               if (auth.kind === "api") {
                 // Ordinary Anthropic API-key request: replace the dummy
                 // x-api-key with the real one and drop OAuth-only mutations.
@@ -1091,18 +1059,9 @@ export const ClaudeOAuthPlugin: Plugin = async (input: PluginInput, options?: Pl
             const access = auth.access
             const accountId = auth.accountId
             const headers = new Headers(init?.headers)
-            const isSubagent = headers.has("x-parent-session-id")
             headers.delete("x-session-affinity")
             headers.delete("x-session-id")
             headers.delete("x-parent-session-id")
-            const requestCredential = requestChainCredentialKey(auth.refresh, accountId)
-            const accessFingerprint = createHash("sha256").update(access).digest("hex")
-            activeRequestCredential = requestCredential
-            if (accessFingerprint !== previousAccessFingerprint) {
-              previousAccessFingerprint = accessFingerprint
-              requestStateGeneration++
-            }
-            const requestGeneration = requestStateGeneration
 
             // Per-invocation request id from chat.headers. Read once, then
             // removed: it is a plugin-only transport marker and must never
@@ -1113,7 +1072,6 @@ export const ClaudeOAuthPlugin: Plugin = async (input: PluginInput, options?: Pl
             const hookRequestId = headers.get(REQUEST_ID_HEADER) ?? undefined
             headers.delete(REQUEST_ID_HEADER)
             const logicalRequestId = hookRequestId ?? randomUUID()
-            const promptId = headers.get(PROMPT_ID_HEADER) ?? undefined
             headers.delete(PROMPT_ID_HEADER)
 
             // The session header must always match the body's metadata
@@ -1121,17 +1079,13 @@ export const ClaudeOAuthPlugin: Plugin = async (input: PluginInput, options?: Pl
             // (hook-provided, preserved from a valid incoming user_id, or
             // synthesized), so the header is set from it below — never the
             // other way around.
-            const opencodeSessionId = headers.get(OPENCODE_SESSION_ID_HEADER) ?? undefined
             headers.delete(OPENCODE_SESSION_ID_HEADER)
-            const hookSessionId = headers.get(SESSION_ID_HEADER) ?? profileSessionId
+            const hookSessionId = headers.get(SESSION_ID_HEADER) ?? undefined
             // Reinsert at dispatch so Bun serializes Claude Code's title casing
             // instead of retaining the SDK-normalized lowercase field name.
             headers.delete(SESSION_ID_HEADER)
             let sessionId = hookSessionId
             let body: RequestInit["body"] = init?.body
-            let requestChain:
-              | { sessionId: string; requestId?: string; generation: number; sequence: number }
-              | undefined
             const isMessages = url.pathname === "/v1/messages"
             const isCountTokens = url.pathname === "/v1/messages/count_tokens"
             const isMessagesApi = isMessages || isCountTokens
@@ -1143,37 +1097,17 @@ export const ClaudeOAuthPlugin: Plugin = async (input: PluginInput, options?: Pl
               requestTarget = url
             }
             if (isMessages && typeof body === "string" && body.startsWith("{")) {
-              const incomingUserId = (JSON.parse(body) as Record<string, any>).metadata?.user_id
-              const attributedSessionId = typeof incomingUserId === "string" ? extractUserIdSessionId(incomingUserId) : undefined
-              const initialChainSessionId = opencodeSessionId ?? hookSessionId ?? attributedSessionId
-              // CLI and Meka track request chains; the Agent SDK profiles do not.
-              if (profile.billingChain && attributionHeader && initialChainSessionId) {
-                requestChain = {
-                  sessionId: initialChainSessionId,
-                  ...requestChains.startRequest(requestCredential, initialChainSessionId, logicalRequestId),
-                }
-              }
-              const { json, thinking, hasTools, hasLongCache, model, sessionId: rewrittenSessionId } = rewriteBody(body, {
+              const { json, thinking, hasTools, sessionId: rewrittenSessionId } = rewriteBody(body, {
                 sessionId: hookSessionId,
                 accountId,
                 attributionHeader,
-                previousRequestId: requestChain?.requestId,
-                promptId,
-                isSubagent,
-                deviceId,
                 profile,
               })
               sessionId = rewrittenSessionId
-              if (!requestChain && profile.billingChain && attributionHeader && sessionId) {
-                requestChain = {
-                  sessionId,
-                  ...requestChains.startRequest(requestCredential, sessionId, logicalRequestId),
-                }
-              }
               body = json
               // Headers.get is case-insensitive, so SDK betas arrive regardless
               // of the caller's key casing.
-              headers.set("anthropic-beta", buildBetas(thinking, hasTools, hasLongCache, headers.get("anthropic-beta"), profile, model))
+              headers.set("anthropic-beta", buildBetas(thinking, hasTools, headers.get("anthropic-beta"), profile))
             } else if (isCountTokens && typeof body === "string" && body.startsWith("{")) {
               const params = JSON.parse(body) as Record<string, any>
               prefixRequestToolNames(params, profile)
@@ -1195,7 +1129,7 @@ export const ClaudeOAuthPlugin: Plugin = async (input: PluginInput, options?: Pl
                 sessionId,
                 betas: headers.get("anthropic-beta") ?? undefined,
                 authorization: `Bearer ${access}`,
-                clientRequestId: profile.id === "cli-meka" ? randomUUID() : logicalRequestId,
+                clientRequestId: logicalRequestId,
                 stainless,
               })
               response = await coworkTransport.impl(requestTarget, {
@@ -1211,40 +1145,6 @@ export const ClaudeOAuthPlugin: Plugin = async (input: PluginInput, options?: Pl
               response = await fetch(requestTarget, { ...init, headers, body })
             }
             if (!isMessages) return response
-            const responseRequestId = response.headers.get("request-id")
-            const completedChain = requestChain
-            const recordPreviousRequest =
-              response.ok && completedChain && responseRequestId && REQUEST_ID_PATTERN.test(responseRequestId)
-                ? async () => {
-                    let latest: AuthSnapshot;
-                    try {
-                      latest = await readAuth()
-                    } catch {
-                      return
-                    }
-                    if (latest.kind !== "oauth") {
-                      requestChains.resetCredential(requestCredential)
-                      requestStateGeneration++
-                      return
-                    }
-                    const latestCredential = requestChainCredentialKey(latest.refresh, latest.accountId)
-                    if (latestCredential !== requestCredential) {
-                      requestChains.resetCredential(requestCredential)
-                      requestStateGeneration++
-                      return
-                    }
-                    if (createHash("sha256").update(latest.access).digest("hex") !== accessFingerprint) return
-                    if (requestStateGeneration !== requestGeneration) return
-                    requestChains.completeRequest(
-                      requestCredential,
-                      completedChain.sessionId,
-                      logicalRequestId,
-                      completedChain.generation,
-                      completedChain.sequence,
-                      responseRequestId,
-                    )
-                  }
-                : undefined
             // Uncloak custom tool names on the way back. Streaming responses are
             // rewritten incrementally (no full buffering); non-streaming JSON
             // bodies are transformed whole within a bounded read. Rewritten
@@ -1252,7 +1152,7 @@ export const ClaudeOAuthPlugin: Plugin = async (input: PluginInput, options?: Pl
             const contentType = response.headers.get("content-type") ?? ""
             if (contentType.includes("text/event-stream")) {
               if (!response.body) return response
-              return new Response(response.body.pipeThrough(createSseToolNameTransform(recordPreviousRequest, profile.toolPrefix)), {
+              return new Response(response.body.pipeThrough(createSseToolNameTransform(profile.toolPrefix)), {
                 status: response.status,
                 statusText: response.statusText,
                 headers: uncloakedResponseHeaders(response),
@@ -1261,9 +1161,6 @@ export const ClaudeOAuthPlugin: Plugin = async (input: PluginInput, options?: Pl
             if (contentType.includes("application/json")) {
               const text = await readBoundedJsonText(response)
               const transformed = transformJsonToolUseNames(text, profile.toolPrefix)
-              try {
-                if ((JSON.parse(text) as { type?: unknown }).type === "message") await recordPreviousRequest?.()
-              } catch {}
               return new Response(transformed, {
                 status: response.status,
                 statusText: response.statusText,
@@ -1353,46 +1250,28 @@ export const ClaudeOAuthPlugin: Plugin = async (input: PluginInput, options?: Pl
       // markers. Marker-based so provider config apiKey merging (which replaces
       // the dummy key) cannot disable stable session propagation.
       if ((input.provider.options as Record<string, unknown>).claudeOAuth !== true) return
-      output.headers["X-Claude-Code-Session-Id"] = profileSessionId ?? requestChains.claudeSessionId(input.sessionID)
+      let wireSessionId = wireSessionIds.get(input.sessionID)
+      if (!wireSessionId) {
+        wireSessionId = randomUUID().toLowerCase()
+        wireSessionIds.set(input.sessionID, wireSessionId)
+      }
+      output.headers["X-Claude-Code-Session-Id"] = wireSessionId
       output.headers[OPENCODE_SESSION_ID_HEADER] = input.sessionID
       // Fresh UUID per logical OpenCode LLM invocation, transported in the
       // private plugin header and emitted as x-client-request-id by the auth
       // fetch. SDK retries reuse the prepared headers — and therefore this id;
       // a separate identical invocation runs this hook again and gets a new one.
       output.headers[REQUEST_ID_HEADER] = randomUUID()
-      // CLI and Meka carry billing prompt attribution; the Agent SDK profiles
-      // never allocate or transport a private prompt-id marker.
-      if (attributionHeader && profile.billingChain) {
-        let sessionPrompts = promptIds.get(input.sessionID)
-        if (!sessionPrompts) {
-          sessionPrompts = new Map()
-          promptIds.set(input.sessionID, sessionPrompts)
-        }
-        let promptId = sessionPrompts.get(input.message.id)
-        if (!promptId) {
-          promptId = randomUUID()
-          sessionPrompts.set(input.message.id, promptId)
-        }
-        output.headers[PROMPT_ID_HEADER] = promptId
-      }
     },
 
     event: async ({ event }) => {
       if (event.type === "session.deleted") {
-        const sessionId = event.properties.info.id
-        requestChains.deleteSession(sessionId)
-        promptIds.delete(sessionId)
-      }
-      if (event.type === "session.compacted") {
-        const sessionId = event.properties.sessionID
-        requestChains.resetSession(sessionId)
-        promptIds.delete(sessionId)
+        wireSessionIds.delete(event.properties.info.id)
       }
     },
 
     dispose: async () => {
-      promptIds.clear()
-      requestChains.close()
+      wireSessionIds.clear()
     },
   }
   return hooks
