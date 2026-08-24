@@ -62,6 +62,7 @@ Use `additionalModels` when a compatible provider exposes one of these models un
 - The installed Anthropic AI SDK adds the required `compact-2026-01-12` beta automatically.
 - Existing non-compaction context-management edits are preserved. An existing `compact_20260112` edit is replaced by this plugin's configuration.
 - Anthropic streams a compaction block as a metadata-tagged text part. OpenCode stores that part and the Anthropic SDK reconstructs it as a `compaction` block on subsequent requests.
+- When that compaction block starts streaming, the plugin shows a five-second toast and inserts a persistent ignored `Compacting context...` message immediately before the triggering user message. The indicator does not become model input or start another turn.
 - The generated summary is visible in the transcript. This is intentional: retaining the metadata-tagged part provides the reliable plugin-only replay path.
 - The internal `title`, `summary`, and `compaction` agents are skipped.
 

@@ -145,6 +145,17 @@ const OpenAICompactionPlugin: Plugin = async ({ client, project, directory }, op
   };
 
   const showCompactionMessage = async (sessionID: string, info: SessionInfo) => {
+    void client.tui
+      .showToast({
+        body: {
+          title: "Context compaction",
+          message: "Compacting context...",
+          variant: "info",
+          duration: 5_000,
+        },
+      })
+      .catch(() => {});
+
     const messageID = precedingMessageID(info.messageID);
     if (!messageID) {
       log("warn", "could not create compaction message before an invalid user message id", {

@@ -310,6 +310,7 @@ describe("plugin", () => {
     process.env.XDG_DATA_HOME = dataHome;
     const calls: Call[] = [];
     const indicators: Indicator[] = [];
+    const toasts: unknown[] = [];
     const stub = (async (input: string | URL | Request, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
       calls.push({ url, init: init ?? {} });
@@ -330,6 +331,7 @@ describe("plugin", () => {
       {
         client: {
           app: { log: async () => {} },
+          tui: { showToast: async (input: unknown) => void toasts.push(input) },
           session: {
             prompt: async (input: Indicator) => {
               indicators.push(input);
@@ -375,6 +377,7 @@ describe("plugin", () => {
     return {
       calls,
       indicators,
+      toasts,
       headers,
       send,
       dataHome,
@@ -465,6 +468,16 @@ describe("plugin", () => {
       },
     });
     expect(harness.indicators[0]!.body.messageID < USER_MESSAGE_ID).toBe(true);
+    expect(harness.toasts).toEqual([
+      {
+        body: {
+          title: "Context compaction",
+          message: "Compacting context...",
+          variant: "info",
+          duration: 5_000,
+        },
+      },
+    ]);
     expect(harness.headers["x-opencode-openai-compaction"]).toBe("ses_1");
     expect(new Headers(sent(sentCall).init.headers).get("x-opencode-openai-compaction")).toBeNull();
     expect(await stateFile(harness).exists()).toBe(true);

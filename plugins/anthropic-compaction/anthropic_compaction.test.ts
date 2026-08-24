@@ -30,6 +30,7 @@ async function setup(
         },
         limit: { context: overrides.context ?? 200_000 },
       },
+      message: { id: "msg_019000000001ABCDEFGHIJKLMN", model: {} },
     } as never,
     output,
   );
@@ -117,6 +118,86 @@ describe("request gating", () => {
       expect(await setup({}, { agent })).toEqual({});
     }
     expect(await setup({}, { context: 0 })).toEqual({});
+  });
+});
+
+describe("compaction indicators", () => {
+  test("shows one toast and inline message when a compaction block starts", async () => {
+    const toasts: unknown[] = [];
+    const prompts: unknown[] = [];
+    const hooks = await plugin.server(
+      {
+        client: {
+          tui: { showToast: async (input: unknown) => void toasts.push(input) },
+          session: {
+            prompt: async (input: unknown) => {
+              prompts.push(input);
+              return { data: {} };
+            },
+          },
+        },
+        directory: "/tmp/project",
+      } as never,
+      {},
+    );
+    await hooks["chat.params"]?.(
+      {
+        sessionID: "ses_1",
+        agent: "build",
+        model: {
+          providerID: "anthropic",
+          id: "claude-sonnet-4-6",
+          api: { id: "claude-sonnet-4-6", npm: "@ai-sdk/anthropic" },
+          limit: { context: 200_000 },
+        },
+        message: { id: "msg_019000000001ABCDEFGHIJKLMN", model: { variant: "high" } },
+      } as never,
+      { options: {} } as never,
+    );
+    const event = {
+      event: {
+        type: "message.part.updated",
+        properties: {
+          part: {
+            id: "prt_1",
+            sessionID: "ses_1",
+            messageID: "msg_assistant",
+            type: "text",
+            text: "",
+            metadata: { anthropic: { type: "compaction" } },
+          },
+        },
+      },
+    } as never;
+
+    await hooks.event?.(event);
+    await hooks.event?.(event);
+
+    expect(toasts).toEqual([
+      {
+        body: {
+          title: "Context compaction",
+          message: "Compacting context...",
+          variant: "info",
+          duration: 5_000,
+        },
+      },
+    ]);
+    expect(prompts).toHaveLength(1);
+    expect(prompts[0]).toMatchObject({
+      path: { id: "ses_1" },
+      query: { directory: "/tmp/project" },
+      body: {
+        model: { providerID: "anthropic", modelID: "claude-sonnet-4-6" },
+        agent: "build",
+        variant: "high",
+        noReply: true,
+        parts: [{ type: "text", text: "Compacting context...", ignored: true }],
+      },
+    });
+    expect((prompts[0] as { body: { messageID: string } }).body.messageID < "msg_019000000001ABCDEFGHIJKLMN").toBe(
+      true,
+    );
   });
 });
 
