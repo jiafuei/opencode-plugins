@@ -149,11 +149,12 @@ describe("rewriteBody", () => {
   });
 
   test("sets metadata.user_id in the CC attribution envelope", () => {
-    const out = parse(rewriteBody(baseBody, { sessionId: "ses-123", accountId: "acct-456" }).json);
+    const deviceId = "d".repeat(64);
+    const out = parse(rewriteBody(baseBody, { sessionId: "ses-123", accountId: "acct-456", deviceId }).json);
     const userId = JSON.parse(out.metadata.user_id);
     expect(userId.session_id).toBe("ses-123");
     expect(userId.account_uuid).toBe("acct-456");
-    expect(userId.device_id).toMatch(/^[0-9a-f]{64}$/);
+    expect(userId.device_id).toBe(deviceId);
   });
 
   const CLOAKING_USER_ID =

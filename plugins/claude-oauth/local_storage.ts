@@ -7,6 +7,27 @@ export function opencodeDataDir(): string {
   return path.join(process.env.XDG_DATA_HOME ?? path.join(os.homedir(), ".local", "share"), "opencode");
 }
 
+/** Read the device identity Claude Code itself persists in its global config. */
+export function readClaudeCodeDeviceId(file = path.join(os.homedir(), ".claude.json")): string | undefined {
+  try {
+    const userId = (JSON.parse(readFileSync(file, "utf8")) as { userID?: unknown }).userID;
+    return typeof userId === "string" && /^[0-9a-f]{64}$/.test(userId) ? userId : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Meka accepts any nonempty trimmed Claude Code userID, including configured legacy values. */
+export function readMekaDeviceId(file = path.join(os.homedir(), ".claude.json")): string | undefined {
+  try {
+    const userId = (JSON.parse(readFileSync(file, "utf8")) as { userID?: unknown }).userID;
+    if (typeof userId !== "string") return undefined;
+    return userId.trim() || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function getInstallId(): string {
   const dir = opencodeDataDir();
   mkdirSync(dir, { recursive: true, mode: 0o700 });

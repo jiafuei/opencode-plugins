@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { deriveDeviceId } from "./local_storage.ts";
 
-// Pure Claude Code (claude-cli) wire-format behavior: beta profiles, Stainless
+// Claude client wire-format behavior: beta profiles, Stainless
 // headers, tool-name cloaking, bounded response uncloaking, and /v1/messages
 // body rewriting (billing fingerprint, cch attestation, metadata.user_id
 // attribution). Nothing here touches OpenCode's plugin API; claude_oauth.ts
@@ -43,14 +43,15 @@ const TOKEN_COUNTING_BETA = "token-counting-2024-11-01";
 
 /**
  * One client identity on the Anthropic wire. `cli` mirrors Claude Code
- * 2.1.241; `cowork` mirrors oh-my-pi's
+ * 2.1.241; `cli-meka` mirrors meka's Claude subscription provider;
+ * `cowork` mirrors oh-my-pi's
  * Cowork desktop-agent profile (packages/ai/src/providers/
  * {claude-code-fingerprint,anthropic,cowork-fetch}.ts); `sdk-cli` mirrors
  * pi-black's Agent SDK CLI profile (src/claude-code-protocol.ts) without any
  * local Claude configuration reads.
  */
 export interface SpoofingProfile {
-  id: "cli" | "cowork" | "sdk-cli";
+  id: "cli" | "cli-meka" | "cowork" | "sdk-cli";
   version: string;
   userAgent: string;
   billingEntrypoint: string;
@@ -71,6 +72,10 @@ export interface SpoofingProfile {
   billingChain: boolean;
   /** Keep SDK-only fields (eager_input_streaming, thinking.display) on the wire. */
   preserveSdkFields: boolean;
+  /** Close custom tool schemas at the top level with additionalProperties:false. */
+  closeToolSchemas: boolean;
+  /** Omit tool_choice entirely rather than preserving non-default choices. */
+  dropToolChoice: boolean;
   /** Normalize cache breakpoints to the captured CLI placement and one-hour shape. */
   upgradeCaches: boolean;
   /** Active thinking replaces incoming context_management edits with the single keep-all clear-thinking edit. */
@@ -96,6 +101,8 @@ export const CLI_PROFILE: SpoofingProfile = {
   cchMode: "normalized",
   billingChain: true,
   preserveSdkFields: false,
+  closeToolSchemas: true,
+  dropToolChoice: false,
   upgradeCaches: true,
   replaceContextManagement: false,
   skipIdentityForHaiku: true,
@@ -121,6 +128,36 @@ export const CLI_PROFILE: SpoofingProfile = {
   ],
 };
 
+/**
+ * Meka's `claude-subscription` wire profile at revision
+ * 326be3d98bdaf022e95fbddffd6e1974e0aae1d3. It shares Claude Code's
+ * public identity constants, but its request builder has distinct model
+ * gates, cache placement, tool handling, metadata, and beta assembly.
+ */
+export const CLI_MEKA_PROFILE: SpoofingProfile = {
+  id: "cli-meka",
+  version: CLAUDE_CODE_VERSION,
+  userAgent: `claude-cli/${CLAUDE_CODE_VERSION} (external, cli)`,
+  billingEntrypoint: "cli",
+  systemInstruction: "You are Claude Code, Anthropic's official CLI for Claude.",
+  toolPrefix: "",
+  stainlessPackageVersion: "0.112.1",
+  deviceDomainInstall: "claude-oauth-device-id-v1:",
+  deviceDomainAccount: "claude-oauth-device-id-v2",
+  cchMode: "normalized",
+  billingChain: true,
+  preserveSdkFields: false,
+  closeToolSchemas: false,
+  dropToolChoice: true,
+  upgradeCaches: false,
+  replaceContextManagement: true,
+  skipIdentityForHaiku: false,
+  fallbackOnAllRequests: true,
+  // cli-meka's model-aware lists are assembled in buildBetas.
+  utilityBetas: [],
+  agentBetas: [],
+};
+
 export const COWORK_PROFILE: SpoofingProfile = {
   id: "cowork",
   version: "2.1.220",
@@ -134,6 +171,8 @@ export const COWORK_PROFILE: SpoofingProfile = {
   cchMode: "raw",
   billingChain: false,
   preserveSdkFields: true,
+  closeToolSchemas: true,
+  dropToolChoice: false,
   upgradeCaches: false,
   replaceContextManagement: true,
   skipIdentityForHaiku: true,
@@ -178,6 +217,8 @@ export const SDK_CLI_PROFILE: SpoofingProfile = {
   cchMode: "sdk-normalized",
   billingChain: false,
   preserveSdkFields: true,
+  closeToolSchemas: true,
+  dropToolChoice: false,
   upgradeCaches: false,
   replaceContextManagement: true,
   // pi-black injects billing and identity for every model, haiku included.
@@ -189,6 +230,7 @@ export const SDK_CLI_PROFILE: SpoofingProfile = {
 
 const SPOOFING_PROFILES: Record<string, SpoofingProfile> = {
   cli: CLI_PROFILE,
+  "cli-meka": CLI_MEKA_PROFILE,
   cowork: COWORK_PROFILE,
   "sdk-cli": SDK_CLI_PROFILE,
 };
@@ -199,7 +241,7 @@ export function resolveSpoofingProfile(value: unknown): SpoofingProfile {
   const profile = SPOOFING_PROFILES[value as string];
   if (!profile) {
     throw new Error(
-      `claude-oauth: unsupported spoofingProfile "${String(value)}" — expected "cli", "cowork", or "sdk-cli"`,
+      `claude-oauth: unsupported spoofingProfile "${String(value)}" — expected "cli", "cli-meka", "cowork", or "sdk-cli"`,
     );
   }
   return profile;
@@ -215,7 +257,7 @@ export const COUNT_TOKENS_BETAS = [
 
 /** Token-counting beta header for a profile: CLI's dedicated list, or the selected utility profile plus token counting. */
 export function countTokensBetas(profile: SpoofingProfile = CLI_PROFILE): string {
-  if (profile.id === "cli") return COUNT_TOKENS_BETAS;
+  if (profile.id === "cli" || profile.id === "cli-meka") return COUNT_TOKENS_BETAS;
   return [...profile.utilityBetas, TOKEN_COUNTING_BETA].join(",");
 }
 
@@ -232,6 +274,45 @@ function isActiveThinking(thinking: unknown): boolean {
   return type === "enabled" || type === "adaptive";
 }
 
+function mekaModelCapabilities(model: string): {
+  haiku: boolean;
+  modern: boolean;
+  temperature: boolean;
+  effort: boolean;
+  midConversationSystem: boolean;
+} {
+  const lower = model.toLowerCase();
+  const haiku = lower.includes("haiku");
+  const modern = lower.includes("claude") && !lower.includes("claude-3-");
+  const numbers = lower
+    .split("-")
+    .filter((part) => /^\d{1,2}$/.test(part))
+    .map(Number);
+  const version = numbers.length > 0 ? `${numbers[0]}.${numbers[1] ?? 0}` : undefined;
+  const opus = lower.includes("opus");
+  const sonnet = lower.includes("sonnet");
+
+  const temperature = lower.includes("claude-3-") ||
+    (opus && ["4.0", "4.1", "4.5", "4.6"].includes(version ?? "")) ||
+    (sonnet && ["4.0", "4.5", "4.6"].includes(version ?? "")) ||
+    (haiku && version === "4.5");
+  const effort = !lower.includes("claude-3-") && (
+    version === undefined ||
+    (opus && !["4.0", "4.1"].includes(version)) ||
+    (sonnet && !["4.0", "4.5"].includes(version)) ||
+    (haiku && version !== "4.5") ||
+    (!opus && !sonnet && !haiku)
+  );
+  const midConversationSystem = !lower.includes("claude-3-") && (
+    version === undefined ||
+    (opus && !["4.0", "4.1", "4.5", "4.6", "4.7"].includes(version)) ||
+    (sonnet && !["4.0", "4.5", "4.6"].includes(version)) ||
+    (haiku && version !== "4.5") ||
+    (!opus && !sonnet && !haiku)
+  );
+  return { haiku, modern, temperature, effort, midConversationSystem };
+}
+
 /**
  * Build the final anthropic-beta header: the profile's betas first, then
  * deduplicated SDK/caller extras (compact, PDF, MCP, skills/files, fast mode,
@@ -246,7 +327,28 @@ export function buildBetas(
   hasLongCache: boolean,
   incoming?: string | null,
   profile: SpoofingProfile = CLI_PROFILE,
+  model = "",
 ): string {
+  if (profile.id === "cli-meka") {
+    const capabilities = mekaModelCapabilities(model);
+    const betas: string[] = [];
+    if (!capabilities.haiku) betas.push(CLAUDE_CODE_20250219_BETA);
+    betas.push(OAUTH_BETA);
+    if (capabilities.modern) {
+      betas.push(
+        INTERLEAVED_THINKING_BETA,
+        REDACT_THINKING_BETA,
+        THINKING_TOKEN_COUNT_BETA,
+        CONTEXT_MANAGEMENT_BETA,
+      );
+    }
+    betas.push(PROMPT_CACHING_SCOPE_BETA);
+    if (capabilities.midConversationSystem) betas.push(MID_CONVERSATION_SYSTEM_BETA);
+    if (hasTools) betas.push(ADVANCED_TOOL_USE_BETA);
+    if (capabilities.effort) betas.push(EFFORT_BETA);
+    betas.push(FALLBACK_CREDIT_BETA, EXTENDED_CACHE_TTL_BETA);
+    return betas.join(",");
+  }
   const agent = hasTools || isActiveThinking(thinking);
   const betas = [...(agent ? profile.agentBetas : profile.utilityBetas)];
   const seen = new Set(betas);
@@ -303,17 +405,31 @@ export const STAINLESS_HEADERS: Record<string, string> = {
   "X-Stainless-Timeout": "600",
 };
 
-/** Stainless header set for a profile; only the package version differs between profiles. */
+/** Stainless header set for a profile; meka also reports the host OS and native Node arch name. */
 export function stainlessHeaders(profile: SpoofingProfile): Record<string, string> {
-  return { ...STAINLESS_HEADERS, "X-Stainless-Package-Version": profile.stainlessPackageVersion };
+  if (profile.id !== "cli-meka") {
+    return { ...STAINLESS_HEADERS, "X-Stainless-Package-Version": profile.stainlessPackageVersion };
+  }
+  const os = ({
+    darwin: "MacOS",
+    win32: "Windows",
+    linux: "Linux",
+    freebsd: "FreeBSD",
+  } as Record<string, string>)[process.platform] ?? process.platform;
+  return {
+    ...STAINLESS_HEADERS,
+    "X-Stainless-Arch": process.arch,
+    "X-Stainless-OS": os,
+    "X-Stainless-Package-Version": profile.stainlessPackageVersion,
+  };
 }
 
 // ---------------------------------------------------------------------------
 // Custom tool name cloaking
 // ---------------------------------------------------------------------------
 
-// Every profile cloaks custom tool names under a single leading underscore;
-// Anthropic built-in tool names are exempt and responses strip exactly one.
+// CLI, Cowork, and SDK CLI cloak custom tool names under a single leading
+// underscore; Meka sends names unchanged. Anthropic built-ins are exempt.
 const TOOL_PREFIX = "_";
 
 // Anthropic built-in tool names are never prefixed or stripped. Server tools
@@ -352,7 +468,12 @@ export function prefixRequestToolNames(params: Record<string, any>, profile: Spo
     for (const tool of params.tools) {
       if (!tool || typeof tool !== "object") continue;
       if (!profile.preserveSdkFields) delete tool.eager_input_streaming;
-      if (tool.input_schema && typeof tool.input_schema === "object" && !Array.isArray(tool.input_schema)) {
+      if (
+        profile.closeToolSchemas &&
+        tool.input_schema &&
+        typeof tool.input_schema === "object" &&
+        !Array.isArray(tool.input_schema)
+      ) {
         tool.input_schema.additionalProperties = false;
       }
       // Provider/server tools are identified by a versioned `type`
@@ -603,12 +724,14 @@ function createBillingHeader(
   firstUserMessageText: string,
   previousRequestId: string | undefined,
   promptId: string | undefined,
+  isSubagent: boolean,
   profile: SpoofingProfile,
 ): string {
   // Fingerprint: SHA256(salt + msg[4] + msg[7] + msg[20] + version)[:3],
   // chars taken from the first non-meta user text block (not the system prompt).
+  const fingerprintText = profile.id === "cli-meka" ? Array.from(firstUserMessageText) : firstUserMessageText;
   const k = [4, 7, 20]
-    .map((i) => firstUserMessageText[i] ?? "0")
+    .map((i) => fingerprintText[i] ?? "0")
     .join("");
   const versionSuffix = createHash("sha256")
     .update(`${BILLING_SALT}${k}${profile.version}`)
@@ -617,8 +740,9 @@ function createBillingHeader(
   // The CCH placeholder is replaced after the complete request object is assembled.
   return (
     `${BILLING_HEADER_PREFIX} cc_version=${profile.version}.${versionSuffix}; cc_entrypoint=${profile.billingEntrypoint}; ${CCH_PLACEHOLDER_STR};` +
-    // Only the CLI profile chains request state through the billing block;
-    // Cowork and SDK CLI carry neither cc_prev_req nor cc_prompt_id.
+    (profile.id === "cli-meka" && isSubagent ? " cc_is_subagent=true;" : "") +
+    // CLI and Meka chain request state through the billing block; Cowork and
+    // SDK CLI carry neither cc_prev_req nor cc_prompt_id.
     (profile.billingChain && previousRequestId && REQUEST_ID_PATTERN.test(previousRequestId)
       ? ` cc_prev_req=${previousRequestId};`
       : "") +
@@ -668,21 +792,21 @@ function readMetadataAccountId(metadata: unknown): string | undefined {
   return undefined;
 }
 
-function extractFirstUserText(messages: unknown): string {
+function extractFirstUserText(messages: unknown, skipSystemReminders: boolean): string {
   if (!Array.isArray(messages)) return "";
   for (const message of messages) {
     if (!message || typeof message !== "object") continue;
     const m = message as { role?: string; content?: unknown };
     if (m.role !== "user") continue;
     if (typeof m.content === "string") {
-      if (!m.content.startsWith("<system-reminder>")) return m.content;
+      if (!skipSystemReminders || !m.content.startsWith("<system-reminder>")) return m.content;
       continue;
     }
     if (Array.isArray(m.content)) {
       for (const block of m.content) {
         if (!block || typeof block !== "object" || (block as ContentBlock).type !== "text") continue;
         const text = (block as ContentBlock).text ?? "";
-        if (!text.startsWith("<system-reminder>")) return text;
+        if (!skipSystemReminders || !text.startsWith("<system-reminder>")) return text;
       }
     }
   }
@@ -704,6 +828,20 @@ const CANONICAL_BODY_KEYS = [
   "stream",
 ];
 
+const MEKA_BODY_KEYS = [
+  "model",
+  "messages",
+  "system",
+  "tools",
+  "metadata",
+  "max_tokens",
+  "thinking",
+  "temperature",
+  "context_management",
+  "output_config",
+  "stream",
+];
+
 /**
  * Rewrite a /v1/messages body into the active profile's shape:
  * - system[0] billing header, system[1] profile identity, then the CLI system message
@@ -713,6 +851,7 @@ const CANONICAL_BODY_KEYS = [
  *   block, final caller system block, and final message block; thinking.display and
  *   eager_input_streaming stripped;
  *   context_management merged with the clear-thinking edit guaranteed first
+ * - Meka: its strict key set, cache placement, model gates, and tool shape
  * - Cowork/SDK CLI: SDK fields preserved, caches untouched, and active
  *   thinking emits a single keep-all clear-thinking edit; their CCH modes
  *   follow OMP and pi-black respectively
@@ -728,15 +867,19 @@ export function rewriteBody(
     attributionHeader?: boolean;
     previousRequestId?: string;
     promptId?: string;
+    isSubagent?: boolean;
+    deviceId?: string;
     profile?: SpoofingProfile;
   },
-): { json: string; thinking: unknown; hasTools: boolean; hasLongCache: boolean; sessionId?: string } {
+): { json: string; thinking: unknown; hasTools: boolean; hasLongCache: boolean; model: string; sessionId?: string } {
   const profile = ctx.profile ?? CLI_PROFILE;
   const params = JSON.parse(body) as Record<string, any>;
   // Cloak custom tool names before anything else, so cch hashes the
   // already-prefixed final body.
   prefixRequestToolNames(params, profile);
-  if (
+  if (profile.dropToolChoice) {
+    delete params.tool_choice;
+  } else if (
     params.tool_choice?.type === "auto" &&
     typeof params.tool_choice === "object" &&
     Object.keys(params.tool_choice).length === 1
@@ -777,7 +920,13 @@ export function rewriteBody(
   if (injectFingerprint && ctx.attributionHeader !== false && !hasBillingBlock) {
     fingerprintBlocks.push({
       type: "text",
-      text: createBillingHeader(extractFirstUserText(params.messages), ctx.previousRequestId, ctx.promptId, profile),
+      text: createBillingHeader(
+        extractFirstUserText(params.messages, profile.id !== "cli-meka"),
+        ctx.previousRequestId,
+        ctx.promptId,
+        ctx.isSubagent === true,
+        profile,
+      ),
     });
   }
   if (injectFingerprint && !hasIdentityBlock) {
@@ -789,6 +938,28 @@ export function rewriteBody(
   const system = [...fingerprintBlocks, ...systemBlocks];
 
   let hasLongCache = false;
+  if (profile.id === "cli-meka") {
+    for (const block of systemBlocks) delete block.cache_control;
+    for (const tool of params.tools ?? []) delete tool.cache_control;
+    for (const message of params.messages ?? []) {
+      if (!Array.isArray(message?.content)) continue;
+      for (const block of message.content) {
+        if (block && typeof block === "object") delete block.cache_control;
+      }
+    }
+    const finalCallerSystemBlock = systemBlocks.at(-1);
+    if (finalCallerSystemBlock) {
+      finalCallerSystemBlock.cache_control = { type: "ephemeral", ttl: "1h", scope: "global" };
+      hasLongCache = true;
+    }
+    const lastMessage = params.messages?.at?.(-1);
+    const lastBlock = Array.isArray(lastMessage?.content) ? lastMessage.content.at(-1) : undefined;
+    if (lastBlock && typeof lastBlock === "object") {
+      lastBlock.cache_control = { type: "ephemeral", ttl: "1h" };
+      hasLongCache = true;
+    }
+    delete params.cache_control;
+  }
   // Only the CLI profile rewrites cache breakpoints. Captured Claude Code
   // requests mark its interactive-agent system block globally, the final
   // caller system block normally, no tools, and the final message block.
@@ -835,27 +1006,35 @@ export function rewriteBody(
   const preservedSession = typeof incomingUserId === "string" ? extractUserIdSessionId(incomingUserId) : undefined;
   let userId: string;
   let sessionId: string;
-  if (preservedSession !== undefined) {
+  if (profile.id === "cli-meka") {
+    sessionId = ctx.sessionId ?? randomUUID().toLowerCase();
+    userId = JSON.stringify({
+      device_id: ctx.deviceId ?? deriveDeviceId(undefined, profile.deviceDomainInstall, profile.deviceDomainAccount),
+      account_uuid: ctx.accountId ?? "",
+      session_id: sessionId,
+    });
+  } else if (preservedSession !== undefined) {
     userId = incomingUserId;
     sessionId = preservedSession;
   } else {
     const accountId = readMetadataAccountId(params.metadata) ?? ctx.accountId;
     const envelope: Record<string, string> = {
-      device_id: deriveDeviceId(accountId, profile.deviceDomainInstall, profile.deviceDomainAccount),
+      device_id: ctx.deviceId ?? deriveDeviceId(accountId, profile.deviceDomainInstall, profile.deviceDomainAccount),
     };
     if (accountId) envelope.account_uuid = accountId;
     envelope.session_id = ctx.sessionId ?? randomUUID().toLowerCase();
     userId = JSON.stringify(envelope);
     sessionId = envelope.session_id;
   }
-  const metadata = { ...params.metadata, user_id: userId };
+  const metadata = profile.id === "cli-meka" ? { user_id: userId } : { ...params.metadata, user_id: userId };
 
-  const thinking =
+  let thinking =
     params.thinking && typeof params.thinking === "object"
       ? profile.preserveSdkFields
         ? { ...params.thinking }
         : Object.fromEntries(Object.entries(params.thinking).filter(([key]) => key !== "display"))
       : params.thinking;
+  if (profile.id === "cli-meka" && !isActiveThinking(thinking)) thinking = undefined;
   // CLI merges, keeping any incoming context_management intact
   // (compact_20260112, clear_tool_uses_20250919, unknown future edits) while
   // guaranteeing the clear-thinking edit first. Cowork and SDK CLI emit a
@@ -863,7 +1042,11 @@ export function rewriteBody(
   // copied, never mutated.
   const incomingContextManagement = params.context_management;
   let contextManagement: Record<string, any> | undefined;
-  if (isActiveThinking(thinking)) {
+  if (profile.id === "cli-meka") {
+    if (isActiveThinking(thinking) && mekaModelCapabilities(modelId).modern) {
+      contextManagement = { edits: [{ type: "clear_thinking_20251015", keep: "all" }] };
+    }
+  } else if (isActiveThinking(thinking)) {
     contextManagement = profile.replaceContextManagement
       ? { edits: [{ type: "clear_thinking_20251015", keep: "all" }] }
       : {
@@ -879,28 +1062,59 @@ export function rewriteBody(
     contextManagement = incomingContextManagement;
   }
 
+  const mekaCapabilities = mekaModelCapabilities(modelId);
+  const mekaBudget = thinking?.type === "enabled" && typeof thinking.budget_tokens === "number"
+    ? thinking.budget_tokens
+    : 0;
+  const mekaDefaultMax = thinking?.type === "adaptive"
+    ? 64_000
+    : thinking?.type === "enabled"
+      ? Math.max(mekaBudget * 2, 32_000)
+      : 32_000;
+  const incomingMax = typeof params.max_tokens === "number" ? params.max_tokens : mekaDefaultMax;
+  const mekaMaxTokens = thinking?.type === "enabled"
+    ? Math.max(Math.min(incomingMax, mekaDefaultMax), mekaBudget + 1)
+    : Math.min(incomingMax, mekaDefaultMax);
   const overrides: Record<string, any> = {
     model: params.model,
     messages: params.messages,
     ...(system.length > 0 && { system }),
     // OAuth requests always carry a tools array, even an empty one (CC does).
-    tools: Array.isArray(params.tools) ? params.tools : [],
+    tools: profile.id === "cli-meka"
+      ? (hasTools ? params.tools : undefined)
+      : (Array.isArray(params.tools) ? params.tools : []),
     metadata,
-    max_tokens: Math.min(MAX_OUTPUT_TOKENS, params.max_tokens ?? MAX_OUTPUT_TOKENS),
+    max_tokens: profile.id === "cli-meka"
+      ? mekaMaxTokens
+      : Math.min(MAX_OUTPUT_TOKENS, params.max_tokens ?? MAX_OUTPUT_TOKENS),
     ...(thinking && { thinking }),
+    ...(profile.id === "cli-meka" && !thinking && mekaCapabilities.temperature && { temperature: 1 }),
     ...(contextManagement && { context_management: contextManagement }),
+    ...(profile.id === "cli-meka" && mekaCapabilities.effort && {
+      output_config: {
+        effort: typeof params.output_config?.effort === "string" ? params.output_config.effort : "high",
+      },
+    }),
   };
   const merged = { ...params, ...overrides };
+  if (profile.id === "cli-meka") {
+    if (!thinking) delete merged.thinking;
+    if (thinking || !mekaCapabilities.temperature) delete merged.temperature;
+    if (!contextManagement) delete merged.context_management;
+    if (!mekaCapabilities.effort) delete merged.output_config;
+  }
 
   // Rebuild known keys in canonical order, then append every remaining key in
   // its original relative order. Incoming `stream` is preserved as-is (the
   // normal SDK path sends true); undefined values drop out on stringify.
   const rewritten: Record<string, any> = {};
-  for (const key of CANONICAL_BODY_KEYS) {
+  for (const key of profile.id === "cli-meka" ? MEKA_BODY_KEYS : CANONICAL_BODY_KEYS) {
     if (merged[key] !== undefined) rewritten[key] = merged[key];
   }
-  for (const [key, value] of Object.entries(params)) {
-    if (!(key in rewritten) && value !== undefined) rewritten[key] = value;
+  if (profile.id !== "cli-meka") {
+    for (const [key, value] of Object.entries(params)) {
+      if (!(key in rewritten) && value !== undefined) rewritten[key] = value;
+    }
   }
 
   const billingBlock = system.find(
@@ -939,5 +1153,5 @@ export function rewriteBody(
     }
   }
 
-  return { json: JSON.stringify(rewritten), thinking, hasTools, hasLongCache, sessionId };
+  return { json: JSON.stringify(rewritten), thinking, hasTools, hasLongCache, model: modelId, sessionId };
 }

@@ -196,6 +196,35 @@ describe("buildEnforcedHeaders", () => {
     expect(Object.values(headers)).not.toContain("private");
   });
 
+  test("rebuilds Meka headers from the same fixed CLI allowlist", () => {
+    const headers = buildEnforcedHeaders(new Headers({ cookie: "private", "x-extra": "private" }), {
+      profile: "cli-meka",
+      userAgent: "claude-cli/2.1.241 (external, cli)",
+      sessionId: "session-1",
+      betas: "beta-one",
+      authorization: "Bearer token",
+      clientRequestId: "request-1",
+      stainless: { "X-Stainless-Arch": "x64", "X-Stainless-Lang": "js" },
+    });
+    expect(Object.keys(headers)).toEqual([
+      "Accept",
+      "Authorization",
+      "Content-Type",
+      "User-Agent",
+      "X-Claude-Code-Session-Id",
+      "X-Stainless-Arch",
+      "X-Stainless-Lang",
+      "anthropic-beta",
+      "anthropic-dangerous-direct-browser-access",
+      "anthropic-version",
+      "x-app",
+      "x-client-request-id",
+      "Connection",
+      "Accept-Encoding",
+    ]);
+    expect(Object.values(headers)).not.toContain("private");
+  });
+
   test("continues forwarding unknown SDK CLI headers", () => {
     const headers = buildEnforcedHeaders(new Headers({ "x-extra": "kept" }), {
       profile: "sdk-cli",

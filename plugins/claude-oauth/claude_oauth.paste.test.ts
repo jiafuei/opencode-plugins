@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { setSystemTime } from "bun:test";
+import { createHash } from "node:crypto";
 import { ClaudeOAuthPlugin } from "./claude_oauth.ts";
 
 // ---------------------------------------------------------------------------
@@ -73,6 +74,21 @@ describe("paste code flow", () => {
       const url = new URL(h.result.url);
       expect(url.origin + url.pathname).toBe("https://claude.com/cai/oauth/authorize");
       expect(url.searchParams.get("redirect_uri")).toBe("https://platform.claude.com/oauth/code/callback");
+    } finally {
+      h.restore();
+    }
+  });
+
+  test("generates Claude Code's 32-byte base64url PKCE verifier", async () => {
+    const h = await makePasteHarness();
+    try {
+      const { state } = authorizeParams(h.result.url);
+      expect((await h.result.callback(`good-code#${state}`)).type).toBe("success");
+      const verifier = h.tokenCalls[0]!.body.code_verifier as string;
+      expect(verifier).toMatch(/^[A-Za-z0-9_-]{43}$/);
+      expect(new URL(h.result.url).searchParams.get("code_challenge")).toBe(
+        createHash("sha256").update(verifier).digest("base64url"),
+      );
     } finally {
       h.restore();
     }

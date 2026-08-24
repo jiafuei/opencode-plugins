@@ -73,7 +73,7 @@ export function buildOrderedHeaders(
 
 // Headers the plugin enforces itself. Caller-supplied entries for these are
 // always dropped when building the ordered record. Non-CLI profiles preserve
-// other caller headers in arrival order; CLI rebuilds from this fixed set.
+// other caller headers in arrival order; CLI and Meka rebuild from this fixed set.
 const MANAGED_HEADER_KEYS = new Set(
   [
     "accept",
@@ -124,7 +124,7 @@ export function buildEnforcedHeaders(
   for (const key of Object.keys(fields.stainless)) managed.add(key.toLowerCase());
   const headers: Record<string, string> = {};
   const extras: Record<string, string> = {};
-  if (fields.profile !== "cli") {
+  if (fields.profile !== "cli" && fields.profile !== "cli-meka") {
     caller.forEach((value, key) => {
       if (managed.has(key.toLowerCase())) return;
       extras[key] = value;

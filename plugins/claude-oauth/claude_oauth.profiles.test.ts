@@ -5,6 +5,7 @@ import { createAnthropic } from "@ai-sdk/anthropic";
 import {
   applyClaudeToolPrefix,
   buildBetas,
+  CLI_MEKA_PROFILE,
   CLI_PROFILE,
   COUNT_TOKENS_BETAS,
   countTokensBetas,
@@ -57,6 +58,7 @@ describe("resolveSpoofingProfile", () => {
   test("defaults to CLI and accepts all ids", () => {
     expect(resolveSpoofingProfile(undefined)).toBe(CLI_PROFILE);
     expect(resolveSpoofingProfile("cli")).toBe(CLI_PROFILE);
+    expect(resolveSpoofingProfile("cli-meka")).toBe(CLI_MEKA_PROFILE);
     expect(resolveSpoofingProfile("cowork")).toBe(COWORK_PROFILE);
     expect(resolveSpoofingProfile("sdk-cli")).toBe(SDK_CLI_PROFILE);
   });
@@ -104,6 +106,17 @@ describe("Cowork profile constants", () => {
     expect(CLI_PROFILE.stainlessPackageVersion).toBe("0.112.1");
     expect(CLI_PROFILE.cchMode).toBe("normalized");
     expect(CLI_PROFILE.billingChain).toBe(true);
+  });
+
+  test("mirrors meka's pinned Claude subscription identity", () => {
+    expect(CLI_MEKA_PROFILE.version).toBe("2.1.241");
+    expect(CLI_MEKA_PROFILE.userAgent).toBe("claude-cli/2.1.241 (external, cli)");
+    expect(CLI_MEKA_PROFILE.billingEntrypoint).toBe("cli");
+    expect(CLI_MEKA_PROFILE.systemInstruction).toBe("You are Claude Code, Anthropic's official CLI for Claude.");
+    expect(CLI_MEKA_PROFILE.toolPrefix).toBe("");
+    expect(CLI_MEKA_PROFILE.stainlessPackageVersion).toBe("0.112.1");
+    expect(CLI_MEKA_PROFILE.cchMode).toBe("normalized");
+    expect(CLI_MEKA_PROFILE.billingChain).toBe(true);
   });
 
   test("mirrors pi-black's SDK CLI identity without Claude config discovery", () => {
@@ -155,6 +168,10 @@ describe("countTokensBetas", () => {
     expect(countTokensBetas()).toBe(COUNT_TOKENS_BETAS);
   });
 
+  test("Meka uses Claude CLI's compatible token-count list", () => {
+    expect(countTokensBetas(CLI_MEKA_PROFILE)).toBe(COUNT_TOKENS_BETAS);
+  });
+
   test("Cowork uses its utility profile plus token counting", () => {
     expect(countTokensBetas(COWORK_PROFILE)).toBe(
       [...COWORK_PROFILE.utilityBetas, "token-counting-2024-11-01"].join(","),
@@ -169,6 +186,162 @@ describe("countTokensBetas", () => {
       "claude-code-20250219",
       "oauth-2025-04-20",
     ]);
+  });
+});
+
+describe("Meka beta profile", () => {
+  test("matches the captured Opus 5 agent list and ignores caller extras", () => {
+    expect(buildBetas(
+      { type: "adaptive" },
+      true,
+      true,
+      "fast-mode-2026-02-01,structured-outputs-2025-12-15",
+      CLI_MEKA_PROFILE,
+      "claude-opus-5",
+    )).toEqual([
+      "claude-code-20250219",
+      "oauth-2025-04-20",
+      "interleaved-thinking-2025-05-14",
+      "redact-thinking-2026-02-12",
+      "thinking-token-count-2026-05-13",
+      "context-management-2025-06-27",
+      "prompt-caching-scope-2026-01-05",
+      "mid-conversation-system-2026-04-07",
+      "advanced-tool-use-2025-11-20",
+      "effort-2025-11-24",
+      "fallback-credit-2026-06-01",
+      "extended-cache-ttl-2025-04-11",
+    ].join(","));
+  });
+
+  test("applies Meka's Haiku and older-model gates", () => {
+    expect(buildBetas(undefined, false, false, null, CLI_MEKA_PROFILE, "claude-haiku-4-5").split(",")).toEqual([
+      "oauth-2025-04-20",
+      "interleaved-thinking-2025-05-14",
+      "redact-thinking-2026-02-12",
+      "thinking-token-count-2026-05-13",
+      "context-management-2025-06-27",
+      "prompt-caching-scope-2026-01-05",
+      "fallback-credit-2026-06-01",
+      "extended-cache-ttl-2025-04-11",
+    ]);
+    expect(buildBetas(undefined, false, false, null, CLI_MEKA_PROFILE, "claude-3-5-haiku").split(",")).toEqual([
+      "oauth-2025-04-20",
+      "prompt-caching-scope-2026-01-05",
+      "fallback-credit-2026-06-01",
+      "extended-cache-ttl-2025-04-11",
+    ]);
+  });
+});
+
+describe("rewriteBody with the Meka profile", () => {
+  test("rebuilds Meka's body shape, attribution, tools, and cache points", () => {
+    const promptId = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+    const firstUserText = "<system-reminder>meka fingerprints this block</system-reminder>";
+    const input = {
+      model: "claude-sonnet-4-6",
+      messages: [{
+        role: "user",
+        content: [
+          { type: "text", text: firstUserText, cache_control: { type: "ephemeral" } },
+          { type: "text", text: "actual prompt", cache_control: { type: "ephemeral" } },
+        ],
+      }],
+      system: [
+        { type: "text", text: "Prelude", cache_control: { type: "ephemeral" } },
+        { type: "text", text: "Meka system", cache_control: { type: "ephemeral" } },
+      ],
+      tools: [{
+        name: "lookup",
+        description: "Lookup",
+        input_schema: { type: "object" },
+        eager_input_streaming: true,
+        cache_control: { type: "ephemeral" },
+      }],
+      tool_choice: { type: "tool", name: "lookup" },
+      metadata: { user_id: JSON.stringify({ device_id: "old", session_id: "old-session" }), extra: true },
+      max_tokens: 128000,
+      thinking: { type: "adaptive", display: "summarized" },
+      temperature: 0.2,
+      context_management: { edits: [{ type: "compact_20260112" }] },
+      fallbacks: ["fallback"],
+      fallback_credit_token: "credit",
+      stream: true,
+      extra: "drop-me",
+    };
+    const result = rewriteBody(JSON.stringify(input), {
+      accountId: "acct-meka",
+      sessionId: "session-meka",
+      deviceId: "device-meka",
+      previousRequestId: "req_previous",
+      promptId,
+      isSubagent: true,
+      profile: CLI_MEKA_PROFILE,
+    });
+    const out = parse(result.json);
+
+    expect(Object.keys(out)).toEqual([
+      "model",
+      "messages",
+      "system",
+      "tools",
+      "metadata",
+      "max_tokens",
+      "thinking",
+      "context_management",
+      "output_config",
+      "stream",
+    ]);
+    expect(out.system.map((block: any) => block.text)).toEqual([
+      expect.stringContaining(`cc_version=2.1.241.${expectedVersionSuffix(firstUserText, CLI_MEKA_PROFILE.version)}`),
+      CLI_MEKA_PROFILE.systemInstruction,
+      "Prelude",
+      "Meka system",
+    ]);
+    expect(out.system[0].text).toContain("cch=");
+    expect(out.system[0].text).toContain("cc_is_subagent=true;");
+    expect(out.system[0].text).toContain("cc_prev_req=req_previous;");
+    expect(out.system[0].text).toContain(`cc_prompt_id=${promptId};`);
+    expect(out.system[0].text).toMatch(/cch=[0-9a-f]{5}; cc_is_subagent=true; cc_prev_req=req_previous; cc_prompt_id=/);
+    expect(out.system[2].cache_control).toBeUndefined();
+    expect(out.system[3].cache_control).toEqual({ type: "ephemeral", ttl: "1h", scope: "global" });
+    expect(out.messages[0].content[0].cache_control).toBeUndefined();
+    expect(out.messages[0].content[1].cache_control).toEqual({ type: "ephemeral", ttl: "1h" });
+    expect(out.tools[0]).toEqual({
+      name: "lookup",
+      description: "Lookup",
+      input_schema: { type: "object" },
+    });
+    expect(out.tool_choice).toBeUndefined();
+    expect(out.metadata).toEqual({
+      user_id: JSON.stringify({ device_id: "device-meka", account_uuid: "acct-meka", session_id: "session-meka" }),
+    });
+    expect(out.max_tokens).toBe(64000);
+    expect(out.thinking).toEqual({ type: "adaptive" });
+    expect(out.temperature).toBeUndefined();
+    expect(out.context_management).toEqual({ edits: [{ type: "clear_thinking_20251015", keep: "all" }] });
+    expect(out.output_config).toEqual({ effort: "high" });
+    expect(result.hasLongCache).toBe(true);
+  });
+
+  test("uses Meka's no-thinking defaults and model capability gates", () => {
+    const oldModel = parse(rewriteBody(JSON.stringify({
+      ...parse(baseBody),
+      model: "claude-sonnet-4-5",
+      thinking: { type: "disabled", display: "summarized" },
+    }), { profile: CLI_MEKA_PROFILE }).json);
+    expect(oldModel.max_tokens).toBe(32000);
+    expect(oldModel.thinking).toBeUndefined();
+    expect(oldModel.temperature).toBe(1);
+    expect(oldModel.output_config).toBeUndefined();
+
+    const newModel = parse(rewriteBody(JSON.stringify({
+      ...parse(baseBody),
+      model: "claude-opus-5",
+    }), { profile: CLI_MEKA_PROFILE }).json);
+    expect(newModel.max_tokens).toBe(32000);
+    expect(newModel.temperature).toBeUndefined();
+    expect(newModel.output_config).toEqual({ effort: "high" });
   });
 });
 
@@ -440,7 +613,7 @@ function sseResponse(): Response {
   return new Response(payload, { status: 200, headers: { "content-type": "text/event-stream" } });
 }
 
-async function setupProfileHarness(spoofingProfile: "cli" | "cowork" | "sdk-cli" = "cowork") {
+async function setupProfileHarness(spoofingProfile: "cli" | "cli-meka" | "cowork" | "sdk-cli" = "cowork") {
   const plugin = await ClaudeOAuthPlugin({ client: { auth: { set: async () => {} } } } as never, {
     spoofingProfile,
   });
@@ -619,7 +792,7 @@ describe("request capture: cowork profile through the pinned SDK", () => {
 
 describe("request capture: shared ordered transport", () => {
   test("routes CLI and SDK CLI through the custom transport with their exact identities", async () => {
-    for (const selected of [CLI_PROFILE, SDK_CLI_PROFILE] as const) {
+    for (const selected of [CLI_PROFILE, CLI_MEKA_PROFILE, SDK_CLI_PROFILE] as const) {
       const { plugin, rawLoaderOptions, captured, restore } = await setupProfileHarness(selected.id);
       try {
         await rawLoaderOptions.fetch!("https://api.anthropic.com/v1/messages", {
@@ -658,7 +831,7 @@ describe("request capture: shared ordered transport", () => {
           "anthropic-version",
           "x-app",
           "x-client-request-id",
-          ...(selected.id === "cli" ? [] : ["x-unknown-outbound"]),
+          ...(selected.id === "cli" || selected.id === "cli-meka" ? [] : ["x-unknown-outbound"]),
           "Connection",
           "Accept-Encoding",
         ]);
@@ -672,6 +845,40 @@ describe("request capture: shared ordered transport", () => {
         restore();
         await plugin.dispose!();
       }
+    }
+  });
+
+  test("Meka reuses one process session, rotates request ids, and marks subagents", async () => {
+    const { plugin, rawLoaderOptions, captured, restore } = await setupProfileHarness("cli-meka");
+    try {
+      for (const parent of [undefined, "ses_parent"]) {
+        await rawLoaderOptions.fetch!("https://api.anthropic.com/v1/messages", {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            ...(parent ? { "x-parent-session-id": parent } : {}),
+          },
+          body: JSON.stringify({
+            model: "claude-opus-5",
+            messages: [{ role: "user", content: [{ type: "text", text: "hello" }] }],
+            system: [{ type: "text", text: "system" }],
+            max_tokens: 1,
+            stream: false,
+          }),
+        });
+      }
+
+      expect(captured).toHaveLength(2);
+      expect(captured[0]!.headers["X-Claude-Code-Session-Id"]).toBe(captured[1]!.headers["X-Claude-Code-Session-Id"]);
+      expect(captured[0]!.headers["x-client-request-id"]).not.toBe(captured[1]!.headers["x-client-request-id"]);
+      expect(captured[0]!.headers["x-client-request-id"]).toMatch(/^[0-9a-f-]{36}$/);
+      expect(captured[0]!.bodyText).not.toContain("cc_is_subagent=true");
+      expect(captured[1]!.bodyText).toContain("cc_is_subagent=true");
+      const sessions = captured.map((request) => JSON.parse(JSON.parse(request.bodyText).metadata.user_id).session_id);
+      expect(sessions[0]).toBe(sessions[1]);
+    } finally {
+      restore();
+      await plugin.dispose!();
     }
   });
 });

@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { readClaudeCodeDeviceId, readMekaDeviceId } from "./local_storage.ts";
 
 // ---------------------------------------------------------------------------
 // Local identity + sidecar durability: exclusive install-ID creation with
@@ -11,6 +12,33 @@ import path from "node:path";
 // ---------------------------------------------------------------------------
 
 const MODULE_PATH = new URL("./claude_oauth.ts", import.meta.url).pathname;
+
+test("reads Claude Code's valid persisted device identity", () => {
+  const { dir, restore } = isolatedDataDir("claude-oauth-native-device-");
+  try {
+    const file = path.join(dir, ".claude.json");
+    const userId = "a".repeat(64);
+    writeFileSync(file, JSON.stringify({ userID: userId }));
+    expect(readClaudeCodeDeviceId(file)).toBe(userId);
+    writeFileSync(file, JSON.stringify({ userID: "not-a-claude-device-id" }));
+    expect(readClaudeCodeDeviceId(file)).toBeUndefined();
+  } finally {
+    restore();
+  }
+});
+
+test("Meka device identity accepts any nonempty trimmed persisted userID", () => {
+  const { dir, restore } = isolatedDataDir("claude-oauth-meka-device-");
+  try {
+    const file = path.join(dir, ".claude.json");
+    writeFileSync(file, JSON.stringify({ userID: "  legacy-device-id  " }));
+    expect(readMekaDeviceId(file)).toBe("legacy-device-id");
+    writeFileSync(file, JSON.stringify({ userID: "   " }));
+    expect(readMekaDeviceId(file)).toBeUndefined();
+  } finally {
+    restore();
+  }
+});
 
 function isolatedDataDir(prefix: string): { dir: string; restore: () => void } {
   const dir = mkdtempSync(path.join(tmpdir(), prefix));
