@@ -151,8 +151,10 @@ endpoint:
     persisted per OpenCode conversation. Meka replaces incoming metadata with
     its process-session envelope. Existing valid CC attribution is preserved
     verbatim in the other profiles.
-  - `max_tokens` clamped to ≤ 64000; Meka uses 32000 when thinking is off;
-    incoming `stream` is preserved as-is
+  - `max_tokens` clamped to ≤ 64000 in the other profiles. Meka honors
+    OpenCode's incoming limit; when absent, it defaults omitted thinking to
+    adaptive at 64000, budgeted thinking to `max(budget × 2, 32000)`, and
+    disabled thinking to 32000. Incoming `stream` is preserved as-is.
   - CLI omits `thinking.display` and SDK `eager_input_streaming`, normalizes
     one-hour cache breakpoints to the Claude Code system block, final caller
     system block, and final message block (never tools), and preserves incoming

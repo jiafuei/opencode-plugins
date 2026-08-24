@@ -316,7 +316,7 @@ describe("rewriteBody with the Meka profile", () => {
     expect(out.metadata).toEqual({
       user_id: JSON.stringify({ device_id: "device-meka", account_uuid: "acct-meka", session_id: "session-meka" }),
     });
-    expect(out.max_tokens).toBe(64000);
+    expect(out.max_tokens).toBe(128000);
     expect(out.thinking).toEqual({ type: "adaptive" });
     expect(out.temperature).toBeUndefined();
     expect(out.context_management).toEqual({ edits: [{ type: "clear_thinking_20251015", keep: "all" }] });
@@ -324,9 +324,11 @@ describe("rewriteBody with the Meka profile", () => {
     expect(result.hasLongCache).toBe(true);
   });
 
-  test("uses Meka's no-thinking defaults and model capability gates", () => {
+  test("defaults omitted thinking to adaptive while preserving explicit disabled mode", () => {
+    const oldBody = parse(baseBody);
+    delete oldBody.max_tokens;
     const oldModel = parse(rewriteBody(JSON.stringify({
-      ...parse(baseBody),
+      ...oldBody,
       model: "claude-sonnet-4-5",
       thinking: { type: "disabled", display: "summarized" },
     }), { profile: CLI_MEKA_PROFILE }).json);
@@ -337,11 +339,25 @@ describe("rewriteBody with the Meka profile", () => {
 
     const newModel = parse(rewriteBody(JSON.stringify({
       ...parse(baseBody),
-      model: "claude-opus-5",
+      model: "claude-sonnet-5",
+      max_tokens: 64000,
     }), { profile: CLI_MEKA_PROFILE }).json);
-    expect(newModel.max_tokens).toBe(32000);
+    expect(newModel.max_tokens).toBe(64000);
+    expect(newModel.thinking).toEqual({ type: "adaptive" });
     expect(newModel.temperature).toBeUndefined();
+    expect(newModel.context_management).toEqual({ edits: [{ type: "clear_thinking_20251015", keep: "all" }] });
     expect(newModel.output_config).toEqual({ effort: "high" });
+  });
+
+  test("honors OpenCode max_tokens instead of capping budgeted thinking at Meka's default", () => {
+    const out = parse(rewriteBody(JSON.stringify({
+      ...parse(baseBody),
+      model: "claude-sonnet-5",
+      max_tokens: 64000,
+      thinking: { type: "enabled", budget_tokens: 8000 },
+    }), { profile: CLI_MEKA_PROFILE }).json);
+    expect(out.max_tokens).toBe(64000);
+    expect(out.thinking).toEqual({ type: "enabled", budget_tokens: 8000 });
   });
 });
 

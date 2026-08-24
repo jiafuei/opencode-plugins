@@ -1034,7 +1034,10 @@ export function rewriteBody(
         ? { ...params.thinking }
         : Object.fromEntries(Object.entries(params.thinking).filter(([key]) => key !== "display"))
       : params.thinking;
-  if (profile.id === "cli-meka" && !isActiveThinking(thinking)) thinking = undefined;
+  if (profile.id === "cli-meka") {
+    if (params.thinking === undefined) thinking = { type: "adaptive" };
+    else if (!isActiveThinking(thinking)) thinking = undefined;
+  }
   // CLI merges, keeping any incoming context_management intact
   // (compact_20260112, clear_tool_uses_20250919, unknown future edits) while
   // guaranteeing the clear-thinking edit first. Cowork and SDK CLI emit a
@@ -1071,10 +1074,12 @@ export function rewriteBody(
     : thinking?.type === "enabled"
       ? Math.max(mekaBudget * 2, 32_000)
       : 32_000;
-  const incomingMax = typeof params.max_tokens === "number" ? params.max_tokens : mekaDefaultMax;
-  const mekaMaxTokens = thinking?.type === "enabled"
-    ? Math.max(Math.min(incomingMax, mekaDefaultMax), mekaBudget + 1)
-    : Math.min(incomingMax, mekaDefaultMax);
+  const incomingMax = typeof params.max_tokens === "number" ? params.max_tokens : undefined;
+  const mekaMaxTokens = incomingMax === undefined
+    ? mekaDefaultMax
+    : thinking?.type === "enabled"
+      ? Math.max(incomingMax, mekaBudget + 1)
+      : incomingMax;
   const overrides: Record<string, any> = {
     model: params.model,
     messages: params.messages,
