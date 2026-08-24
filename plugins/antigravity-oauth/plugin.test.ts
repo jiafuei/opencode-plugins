@@ -23,6 +23,7 @@ interface RecordedCall {
 
 function makeHarness(auth: AuthStore | undefined, options?: Record<string, unknown>) {
   const persistedBodies: Array<Record<string, unknown>> = [];
+  const logs: Array<Record<string, unknown>> = [];
   let current = auth;
   const input = {
     client: {
@@ -33,6 +34,9 @@ function makeHarness(auth: AuthStore | undefined, options?: Record<string, unkno
           persistedBodies.push({ ...body });
           current = { ...current, ...body } as AuthStore;
         },
+      },
+      app: {
+        log: async ({ body }: { body: Record<string, unknown> }) => void logs.push(body),
       },
     },
     directory: "/tmp",
@@ -46,6 +50,7 @@ function makeHarness(auth: AuthStore | undefined, options?: Record<string, unkno
   const pluginOnce = () => (cachedPlugin ??= AntigravityOAuthPlugin(input, options) as any);
   return {
     persistedBodies,
+    logs,
     getAuth: async () => current,
     setAuth(next: AuthStore | undefined) {
       current = next;
@@ -148,6 +153,103 @@ describe("config hook: provider registration", () => {
     expect(provider.models["gemini-3.1-pro"].variants.low).toBeDefined();
     expect(provider.models["custom-model"]).toBeDefined();
     expect(provider.models["claude-opus-4-6"]).toBeDefined();
+  });
+});
+
+describe("OAuth method integration", () => {
+  test("browser method binds the registered callback before returning", async () => {
+    const harness = await makeHarness(undefined);
+    const method = (await harness.plugin()).auth!.methods.find((candidate: any) => candidate.label.includes("browser"));
+    const authorization = await method.authorize();
+    const url = new URL(authorization.url);
+    const state = url.searchParams.get("state");
+    expect(url.searchParams.get("redirect_uri")).toBe("http://127.0.0.1:51121/oauth-callback");
+
+    const browserFetch = globalThis.fetch;
+    let call = 0;
+    const mock = mockFetch(() => {
+      call++;
+      if (call === 1) {
+        return new Response(JSON.stringify({ access_token: "at", refresh_token: "rt", expires_in: 3600 }), {
+          headers: { "content-type": "application/json" },
+        });
+      }
+      if (call === 2) return new Response(JSON.stringify({ email: "me@example.com" }));
+      return new Response(
+        JSON.stringify({
+          currentTier: { id: "free-tier" },
+          paidTier: { id: "free-tier" },
+          cloudaicompanionProject: "project-1",
+        }),
+      );
+    });
+    try {
+      // OpenCode invokes auto callbacks immediately and waits while the browser
+      // reaches the already-bound listener.
+      const completion = authorization.callback();
+      const response = await browserFetch(`http://127.0.0.1:51121/oauth-callback?code=code-1&state=${state}`);
+      expect(response.status).toBe(200);
+      expect(await response.text()).toContain("Sign-in complete");
+      await expect(completion).resolves.toMatchObject({
+        type: "success",
+        access: "at",
+        refresh: "rt",
+        accountId: "project-1",
+      });
+      expect(mock.calls).toHaveLength(4);
+    } finally {
+      mock.restore();
+    }
+
+    // callback() always tears the listener down.
+    await Bun.sleep(5);
+    await expect(browserFetch("http://127.0.0.1:51121/oauth-callback")).rejects.toThrow();
+  });
+
+  test("paste method exchanges a complete failed-redirect URL", async () => {
+    const harness = await makeHarness(undefined);
+    const method = (await harness.plugin()).auth!.methods.find((candidate: any) => candidate.label.includes("paste"));
+    const authorization = await method.authorize();
+    const state = new URL(authorization.url).searchParams.get("state");
+    expect(authorization.instructions).toContain("cannot connect");
+
+    let call = 0;
+    const mock = mockFetch(() => {
+      call++;
+      if (call === 1) {
+        return new Response(JSON.stringify({ access_token: "at", refresh_token: "rt", expires_in: 3600 }), {
+          headers: { "content-type": "application/json" },
+        });
+      }
+      if (call === 2) return new Response(JSON.stringify({ email: "me@example.com" }));
+      return new Response(
+        JSON.stringify({
+          currentTier: { id: "free-tier" },
+          paidTier: { id: "free-tier" },
+          cloudaicompanionProject: "project-1",
+        }),
+      );
+    });
+    try {
+      const result = await authorization.callback(
+        `http://127.0.0.1:51121/oauth-callback?code=code-1&state=${state}&scope=profile`,
+      );
+      expect(result).toMatchObject({ type: "success", access: "at", refresh: "rt", accountId: "project-1" });
+      expect(mock.calls).toHaveLength(4);
+      expect(harness.logs).toHaveLength(0);
+    } finally {
+      mock.restore();
+    }
+  });
+
+  test("paste method reports invalid or stale redirect URLs", async () => {
+    const harness = await makeHarness(undefined);
+    const method = (await harness.plugin()).auth!.methods.find((candidate: any) => candidate.label.includes("paste"));
+    const authorization = await method.authorize();
+    await expect(
+      authorization.callback("http://127.0.0.1:51121/oauth-callback?code=old&state=another-attempt"),
+    ).rejects.toThrow(/matching redirect URL from this login attempt/);
+    expect(harness.logs.at(-1)?.message).toContain("paste-code login failed");
   });
 });
 

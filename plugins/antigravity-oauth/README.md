@@ -22,8 +22,8 @@ opencode auth login
 
 1. Pick **Google Antigravity**.
 2. Choose a sign-in method:
-   - **Antigravity (browser)** — opens `accounts.google.com` in your browser and completes login against a local callback server on `127.0.0.1:51121/oauth-callback` (the native Antigravity port).
-   - **Antigravity (paste code)** — same authorization URL; paste back either the redirected URL or just its `code` query parameter. Use this when the callback port is occupied.
+   - **Antigravity (browser)** — opens `accounts.google.com` in your browser and completes login against a local callback server on `127.0.0.1:51121/oauth-callback` (the native Antigravity port). Keep the command running until the redirect completes.
+   - **Antigravity (paste code)** — use this when the browser cannot reach the callback server (remote OpenCode, container, or restricted loopback forwarding). This method intentionally does not start a server: after Google redirects, the browser may show “cannot connect.” Copy the complete `http://127.0.0.1:51121/oauth-callback?...` URL from its address bar and paste that URL into OpenCode. Start a fresh paste-code login first; a redirect from an older browser-method attempt has a different `state` and is rejected.
 3. On first login the plugin checks your Cloud Code Assist account state, provisions the Antigravity free tier if needed (one long-running operation polled every second under a 30-second deadline), and stores the resolved project.
 
 The flow uses Google's installed-app OAuth client with offline access and consent prompt. It does **not** use PKCE — the current native flow does not either; CSRF protection is the `state` parameter, which is validated locally before any token exchange.
