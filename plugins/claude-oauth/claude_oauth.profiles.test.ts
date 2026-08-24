@@ -628,6 +628,7 @@ describe("request capture: shared ordered transport", () => {
             "content-type": "application/json",
             "user-agent": "claude-cli/9.9.9 (external, wrong-profile)",
             "X-Claude-Code-Session-Id": `session-${selected.id}`,
+            "x-unknown-outbound": "profile-specific",
           },
           body: JSON.stringify({
             model: "claude-sonnet-4-6",
@@ -657,6 +658,7 @@ describe("request capture: shared ordered transport", () => {
           "anthropic-version",
           "x-app",
           "x-client-request-id",
+          ...(selected.id === "cli" ? [] : ["x-unknown-outbound"]),
           "Connection",
           "Accept-Encoding",
         ]);

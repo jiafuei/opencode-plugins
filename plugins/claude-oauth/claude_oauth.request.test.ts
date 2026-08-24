@@ -336,7 +336,7 @@ describe("request capture: SDK-generated beta/context-management data", () => {
     const betas = req.headers["anthropic-beta"]!.split(",");
     const body = JSON.parse(req.bodyText);
     expect(betas).not.toContain("structured-outputs-2025-11-13");
-    expect(betas).not.toContain("advanced-tool-use-2025-11-20");
+    expect(betas).toContain("advanced-tool-use-2025-11-20");
     expect(betas).toContain("extended-cache-ttl-2025-04-11");
     expect(body.tools[0].name).toBe("_lookup");
     expect(body.tools[0].eager_input_streaming).toBeUndefined();

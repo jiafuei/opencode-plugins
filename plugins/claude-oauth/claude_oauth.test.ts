@@ -396,7 +396,7 @@ describe("buildBetas", () => {
 
   test("agent profile for tools without thinking: fallback credit but no effort", () => {
     const betas = buildBetas({ type: "disabled" }, true, false, null).split(",");
-    expect(betas).toEqual([...AGENT_BASE, "fallback-credit-2026-06-01"]);
+    expect(betas).toEqual([...AGENT_BASE, "advanced-tool-use-2025-11-20", "fallback-credit-2026-06-01"]);
     expect(betas).not.toContain("effort-2025-11-24");
   });
 
@@ -412,12 +412,12 @@ describe("buildBetas", () => {
     expect(betas).toContain("fallback-credit-2026-06-01");
   });
 
-  test("adds advanced tool use only when the SDK requested it", () => {
-    const withoutAdvanced = buildBetas(undefined, true, false, null).split(",");
-    expect(withoutAdvanced).not.toContain("advanced-tool-use-2025-11-20");
+  test("adds advanced tool use whenever the CLI request has tools", () => {
+    const withoutIncomingAdvanced = buildBetas(undefined, true, false, null).split(",");
+    expect(withoutIncomingAdvanced).toContain("advanced-tool-use-2025-11-20");
 
-    const withAdvanced = buildBetas(undefined, true, false, "advanced-tool-use-2025-11-20").split(",");
-    expect(withAdvanced).toEqual([
+    const withIncomingAdvanced = buildBetas(undefined, true, false, "advanced-tool-use-2025-11-20").split(",");
+    expect(withIncomingAdvanced).toEqual([
       ...AGENT_BASE,
       "advanced-tool-use-2025-11-20",
       "fallback-credit-2026-06-01",
@@ -439,8 +439,12 @@ describe("buildBetas", () => {
       "fallback-credit-2026-06-01",
     ].join(",");
     const betas = buildBetas({ type: "enabled", budget_tokens: 1024 }, true, false, incoming).split(",");
-    expect(betas.slice(0, AGENT_BASE.length + 1)).toEqual([...AGENT_BASE, "effort-2025-11-24"]);
-    expect(betas.slice(AGENT_BASE.length + 1)).toEqual([
+    expect(betas.slice(0, AGENT_BASE.length + 2)).toEqual([
+      ...AGENT_BASE,
+      "advanced-tool-use-2025-11-20",
+      "effort-2025-11-24",
+    ]);
+    expect(betas.slice(AGENT_BASE.length + 2)).toEqual([
       "fallback-credit-2026-06-01",
       "compact-2026-01-01",
       "fast-mode-2026-02-01",

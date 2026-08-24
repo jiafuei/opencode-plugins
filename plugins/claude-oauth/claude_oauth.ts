@@ -1181,7 +1181,7 @@ export const ClaudeOAuthPlugin: Plugin = async (input: PluginInput, options?: Pl
               const stainless = stainlessHeaders(profile)
               if (isCountTokens) delete stainless["X-Stainless-Timeout"]
               const wireHeaders = buildEnforcedHeaders(headers, {
-                order: profile.id === "cowork" ? "cowork" : "cli",
+                profile: profile.id,
                 userAgent: profile.userAgent,
                 sessionId,
                 betas: headers.get("anthropic-beta") ?? undefined,

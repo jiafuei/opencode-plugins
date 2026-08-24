@@ -7,7 +7,7 @@ import { buildEnforcedHeaders, buildOrderedHeaders, coworkFetch } from "./cowork
 
 describe("coworkFetch bypass handling", () => {
   const nativeFetch = globalThis.fetch;
-  let calls: Array<{ url: string; proxy: unknown }>;
+  let calls: Array<{ url: string; proxy: unknown; headers: RequestInit["headers"] }>;
 
   beforeEach(() => {
     calls = [];
@@ -15,6 +15,7 @@ describe("coworkFetch bypass handling", () => {
       calls.push({
         url: input instanceof Request ? input.url : String(input),
         proxy: (init as { proxy?: unknown } | undefined)?.proxy,
+        headers: init?.headers,
       });
       return new Response("ok");
     }) as typeof globalThis.fetch;
@@ -36,6 +37,28 @@ describe("coworkFetch bypass handling", () => {
     expect(calls).toHaveLength(1);
     expect(calls[0]!.url).toBe("https://api.anthropic.com/v1/messages");
     expect(calls[0]!.proxy).toBe("http://127.0.0.1:24560");
+  });
+
+  test("passes only whitelisted CLI headers through the proxy fallback", async () => {
+    const headers = buildEnforcedHeaders(new Headers({ cookie: "private", "x-unknown": "private" }), {
+      profile: "cli",
+      userAgent: "claude-cli/2.1.241 (external, cli)",
+      authorization: "Bearer token",
+      clientRequestId: "request-1",
+      stainless: {},
+    });
+
+    await coworkFetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers,
+      body: "{}",
+      proxy: "http://127.0.0.1:24560",
+    } as RequestInit);
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.headers).toBe(headers);
+    expect(Object.keys(calls[0]!.headers as Record<string, string>)).not.toContain("cookie");
+    expect(Object.keys(calls[0]!.headers as Record<string, string>)).not.toContain("x-unknown");
   });
 
   test("delegates Request-object input to the global fetch", async () => {
@@ -96,7 +119,7 @@ describe("buildEnforcedHeaders", () => {
       "x-custom-extra": "keep-me",
     });
     const headers = buildEnforcedHeaders(caller, {
-      order: "cowork",
+      profile: "cowork",
       userAgent: "claude-cli/2.1.220 (external, claude-desktop)",
       sessionId: "session-1",
       betas: "beta-one,beta-two",
@@ -134,7 +157,7 @@ describe("buildEnforcedHeaders", () => {
 
   test("omits optional session/beta entries when absent", () => {
     const headers = buildEnforcedHeaders(new Headers(), {
-      order: "cowork",
+      profile: "cowork",
       userAgent: "ua",
       authorization: "Bearer t",
       clientRequestId: "id",
@@ -144,9 +167,9 @@ describe("buildEnforcedHeaders", () => {
     expect("anthropic-beta" in headers).toBe(false);
   });
 
-  test("matches genuine Claude CLI header order and casing", () => {
-    const headers = buildEnforcedHeaders(new Headers({ "x-extra": "kept" }), {
-      order: "cli",
+  test("matches genuine Claude CLI header order and casing without unknown caller headers", () => {
+    const headers = buildEnforcedHeaders(new Headers({ cookie: "private", "x-extra": "private" }), {
+      profile: "cli",
       userAgent: "claude-cli/2.1.241 (external, cli)",
       sessionId: "session-1",
       betas: "beta-one",
@@ -167,9 +190,20 @@ describe("buildEnforcedHeaders", () => {
       "anthropic-version",
       "x-app",
       "x-client-request-id",
-      "x-extra",
       "Connection",
       "Accept-Encoding",
     ]);
+    expect(Object.values(headers)).not.toContain("private");
+  });
+
+  test("continues forwarding unknown SDK CLI headers", () => {
+    const headers = buildEnforcedHeaders(new Headers({ "x-extra": "kept" }), {
+      profile: "sdk-cli",
+      userAgent: "claude-cli/2.1.224 (external, sdk-cli)",
+      authorization: "Bearer token",
+      clientRequestId: "request-1",
+      stainless: {},
+    });
+    expect(headers["x-extra"]).toBe("kept");
   });
 });

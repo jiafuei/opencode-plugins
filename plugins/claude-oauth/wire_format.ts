@@ -241,7 +241,9 @@ export function buildBetas(
     }
   };
   const incomingBetas = incoming?.split(",").map((beta) => beta.trim()) ?? [];
-  if (agent && incomingBetas.includes(ADVANCED_TOOL_USE_BETA)) push(ADVANCED_TOOL_USE_BETA);
+  if ((profile.id === "cli" && hasTools) || (agent && incomingBetas.includes(ADVANCED_TOOL_USE_BETA))) {
+    push(ADVANCED_TOOL_USE_BETA);
+  }
   if (agent && isActiveThinking(thinking)) push(EFFORT_BETA);
   // CLI and sdk-cli advertise fallback credit on every request; Cowork
   // (matching OMP) only on agent requests.

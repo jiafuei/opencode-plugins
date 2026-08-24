@@ -7,6 +7,7 @@ import * as https from "node:https";
 import * as stream from "node:stream";
 import * as tls from "node:tls";
 import * as zlib from "node:zlib";
+import type { SpoofingProfile } from "./wire_format.ts";
 
 export type FetchImpl = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
 
@@ -71,8 +72,8 @@ export function buildOrderedHeaders(
 }
 
 // Headers the plugin enforces itself. Caller-supplied entries for these are
-// dropped when building the ordered record; everything else passes through
-// first, in arrival order.
+// always dropped when building the ordered record. Non-CLI profiles preserve
+// other caller headers in arrival order; CLI rebuilds from this fixed set.
 const MANAGED_HEADER_KEYS = new Set(
   [
     "accept",
@@ -109,7 +110,7 @@ const MANAGED_HEADER_KEYS = new Set(
 export function buildEnforcedHeaders(
   caller: Headers,
   fields: {
-    order: "cli" | "cowork";
+    profile: SpoofingProfile["id"];
     userAgent: string;
     sessionId?: string;
     betas?: string;
@@ -118,17 +119,20 @@ export function buildEnforcedHeaders(
     stainless: Record<string, string>;
   },
 ): Record<string, string> {
+  const order = fields.profile === "cowork" ? "cowork" : "cli";
   const managed = new Set(MANAGED_HEADER_KEYS);
   for (const key of Object.keys(fields.stainless)) managed.add(key.toLowerCase());
   const headers: Record<string, string> = {};
   const extras: Record<string, string> = {};
-  caller.forEach((value, key) => {
-    if (managed.has(key.toLowerCase())) return;
-    extras[key] = value;
-  });
-  if (fields.order === "cowork") Object.assign(headers, extras);
+  if (fields.profile !== "cli") {
+    caller.forEach((value, key) => {
+      if (managed.has(key.toLowerCase())) return;
+      extras[key] = value;
+    });
+  }
+  if (order === "cowork") Object.assign(headers, extras);
   headers["Accept"] = "application/json";
-  if (fields.order === "cli") headers["Authorization"] = fields.authorization;
+  if (order === "cli") headers["Authorization"] = fields.authorization;
   headers["Content-Type"] = "application/json";
   headers["User-Agent"] = fields.userAgent;
   if (fields.sessionId) headers["X-Claude-Code-Session-Id"] = fields.sessionId;
@@ -136,10 +140,10 @@ export function buildEnforcedHeaders(
   if (fields.betas) headers["anthropic-beta"] = fields.betas;
   headers["anthropic-dangerous-direct-browser-access"] = "true";
   headers["anthropic-version"] = "2023-06-01";
-  if (fields.order === "cowork") headers["Authorization"] = fields.authorization;
+  if (order === "cowork") headers["Authorization"] = fields.authorization;
   headers["x-app"] = "cli";
   headers["x-client-request-id"] = fields.clientRequestId;
-  if (fields.order === "cli") Object.assign(headers, extras);
+  if (order === "cli") Object.assign(headers, extras);
   headers["Connection"] = "keep-alive";
   headers["Accept-Encoding"] = "gzip, deflate, br, zstd";
   return headers;
