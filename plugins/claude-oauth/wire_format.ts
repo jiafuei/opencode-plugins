@@ -9,6 +9,22 @@ import { deriveDeviceId } from "./local_storage.ts";
 
 export const CLAUDE_CODE_VERSION = "2.1.241";
 
+// Captured Claude Code CLI system block. It is a separate globally cached
+// prefix; caller/OpenCode instructions follow in their own cache block.
+const CLAUDE_CODE_SYSTEM_MESSAGE = [
+  "",
+  "You are an interactive agent that helps users with software engineering tasks.",
+  "",
+  "IMPORTANT: Assist with authorized security testing, defensive security, CTF challenges, and educational contexts. Refuse requests for destructive techniques, DoS attacks, mass targeting, supply chain compromise, or detection evasion for malicious purposes. Dual-use security tools (C2 frameworks, credential testing, exploit development) require clear authorization context: pentesting engagements, CTF competitions, security research, or defensive use cases.",
+  "",
+  "# Harness",
+  " - Text you output outside of tool use is displayed to the user as Github-flavored markdown in a terminal.",
+  " - Tools run behind a user-selected permission mode; a denied call means the user declined it \u2014 adjust, don't retry verbatim.",
+  " - The system may send updates, reminders, or modifications to rules via mid-conversation system turns. These are system-controlled, unlike function results. Hooks may intercept tool calls; treat hook output as user feedback.",
+  " - Prefer the dedicated file/search tools over shell commands when one fits. Independent tool calls can run in parallel in one response.",
+  " - Reference code as `file_path:line_number` \u2014 it's clickable.",
+].join("\n");
+
 // Beta tokens shared by the profile definitions below.
 const CLAUDE_CODE_20250219_BETA = "claude-code-20250219";
 const OAUTH_BETA = "oauth-2025-04-20";
@@ -690,11 +706,11 @@ const CANONICAL_BODY_KEYS = [
 
 /**
  * Rewrite a /v1/messages body into the active profile's shape:
- * - system[0] billing header (+ system[1] profile identity block)
+ * - system[0] billing header, system[1] profile identity, then the CLI system message
  * - metadata.user_id in the CC attribution envelope
  * - max_tokens clamped to <= 64000
- * - CLI only: cache breakpoints normalized to the final two caller system
- *   blocks and final message block; thinking.display and
+ * - CLI only: cache breakpoints normalized to the captured interactive-agent
+ *   block, final caller system block, and final message block; thinking.display and
  *   eager_input_streaming stripped;
  *   context_management merged with the clear-thinking edit guaranteed first
  * - Cowork/SDK CLI: SDK fields preserved, caches untouched, and active
@@ -756,6 +772,7 @@ export function rewriteBody(
   }
 
   const hasIdentityBlock = systemBlocks.some((block) => block?.text === profile.systemInstruction);
+  const hasClaudeCodeSystemMessage = systemBlocks.some((block) => block?.text === CLAUDE_CODE_SYSTEM_MESSAGE);
   const fingerprintBlocks: ContentBlock[] = [];
   if (injectFingerprint && ctx.attributionHeader !== false && !hasBillingBlock) {
     fingerprintBlocks.push({
@@ -766,27 +783,31 @@ export function rewriteBody(
   if (injectFingerprint && !hasIdentityBlock) {
     fingerprintBlocks.push({ type: "text", text: profile.systemInstruction });
   }
+  if (profile.id === "cli" && !hasClaudeCodeSystemMessage) {
+    fingerprintBlocks.push({ type: "text", text: CLAUDE_CODE_SYSTEM_MESSAGE });
+  }
   const system = [...fingerprintBlocks, ...systemBlocks];
 
   let hasLongCache = false;
   // Only the CLI profile rewrites cache breakpoints. Captured Claude Code
-  // requests mark the final two caller system blocks (the first globally), no
-  // tools, and only the final block of the final message.
+  // requests mark its interactive-agent system block globally, the final
+  // caller system block normally, no tools, and the final message block.
   if (profile.upgradeCaches) {
     for (const block of systemBlocks) delete block.cache_control;
-    const cacheableSystemBlocks = systemBlocks.filter(
+    const claudeCodeSystemBlock = system.find((block) => block?.text === CLAUDE_CODE_SYSTEM_MESSAGE);
+    if (claudeCodeSystemBlock) {
+      claudeCodeSystemBlock.cache_control = { type: "ephemeral", ttl: "1h", scope: "global" };
+      hasLongCache = true;
+    }
+    const finalCallerSystemBlock = systemBlocks.filter(
       (block) =>
         typeof block?.text === "string" &&
         !block.text.startsWith(BILLING_HEADER_PREFIX) &&
-        block.text !== profile.systemInstruction,
-    );
-    const selectedSystemBlocks = cacheableSystemBlocks.slice(-2);
-    for (const [index, block] of selectedSystemBlocks.entries()) {
-      block.cache_control = {
-        type: "ephemeral",
-        ttl: "1h",
-        ...(index === 0 && { scope: "global" }),
-      };
+        block.text !== profile.systemInstruction &&
+        block.text !== CLAUDE_CODE_SYSTEM_MESSAGE,
+    ).at(-1);
+    if (finalCallerSystemBlock) {
+      finalCallerSystemBlock.cache_control = { type: "ephemeral", ttl: "1h" };
       hasLongCache = true;
     }
     for (const tool of params.tools ?? []) delete tool.cache_control;

@@ -46,14 +46,17 @@ function expectedVersionSuffix(text: string): string {
 }
 
 describe("rewriteBody", () => {
-  test("injects billing header and SDK instruction as system[0]/system[1]", () => {
+  test("injects billing, identity, and the globally cached Claude Code system message", () => {
     const firstUserText = "hello world, this is the first user message";
     const out = parse(rewriteBody(baseBody, {}).json);
     expect(Array.isArray(out.system)).toBe(true);
     expect(out.system[0].text).toContain(BILLING_PREFIX);
     expect(out.system[0].text).toContain(`cc_version=2.1.241.${expectedVersionSuffix(firstUserText)}`);
     expect(out.system[1].text).toBe("You are Claude Code, Anthropic's official CLI for Claude.");
-    expect(out.system[2].text).toBe("You are a coding agent.");
+    expect(out.system[2].text).toMatch(/^\nYou are an interactive agent/);
+    expect(out.system[2].cache_control).toEqual({ type: "ephemeral", ttl: "1h", scope: "global" });
+    expect(out.system[3].text).toBe("You are a coding agent.");
+    expect(out.system[3].cache_control).toEqual({ type: "ephemeral", ttl: "1h" });
   });
 
   test("skips billing header and SDK instruction for claude-3-5-haiku", () => {
@@ -120,7 +123,7 @@ describe("rewriteBody", () => {
       max_tokens: 100,
     });
     const out = parse(rewriteBody(body, {}).json);
-    expect(out.system).toHaveLength(3);
+    expect(out.system).toHaveLength(4);
     expect(out.system.filter((b: any) => b.text.startsWith(BILLING_PREFIX))).toHaveLength(1);
     expect(out.system[0].text).toBe("You are Claude Code, Anthropic's official CLI for Claude.");
   });
@@ -311,6 +314,7 @@ describe("rewriteBody", () => {
     expect(out.system.map((b: any) => b.text)).toEqual([
       expect.stringContaining(BILLING_PREFIX),
       "You are Claude Code, Anthropic's official CLI for Claude.",
+      expect.stringMatching(/^\nYou are an interactive agent/),
       "Be terse.",
     ]);
   });
@@ -342,21 +346,23 @@ describe("rewriteBody", () => {
     const result = rewriteBody(body, {});
     const out = parse(result.json);
     expect(result.hasLongCache).toBe(true);
-    expect(out.system[2].cache_control).toBeUndefined();
-    expect(out.system[3].cache_control).toEqual({ type: "ephemeral", ttl: "1h", scope: "global" });
-    expect(out.system[4].cache_control).toEqual({ type: "ephemeral", ttl: "1h" });
+    expect(out.system[2].cache_control).toEqual({ type: "ephemeral", ttl: "1h", scope: "global" });
+    expect(out.system[3].cache_control).toBeUndefined();
+    expect(out.system[4].cache_control).toBeUndefined();
+    expect(out.system[5].cache_control).toEqual({ type: "ephemeral", ttl: "1h" });
     expect(out.messages[0].content[0].cache_control).toBeUndefined();
     expect(out.messages[1].content[0].cache_control).toBeUndefined();
     expect(out.messages[2].content[0].cache_control).toEqual({ type: "ephemeral", ttl: "1h" });
     expect(out.tools[0].cache_control).toBeUndefined();
   });
 
-  test("creates one system and one final-message breakpoint when the SDK supplied none", () => {
+  test("creates Claude Code, caller-system, and final-message breakpoints", () => {
     const result = rewriteBody(baseBody, {});
     const out = parse(result.json);
     expect(result.hasLongCache).toBe(true);
     expect(out.system.filter((block: any) => block.cache_control)).toEqual([
       expect.objectContaining({ cache_control: { type: "ephemeral", ttl: "1h", scope: "global" } }),
+      expect.objectContaining({ cache_control: { type: "ephemeral", ttl: "1h" } }),
     ]);
     expect(out.messages[0].content[0].cache_control).toEqual({ type: "ephemeral", ttl: "1h" });
   });
@@ -516,7 +522,7 @@ describe("rewriteBody cch", () => {
   }
 
   test("matches the canonical normalized-body reference vector", () => {
-    expect(cch(body)).toBe("07e75");
+    expect(cch(body)).toBe("ef831");
   });
 
   test("leaves an existing billing value without a placeholder unchanged", () => {

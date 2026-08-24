@@ -215,7 +215,8 @@ describe("request capture: normal streaming request", () => {
     expect(body.system[0].text).not.toContain("cch=00000");
     expect(body.system[0].text).toMatch(/cch=[0-9a-f]{5}/);
     expect(body.system[1].text).toBe("You are Claude Code, Anthropic's official CLI for Claude.");
-    expect(body.system[2].text).toBe("You are a coding agent.");
+    expect(body.system[2].text).toMatch(/^\nYou are an interactive agent/);
+    expect(body.system[3].text).toBe("You are a coding agent.");
 
     const userId = JSON.parse(body.metadata.user_id);
     expect(userId.device_id).toMatch(/^[0-9a-f]{64}$/);
@@ -343,6 +344,7 @@ describe("request capture: SDK-generated beta/context-management data", () => {
     expect(body.tools[0].cache_control).toBeUndefined();
     expect(body.tools[0].input_schema.additionalProperties).toBe(false);
     expect(body.system[2].cache_control).toEqual({ type: "ephemeral", ttl: "1h", scope: "global" });
+    expect(body.system[3].cache_control).toEqual({ type: "ephemeral", ttl: "1h" });
     expect(body.messages.at(-1).content.at(-1).cache_control).toEqual({ type: "ephemeral", ttl: "1h" });
   });
 
