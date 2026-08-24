@@ -5,6 +5,7 @@ Standalone plugins for [OpenCode](https://opencode.ai), maintained as independen
 ## Plugins
 
 - [Anthropic compaction](plugins/anthropic-compaction/README.md): compact supported Claude sessions with Anthropic's server-side context management.
+- [Antigravity OAuth](plugins/antigravity-oauth/README.md): sign in with Google Antigravity to run Gemini, Claude, and GPT-OSS on the free Cloud Code Assist tier with the native client fingerprint.
 - [Memory](plugins/memory/README.md): project-scoped automatic memory with a `/memory` browser.
 - [Model glob](plugins/model-glob/README.md): search connected model IDs and their available variants.
 - [OpenAI compaction](plugins/openai-compaction/README.md): compact OpenAI sessions with the provider's server-side compact endpoint instead of a summary.
@@ -17,6 +18,7 @@ Install a plugin for the current project:
 
 ```sh
 opencode plugin @jiafuei/opencode-anthropic-compaction
+opencode plugin @jiafuei/opencode-antigravity-oauth
 opencode plugin @jiafuei/opencode-memory
 opencode plugin @jiafuei/opencode-model-glob
 opencode plugin @jiafuei/opencode-openai-compaction

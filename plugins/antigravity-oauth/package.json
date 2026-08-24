@@ -1,0 +1,33 @@
+{
+  "name": "@jiafuei/opencode-antigravity-oauth",
+  "version": "0.1.0",
+  "description": "Google Antigravity OAuth for OpenCode: Gemini, Claude, and GPT-OSS through Cloud Code Assist with the native antigravity/hub wire fingerprint",
+  "type": "module",
+  "exports": {
+    "./server": "./antigravity_oauth.ts"
+  },
+  "files": [
+    "antigravity_oauth.ts",
+    "oauth_flow.ts",
+    "wire.ts",
+    "README.md"
+  ],
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "google",
+    "antigravity",
+    "gemini",
+    "claude",
+    "oauth"
+  ],
+  "engines": {
+    "opencode": ">=1.18.20"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "@opencode-ai/plugin": "^1.18.20"
+  }
+}
