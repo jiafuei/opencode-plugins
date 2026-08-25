@@ -89,7 +89,7 @@ export function toggledSettings(current: unknown, key: "enabled" | "dream_auto")
 // Concise operation counts for the dream completion toast.
 export function dreamCountsMessage(counts: Record<string, unknown> | undefined): string {
   const parts: string[] = [];
-  const labels = [["merge", "merged", "merged"], ["supersede", "superseded", "superseded"], ["synthesize", "insight", "insights"]] as const;
+  const labels = [["merge", "merged", "merged"], ["supersede", "superseded", "superseded"], ["synthesize", "insight", "insights"], ["prune", "pruned", "pruned"]] as const;
   for (const [key, one, many] of labels) {
     const count = counts?.[key];
     if (typeof count === "number" && count > 0) parts.push(`${count} ${count === 1 ? one : many}`);

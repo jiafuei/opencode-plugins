@@ -18,7 +18,8 @@ afterEach(() => {
   else process.env.XDG_DATA_HOME = originalDataHome;
 });
 
-type WorkerCall = { parentID: string; system: string; prompt: string; variant?: string; sessionVariant?: string };
+type WorkerPermission = { permission: string; pattern: string; action: string };
+type WorkerCall = { parentID: string; system: string; prompt: string; variant?: string; sessionVariant?: string; permission?: WorkerPermission[] };
 type FakeMessage = { info: { id: string; sessionID: string; role: string }; parts: Array<{ type?: string; id?: string; synthetic?: boolean; text: string }> };
 type LogCall = { service: string; level: string; message: string; extra?: Record<string, unknown> };
 
@@ -44,16 +45,18 @@ async function fixture(
   const logs: LogCall[] = [];
   let parentID = "";
   let sessionVariant: string | undefined;
+  let permission: WorkerPermission[] | undefined;
   const client = {
     session: {
-      create: async (options: { body: { parentID: string; metadata?: unknown; model?: { variant?: string } } }) => {
+      create: async (options: { body: { parentID: string; metadata?: unknown; model?: { variant?: string }; permission?: WorkerPermission[] } }) => {
         parentID = options.body.parentID;
         sessionVariant = options.body.model?.variant;
+        permission = options.body.permission;
         creations.push(options.body.metadata ?? null);
         return { data: { id: crypto.randomUUID() } };
       },
       prompt: async (options: { body: { system: string; parts: { text: string }[]; variant?: string } }) => {
-        const call = { parentID, system: options.body.system, prompt: options.body.parts[0]!.text, variant: options.body.variant, sessionVariant };
+        const call = { parentID, system: options.body.system, prompt: options.body.parts[0]!.text, variant: options.body.variant, sessionVariant, permission };
         calls.push(call);
         return { data: { info: { structured: await respond(call) } } };
       },
@@ -319,12 +322,15 @@ describe("memory persistence", () => {
     expect(workerPrompts[0]).not.toContain("SUCCESS_EVIDENCE");
     expect(workerPrompts[0]).not.toContain("READ_EVIDENCE");
     expect(workerPrompts[0]).not.toContain("FAILED_EVIDENCE");
-    expect(workerPrompts[0]).toContain("Recaps are only for completed tasks.");
+    expect(workerPrompts[0]).toContain("Recaps are only for completed tasks and only when");
+    expect(workerPrompts[0]).toContain("hard-won diagnoses or negative findings");
+    expect(workerPrompts[0]).toContain("Commit receipts, passing test results, file edits, cleanups, and review results are not memories by themselves");
     expect(workerPrompts[0]).toContain("questions and answers");
     // Extraction is constrained to the decision subject.
     expect(workerPrompts[1]).toContain("<subject>");
     expect(workerPrompts[1]).toContain("confirmed focused test approach");
     expect(workerSystems[1]).toContain("concretely completed task");
+    expect(workerSystems[1]).toContain("conclusions requiring re-derivation");
     expect(workerMetadata[0]).toEqual({ memoryWorker: true, memoryActivity: "classification" });
     expect(workerMetadata[1]).toEqual({ memoryWorker: true, memoryActivity: "extraction" });
     await rm(dataHome, { recursive: true, force: true });
@@ -1373,7 +1379,7 @@ describe("memory manual dreaming", () => {
     // revisions, output metadata, and the model's reason. No old content.
     expect(status.requestID).toBe("req-big");
     expect(status.state).toBe("changed");
-    expect(status.counts).toEqual({ merge: 1, supersede: 1, synthesize: 1 });
+    expect(status.counts).toEqual({ merge: 1, supersede: 1, synthesize: 1, prune: 0 });
     expect(manifest.trigger).toBe("manual");
     expect(manifest.model).toBe("test/small");
     expect(manifest.sessionID).toBe("ses_dreamer");
@@ -1413,7 +1419,7 @@ describe("memory manual dreaming", () => {
     expect(dreamLogs.at(-1)).toMatchObject({
       level: "info",
       message: "Memory dream completed",
-      extra: { runID: status.runID, trigger: "manual", state: "changed", counts: { merge: 1, supersede: 1, synthesize: 1 } },
+      extra: { runID: status.runID, trigger: "manual", state: "changed", counts: { merge: 1, supersede: 1, synthesize: 1, prune: 0 } },
     });
 
     expect(await Bun.file(join(path, ".dream.request")).exists()).toBe(false);
@@ -1427,6 +1433,13 @@ describe("memory manual dreaming", () => {
     // All dream workers carry the dream activity marker.
     for (const metadata of app.creations) {
       expect(metadata).toEqual({ memoryWorker: true, memoryActivity: "dream" });
+    }
+    const toolFreePermission = [
+      { permission: "*", pattern: "*", action: "deny" },
+      { permission: "StructuredOutput", pattern: "*", action: "allow" },
+    ];
+    for (const call of app.calls.filter((call) => isDreamSelector(call) || isDreamCurator(call))) {
+      expect(call.permission).toEqual(toolFreePermission);
     }
 
     // The selector receives the complete candidate index inside its untrusted
@@ -1457,6 +1470,309 @@ describe("memory manual dreaming", () => {
     expect(curatorPrompts[2]).toContain("The parser migration shipped and the focused suite passes.");
     expect(curatorPrompts[2]).toContain("DELTA_BODY");
     expect(curatorPrompts[2]).toContain("non-authoritative");
+    await rm(dataHome, { recursive: true, force: true });
+  });
+
+  test.serial("prunes a singleton into quarantine with evidence, permissions, tombstones, and file counts", async () => {
+    const dataHome = await mkdtemp("/tmp/opencode-memory-dream-prune-");
+    process.env.XDG_DATA_HOME = dataHome;
+    const directory = "/tmp/memory-dream-prune-project";
+    const path = await store(dataHome, directory, [{
+      file: "receipt.md",
+      title: "Completed cleanup",
+      summary: "[recap|plugins/memory|2026-08-01] Cleanup receipt",
+      content: seededTopic("abc1111", "The cleanup commit landed and tests pass."),
+    }]);
+    await Bun.write(join(path, ".dream.request"), JSON.stringify({ requestID: "req-prune", sessionID: "ses_prune" }));
+    const app = await fixture(directory, ({ system, prompt }) => {
+      if (isDreamSelector(system)) return { action: "prune", files: ["receipt.md"], reason: "task receipt" };
+      if (isDreamCurator(system)) {
+        expect(prompt).toContain(`<project_directory>${directory}</project_directory>`);
+        expect(prompt).toContain('<memory_file path="receipt.md">');
+        expect(prompt).toContain("The cleanup commit landed and tests pass.");
+        expect(prompt).toContain("unknown external directories blocks for permission");
+        expect(prompt).toContain("the request times out");
+        return { verdicts: [{
+          file: "receipt.md",
+          verdict: "remove",
+          category: "task_receipt",
+          reason: "Only records completed cleanup and passing tests.",
+          evidence: ["plugins/memory/memory.test.ts"],
+        }] };
+      }
+      return saveDecisions();
+    });
+
+    await app.message("ses_prune", "Start pruning.");
+    await until(async () => {
+      try {
+        return (await Bun.file(join(path, ".dream.status")).json() as { state?: string }).state === "changed";
+      } catch {
+        return false;
+      }
+    });
+    await app.hooks.dispose!();
+
+    const status = await Bun.file(join(path, ".dream.status")).json();
+    expect(status.counts).toEqual({ merge: 0, supersede: 0, synthesize: 0, prune: 1 });
+    expect(await Bun.file(join(path, "receipt.md")).exists()).toBe(false);
+    expect(await Bun.file(join(path, ".trash", status.runID, "receipt.md")).text()).toContain("cleanup commit landed");
+    expect(await Bun.file(join(path, "index.md")).text()).not.toContain("receipt.md");
+    const manifest = await Bun.file(join(path, ".dreams", `${status.runID}.json`)).json();
+    expect(manifest.actions[0]).toEqual({
+      action: "prune",
+      reason: "task receipt",
+      sources: [{ file: "receipt.md", revision: "abc1111" }],
+      verdicts: [{
+        file: "receipt.md",
+        verdict: "remove",
+        category: "task_receipt",
+        reason: "Only records completed cleanup and passing tests.",
+        evidence: ["plugins/memory/memory.test.ts"],
+        quarantinePath: `.trash/${status.runID}/receipt.md`,
+      }],
+    });
+
+    const selectorCall = app.calls.find(isDreamSelector)!;
+    expect(selectorCall.prompt).toContain("pick 1-8 exact candidates, including a singleton");
+    expect(selectorCall.permission).toEqual([
+      { permission: "*", pattern: "*", action: "deny" },
+      { permission: "StructuredOutput", pattern: "*", action: "allow" },
+    ]);
+    expect(app.calls.find(isDreamCurator)!.permission).toEqual([
+      { permission: "*", pattern: "*", action: "deny" },
+      { permission: "read", pattern: "*", action: "allow" },
+      { permission: "read", pattern: "*.env", action: "ask" },
+      { permission: "read", pattern: "*.env.*", action: "ask" },
+      { permission: "read", pattern: "*.env.example", action: "allow" },
+      { permission: "grep", pattern: "*", action: "allow" },
+      { permission: "glob", pattern: "*", action: "allow" },
+      { permission: "StructuredOutput", pattern: "*", action: "allow" },
+      { permission: "external_directory", pattern: "*", action: "ask" },
+    ]);
+
+    const message: FakeMessage = { info: { id: "msg-pruned", sessionID: "ses_prune", role: "user" }, parts: [{ type: "text", text: "next" }] };
+    await app.hooks["experimental.chat.messages.transform"]!({} as never, { messages: [message] } as never);
+    expect(message.parts[1]!.text).toContain("Removed topics: receipt.md");
+    await rm(dataHome, { recursive: true, force: true });
+  });
+
+  test.serial("safely keeps evidence-less removals and does not reselect all-kept nominations", async () => {
+    const dataHome = await mkdtemp("/tmp/opencode-memory-dream-prune-keep-");
+    process.env.XDG_DATA_HOME = dataHome;
+    const directory = "/tmp/memory-dream-prune-keep-project";
+    const path = await store(dataHome, directory, [
+      { file: "a.md", title: "A", content: seededTopic("aaa1111", "Potentially durable rationale.") },
+      { file: "b.md", title: "B", content: seededTopic("bbb2222", "Another durable constraint.") },
+    ]);
+    await Bun.write(join(path, ".dream.request"), JSON.stringify({ requestID: "req-keep", sessionID: "ses_keep" }));
+    let selectors = 0;
+    const app = await fixture(directory, ({ system, prompt }) => {
+      if (isDreamSelector(system)) {
+        selectors += 1;
+        if (selectors === 1) return { action: "prune", files: ["a.md"], reason: "verify repository state" };
+        expect(prompt).not.toContain("(a.md)");
+        return { action: "none" };
+      }
+      if (isDreamCurator(system)) return { verdicts: [{
+        file: "a.md",
+        verdict: "remove",
+        category: "repo_recoverable_state",
+        reason: "Probably visible in the repository.",
+        evidence: [],
+      }] };
+      return saveDecisions();
+    });
+
+    await app.message("ses_keep", "Start dreaming.");
+    await until(async () => {
+      try {
+        return (await Bun.file(join(path, ".dream.status")).json() as { state?: string }).state === "noop";
+      } catch {
+        return false;
+      }
+    });
+    await app.hooks.dispose!();
+
+    expect(selectors).toBe(2);
+    expect(await Bun.file(join(path, "a.md")).exists()).toBe(true);
+    const status = await Bun.file(join(path, ".dream.status")).json();
+    expect(status.counts.prune).toBe(0);
+    const manifest = await Bun.file(join(path, ".dreams", `${status.runID}.json`)).json();
+    expect(manifest.actions[0].verdicts[0]).toMatchObject({
+      file: "a.md",
+      verdict: "keep",
+      category: "retain",
+      evidence: [],
+    });
+    await rm(dataHome, { recursive: true, force: true });
+  });
+
+  test.serial("cascades pruned sources into dependent insight quarantine and tombstones", async () => {
+    const dataHome = await mkdtemp("/tmp/opencode-memory-dream-prune-cascade-");
+    process.env.XDG_DATA_HOME = dataHome;
+    const directory = "/tmp/memory-dream-prune-cascade-project";
+    const insight = `---\nrevision: "def2222"\ntype: "insight"\nscope: "project"\nsessionId: "ses_seed"\nupdatedAt: "2026-08-01"\nsources: ["source.md@abc1111"]\n---\n\nDerived only from the source.\n`;
+    const path = await store(dataHome, directory, [
+      { file: "source.md", title: "Source", content: seededTopic("abc1111", "Passing test receipt.") },
+      { file: "insight.md", title: "Insight", summary: "[insight|project|2026-08-01] Derived", content: insight },
+    ]);
+    await Bun.write(join(path, ".dream.request"), JSON.stringify({ requestID: "req-cascade", sessionID: "ses_cascade" }));
+    const app = await fixture(directory, ({ system }) => {
+      if (isDreamSelector(system)) return { action: "prune", files: ["source.md"], reason: "receipt" };
+      if (isDreamCurator(system)) return { verdicts: [{ file: "source.md", verdict: "remove", category: "task_receipt", reason: "Only a test receipt.", evidence: [] }] };
+      return saveDecisions();
+    });
+
+    await app.message("ses_cascade", "Start dreaming.");
+    await until(async () => {
+      try {
+        return (await Bun.file(join(path, ".dream.status")).json() as { state?: string }).state === "changed";
+      } catch {
+        return false;
+      }
+    });
+    await app.hooks.dispose!();
+
+    const status = await Bun.file(join(path, ".dream.status")).json();
+    expect(status.counts.prune).toBe(2);
+    for (const file of ["source.md", "insight.md"]) {
+      expect(await Bun.file(join(path, file)).exists()).toBe(false);
+      expect(await Bun.file(join(path, ".trash", status.runID, file)).exists()).toBe(true);
+    }
+    const manifest = await Bun.file(join(path, ".dreams", `${status.runID}.json`)).json();
+    expect(manifest.actions[0].verdicts).toContainEqual(expect.objectContaining({
+      file: "insight.md",
+      verdict: "remove",
+      category: "superseded",
+      evidence: ["source.md"],
+      cascaded: true,
+      quarantinePath: `.trash/${status.runID}/insight.md`,
+    }));
+    const message: FakeMessage = { info: { id: "msg-cascade", sessionID: "ses_cascade", role: "user" }, parts: [{ type: "text", text: "next" }] };
+    await app.hooks["experimental.chat.messages.transform"]!({} as never, { messages: [message] } as never);
+    expect(message.parts[1]!.text).toContain("source.md");
+    expect(message.parts[1]!.text).toContain("insight.md");
+    await rm(dataHome, { recursive: true, force: true });
+  });
+
+  test.serial("suppresses synthesis above 30 topics and retains it at the target", async () => {
+    const dataHome = await mkdtemp("/tmp/opencode-memory-dream-target-");
+    process.env.XDG_DATA_HOME = dataHome;
+
+    const overDirectory = "/tmp/memory-dream-over-target";
+    const overEntries = Array.from({ length: 31 }, (_, index) => ({ file: `topic-${index}.md`, content: seededTopic(`${index.toString(16)}abc`, `Topic ${index}`) }));
+    const overPath = await store(dataHome, overDirectory, overEntries);
+    await Bun.write(join(overPath, ".dream.request"), JSON.stringify({ requestID: "req-over", sessionID: "ses_over" }));
+    const over = await fixture(overDirectory, ({ system, prompt }) => {
+      if (isDreamSelector(system)) {
+        expect(prompt).not.toContain("- synthesize:");
+        expect(prompt).toContain("store currently has 31 indexed topics");
+        return { action: "synthesize", files: ["topic-0.md", "topic-1.md"], reason: "should be rejected" };
+      }
+      return saveDecisions();
+    });
+    await over.message("ses_over", "Start dreaming.");
+    await until(async () => {
+      try {
+        return (await Bun.file(join(overPath, ".dream.status")).json() as { state?: string }).state === "failed";
+      } catch {
+        return false;
+      }
+    });
+    expect((await Bun.file(join(overPath, ".dream.status")).json()).message).toContain("disabled above the soft target");
+    expect(over.calls.filter(isDreamCurator)).toHaveLength(0);
+    await over.hooks.dispose!();
+
+    const atDirectory = "/tmp/memory-dream-at-target";
+    const atEntries = Array.from({ length: 30 }, (_, index) => ({ file: `topic-${index}.md`, content: seededTopic(`${index.toString(16)}def`, `Topic ${index}`) }));
+    const atPath = await store(dataHome, atDirectory, atEntries);
+    await Bun.write(join(atPath, ".dream.request"), JSON.stringify({ requestID: "req-at", sessionID: "ses_at" }));
+    let selected = false;
+    const at = await fixture(atDirectory, ({ system, prompt }) => {
+      if (isDreamSelector(system)) {
+        if (!selected) {
+          expect(prompt).toContain("- synthesize:");
+          selected = true;
+          return { action: "synthesize", files: ["topic-0.md", "topic-1.md"], reason: "derived pattern" };
+        }
+        expect(prompt).not.toContain("- synthesize:");
+        return { action: "none" };
+      }
+      if (isDreamCurator(system)) return memoryExtraction({ title: "Target insight" });
+      return saveDecisions();
+    });
+    await at.message("ses_at", "Start dreaming.");
+    await until(async () => {
+      try {
+        return (await Bun.file(join(atPath, ".dream.status")).json() as { state?: string }).state === "changed";
+      } catch {
+        return false;
+      }
+    });
+    expect((await Bun.file(join(atPath, ".dream.status")).json()).counts.synthesize).toBe(1);
+    await at.hooks.dispose!();
+    await rm(dataHome, { recursive: true, force: true });
+  });
+
+  test.serial("purges successful older quarantine only after a later successful run", async () => {
+    const dataHome = await mkdtemp("/tmp/opencode-memory-dream-trash-retention-");
+    process.env.XDG_DATA_HOME = dataHome;
+    const directory = "/tmp/memory-dream-trash-retention-project";
+    const path = await store(dataHome, directory, [{ file: "old.md", content: seededTopic("abc1111", "Task receipt.") }]);
+
+    await Bun.write(join(path, ".dream.request"), JSON.stringify({ requestID: "req-trash-1", sessionID: "ses_trash" }));
+    let app = await fixture(directory, ({ system }) => {
+      if (isDreamSelector(system)) return { action: "prune", files: ["old.md"], reason: "receipt" };
+      if (isDreamCurator(system)) return { verdicts: [{ file: "old.md", verdict: "remove", category: "task_receipt", reason: "Receipt only.", evidence: [] }] };
+      return saveDecisions();
+    });
+    await app.message("ses_trash", "First run.");
+    await until(async () => {
+      try {
+        return (await Bun.file(join(path, ".dream.status")).json() as { state?: string }).state === "changed";
+      } catch {
+        return false;
+      }
+    });
+    const firstRun = (await Bun.file(join(path, ".dream.status")).json()).runID as string;
+    await app.hooks.dispose!();
+    expect(await Bun.file(join(path, ".trash", firstRun, "old.md")).exists()).toBe(true);
+
+    await Bun.write(join(path, "new.md"), seededTopic("def2222", "Still durable."));
+    await Bun.write(join(path, "index.md"), "# Project memory\n\n- [New](new.md) - Stored topic\n");
+
+    await Bun.write(join(path, ".dream.request"), JSON.stringify({ requestID: "req-trash-2", sessionID: "ses_trash" }));
+    app = await fixture(directory, ({ system }) => isDreamSelector(system) ? { action: "prune", files: [], reason: "malformed" } : saveDecisions());
+    await app.message("ses_trash", "Failed run.");
+    await until(async () => {
+      try {
+        return (await Bun.file(join(path, ".dream.status")).json() as { state?: string }).state === "failed";
+      } catch {
+        return false;
+      }
+    });
+    await app.hooks.dispose!();
+    expect(await Bun.file(join(path, ".trash", firstRun, "old.md")).exists()).toBe(true);
+
+    const corruptRun = "corrupt-run";
+    await mkdir(join(path, ".trash", corruptRun), { recursive: true });
+    await Bun.write(join(path, ".trash", corruptRun, "recoverable.md"), "quarantined");
+    await Bun.write(join(path, ".dreams", `${corruptRun}.json`), "{");
+
+    await Bun.write(join(path, ".dream.request"), JSON.stringify({ requestID: "req-trash-3", sessionID: "ses_trash" }));
+    app = await fixture(directory, ({ system }) => isDreamSelector(system) ? { action: "none" } : saveDecisions());
+    await app.message("ses_trash", "No-op run.");
+    await until(async () => {
+      try {
+        return (await Bun.file(join(path, ".dream.status")).json() as { state?: string }).state === "noop";
+      } catch {
+        return false;
+      }
+    });
+    await app.hooks.dispose!();
+    expect(await Bun.file(join(path, ".trash", firstRun, "old.md")).exists()).toBe(false);
+    expect(await Bun.file(join(path, ".trash", corruptRun, "recoverable.md")).exists()).toBe(true);
     await rm(dataHome, { recursive: true, force: true });
   });
 
@@ -1855,7 +2171,7 @@ describe("memory tui parsing helpers", () => {
 
     expect(JSON.parse(toggledSettings({ enabled: true, custom: 3 }, "dream_auto"))).toEqual({ enabled: true, custom: 3, dream_auto: true });
     expect(JSON.parse(toggledSettings({ enabled: false, dream_auto: true }, "enabled"))).toEqual({ enabled: true, dream_auto: true });
-    expect(dreamCountsMessage({ merge: 1, supersede: 2, synthesize: 1 })).toBe("1 merged, 2 superseded, 1 insight");
+    expect(dreamCountsMessage({ merge: 1, supersede: 2, synthesize: 1, prune: 3 })).toBe("1 merged, 2 superseded, 1 insight, 3 pruned");
     expect(isDreamingForSession({ state: "running", sessionID: "ses_parent" }, "ses_parent")).toBe(true);
     expect(isDreamingForSession({ state: "running", sessionID: "ses_parent" }, "ses_other")).toBe(false);
     expect(isDreamingForSession({ state: "failed", sessionID: "ses_parent" }, "ses_parent")).toBe(false);
