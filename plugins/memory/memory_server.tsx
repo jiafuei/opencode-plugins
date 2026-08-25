@@ -1198,7 +1198,7 @@ const MemoryPlugin: Plugin = async ({ client, directory }, options) => {
     const consolidationModel = extractorModel;
     if (!(await enabled())) return;
 
-    await coordinatedWrite(async () => {
+    const removed = await coordinatedWrite(async () => {
       const index = await readIndex();
       const entries = parseIndex(index);
       const retained: IndexEntry[] = [];
@@ -1212,7 +1212,9 @@ const MemoryPlugin: Plugin = async ({ client, directory }, options) => {
         if (!(await enabled())) return;
         await atomicWrite(indexPath, `${[...unmanaged, ...retained.map(indexLine)].join("\n").replace(/\n+$/, "")}\n`);
       }
+      return entries.filter((entry) => !retainedFiles.has(entry.file));
     });
+    for (const entry of removed ?? []) broadcastDelta(entry.file, null);
 
     if (!selectionModel || !consolidationModel) {
       const entries = parseIndex(await readIndex());
@@ -1492,17 +1494,24 @@ const MemoryPlugin: Plugin = async ({ client, directory }, options) => {
     // files from this snapshot. Only prune curation may inspect the workspace.
     // Effective type always comes from topic frontmatter so legacy index lines
     // stay eligible.
-    const snapshot = await coordinatedWrite(async () => {
+    const captured = await coordinatedWrite(async () => {
+      const index = await readIndex();
       const files = new Map<string, DreamSource>();
-      for (const entry of parseIndex(await readIndex())) {
+      const missing: IndexEntry[] = [];
+      for (const entry of parseIndex(index)) {
         const file = Bun.file(join(memoryDirectory, entry.file));
-        if (!(await file.exists())) continue;
+        if (!(await file.exists())) {
+          missing.push(entry);
+          continue;
+        }
         const content = await file.text();
         const revision = revisionOf(content) ?? `legacy-${Bun.hash.wyhash(content).toString(16)}`;
         files.set(entry.file, { entry, content, revision, type: typeOf(content) });
       }
-      return files;
+      if (missing.length > 0) await atomicWrite(indexPath, removeFromIndex(index, new Set(missing.map((entry) => entry.file))));
+      return { files, missing };
     });
+    const snapshot = captured.files;
 
     // Sources already fingerprinted by an existing insight's frontmatter stay
     // protected from transformations that would break provenance. Pruning may
@@ -1535,6 +1544,21 @@ const MemoryPlugin: Plugin = async ({ client, directory }, options) => {
 
     const actions: DreamManifestAction[] = [];
     const deltas: Array<[string, IndexEntry | null]> = [];
+    if (captured.missing.length > 0) {
+      actions.push({
+        action: "prune",
+        reason: "Removed index entries whose topic files are missing",
+        sources: [],
+        verdicts: captured.missing.map((entry) => ({
+          file: entry.file,
+          verdict: "remove",
+          category: "repo_recoverable_state",
+          reason: "Removed stale index reference because the topic file is missing",
+          evidence: [],
+        })),
+      });
+      for (const entry of captured.missing) deltas.push([entry.file, null]);
+    }
     const generated = new Set<string>();
     let abortReason: string | undefined;
     let indexedCount = snapshot.size;
@@ -1543,24 +1567,43 @@ const MemoryPlugin: Plugin = async ({ client, directory }, options) => {
       if (candidates.size === 0) break;
       if (candidates.size === 1 && generated.has(candidates.keys().next().value!)) break;
 
-      let selection: ReturnType<typeof validateDreamSelection>;
-      try {
-        const overTarget = indexedCount > DREAM_SOFT_TARGET;
-        selection = validateDreamSelection(
-          await runWorker(
+      let selection: ReturnType<typeof validateDreamSelection> = undefined;
+      let rejectedSelection: string | undefined;
+      const overTarget = indexedCount > DREAM_SOFT_TARGET;
+      for (let attempt = 0; attempt < 2; attempt++) {
+        let rawSelection: unknown;
+        try {
+          rawSelection = await runWorker(
             input.sessionID,
             model,
             dreamSelectorSchema(overTarget),
             DREAM_SELECTOR_SYSTEM,
-            `${dreamSelectorPrompt(indexedCount)}${selectorLines()}\n</candidate_index>`,
+            `${dreamSelectorPrompt(indexedCount)}${selectorLines()}\n</candidate_index>${rejectedSelection
+              ? `\n\nYour previous selection was rejected: ${rejectedSelection}. Retry using only exact filenames from the candidate index and valid group sizes.`
+              : ""}`,
             "dream",
-          ),
-          candidates,
-          covered,
-          overTarget,
-        );
-      } catch (error) {
-        abortReason = error instanceof Error ? error.message : String(error);
+          );
+        } catch (error) {
+          abortReason = error instanceof Error ? error.message : String(error);
+          break;
+        }
+        try {
+          selection = validateDreamSelection(rawSelection, candidates, covered, overTarget);
+          rejectedSelection = undefined;
+          break;
+        } catch (error) {
+          rejectedSelection = error instanceof Error ? error.message : String(error);
+        }
+      }
+      if (abortReason) break;
+      if (rejectedSelection) {
+        await log("warn", "Memory dream selector output skipped", {
+          runID: input.runID,
+          iteration: iteration + 1,
+          reason: rejectedSelection,
+          priorActions: actions.length,
+        });
+        if (actions.length === 0) abortReason = rejectedSelection;
         break;
       }
       if (!selection) break;

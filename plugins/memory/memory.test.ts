@@ -1557,6 +1557,103 @@ describe("memory manual dreaming", () => {
     await rm(dataHome, { recursive: true, force: true });
   });
 
+  test.serial("retries an ineligible selector result after a committed prune", async () => {
+    const dataHome = await mkdtemp("/tmp/opencode-memory-dream-selector-retry-");
+    process.env.XDG_DATA_HOME = dataHome;
+    const directory = "/tmp/memory-dream-selector-retry-project";
+    const path = await store(dataHome, directory, [
+      { file: "receipt.md", title: "Receipt", content: seededTopic("abc1111", "Passing test receipt.") },
+      { file: "durable.md", title: "Durable", content: seededTopic("def2222", "Durable project constraint.") },
+    ]);
+    await Bun.write(join(path, ".dream.request"), JSON.stringify({ requestID: "req-selector-retry", sessionID: "ses_selector_retry" }));
+    let selectors = 0;
+    const app = await fixture(directory, ({ system, prompt }) => {
+      if (isDreamSelector(system)) {
+        selectors += 1;
+        if (selectors === 1) return { action: "prune", files: ["receipt.md"], reason: "task receipt" };
+        if (selectors === 2) return { action: "prune", files: ["receipt.md"], reason: "stale filename" };
+        expect(prompt).toContain("previous selection was rejected");
+        expect(prompt).toContain("unknown or ineligible topic");
+        return { action: "none" };
+      }
+      if (isDreamCurator(system)) return { verdicts: [{
+        file: "receipt.md",
+        verdict: "remove",
+        category: "task_receipt",
+        reason: "Only records passing tests.",
+        evidence: [],
+      }] };
+      return saveDecisions();
+    });
+
+    await app.message("ses_selector_retry", "Start dreaming.");
+    await until(async () => {
+      try {
+        return (await Bun.file(join(path, ".dream.status")).json() as { state?: string }).state === "changed";
+      } catch {
+        return false;
+      }
+    });
+    await app.hooks.dispose!();
+
+    expect(selectors).toBe(3);
+    expect(await Bun.file(join(path, "receipt.md")).exists()).toBe(false);
+    expect(await Bun.file(join(path, "durable.md")).exists()).toBe(true);
+    const status = await Bun.file(join(path, ".dream.status")).json();
+    expect(status.counts.prune).toBe(1);
+    expect((await Bun.file(join(path, ".dreams", `${status.runID}.json`)).json()).state).toBe("changed");
+    await rm(dataHome, { recursive: true, force: true });
+  });
+
+  test.serial("removes stale index references when topic files are missing", async () => {
+    const dataHome = await mkdtemp("/tmp/opencode-memory-dream-missing-topic-");
+    process.env.XDG_DATA_HOME = dataHome;
+    const directory = "/tmp/memory-dream-missing-topic-project";
+    const path = await store(dataHome, directory, [
+      { file: "missing.md", title: "Missing", content: seededTopic("abc1111", "Missing topic.") },
+      { file: "durable.md", title: "Durable", content: seededTopic("def2222", "Durable project constraint.") },
+    ]);
+    await rm(join(path, "missing.md"));
+    await Bun.write(join(path, ".dream.request"), JSON.stringify({ requestID: "req-missing-topic", sessionID: "ses_missing_topic" }));
+    const app = await fixture(directory, ({ system, prompt }) => {
+      if (isDreamSelector(system)) {
+        expect(prompt).not.toContain("(missing.md)");
+        return { action: "none" };
+      }
+      return saveDecisions();
+    });
+
+    await app.message("ses_missing_topic", "Start dreaming.");
+    await until(async () => {
+      try {
+        const state = (await Bun.file(join(path, ".dream.status")).json() as { state?: string }).state;
+        return state === "changed" || state === "noop";
+      } catch {
+        return false;
+      }
+    });
+    await app.hooks.dispose!();
+
+    expect(await Bun.file(join(path, "index.md")).text()).not.toContain("missing.md");
+    const status = await Bun.file(join(path, ".dream.status")).json();
+    expect(status.state).not.toBe("failed");
+    if (status.state === "changed") {
+      expect(status.counts.prune).toBe(1);
+      const manifest = await Bun.file(join(path, ".dreams", `${status.runID}.json`)).json();
+      expect(manifest.actions[0]).toMatchObject({
+        action: "prune",
+        reason: "Removed index entries whose topic files are missing",
+        sources: [],
+        verdicts: [{ file: "missing.md", verdict: "remove" }],
+      });
+      expect(manifest.actions[0].verdicts[0].quarantinePath).toBeUndefined();
+    }
+    const message: FakeMessage = { info: { id: "msg-missing", sessionID: "ses_missing_topic", role: "user" }, parts: [{ type: "text", text: "next" }] };
+    await app.hooks["experimental.chat.messages.transform"]!({} as never, { messages: [message] } as never);
+    expect(message.parts[1]!.text).toContain("Removed topics: missing.md");
+    await rm(dataHome, { recursive: true, force: true });
+  });
+
   test.serial("safely keeps evidence-less removals and does not reselect all-kept nominations", async () => {
     const dataHome = await mkdtemp("/tmp/opencode-memory-dream-prune-keep-");
     process.env.XDG_DATA_HOME = dataHome;
