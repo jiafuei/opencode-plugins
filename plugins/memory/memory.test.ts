@@ -82,10 +82,6 @@ async function fixture(
       await hooks["chat.message"]!({ sessionID } as never, output as never);
       return output;
     },
-    agentOutput: (sessionID: string, text: string) => hooks["experimental.text.complete"]!(
-      { sessionID, messageID: crypto.randomUUID(), partID: crypto.randomUUID() },
-      { text },
-    ),
   };
 }
 
@@ -282,16 +278,8 @@ describe("memory persistence", () => {
       { sessionID: "ses_origin" } as never,
       { message: { id: crypto.randomUUID() }, parts: [{ type: "text", text }] } as never,
     );
-    await message("Remember confirmed approaches.");
-    await plugin["experimental.text.complete"]!({ sessionID: "ses_origin", messageID: "assistant-1", partID: "part-1" } as never,
-      { text: "The focused Bun test is the confirmed approach." });
-    await plugin["tool.execute.after"]!({ sessionID: "ses_origin", tool: "bash", args: { command: "bun test" } } as never,
-      { title: "failed", output: "FAILED_EVIDENCE", metadata: { exit: 1 } } as never);
-    await plugin["tool.execute.after"]!({ sessionID: "ses_origin", tool: "bash", args: { command: "bun test" } } as never,
-      { title: "passed", output: "SUCCESS_EVIDENCE", metadata: { exit: 0 } } as never);
-    await plugin["tool.execute.after"]!({ sessionID: "ses_origin", tool: "read", args: {} } as never,
-      { title: "read", output: "READ_EVIDENCE", metadata: { exit: 1 } } as never);
-    await message("This focused test approach worked.");
+    await message("For future testing, run the affected plugin's focused Bun test before the full suite.");
+    await message("Keep that as a testing instruction.");
     await message("Continue.");
     const memoryDirectory = join(dataHome, "opencode", "memory", serverProjectKey(directory));
     await until(async () => Bun.file(join(memoryDirectory, "index.md")).exists());
@@ -308,29 +296,22 @@ describe("memory persistence", () => {
       /- \[Confirmed test approach\]\([a-z0-9-]+\.md\) - \[instruction\|testing\|\d{4}-\d{2}-\d{2}\] Use the confirmed focused test approach\./,
     );
 
-    // The classifier sees only previously completed turns: buffered prompts and
-    // the completed assistant output, but neither the triggering prompt nor any
-    // tool output body.
-    expect(workerPrompts[0]).toContain("Remember confirmed approaches.");
-    expect(workerPrompts[0]).toContain("This focused test approach worked.");
-    expect(workerPrompts[0]).toContain("agent_output");
-    expect(workerPrompts[0]).toContain("The focused Bun test is the confirmed approach.");
+    // The classifier sees only previously completed, genuine user turns.
+    expect(workerPrompts[0]).toContain("For future testing");
+    expect(workerPrompts[0]).toContain("Keep that as a testing instruction.");
     expect(workerPrompts[0]).not.toContain("Continue.");
-    expect(workerPrompts[0]).toContain("bash: passed");
-    expect(workerPrompts[0]).toContain("read: read");
-    expect(workerPrompts[0]).not.toContain("command: bun test");
-    expect(workerPrompts[0]).not.toContain("SUCCESS_EVIDENCE");
-    expect(workerPrompts[0]).not.toContain("READ_EVIDENCE");
-    expect(workerPrompts[0]).not.toContain("FAILED_EVIDENCE");
-    expect(workerPrompts[0]).toContain("Recaps are only for completed tasks and only when");
+    expect(workerPrompts[0]).not.toContain("agent_output");
+    expect(workerPrompts[0]).not.toContain("tool_activity");
+    expect(workerPrompts[0]).toContain("Every saved claim must be directly supported");
+    expect(workerPrompts[0]).toContain("Never infer or preserve a codebase fact");
     expect(workerPrompts[0]).toContain("hard-won diagnoses or negative findings");
     expect(workerPrompts[0]).toContain("Commit receipts, passing test results, file edits, cleanups, and review results are not memories by themselves");
     expect(workerPrompts[0]).toContain("questions and answers");
     // Extraction is constrained to the decision subject.
     expect(workerPrompts[1]).toContain("<subject>");
     expect(workerPrompts[1]).toContain("confirmed focused test approach");
-    expect(workerSystems[1]).toContain("concretely completed task");
-    expect(workerSystems[1]).toContain("conclusions requiring re-derivation");
+    expect(workerSystems[1]).toContain("directly supported by the supplied user-authored messages");
+    expect(workerSystems[1]).toContain("conclusions explicitly stated or confirmed by the user");
     expect(workerMetadata[0]).toEqual({ memoryWorker: true, memoryActivity: "classification" });
     expect(workerMetadata[1]).toEqual({ memoryWorker: true, memoryActivity: "extraction" });
     await rm(dataHome, { recursive: true, force: true });
@@ -1022,7 +1003,7 @@ describe("memory idle revision gating", () => {
     await rm(dataHome, { recursive: true, force: true });
   });
 
-  test.serial("re-arms idle review on assistant output and tool activity but not blank collection", async () => {
+  test.serial("re-arms idle review only after another user message", async () => {
     const dataHome = await mkdtemp("/tmp/opencode-memory-idle-collect-");
     process.env.XDG_DATA_HOME = dataHome;
     const directory = "/tmp/memory-idle-collect-project";
@@ -1040,29 +1021,21 @@ describe("memory idle revision gating", () => {
       await until(() => app.calls.length === 1);
       await settle();
 
-      // Blank assistant output collects nothing: no re-review of the already
-      // consumed source.
-      await app.agentOutput("ses_idle_collect", "   \n");
+      expect(app.hooks["experimental.text.complete"]).toBeUndefined();
+      expect(app.hooks["tool.execute.after"]).toBeUndefined();
+
+      // Repeated idle events cannot review already consumed user source.
       await idle();
       jest.advanceTimersByTime(1000);
       await settle();
       expect(app.calls).toHaveLength(1);
 
-      // Completed assistant output is collected and reviewed on the next idle.
-      await app.agentOutput("ses_idle_collect", "Wrapped up the parser migration.");
+      // A new genuine user message makes the source reviewable again.
+      await app.message("ses_idle_collect", "Remember that deployment approvals require two reviewers.");
       await idle();
       jest.advanceTimersByTime(1000);
       await until(() => app.calls.length === 2);
-      expect(app.calls[1]!.prompt).toContain("Wrapped up the parser migration.");
-      await settle();
-
-      // Qualifying tool activity likewise makes a later idle event reviewable.
-      await app.hooks["tool.execute.after"]!({ sessionID: "ses_idle_collect", tool: "bash", args: { command: "bun test plugins/memory" } } as never,
-        { title: "passed", metadata: { exit: 0 } } as never);
-      await idle();
-      jest.advanceTimersByTime(1000);
-      await until(() => app.calls.length === 3);
-      expect(app.calls[2]!.prompt).toContain("bash: passed");
+      expect(app.calls[1]!.prompt).toContain("deployment approvals require two reviewers");
       await settle();
     } finally {
       jest.useRealTimers();
