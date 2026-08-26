@@ -17,19 +17,29 @@ export type CompactionState = {
   window: unknown[];
 };
 
-export type CompactionPlan =
-  | { type: "passthrough" }
-  | { type: "replay"; input: unknown[] }
-  | {
-      type: "compact";
-      instructions: string;
-      compactInput: unknown[];
-      envelope: unknown[];
-      keptTail: unknown[];
-      compactedCount: number;
-      signature: string;
-      fallbackInput?: unknown[];
-    };
+type CompactionDiagnostics = {
+  estimatedTokens: number;
+  tokenThreshold: number;
+  state: "none" | "valid" | "stale";
+};
+
+type SettledReason = "threshold_unavailable" | "below_threshold" | "no_compactable_history";
+
+export type CompactionPlan = CompactionDiagnostics &
+  (
+    | { type: "passthrough"; reason: SettledReason }
+    | { type: "replay"; input: unknown[]; reason: SettledReason }
+    | {
+        type: "compact";
+        instructions: string;
+        compactInput: unknown[];
+        envelope: unknown[];
+        keptTail: unknown[];
+        compactedCount: number;
+        signature: string;
+        fallbackInput?: unknown[];
+      }
+  );
 
 type Item = Record<string, unknown>;
 
@@ -131,14 +141,23 @@ export function planRequest(input: {
   const offset = state ? state.window.length : 0;
   const base = state ? [...state.window, ...history.slice(state.compactedCount)] : history;
   const replayInput = state ? [...envelope, ...base] : undefined;
-  const settled: CompactionPlan = replayInput ? { type: "replay", input: replayInput } : { type: "passthrough" };
-
   const tokenThreshold = threshold <= 1 ? contextLimit * threshold : threshold;
-  if (tokenThreshold <= 0) return settled;
-  if (estimateTokens([...envelope, ...base]) < tokenThreshold) return settled;
+  const estimatedTokens = estimateTokens({ ...body, input: [...envelope, ...base] });
+  const diagnostics = {
+    estimatedTokens,
+    tokenThreshold,
+    state: stored ? (state ? "valid" : "stale") : "none",
+  } as const;
+  const settled = (reason: SettledReason): CompactionPlan =>
+    replayInput
+      ? { type: "replay", input: replayInput, reason, ...diagnostics }
+      : { type: "passthrough", reason, ...diagnostics };
+
+  if (tokenThreshold <= 0) return settled("threshold_unavailable");
+  if (estimatedTokens < tokenThreshold) return settled("below_threshold");
 
   const tailStart = Math.max(lastUserTurnIndex(base), offset);
-  if (tailStart <= offset) return settled;
+  if (tailStart <= offset) return settled("no_compactable_history");
 
   const compactedCount = (state?.compactedCount ?? 0) + (tailStart - offset);
   return {
@@ -150,6 +169,7 @@ export function planRequest(input: {
     compactedCount,
     signature: fingerprint(history.slice(0, compactedCount)),
     fallbackInput: replayInput,
+    ...diagnostics,
   };
 }
 

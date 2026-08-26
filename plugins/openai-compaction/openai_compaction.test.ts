@@ -166,6 +166,28 @@ describe("planRequest", () => {
     expect(plan.instructions).toBe("codex prompt");
   });
 
+  test("counts the complete request body toward the threshold", () => {
+    const items = history(2);
+    const withoutInstructions = planRequest({
+      body: body(items),
+      state: undefined,
+      endpoint: ENDPOINT,
+      contextLimit: 0,
+      threshold: 5_000,
+    });
+    const withInstructions = planRequest({
+      body: body(items, { instructions: "x".repeat(20_000) }),
+      state: undefined,
+      endpoint: ENDPOINT,
+      contextLimit: 0,
+      threshold: 5_000,
+    });
+
+    expect(withoutInstructions.type).toBe("passthrough");
+    expect(withInstructions.type).toBe("compact");
+    expect(withInstructions.estimatedTokens).toBeGreaterThan(withoutInstructions.estimatedTokens);
+  });
+
   test("replays a stored window on later turns", () => {
     const items = history(6);
     const stored = state({ signature: fingerprint(items.slice(0, 20)) });

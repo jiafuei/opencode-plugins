@@ -41,6 +41,13 @@ type SessionInfo = {
   messageID: string;
   variant?: string;
   failed: boolean;
+  lastDecision?: {
+    type: "passthrough" | "replay" | "compact";
+    reason?: string;
+    estimatedTokens: number;
+    tokenThreshold: number;
+    state: "none" | "valid" | "stale";
+  };
 };
 
 type LogClient = {
@@ -106,6 +113,11 @@ const OpenAICompactionPlugin: Plugin = async ({ client, project, directory }, op
       .log({ body: { service: "openai-compaction", level, message, extra }, query: { directory } })
       .catch(() => {});
   };
+  log("info", "plugin initialized", {
+    threshold: configuredThreshold,
+    providers: [...providers],
+    debug: config.debug === true,
+  });
 
   const readState = async (sessionID: string) => {
     if (states.has(sessionID)) return states.get(sessionID);
@@ -181,7 +193,14 @@ const OpenAICompactionPlugin: Plugin = async ({ client, project, directory }, op
 
   const rewrite = async (sessionID: string, url: string, body: ResponsesBody, headers: Headers) => {
     const info = sessions.get(sessionID);
-    if (!info || info.failed) return undefined;
+    if (!info) {
+      log("debug", "tagged request has no session metadata", { sessionID });
+      return undefined;
+    }
+    if (info.failed) {
+      log("debug", "native compaction is disabled after an earlier failure", { sessionID });
+      return undefined;
+    }
 
     const endpoint = normalizeEndpoint(url);
     const plan = planRequest({
@@ -190,6 +209,20 @@ const OpenAICompactionPlugin: Plugin = async ({ client, project, directory }, op
       endpoint,
       contextLimit: info.contextLimit,
       threshold,
+    });
+    info.lastDecision = {
+      type: plan.type,
+      ...(plan.type === "compact" ? {} : { reason: plan.reason }),
+      estimatedTokens: plan.estimatedTokens,
+      tokenThreshold: plan.tokenThreshold,
+      state: plan.state,
+    };
+    log("debug", "evaluated request", {
+      sessionID,
+      model: body.model,
+      contextLimit: info.contextLimit,
+      inputItems: body.input.length,
+      ...info.lastDecision,
     });
     if (plan.type === "passthrough") return undefined;
     if (plan.type === "replay") {
@@ -285,7 +318,14 @@ const OpenAICompactionPlugin: Plugin = async ({ client, project, directory }, op
 
   return {
     "chat.headers": async (input, output) => {
-      if (!providers.has(input.model.providerID) || SKIPPED_AGENTS.has(input.agent)) return;
+      if (!providers.has(input.model.providerID)) return;
+      if (SKIPPED_AGENTS.has(input.agent)) {
+        log("debug", "skipping internal agent", {
+          sessionID: input.sessionID,
+          agent: input.agent,
+        });
+        return;
+      }
       const previous = sessions.get(input.sessionID);
       sessions.set(input.sessionID, {
         contextLimit: input.model.limit.context,
@@ -296,8 +336,32 @@ const OpenAICompactionPlugin: Plugin = async ({ client, project, directory }, op
         variant: (input.message.model as typeof input.message.model & { variant?: string }).variant,
         failed:
           previous?.providerID === input.model.providerID && previous.model === input.model.id ? previous.failed : false,
+        lastDecision:
+          previous?.providerID === input.model.providerID && previous.model === input.model.id
+            ? previous.lastDecision
+            : undefined,
       });
       output.headers[SESSION_HEADER] = input.sessionID;
+      log("debug", "tracking session request", {
+        sessionID: input.sessionID,
+        providerID: input.model.providerID,
+        model: input.model.id,
+        agent: input.agent,
+        contextLimit: input.model.limit.context,
+        tokenThreshold: threshold <= 1 ? input.model.limit.context * threshold : threshold,
+      });
+    },
+    "experimental.session.compacting": async (input) => {
+      const info = sessions.get(input.sessionID);
+      if (!info) return;
+      log("warn", "OpenCode built-in compaction started", {
+        sessionID: input.sessionID,
+        providerID: info.providerID,
+        model: info.model,
+        contextLimit: info.contextLimit,
+        nativeFailed: info.failed,
+        lastDecision: info.lastDecision,
+      });
     },
     event: async ({ event }) => {
       if (event.type !== "session.deleted") return;
