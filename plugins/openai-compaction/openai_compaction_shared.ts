@@ -58,6 +58,10 @@ export function isResponsesEndpoint(url: string): boolean {
   return new URL(url).pathname.endsWith("/responses");
 }
 
+export function isCodexResponsesEndpoint(url: string): boolean {
+  return new URL(url).pathname.endsWith("/codex/responses");
+}
+
 export function normalizeEndpoint(url: string): string {
   const parsed = new URL(url);
   return `${parsed.origin}${parsed.pathname}`;
@@ -176,6 +180,56 @@ export function planRequest(input: {
 export function readCompactedWindow(value: unknown): unknown[] | undefined {
   const output = asItem(value)?.output;
   return Array.isArray(output) && output.length > 0 ? output : undefined;
+}
+
+export function readStreamingCompactedWindow(value: string, input: readonly unknown[]): unknown[] | undefined {
+  let completed = false;
+  const compactionItems: unknown[] = [];
+
+  for (const block of value.split(/\r?\n\r?\n/)) {
+    const lines = block.split(/\r?\n/);
+    const eventName = lines.find((line) => line.startsWith("event:"))?.slice("event:".length).trim();
+    const data = lines
+      .filter((line) => line.startsWith("data:"))
+      .map((line) => line.slice("data:".length).trimStart())
+      .join("\n");
+    if (!data || data === "[DONE]") continue;
+
+    let event: Item;
+    try {
+      const parsed = asItem(JSON.parse(data));
+      if (!parsed) return undefined;
+      event = parsed;
+    } catch {
+      return undefined;
+    }
+
+    const type = typeof event.type === "string" ? event.type : eventName;
+    if (type === "response.output_item.done") {
+      const item = asItem(event.item);
+      if (item?.type === "compaction") compactionItems.push(item);
+    } else if (type === "response.completed" || type === "response.done") {
+      completed = true;
+    } else if (type === "response.failed" || type === "response.incomplete") {
+      return undefined;
+    }
+  }
+
+  if (!completed || compactionItems.length !== 1) return undefined;
+
+  // Codex V2 returns one opaque compaction item and expects recent real user
+  // messages to remain alongside it, capped at the same 64K budget as Codex.
+  let remainingTokens = 64_000;
+  const retained: unknown[] = [];
+  for (let index = input.length - 1; index >= 0; index--) {
+    const item = asItem(input[index]);
+    if (item?.role !== "user" || (item.type !== undefined && item.type !== "message")) continue;
+    const tokens = estimateTokens(item);
+    if (tokens > remainingTokens) break;
+    retained.unshift(item);
+    remainingTokens -= tokens;
+  }
+  return [...retained, ...compactionItems];
 }
 
 export function compactionProjectKey(projectID: string, directory: string): string {

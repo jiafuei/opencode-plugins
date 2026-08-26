@@ -3,12 +3,14 @@ import { rm } from "node:fs/promises";
 import {
   compactUrl,
   compactionDirectory,
+  isCodexResponsesEndpoint,
   isResponsesBody,
   isResponsesEndpoint,
   normalizeEndpoint,
   planRequest,
   precedingMessageID,
   readCompactedWindow,
+  readStreamingCompactedWindow,
   statePath,
   type CompactionState,
   type ResponsesBody,
@@ -138,20 +140,61 @@ const OpenAICompactionPlugin: Plugin = async ({ client, project, directory }, op
     await rm(statePath(root, sessionID), { force: true });
   };
 
-  const compact = async (url: string, headers: Headers, body: ResponsesBody) => {
+  const compact = async (
+    url: string,
+    headers: Headers,
+    body: ResponsesBody,
+    input: unknown[],
+    instructions: string,
+  ) => {
+    const codex = isCodexResponsesEndpoint(url);
     const compactHeaders = new Headers(headers);
-    compactHeaders.set("accept", "application/json");
     compactHeaders.set("content-type", "application/json");
-    const response = await originalFetch(compactUrl(url), {
+    const endpoint = codex ? normalizeEndpoint(url) : compactUrl(url);
+    let compactBody: ResponsesBody;
+    if (codex) {
+      compactHeaders.set("accept", "text/event-stream");
+      compactHeaders.set("openai-beta", "responses=experimental");
+      compactHeaders.set("x-codex-beta-features", "remote_compaction_v2");
+      const include = Array.isArray(body.include)
+        ? [...new Set([...body.include, "reasoning.encrypted_content"])]
+        : body.reasoning
+          ? ["reasoning.encrypted_content"]
+          : undefined;
+      compactBody = {
+        model: body.model,
+        input: [...input, { type: "compaction_trigger" }],
+        instructions,
+        stream: true,
+        store: false,
+        ...(body.reasoning ? { reasoning: body.reasoning } : {}),
+        ...(include ? { include } : {}),
+        ...(typeof body.prompt_cache_key === "string" ? { prompt_cache_key: body.prompt_cache_key } : {}),
+        ...(Array.isArray(body.tools) && body.tools.length > 0
+          ? { tools: body.tools, tool_choice: "auto" }
+          : {}),
+      };
+    } else {
+      compactHeaders.set("accept", "application/json");
+      compactBody = { model: body.model, input, instructions };
+    }
+    const response = await originalFetch(endpoint, {
       method: "POST",
       headers: compactHeaders,
-      body: JSON.stringify(body),
+      body: JSON.stringify(compactBody),
     });
     if (!response.ok) {
-      log("warn", "compact request failed", { status: response.status, body: await response.text() });
+      log("warn", "compact request failed", {
+        endpoint,
+        protocol: codex ? "codex_v2" : "responses_compact",
+        status: response.status,
+        body: await response.text(),
+      });
       return undefined;
     }
-    const window = readCompactedWindow(await response.json());
+    const window = codex
+      ? readStreamingCompactedWindow(await response.text(), input)
+      : readCompactedWindow(await response.json());
     if (!window) log("warn", "compact response had no output items");
     return window;
   };
@@ -240,11 +283,7 @@ const OpenAICompactionPlugin: Plugin = async ({ client, project, directory }, op
         error: error instanceof Error ? error.message : String(error),
       });
     });
-    const window = await compact(url, headers, {
-      model: body.model,
-      input: plan.compactInput,
-      ...(plan.instructions ? { instructions: plan.instructions } : {}),
-    });
+    const window = await compact(url, headers, body, plan.compactInput, plan.instructions);
     if (!window) {
       info.failed = true;
       return plan.fallbackInput ? { body: { ...body, input: plan.fallbackInput }, fresh: false } : undefined;

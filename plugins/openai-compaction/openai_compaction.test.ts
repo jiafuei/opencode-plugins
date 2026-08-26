@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
   compactUrl,
   fingerprint,
+  isCodexResponsesEndpoint,
   isResponsesEndpoint,
   lastUserTurnIndex,
   planRequest,
@@ -66,11 +67,13 @@ describe("endpoints", () => {
     expect(isResponsesEndpoint("https://api.openai.com/v1/chat/completions")).toBe(false);
   });
 
-  test("derives the compact url for both endpoints", () => {
+  test("recognizes the Codex Responses endpoint", () => {
+    expect(isCodexResponsesEndpoint("https://chatgpt.com/backend-api/codex/responses")).toBe(true);
+    expect(isCodexResponsesEndpoint(ENDPOINT)).toBe(false);
+  });
+
+  test("derives the direct compact url", () => {
     expect(compactUrl(ENDPOINT)).toBe("https://api.openai.com/v1/responses/compact");
-    expect(compactUrl("https://chatgpt.com/backend-api/codex/responses")).toBe(
-      "https://chatgpt.com/backend-api/codex/responses/compact",
-    );
   });
 
   test("creates an indicator id before the active user message", () => {
@@ -336,12 +339,23 @@ describe("plugin", () => {
     const stub = (async (input: string | URL | Request, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
       calls.push({ url, init: init ?? {} });
-      if (url.endsWith("/compact")) {
+      const requestBody = typeof init?.body === "string" ? JSON.parse(init.body) : undefined;
+      const streamingCompact = requestBody?.input?.at(-1)?.type === "compaction_trigger";
+      if (url.endsWith("/compact") || streamingCompact) {
         return (
           overrides.compact?.() ??
-          new Response(JSON.stringify({ id: "resp_1", output: [{ type: "message", id: "compacted" }] }), {
-            status: 200,
-          })
+          (streamingCompact
+            ? new Response(
+                [
+                  'data: {"type":"response.output_item.done","item":{"type":"compaction","encrypted_content":"compacted"}}',
+                  'data: {"type":"response.completed","response":{"status":"completed"}}',
+                  "",
+                ].join("\n\n"),
+                { status: 200, headers: { "content-type": "text/event-stream" } },
+              )
+            : new Response(JSON.stringify({ id: "resp_1", output: [{ type: "message", id: "compacted" }] }), {
+                status: 200,
+              }))
         );
       }
       return overrides.main?.() ?? new Response("{}", { status: 200 });
@@ -442,6 +456,30 @@ describe("plugin", () => {
     expect(harness.indicators[0]).toMatchObject({
       body: { model: { providerID: "openai-compatible", modelID: "gpt-5.5" } },
     });
+    await harness.dispose();
+  });
+
+  test("uses streaming V2 compaction for the ChatGPT Codex endpoint", async () => {
+    const endpoint = "https://chatgpt.com/backend-api/codex/responses";
+    const harness = await createHarness({ endpoint });
+    const items = history(6);
+    await harness.send(items);
+
+    expect(harness.calls).toHaveLength(2);
+    const [compactCall, sentCall] = harness.calls;
+    expect(sent(compactCall).url).toBe(endpoint);
+    const compactBody = JSON.parse(sent(compactCall).init.body as string);
+    expect(compactBody.input.at(-1)).toEqual({ type: "compaction_trigger" });
+    expect(compactBody).toMatchObject({ stream: true, store: false });
+    const compactHeaders = new Headers(sent(compactCall).init.headers);
+    expect(compactHeaders.get("openai-beta")).toBe("responses=experimental");
+    expect(compactHeaders.get("x-codex-beta-features")).toBe("remote_compaction_v2");
+    expect(sent(sentCall).url).toBe(endpoint);
+    expect(sentInput(sentCall)).toEqual([
+      ...items.slice(0, -4).filter((item) => "role" in item && item.role === "user"),
+      { type: "compaction", encrypted_content: "compacted" },
+      ...items.slice(-4),
+    ]);
     await harness.dispose();
   });
 
