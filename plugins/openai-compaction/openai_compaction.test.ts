@@ -6,7 +6,6 @@ import {
   isResponsesEndpoint,
   lastUserTurnIndex,
   planRequest,
-  precedingMessageID,
   readCompactedWindow,
   splitEnvelope,
   type CompactionState,
@@ -76,12 +75,6 @@ describe("endpoints", () => {
     expect(compactUrl(ENDPOINT)).toBe("https://api.openai.com/v1/responses/compact");
   });
 
-  test("creates an indicator id before the active user message", () => {
-    const id = precedingMessageID(USER_MESSAGE_ID);
-    expect(id).toMatch(/^msg_[0-9a-f]{12}[0-9a-zA-Z]{14}$/);
-    expect(id! < USER_MESSAGE_ID).toBe(true);
-    expect(precedingMessageID("not-a-message-id")).toBeUndefined();
-  });
 });
 
 describe("payload parsing", () => {
@@ -306,24 +299,24 @@ describe("planRequest", () => {
 
 describe("plugin", () => {
   type Call = { url: string; init: RequestInit };
-  type Indicator = {
-    path: { id: string };
+  type PartUpdate = {
+    url: string;
+    path: { sessionID: string; messageID: string; partID: string };
     query: { directory: string };
     body: {
+      id: string;
+      sessionID: string;
       messageID: string;
-      model: { providerID: string; modelID: string };
-      agent: string;
-      variant?: string;
-      noReply: true;
-      parts: Array<{ type: "text"; text: string; ignored: true }>;
+      type: "text";
+      text: string;
+      synthetic: true;
+      ignored: true;
     };
   };
-
   async function createHarness(
     overrides: {
       compact?: () => Response;
       main?: () => Response;
-      indicator?: (input: Indicator) => Promise<{ data?: unknown; error?: unknown }>;
       contextLimit?: number;
       threshold?: number | `${number}%`;
       providerID?: string;
@@ -334,7 +327,7 @@ describe("plugin", () => {
     const dataHome = join(tmpdir(), `openai-compaction-${Bun.hash.wyhash(`${Math.random()}`).toString(16)}`);
     process.env.XDG_DATA_HOME = dataHome;
     const calls: Call[] = [];
-    const indicators: Indicator[] = [];
+    const partUpdates: PartUpdate[] = [];
     const toasts: unknown[] = [];
     const stub = (async (input: string | URL | Request, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
@@ -367,13 +360,15 @@ describe("plugin", () => {
       {
         client: {
           app: { log: async () => {} },
-          tui: { showToast: async (input: unknown) => void toasts.push(input) },
           session: {
-            prompt: async (input: Indicator) => {
-              indicators.push(input);
-              return overrides.indicator?.(input) ?? { data: {} };
+            _client: {
+              patch: async (input: PartUpdate) => {
+                partUpdates.push(input);
+                return { data: input.body };
+              },
             },
           },
+          tui: { showToast: async (input: unknown) => void toasts.push(input) },
         },
         project: { id: "proj" },
         directory: dataHome,
@@ -412,7 +407,7 @@ describe("plugin", () => {
 
     return {
       calls,
-      indicators,
+      partUpdates,
       toasts,
       headers,
       send,
@@ -453,9 +448,6 @@ describe("plugin", () => {
 
     expect(harness.calls).toHaveLength(2);
     expect(sent(harness.calls[0]).url).toBe(compactUrl(endpoint));
-    expect(harness.indicators[0]).toMatchObject({
-      body: { model: { providerID: "openai-compatible", modelID: "gpt-5.5" } },
-    });
     await harness.dispose();
   });
 
@@ -493,7 +485,6 @@ describe("plugin", () => {
 
     expect(harness.calls).toHaveLength(1);
     expect(sentInput(harness.calls[0])).toEqual(items);
-    expect(harness.indicators).toHaveLength(0);
     await harness.dispose();
   });
 
@@ -516,18 +507,6 @@ describe("plugin", () => {
     expect(sent(compactCall).url).toBe(compactUrl(ENDPOINT));
     expect(sentInput(compactCall)).toHaveLength(items.length - 4);
     expect(sentInput(sentCall)).toEqual([{ type: "message", id: "compacted" }, ...items.slice(-4)]);
-    expect(harness.indicators).toHaveLength(1);
-    expect(harness.indicators[0]).toMatchObject({
-      path: { id: "ses_1" },
-      body: {
-        model: { providerID: "openai", modelID: "gpt-5.5" },
-        agent: "build",
-        variant: "high",
-        noReply: true,
-        parts: [{ type: "text", text: "Compacting context...", ignored: true }],
-      },
-    });
-    expect(harness.indicators[0]!.body.messageID < USER_MESSAGE_ID).toBe(true);
     expect(harness.toasts).toEqual([
       {
         body: {
@@ -538,6 +517,20 @@ describe("plugin", () => {
         },
       },
     ]);
+    expect(harness.partUpdates).toHaveLength(2);
+    expect(harness.partUpdates[0]).toMatchObject({
+      path: { sessionID: "ses_1", messageID: USER_MESSAGE_ID },
+      body: {
+        sessionID: "ses_1",
+        messageID: USER_MESSAGE_ID,
+        type: "text",
+        text: "--- Compacting context... ---",
+        synthetic: true,
+        ignored: true,
+      },
+    });
+    expect(harness.partUpdates[1]?.path.partID).toBe(harness.partUpdates[0]?.path.partID);
+    expect(harness.partUpdates[1]?.body.text).toBe("--- Context compacted ---");
     expect(harness.headers["x-opencode-openai-compaction"]).toBe("ses_1");
     expect(new Headers(sent(sentCall).init.headers).get("x-opencode-openai-compaction")).toBeNull();
     expect(await stateFile(harness).exists()).toBe(true);
@@ -546,20 +539,10 @@ describe("plugin", () => {
     harness.calls.length = 0;
     await harness.send(next);
     expect(harness.calls).toHaveLength(1);
-    expect(harness.indicators).toHaveLength(1);
     expect(sentInput(harness.calls[0])).toEqual([
       { type: "message", id: "compacted" },
       ...next.slice(items.length - 4),
     ]);
-    await harness.dispose();
-  });
-
-  test("continues compaction when the indicator message fails", async () => {
-    const harness = await createHarness({ indicator: async () => { throw new Error("indicator failed"); } });
-    await harness.send(history(6));
-    expect(harness.indicators).toHaveLength(1);
-    expect(harness.calls).toHaveLength(2);
-    expect(sent(harness.calls[0]).url).toBe(compactUrl(ENDPOINT));
     await harness.dispose();
   });
 
@@ -570,6 +553,7 @@ describe("plugin", () => {
 
     expect(harness.calls).toHaveLength(2);
     expect(sentInput(harness.calls[1])).toEqual(items);
+    expect(harness.partUpdates.at(-1)?.body.text).toBe("--- Context compaction failed ---");
 
     harness.calls.length = 0;
     await harness.send(items);

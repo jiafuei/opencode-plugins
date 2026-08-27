@@ -8,7 +8,6 @@ import {
   isResponsesEndpoint,
   normalizeEndpoint,
   planRequest,
-  precedingMessageID,
   readCompactedWindow,
   readStreamingCompactedWindow,
   statePath,
@@ -39,9 +38,7 @@ type SessionInfo = {
   contextLimit: number;
   providerID: string;
   model: string;
-  agent: string;
   messageID: string;
-  variant?: string;
   failed: boolean;
   lastDecision?: {
     type: "passthrough" | "replay" | "compact";
@@ -61,20 +58,23 @@ type LogClient = {
   };
 };
 
-type SessionClient = {
-  session: {
-    prompt(input: {
-      path: { id: string };
+type PartUpdateClient = {
+  _client: {
+    patch(input: {
+      url: "/session/{sessionID}/message/{messageID}/part/{partID}";
+      path: { sessionID: string; messageID: string; partID: string };
       query: { directory: string };
       body: {
+        id: string;
+        sessionID: string;
         messageID: string;
-        model: { providerID: string; modelID: string };
-        agent: string;
-        variant?: string;
-        noReply: true;
-        parts: Array<{ type: "text"; text: string; ignored: true }>;
+        type: "text";
+        text: string;
+        synthetic: true;
+        ignored: true;
       };
-    }): Promise<{ data?: unknown; error?: unknown }>;
+      headers: { "content-type": "application/json" };
+    }): Promise<{ error?: unknown }>;
   };
 };
 
@@ -103,7 +103,9 @@ const OpenAICompactionPlugin: Plugin = async ({ client, project, directory }, op
   // `Bun.write` creates the parent directory on first save.
   const root = compactionDirectory(project.id, directory);
   const logClient = client as unknown as LogClient;
-  const sessionClient = client as unknown as SessionClient;
+  // The legacy plugin client does not expose the experimental part endpoint.
+  // Reuse its configured transport so server auth and in-process fetch still work.
+  const partClient = (client.session as unknown as PartUpdateClient)._client;
   const sessions = new Map<string, SessionInfo>();
   const states = new Map<string, CompactionState | undefined>();
   const originalFetch = globalThis.fetch;
@@ -199,7 +201,7 @@ const OpenAICompactionPlugin: Plugin = async ({ client, project, directory }, op
     return window;
   };
 
-  const showCompactionMessage = async (sessionID: string, info: SessionInfo) => {
+  const showCompactionToast = () => {
     void client.tui
       .showToast({
         body: {
@@ -210,26 +212,23 @@ const OpenAICompactionPlugin: Plugin = async ({ client, project, directory }, op
         },
       })
       .catch(() => {});
+  };
 
-    const messageID = precedingMessageID(info.messageID);
-    if (!messageID) {
-      log("warn", "could not create compaction message before an invalid user message id", {
-        sessionID,
-        messageID: info.messageID,
-      });
-      return;
-    }
-    const result = await sessionClient.session.prompt({
-      path: { id: sessionID },
+  const writeCompactionPart = async (sessionID: string, messageID: string, partID: string, text: string) => {
+    const result = await partClient.patch({
+      url: "/session/{sessionID}/message/{messageID}/part/{partID}",
+      path: { sessionID, messageID, partID },
       query: { directory },
       body: {
+        id: partID,
+        sessionID,
         messageID,
-        model: { providerID: info.providerID, modelID: info.model },
-        agent: info.agent,
-        ...(info.variant ? { variant: info.variant } : {}),
-        noReply: true,
-        parts: [{ type: "text", text: "Compacting context...", ignored: true }],
+        type: "text",
+        text,
+        synthetic: true,
+        ignored: true,
       },
+      headers: { "content-type": "application/json" },
     });
     if (result.error) throw result.error;
   };
@@ -277,13 +276,44 @@ const OpenAICompactionPlugin: Plugin = async ({ client, project, directory }, op
       return { body: { ...body, input: plan.input }, fresh: false };
     }
 
-    await showCompactionMessage(sessionID, info).catch((error) => {
-      log("warn", "could not show compaction message", {
+    showCompactionToast();
+    const time = (BigInt(Date.now()) * 0x1000n + 1n).toString(16).padStart(12, "0");
+    const partID = `prt_${time}${crypto.randomUUID().replaceAll("-", "").slice(0, 14)}`;
+    const partVisible = await writeCompactionPart(
+      sessionID,
+      info.messageID,
+      partID,
+      "--- Compacting context... ---",
+    ).then(
+      () => true,
+      (error) => {
+        log("warn", "could not show compaction transcript marker", {
+          sessionID,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        return false;
+      },
+    );
+
+    let window: unknown[] | undefined;
+    try {
+      window = await compact(url, headers, body, plan.compactInput, plan.instructions);
+    } catch (error) {
+      if (partVisible) {
+        await writeCompactionPart(sessionID, info.messageID, partID, "--- Context compaction failed ---").catch(
+          () => {},
+        );
+      }
+      throw error;
+    }
+    if (partVisible) {
+      await writeCompactionPart(
         sessionID,
-        error: error instanceof Error ? error.message : String(error),
-      });
-    });
-    const window = await compact(url, headers, body, plan.compactInput, plan.instructions);
+        info.messageID,
+        partID,
+        window ? "--- Context compacted ---" : "--- Context compaction failed ---",
+      ).catch(() => {});
+    }
     if (!window) {
       info.failed = true;
       return plan.fallbackInput ? { body: { ...body, input: plan.fallbackInput }, fresh: false } : undefined;
@@ -370,9 +400,7 @@ const OpenAICompactionPlugin: Plugin = async ({ client, project, directory }, op
         contextLimit: input.model.limit.context,
         providerID: input.model.providerID,
         model: input.model.id,
-        agent: input.agent,
         messageID: input.message.id,
-        variant: (input.message.model as typeof input.message.model & { variant?: string }).variant,
         failed:
           previous?.providerID === input.model.providerID && previous.model === input.model.id ? previous.failed : false,
         lastDecision:
