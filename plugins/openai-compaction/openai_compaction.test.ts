@@ -121,25 +121,27 @@ describe("planRequest", () => {
   const contextLimit = 1_000_000;
   const oversized = 1_000;
 
-  test("passes through below the threshold", () => {
-    const plan = planRequest({
+  test("passes through below the threshold", async () => {
+    const plan = await planRequest({
       body: body([user("hi"), assistant("msg_0", "hello")]),
       state: undefined,
       endpoint: ENDPOINT,
       contextLimit,
       threshold: 0.7,
+      latestTokens: 1_000,
     });
     expect(plan.type).toBe("passthrough");
   });
 
-  test("compacts everything before the last user turn once oversized", () => {
+  test("compacts everything before the last user turn once oversized", async () => {
     const items = history(6);
-    const plan = planRequest({
+    const plan = await planRequest({
       body: body([{ role: "system", content: "prompt" }, ...items]),
       state: undefined,
       endpoint: ENDPOINT,
       contextLimit: oversized,
       threshold: 0.7,
+      latestTokens: 800,
     });
     if (plan.type !== "compact") throw new Error(`expected compact, got ${plan.type}`);
     expect(plan.instructions).toBe("prompt");
@@ -150,63 +152,44 @@ describe("planRequest", () => {
     expect(plan.fallbackInput).toBeUndefined();
   });
 
-  test("uses body instructions when there is no envelope", () => {
-    const plan = planRequest({
+  test("uses body instructions when there is no envelope", async () => {
+    const plan = await planRequest({
       body: body(history(6), { instructions: "codex prompt" }),
       state: undefined,
       endpoint: ENDPOINT,
       contextLimit: oversized,
       threshold: 0.7,
+      latestTokens: 800,
     });
     if (plan.type !== "compact") throw new Error(`expected compact, got ${plan.type}`);
     expect(plan.instructions).toBe("codex prompt");
   });
 
-  test("counts the complete request body toward the threshold", () => {
-    const items = history(2);
-    const withoutInstructions = planRequest({
-      body: body(items),
-      state: undefined,
-      endpoint: ENDPOINT,
-      contextLimit: 0,
-      threshold: 5_000,
-    });
-    const withInstructions = planRequest({
-      body: body(items, { instructions: "x".repeat(20_000) }),
-      state: undefined,
-      endpoint: ENDPOINT,
-      contextLimit: 0,
-      threshold: 5_000,
-    });
-
-    expect(withoutInstructions.type).toBe("passthrough");
-    expect(withInstructions.type).toBe("compact");
-    expect(withInstructions.estimatedTokens).toBeGreaterThan(withoutInstructions.estimatedTokens);
-  });
-
-  test("replays a stored window on later turns", () => {
+  test("replays a stored window on later turns", async () => {
     const items = history(6);
     const stored = state({ signature: fingerprint(items.slice(0, 20)) });
-    const plan = planRequest({
+    const plan = await planRequest({
       body: body([{ role: "system", content: "prompt" }, ...items]),
       state: stored,
       endpoint: ENDPOINT,
       contextLimit: 1_000_000,
       threshold: 0.7,
+      latestTokens: 1_000,
     });
     if (plan.type !== "replay") throw new Error(`expected replay, got ${plan.type}`);
     expect(plan.input).toEqual([{ role: "system", content: "prompt" }, ...stored.window, ...items.slice(20)]);
   });
 
-  test("chains a second compaction on top of the stored window", () => {
+  test("chains a second compaction on top of the stored window", async () => {
     const items = history(10);
     const window = [{ type: "message", id: "compacted" }];
-    const plan = planRequest({
+    const plan = await planRequest({
       body: body(items),
       state: state({ signature: fingerprint(items.slice(0, 20)), window }),
       endpoint: ENDPOINT,
       contextLimit: oversized,
       threshold: 0.7,
+      latestTokens: 800,
     });
     if (plan.type !== "compact") throw new Error(`expected compact, got ${plan.type}`);
     expect(plan.compactInput[0]).toBe(window[0]);
@@ -216,10 +199,10 @@ describe("planRequest", () => {
     expect(plan.fallbackInput).toEqual([...window, ...items.slice(20)]);
   });
 
-  test("never cuts the kept tail into the opaque window", () => {
+  test("never cuts the kept tail into the opaque window", async () => {
     const items = [...history(5), user("only recent turn")];
     const window = [{ type: "message", id: "compacted" }];
-    const plan = planRequest({
+    const plan = await planRequest({
       body: body(items),
       state: state({
         compactedCount: items.length - 1,
@@ -229,71 +212,113 @@ describe("planRequest", () => {
       endpoint: ENDPOINT,
       contextLimit: 10,
       threshold: 0.7,
+      latestTokens: 10,
     });
     if (plan.type !== "replay") throw new Error(`expected replay, got ${plan.type}`);
     expect(plan.input).toEqual([...window, items.at(-1)]);
   });
 
-  test("drops stale state when history no longer matches", () => {
+  test("drops stale state when history no longer matches", async () => {
     expect(
-      planRequest({
-        body: body(history(6)),
-        state: state({ signature: "1:deadbeef" }),
-        endpoint: ENDPOINT,
-        contextLimit: 1_000_000,
-        threshold: 0.7,
-      }).type,
+      (
+        await planRequest({
+          body: body(history(6)),
+          state: state({ signature: "1:deadbeef" }),
+          endpoint: ENDPOINT,
+          contextLimit: 1_000_000,
+          threshold: 0.7,
+          latestTokens: 1_000,
+        })
+      ).type,
     ).toBe("passthrough");
   });
 
-  test("drops state when the history is shorter than the compacted prefix", () => {
+  test("drops state when the history is shorter than the compacted prefix", async () => {
     const items = history(6);
     expect(
-      planRequest({
-        body: body(items.slice(0, 8)),
-        state: state({ signature: fingerprint(items.slice(0, 20)) }),
-        endpoint: ENDPOINT,
-        contextLimit: 1_000_000,
-        threshold: 0.7,
-      }).type,
+      (
+        await planRequest({
+          body: body(items.slice(0, 8)),
+          state: state({ signature: fingerprint(items.slice(0, 20)) }),
+          endpoint: ENDPOINT,
+          contextLimit: 1_000_000,
+          threshold: 0.7,
+          latestTokens: 1_000,
+        })
+      ).type,
     ).toBe("passthrough");
   });
 
-  test("drops state after a model or endpoint switch", () => {
+  test("drops state after a model or endpoint switch", async () => {
     const items = history(6);
     const stored = state({ signature: fingerprint(items.slice(0, 20)) });
     expect(
-      planRequest({
-        body: body(items, { model: "gpt-5.4" }),
-        state: stored,
-        endpoint: ENDPOINT,
-        contextLimit: 1_000_000,
-        threshold: 0.7,
-      }).type,
+      (
+        await planRequest({
+          body: body(items, { model: "gpt-5.4" }),
+          state: stored,
+          endpoint: ENDPOINT,
+          contextLimit: 1_000_000,
+          threshold: 0.7,
+          latestTokens: 1_000,
+        })
+      ).type,
     ).toBe("passthrough");
     expect(
-      planRequest({
-        body: body(items),
-        state: stored,
-        endpoint: "https://chatgpt.com/backend-api/codex/responses",
-        contextLimit: 1_000_000,
-        threshold: 0.7,
-      }).type,
+      (
+        await planRequest({
+          body: body(items),
+          state: stored,
+          endpoint: "https://chatgpt.com/backend-api/codex/responses",
+          contextLimit: 1_000_000,
+          threshold: 0.7,
+          latestTokens: 1_000,
+        })
+      ).type,
     ).toBe("passthrough");
   });
 
-  test("skips compaction when the model has no known context limit", () => {
+  test("skips compaction when the model has no known context limit", async () => {
     expect(
-      planRequest({ body: body(history(10)), state: undefined, endpoint: ENDPOINT, contextLimit: 0, threshold: 0.7 })
-        .type,
+      (
+        await planRequest({
+          body: body(history(10)),
+          state: undefined,
+          endpoint: ENDPOINT,
+          contextLimit: 0,
+          threshold: 0.7,
+          latestTokens: 100_000,
+        })
+      ).type,
     ).toBe("passthrough");
   });
 
-  test("uses an absolute token threshold without a known context limit", () => {
+  test("uses an absolute token threshold without a known context limit", async () => {
     expect(
-      planRequest({ body: body(history(6)), state: undefined, endpoint: ENDPOINT, contextLimit: 0, threshold: 1_000 })
-        .type,
+      (
+        await planRequest({
+          body: body(history(6)),
+          state: undefined,
+          endpoint: ENDPOINT,
+          contextLimit: 0,
+          threshold: 1_000,
+          latestTokens: 1_000,
+        })
+      ).type,
     ).toBe("compact");
+  });
+
+  test("uses zero when OpenCode has not reported a token count", async () => {
+    const plan = await planRequest({
+      body: body(history(6)),
+      state: undefined,
+      endpoint: ENDPOINT,
+      contextLimit: 1_000,
+      threshold: 0.5,
+    });
+
+    expect(plan.type).toBe("passthrough");
+    expect(plan.tokens).toBe(0);
   });
 });
 
@@ -318,6 +343,10 @@ describe("plugin", () => {
       compact?: () => Response;
       main?: () => Response;
       contextLimit?: number;
+      latestTokens?: number;
+      latestProviderID?: string;
+      latestModelID?: string;
+      messagesFail?: boolean;
       threshold?: number | `${number}%`;
       providerID?: string;
       additionalProviders?: string[];
@@ -331,8 +360,8 @@ describe("plugin", () => {
     const toasts: unknown[] = [];
     const stub = (async (input: string | URL | Request, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
-      calls.push({ url, init: init ?? {} });
       const requestBody = typeof init?.body === "string" ? JSON.parse(init.body) : undefined;
+      calls.push({ url, init: init ?? {} });
       const streamingCompact = requestBody?.input?.at(-1)?.type === "compaction_trigger";
       if (url.endsWith("/compact") || streamingCompact) {
         return (
@@ -361,6 +390,30 @@ describe("plugin", () => {
         client: {
           app: { log: async () => {} },
           session: {
+            messages: async () => {
+              if (overrides.messagesFail) throw new Error("messages unavailable");
+              return {
+                data: [
+                  {
+                    info: {
+                      id: "msg_previous",
+                      sessionID: "ses_1",
+                      role: "assistant",
+                      providerID: overrides.latestProviderID ?? overrides.providerID ?? "openai",
+                      modelID: overrides.latestModelID ?? "gpt-5.5",
+                      mode: "build",
+                      tokens: {
+                        input: overrides.latestTokens ?? 1_000_000,
+                        output: 0,
+                        reasoning: 0,
+                        cache: { read: 0, write: 0 },
+                      },
+                    },
+                    parts: [],
+                  },
+                ],
+              };
+            },
             _client: {
               patch: async (input: PartUpdate) => {
                 partUpdates.push(input);
@@ -379,6 +432,7 @@ describe("plugin", () => {
       },
     )) as {
       "chat.headers": (input: unknown, output: { headers: Record<string, string> }) => Promise<void>;
+      event: (input: { event: unknown }) => Promise<void>;
       dispose: () => Promise<void>;
     };
     const patched = globalThis.fetch;
@@ -411,6 +465,7 @@ describe("plugin", () => {
       toasts,
       headers,
       send,
+      emit: hooks.event,
       dataHome,
       dispose: async () => {
         await hooks.dispose();
@@ -496,6 +551,85 @@ describe("plugin", () => {
     }
   });
 
+  test("waits until the latest OpenCode count reaches the threshold", async () => {
+    const harness = await createHarness({ contextLimit: 1_000, threshold: 0.5, latestTokens: 449 });
+    const items = history(6);
+    await harness.send(items);
+
+    expect(harness.calls).toHaveLength(1);
+    expect(sentInput(harness.calls[0])).toEqual(items);
+    await harness.dispose();
+  });
+
+  test("uses message updates as the latest OpenCode count", async () => {
+    const harness = await createHarness({ contextLimit: 1_000, threshold: 0.5, latestTokens: 0 });
+    await harness.emit({
+      event: {
+        type: "message.updated",
+        properties: {
+          info: {
+            id: "msg_latest",
+            sessionID: "ses_1",
+            role: "assistant",
+            providerID: "openai",
+            modelID: "gpt-5.5",
+            mode: "build",
+            tokens: { input: 350, output: 50, reasoning: 25, cache: { read: 75, write: 0 } },
+          },
+        },
+      },
+    });
+    await harness.send(history(6));
+
+    expect(harness.calls).toHaveLength(2);
+    await harness.dispose();
+  });
+
+  test("passes through when the latest OpenCode count cannot be loaded", async () => {
+    const harness = await createHarness({
+      contextLimit: 1_000,
+      threshold: 0.5,
+      messagesFail: true,
+    });
+    await harness.send(history(6));
+
+    expect(harness.calls).toHaveLength(1);
+    await harness.dispose();
+  });
+
+  test("uses the latest OpenCode count after a model switch", async () => {
+    const harness = await createHarness({
+      contextLimit: 1_000,
+      threshold: 0.5,
+      latestTokens: 100,
+      latestModelID: "gpt-5.4",
+    });
+    await harness.send(history(6));
+
+    expect(harness.calls).toHaveLength(1);
+    await harness.dispose();
+  });
+
+  test("invalidates the latest OpenCode count when its message is removed", async () => {
+    const harness = await createHarness({
+      contextLimit: 1_000,
+      threshold: 0.5,
+      latestTokens: 100,
+    });
+    await harness.emit({
+      event: {
+        type: "message.removed",
+        properties: { sessionID: "ses_1", messageID: "msg_previous" },
+      },
+    });
+    const items = history(6);
+    await harness.send(items);
+
+    expect(harness.calls).toHaveLength(1);
+    expect(sentInput(harness.calls[0])).toEqual(items);
+    await harness.dispose();
+  });
+
   test("compacts an oversized request and replays the window on the next turn", async () => {
     // Sized so the full history is over the threshold but the replayed window plus
     // the kept tail is under it, i.e. the next turn replays instead of recompacting.
@@ -535,6 +669,22 @@ describe("plugin", () => {
     expect(new Headers(sent(sentCall).init.headers).get("x-opencode-openai-compaction")).toBeNull();
     expect(await stateFile(harness).exists()).toBe(true);
 
+    await harness.emit({
+      event: {
+        type: "message.updated",
+        properties: {
+          info: {
+            id: "msg_compacted",
+            sessionID: "ses_1",
+            role: "assistant",
+            providerID: "openai",
+            modelID: "gpt-5.5",
+            mode: "build",
+            tokens: { input: 700, output: 100, reasoning: 0, cache: { read: 0, write: 0 } },
+          },
+        },
+      },
+    });
     const next = [...items, user("what did we decide?")];
     harness.calls.length = 0;
     await harness.send(next);

@@ -40,10 +40,12 @@ type SessionInfo = {
   model: string;
   messageID: string;
   failed: boolean;
+  latestTokens?: number;
+  latestTokenMessageID?: string;
   lastDecision?: {
     type: "passthrough" | "replay" | "compact";
     reason?: string;
-    estimatedTokens: number;
+    tokens: number;
     tokenThreshold: number;
     state: "none" | "valid" | "stale";
   };
@@ -80,6 +82,15 @@ type PartUpdateClient = {
 
 const SESSION_HEADER = "x-opencode-openai-compaction";
 const SKIPPED_AGENTS = new Set(["title", "compaction"]);
+
+function totalOpenCodeTokens(tokens: {
+  input: number;
+  output: number;
+  reasoning: number;
+  cache: { read: number; write: number };
+}) {
+  return tokens.input + tokens.output + tokens.reasoning + tokens.cache.read + tokens.cache.write;
+}
 
 const OpenAICompactionPlugin: Plugin = async ({ client, project, directory }, options) => {
   const config = (options ?? {}) as PluginOptions & CompactionOptions;
@@ -251,11 +262,12 @@ const OpenAICompactionPlugin: Plugin = async ({ client, project, directory }, op
       endpoint,
       contextLimit: info.contextLimit,
       threshold,
+      latestTokens: info.latestTokens,
     });
     info.lastDecision = {
       type: plan.type,
       ...(plan.type === "compact" ? {} : { reason: plan.reason }),
-      estimatedTokens: plan.estimatedTokens,
+      tokens: plan.tokens,
       tokenThreshold: plan.tokenThreshold,
       state: plan.state,
     };
@@ -396,17 +408,39 @@ const OpenAICompactionPlugin: Plugin = async ({ client, project, directory }, op
         return;
       }
       const previous = sessions.get(input.sessionID);
+      const sameModel = previous?.providerID === input.model.providerID && previous.model === input.model.id;
+      const latest = sameModel && previous !== undefined && previous.latestTokens !== undefined
+        ? {
+            tokens: previous.latestTokens,
+            messageID: previous.latestTokenMessageID,
+          }
+        : await client.session
+            .messages({ path: { id: input.sessionID }, query: { directory, limit: 20 } })
+            .then((result) => {
+              const messages = result.data ?? [];
+              for (let index = messages.length - 1; index >= 0; index--) {
+                const message = messages[index]?.info;
+                if (message?.role !== "assistant" || message.summary) continue;
+                const tokens = totalOpenCodeTokens(message.tokens);
+                if (tokens > 0) {
+                  return {
+                    tokens,
+                    messageID: message.id,
+                  };
+                }
+              }
+              return { tokens: 0 };
+            })
+            .catch(() => undefined);
       sessions.set(input.sessionID, {
         contextLimit: input.model.limit.context,
         providerID: input.model.providerID,
         model: input.model.id,
         messageID: input.message.id,
-        failed:
-          previous?.providerID === input.model.providerID && previous.model === input.model.id ? previous.failed : false,
-        lastDecision:
-          previous?.providerID === input.model.providerID && previous.model === input.model.id
-            ? previous.lastDecision
-            : undefined,
+        failed: sameModel && previous !== undefined ? previous.failed : false,
+        latestTokens: latest?.tokens,
+        latestTokenMessageID: latest?.messageID,
+        lastDecision: sameModel && previous !== undefined ? previous.lastDecision : undefined,
       });
       output.headers[SESSION_HEADER] = input.sessionID;
       log("debug", "tracking session request", {
@@ -415,6 +449,7 @@ const OpenAICompactionPlugin: Plugin = async ({ client, project, directory }, op
         model: input.model.id,
         agent: input.agent,
         contextLimit: input.model.limit.context,
+        latestTokens: latest?.tokens,
         tokenThreshold: threshold <= 1 ? input.model.limit.context * threshold : threshold,
       });
     },
@@ -431,10 +466,31 @@ const OpenAICompactionPlugin: Plugin = async ({ client, project, directory }, op
       });
     },
     event: async ({ event }) => {
-      if (event.type !== "session.deleted") return;
-      const sessionID = event.properties.info.id;
-      sessions.delete(sessionID);
-      await discardState(sessionID);
+      if (event.type === "message.updated") {
+        const message = event.properties.info;
+        if (message.role !== "assistant" || message.summary || SKIPPED_AGENTS.has(message.mode)) return;
+        const info = sessions.get(message.sessionID);
+        if (!info || info.providerID !== message.providerID || info.model !== message.modelID) return;
+        const tokens = totalOpenCodeTokens(message.tokens);
+        if (tokens > 0) {
+          info.latestTokens = tokens;
+          info.latestTokenMessageID = message.id;
+        }
+        return;
+      }
+      if (event.type === "message.removed") {
+        const info = sessions.get(event.properties.sessionID);
+        if (info?.latestTokenMessageID === event.properties.messageID) {
+          info.latestTokens = undefined;
+          info.latestTokenMessageID = undefined;
+        }
+        return;
+      }
+      if (event.type === "session.deleted") {
+        const sessionID = event.properties.info.id;
+        sessions.delete(sessionID);
+        await discardState(sessionID);
+      }
     },
     // Another plugin instance may have wrapped ours afterwards; in that case the
     // `disposed` flag turns this wrapper into a pass-through instead.

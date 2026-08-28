@@ -31,14 +31,14 @@ opencode plugin @jiafuei/opencode-openai-compaction
 }
 ```
 
-- `threshold` — estimated input size at which a request is compacted before being sent. Use an absolute token count such as `100000`, a percentage such as `"70%"`, or the legacy fractional form `0.7` for 70% of the model's context window (default `0.7`).
+- `threshold` — input size at which a request is compacted before being sent. Use an absolute token count such as `100000`, a percentage such as `"70%"`, or the legacy fractional form `0.7` for 70% of the model's context window (default `0.7`).
 - `additionalProviders` — provider IDs to enable in addition to `openai`. Each provider must send OpenAI Responses-shaped requests to a `/responses` endpoint and implement the matching `/responses/compact` contract.
-- `debug` — log session eligibility and every request decision, including the estimated tokens, threshold, stored-state status and reason for passing through. Logs go to the OpenCode server log under the `openai-compaction` service. Plugin startup, successful compactions, failures and unexpected OpenCode built-in compactions are always logged.
+- `debug` — log session eligibility and every request decision, including OpenCode's latest token count, the threshold, stored-state status and reason for passing through. Logs go to the OpenCode server log under the `openai-compaction` service. Plugin startup, successful compactions, failures and unexpected OpenCode built-in compactions are always logged.
 
 ## How it works
 
-- `chat.headers` tags each enabled provider's turns with the session ID (skipping the `title` and `compaction` agents) and records the provider, model and context limit.
-- The trigger estimates the complete outgoing Responses request, including `instructions`, tools and the replayed input. OpenCode's built-in fallback instead uses exact token usage reported by the preceding response, so keep the native threshold comfortably below OpenCode's usable-context boundary.
+- `chat.headers` tags each enabled provider's turns with the session ID (skipping the `title` and `compaction` agents), records the provider, model and context limit, and loads OpenCode's latest completed assistant token count. Later `message.updated` events keep that count current.
+- OpenCode's latest reported count directly decides whether to compact. If no completed assistant count is available yet, the plugin passes the request through.
 - Before calling the compact endpoint, the plugin shows a five-second toast and adds an ignored synthetic `--- Compacting context... ---` part to the active user message. The part becomes `--- Context compacted ---` afterward and is visible in the transcript but excluded from model input. Attaching it to the existing message avoids creating a newer unanswered user turn, and the native compact request finishes before the assistant request begins.
 - The plugin wraps `globalThis.fetch` and intercepts the tagged POSTs to `…/responses`. It runs *inside* OpenCode's built-in codex plugin, so the request is already authenticated and addressed. API-key sessions use `POST /v1/responses/compact`; ChatGPT OAuth sessions negotiate Codex's streaming V2 protocol on `POST /backend-api/codex/responses`. The session header is always stripped before the request goes out.
 - Compacted windows are stored per session under `${XDG_DATA_HOME:-~/.local/share}/opencode/openai-compaction/<project>/<session>.json` and removed when the session is deleted.

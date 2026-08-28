@@ -18,7 +18,7 @@ export type CompactionState = {
 };
 
 type CompactionDiagnostics = {
-  estimatedTokens: number;
+  tokens: number;
   tokenThreshold: number;
   state: "none" | "valid" | "stale";
 };
@@ -130,6 +130,7 @@ export function planRequest(input: {
   endpoint: string;
   contextLimit: number;
   threshold: number;
+  latestTokens?: number;
 }): CompactionPlan {
   const { body, endpoint, contextLimit, threshold } = input;
   const { envelope, history } = splitEnvelope(body.input);
@@ -146,9 +147,9 @@ export function planRequest(input: {
   const base = state ? [...state.window, ...history.slice(state.compactedCount)] : history;
   const replayInput = state ? [...envelope, ...base] : undefined;
   const tokenThreshold = threshold <= 1 ? contextLimit * threshold : threshold;
-  const estimatedTokens = estimateTokens({ ...body, input: [...envelope, ...base] });
+  const tokens = input.latestTokens ?? 0;
   const diagnostics = {
-    estimatedTokens,
+    tokens,
     tokenThreshold,
     state: stored ? (state ? "valid" : "stale") : "none",
   } as const;
@@ -158,7 +159,7 @@ export function planRequest(input: {
       : { type: "passthrough", reason, ...diagnostics };
 
   if (tokenThreshold <= 0) return settled("threshold_unavailable");
-  if (estimatedTokens < tokenThreshold) return settled("below_threshold");
+  if (tokens < tokenThreshold) return settled("below_threshold");
 
   const tailStart = Math.max(lastUserTurnIndex(base), offset);
   if (tailStart <= offset) return settled("no_compactable_history");
