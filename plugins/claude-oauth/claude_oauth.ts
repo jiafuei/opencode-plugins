@@ -17,6 +17,12 @@ import {
 import type { SpoofingProfile } from "./wire_format.ts";
 import { opencodeDataDir } from "./local_storage.ts";
 import { buildEnforcedHeaders, coworkTransport } from "./cowork_fetch.ts";
+import {
+  buildExMachinaHeaders,
+  rewriteExMachinaBody,
+  rewriteExMachinaUrl,
+  unprefixExMachinaName,
+} from "./ex_machina_wire.ts";
 
 // Preserve the historical public API: tests and package consumers import these
 // from the plugin entry.
@@ -31,6 +37,7 @@ export {
 } from "./wire_format.ts";
 export { resolveSpoofingProfile } from "./wire_format.ts";
 export type { SpoofingProfile } from "./wire_format.ts";
+export { EX_MACHINA_PROFILE } from "./ex_machina_wire.ts";
 
 // Configure in `opencode.json` like:
 //
@@ -866,9 +873,8 @@ function buildAuthorizeUrl(redirectUri: string, pkce: PkceCodes, state: string):
 export interface ClaudeOAuthOptions {
   attributionHeader?: boolean;
   /**
-   * Client identity spoofed on the Anthropic wire: "sdk-cli" (default) mirrors
-   * pi-black's Agent SDK CLI identity; "cowork" mirrors oh-my-pi's Cowork
-   * desktop-agent. Every profile uses the ordered HTTP/1.1 transport.
+    * Client identity spoofed on the Anthropic wire: "sdk-cli" (default),
+    * "cowork", or the source-derived "ex-machina" profile.
    */
   spoofingProfile?: SpoofingProfile["id"];
 }
@@ -1057,6 +1063,43 @@ export const ClaudeOAuthPlugin: Plugin = async (input: PluginInput, options?: Pl
 
             if (!url) throw new Error("OAuth request URL was not initialized");
             const access = auth.access
+
+            if (profile.wireFormat === "ex-machina") {
+              const rewrittenUrl = rewriteExMachinaUrl(url)
+              const requestTarget = rewrittenUrl.href === url.href
+                ? requestInput
+                : requestInput instanceof Request
+                  ? new Request(rewrittenUrl, requestInput)
+                  : rewrittenUrl
+              const body = typeof init?.body === "string"
+                ? rewriteExMachinaBody(init.body, attributionHeader)
+                : init?.body
+              const headers = buildExMachinaHeaders(requestInput, init?.headers, access)
+              const response = await fetch(requestTarget, { ...init, headers, body })
+              const contentType = response.headers.get("content-type") ?? ""
+              if (contentType.includes("text/event-stream")) {
+                if (!response.body) return response
+                return new Response(
+                  response.body.pipeThrough(createSseToolNameTransform("mcp_", unprefixExMachinaName)),
+                  {
+                    status: response.status,
+                    statusText: response.statusText,
+                    headers: uncloakedResponseHeaders(response),
+                  },
+                )
+              }
+              if (contentType.includes("application/json")) {
+                const text = await readBoundedJsonText(response)
+                const transformed = transformJsonToolUseNames(text, "mcp_", unprefixExMachinaName)
+                return new Response(transformed, {
+                  status: response.status,
+                  statusText: response.statusText,
+                  headers: uncloakedResponseHeaders(response),
+                })
+              }
+              return response
+            }
+
             const accountId = auth.accountId
             const headers = new Headers(init?.headers)
             headers.delete("x-session-affinity")
@@ -1118,7 +1161,7 @@ export const ClaudeOAuthPlugin: Plugin = async (input: PluginInput, options?: Pl
             headers.delete("x-api-key")
             let response: Response
             if (isMessagesApi) {
-              // Every spoofing profile uses the ordered HTTP/1.1 transport.
+              // Claude Code profiles use the ordered HTTP/1.1 transport.
               // It only engages for a plain header record, which this builder
               // supplies in the profile's captured order.
               const stainless = stainlessHeaders(profile)

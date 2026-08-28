@@ -35,7 +35,7 @@ function parse(json: string) {
 }
 
 describe("resolveSpoofingProfile", () => {
-  test("defaults to SDK CLI and accepts only cowork/sdk-cli", () => {
+  test("defaults to SDK CLI and accepts the legacy profiles", () => {
     expect(resolveSpoofingProfile(undefined)).toBe(SDK_CLI_PROFILE);
     expect(resolveSpoofingProfile("cowork")).toBe(COWORK_PROFILE);
     expect(resolveSpoofingProfile("sdk-cli")).toBe(SDK_CLI_PROFILE);
@@ -47,8 +47,8 @@ describe("resolveSpoofingProfile", () => {
     }
   });
 
-  test("the unsupported-profile error lists only cowork/sdk-cli", () => {
-    expect(() => resolveSpoofingProfile("cli")).toThrow(/expected "cowork" or "sdk-cli"/);
+  test("the unsupported-profile error lists all supported profiles", () => {
+    expect(() => resolveSpoofingProfile("cli")).toThrow(/expected "cowork", "sdk-cli", or "ex-machina"/);
   });
 });
 

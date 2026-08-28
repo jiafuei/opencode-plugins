@@ -2,9 +2,9 @@
 
 Claude Pro/Max subscription login for OpenCode. Adds OAuth auth methods to the
 built-in `anthropic` provider and rewrites requests using selectable Agent SDK
-CLI (default) or Cowork desktop-agent wire profiles. This includes ordered
-HTTP/1.1 headers, beta profiles, billing/system fingerprints,
-`metadata.user_id` attribution, tool-name transport, and `cch` attestation.
+CLI (default), Cowork desktop-agent, or ex-machina wire profiles. Profiles pin
+their own headers, beta list, billing/system fingerprint, and tool-name
+transport.
 
 ## Install
 
@@ -18,7 +18,7 @@ HTTP/1.1 headers, beta profiles, billing/system fingerprints,
 
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
-| `spoofingProfile` | `"cowork" \| "sdk-cli"` | `"sdk-cli"` | Selects the complete client wire profile. |
+| `spoofingProfile` | `"cowork" \| "sdk-cli" \| "ex-machina"` | `"sdk-cli"` | Selects the complete client wire profile. |
 | `attributionHeader` | `boolean` | `true` | Controls the billing header and `cch`. Profile identity remains enabled when false. |
 
 ### Spoofing profiles
@@ -29,6 +29,7 @@ Each value selects one coherent wire identity:
 | --- | --- | --- | --- |
 | `"cowork"` | oh-my-pi Cowork | `2.1.246` / `claude-desktop` | Raw serialized-body attestation |
 | `"sdk-cli"` | pi-black Agent SDK CLI | `2.1.224` / `sdk-cli` | Top-level model/max-token normalization |
+| `"ex-machina"` | opencode-anthropic-auth production source | `2.1.87` / `sdk-cli` | SHA-256 of first user text |
 
 ```json
 {
@@ -38,15 +39,19 @@ Each value selects one coherent wire identity:
 }
 ```
 
-Both profiles derive identity from this plugin's stable install ID and the
-OAuth account. Neither reads `~/.claude.json` or `CLAUDE_CONFIG_DIR`, and
-neither emits billing request-chain fields (`cc_prev_req` / `cc_prompt_id`).
+The Cowork and SDK CLI profiles derive identity from this plugin's stable
+install ID and the OAuth account. No profile reads `~/.claude.json` or
+`CLAUDE_CONFIG_DIR`, and none emits billing request-chain fields
+(`cc_prev_req` / `cc_prompt_id`).
 
-All profiles use the custom ordered HTTPS transport. `sdk-cli` uses the header
-order observed in genuine Claude CLI captures; `cowork` uses OMP's
+`sdk-cli` and `cowork` use the custom ordered HTTPS transport. `sdk-cli` uses
+the header order observed in genuine Claude CLI captures; `cowork` uses OMP's
 desktop-agent order. Direct HTTPS uses HTTP/1.1 and preserves header casing and
 order. A configured proxy intentionally falls back to the runtime fetch so the
 proxy is honored, which means exact transport ordering is not retained there.
+`ex-machina` uses the runtime fetch and a strict inherited-header allowlist,
+matching its source-derived behavior rather than synthesizing either ordered
+profile's fingerprint headers.
 
 ### Billing attribution
 
@@ -108,24 +113,26 @@ concurrently.
 ## What it does
 
 When the stored anthropic credential is an OAuth grant, the plugin's auth
-loader installs the ordered transport for `/v1/messages` and
-`/v1/messages/count_tokens` calls to the official `api.anthropic.com`
-endpoint:
+loader installs the selected wire transform for calls to the official
+`api.anthropic.com` endpoint:
 
 - `Authorization: Bearer sk-ant-oat01-…` (never `x-api-key`) and
-  `?beta=true` on `/v1/messages`
-- The selected profile's exact `User-Agent`, `x-app: cli`,
+  `?beta=true` on `/v1/messages`. `ex-machina` preserves an existing `beta`
+  value and never adds the query to `/v1/messages/count_tokens`.
+- Cowork and SDK CLI emit the selected profile's exact `User-Agent`, `x-app: cli`,
   a per-invocation `x-client-request-id` (stable across SDK retries), the
   Stainless header set, and a stable per-session
   `X-Claude-Code-Session-Id` UUID (mapped process-locally from OpenCode's
   session id); OpenCode's internal session-routing headers are stripped before
-  dispatch
-- The selected client's beta profile, chosen per request shape (utility vs
+  dispatch. `ex-machina` pins its `User-Agent` and bearer while retaining only
+  safe inherited Anthropic/Stainless headers; it never emits the private
+  request ID or Claude session ID.
+- Cowork and SDK CLI use a beta profile chosen per request shape (utility vs
   agent profile). Other caller betas are preserved and deduplicated after the
   profile's list, except `fine-grained-tool-streaming-2025-05-14` (absent from
   the profile), the SDK's obsolete `structured-outputs-2025-11-13` tool beta,
   and `context-1m-2025-08-07` (hard-429'd for subscription credentials).
-- Body rewrite:
+- Cowork and SDK CLI body rewrite:
   - `system[0]` = `x-anthropic-billing-header` with the selected version and
     entrypoint; its prompt fingerprint skips leading `<system-reminder>` text
     blocks. `system[1]` carries the selected Agent SDK identity. Cowork skips
@@ -141,16 +148,26 @@ endpoint:
     a single keep-all clear-thinking context edit replacing whatever arrived;
     tool input schemas are closed with top-level `additionalProperties:false`.
   - The redundant default `tool_choice:{type:"auto"}` is omitted.
-- The selected `cch` algorithm from the profile table, patched over the
+- Cowork and SDK CLI use the selected `cch` algorithm from the profile table, patched over the
   `cch=00000` placeholder as five lowercase hex characters.
-- Token-count requests use the selected profile's beta and header set,
+- Cowork and SDK CLI token-count requests use the selected profile's beta and header set,
   omit `X-Stainless-Timeout`, preserve their body shape apart from tool
   normalization, and are not response-rewritten
-- Custom tool names are cloaked with one `_` prefix on the way out
+- Cowork and SDK CLI custom tool names are cloaked with one `_` prefix on the way out
   (definitions, `tool_choice`, historical
   `tool_use` blocks) and the exact prefix is stripped on the way in through both
   streaming SSE (`content_block_start`) and non-streaming JSON responses, so
   OpenCode's logical tool names remain unchanged.
+- `ex-machina` instead prefixes every tool definition and historical
+  `tool_use` with `mcp_` plus an uppercase first character, leaves
+  `tool_choice` and schemas untouched, and recursively uncloaks every parsed
+  JSON `name` property in JSON and fragmentation-safe SSE responses. Its body
+  transform sanitizes OpenCode prompt anchors, prepends the pinned Agent SDK
+  identity, and otherwise preserves fields exactly: no metadata attribution,
+  max-token normalization, schema closure, canonical ordering, or
+  thinking/context mutation. Its required beta list is exactly
+  `oauth-2025-04-20,interleaved-thinking-2025-05-14` before deduplicated caller
+  betas.
 - Model costs reported as zero while on OAuth (subscription-billed)
 
 ### Token refresh
@@ -217,9 +234,10 @@ transient only — there is deliberately no second credential store.
 
 - **Version-pinned parity.** The plugin mirrors the selected profile's headers,
   payload, beta profile, tool-name transport, and `cch` behavior. Direct HTTPS
-  reproduces the captured HTTP/1.1 header order, but not Claude's TLS handshake
-  or every runtime detail. Proxy fallback uses runtime fetch. Pinned profile
-  constants must be updated when their reference clients change.
+  reproduces captured HTTP/1.1 header order for Cowork and SDK CLI, but not
+  Claude's TLS handshake or every runtime detail. Proxy fallback and
+  `ex-machina` use runtime fetch. Pinned profile constants must be updated when
+  their reference clients change.
 - **Official endpoint only.** Subscription OAuth cannot be used through custom
   base URLs, enterprise gateways, or signing proxies. Those configurations
   must use API-key auth.

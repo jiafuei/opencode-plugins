@@ -1,5 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { deriveDeviceId } from "./local_storage.ts";
+import { EX_MACHINA_PROFILE } from "./ex_machina_wire.ts";
+import type { ExMachinaProfile } from "./ex_machina_wire.ts";
 
 // Beta tokens shared by the profile definitions below.
 const CLAUDE_CODE_20250219_BETA = "claude-code-20250219";
@@ -29,8 +31,9 @@ const TOKEN_COUNTING_BETA = "token-counting-2024-11-01";
  * pi-black's Agent SDK CLI profile (src/claude-code-protocol.ts) without any
  * local Claude configuration reads.
  */
-export interface SpoofingProfile {
+export interface ClaudeCodeSpoofingProfile {
   id: "cowork" | "sdk-cli";
+  wireFormat: "claude-code";
   version: string;
   userAgent: string;
   billingEntrypoint: string;
@@ -53,8 +56,11 @@ export interface SpoofingProfile {
   agentBetas: readonly string[];
 }
 
-export const COWORK_PROFILE: SpoofingProfile = {
+export type SpoofingProfile = ClaudeCodeSpoofingProfile | ExMachinaProfile;
+
+export const COWORK_PROFILE: ClaudeCodeSpoofingProfile = {
   id: "cowork",
+  wireFormat: "claude-code",
   version: "2.1.246",
   userAgent: `claude-cli/2.1.246 (external, claude-desktop)`,
   billingEntrypoint: "claude-desktop",
@@ -95,8 +101,9 @@ export const COWORK_PROFILE: SpoofingProfile = {
  * plugin's install ID plus the OAuth account — never from `.claude.json` or
  * any local Claude configuration.
  */
-export const SDK_CLI_PROFILE: SpoofingProfile = {
+export const SDK_CLI_PROFILE: ClaudeCodeSpoofingProfile = {
   id: "sdk-cli",
+  wireFormat: "claude-code",
   version: "2.1.224",
   userAgent: `claude-cli/2.1.224 (external, sdk-cli)`,
   billingEntrypoint: "sdk-cli",
@@ -134,6 +141,7 @@ export const SDK_CLI_PROFILE: SpoofingProfile = {
 const SPOOFING_PROFILES: Record<string, SpoofingProfile> = {
   cowork: COWORK_PROFILE,
   "sdk-cli": SDK_CLI_PROFILE,
+  "ex-machina": EX_MACHINA_PROFILE,
 };
 
 /** Resolve the plugin's spoofingProfile option once at the boundary. Undefined selects SDK CLI. */
@@ -142,14 +150,14 @@ export function resolveSpoofingProfile(value: unknown): SpoofingProfile {
   const profile = SPOOFING_PROFILES[value as string];
   if (!profile) {
     throw new Error(
-      `claude-oauth: unsupported spoofingProfile "${String(value)}" — expected "cowork" or "sdk-cli"`,
+      `claude-oauth: unsupported spoofingProfile "${String(value)}" — expected "cowork", "sdk-cli", or "ex-machina"`,
     );
   }
   return profile;
 }
 
 /** Token-counting beta header for a profile: its utility list plus token counting. */
-export function countTokensBetas(profile: SpoofingProfile = SDK_CLI_PROFILE): string {
+export function countTokensBetas(profile: ClaudeCodeSpoofingProfile = SDK_CLI_PROFILE): string {
   return [...profile.utilityBetas, TOKEN_COUNTING_BETA].join(",");
 }
 
@@ -178,7 +186,7 @@ export function buildBetas(
   thinking: unknown,
   hasTools: boolean,
   incoming?: string | null,
-  profile: SpoofingProfile = SDK_CLI_PROFILE,
+  profile: ClaudeCodeSpoofingProfile = SDK_CLI_PROFILE,
 ): string {
   const agent = hasTools || isActiveThinking(thinking);
   const betas = [...(agent ? profile.agentBetas : profile.utilityBetas)];
@@ -236,7 +244,7 @@ export const STAINLESS_HEADERS: Record<string, string> = {
 };
 
 /** Stainless header set for a profile; only the package version varies. */
-export function stainlessHeaders(profile: SpoofingProfile): Record<string, string> {
+export function stainlessHeaders(profile: ClaudeCodeSpoofingProfile): Record<string, string> {
   return { ...STAINLESS_HEADERS, "X-Stainless-Package-Version": profile.stainlessPackageVersion };
 }
 
@@ -277,7 +285,7 @@ export function stripClaudeToolPrefix(name: string, prefix: string = TOOL_PREFIX
  * `type`), `tool_choice.name`, and historical assistant `tool_use` blocks. IDs,
  * SDK-only fields, and `tool_result` blocks are preserved verbatim.
  */
-export function prefixRequestToolNames(params: Record<string, any>, profile: SpoofingProfile = SDK_CLI_PROFILE): void {
+export function prefixRequestToolNames(params: Record<string, any>, profile: ClaudeCodeSpoofingProfile = SDK_CLI_PROFILE): void {
   const prefix = profile.toolPrefix;
   if (Array.isArray(params.tools)) {
     for (const tool of params.tools) {
@@ -322,12 +330,39 @@ export function prefixRequestToolNames(params: Record<string, any>, profile: Spo
 // ---------------------------------------------------------------------------
 
 /** Strip the cloaking prefix from `content[].type === "tool_use"` names in a non-streaming JSON response body. */
-export function transformJsonToolUseNames(body: string, prefix: string = TOOL_PREFIX): string {
+export function transformJsonToolUseNames(
+  body: string,
+  prefix: string = TOOL_PREFIX,
+  transformName?: (name: string) => string,
+): string {
   let parsed: unknown;
   try {
     parsed = JSON.parse(body);
   } catch {
     return body;
+  }
+  if (transformName) {
+    let changed = false;
+    const visit = (value: unknown): void => {
+      if (!value || typeof value !== "object") return;
+      if (Array.isArray(value)) {
+        for (const item of value) visit(item);
+        return;
+      }
+      for (const [key, item] of Object.entries(value)) {
+        if (key === "name" && typeof item === "string") {
+          const next = transformName(item);
+          if (next !== item) {
+            (value as Record<string, unknown>)[key] = next;
+            changed = true;
+          }
+        } else {
+          visit(item);
+        }
+      }
+    };
+    visit(parsed);
+    return changed ? JSON.stringify(parsed) : body;
   }
   if (!parsed || typeof parsed !== "object" || !Array.isArray((parsed as Record<string, any>).content)) return body;
   for (const block of (parsed as Record<string, any>).content) {
@@ -355,6 +390,7 @@ const SSE_EVENT_BUFFER_LIMIT = 1024 * 1024;
  */
 export function createSseToolNameTransform(
   prefix: string = TOOL_PREFIX,
+  transformName?: (name: string) => string,
 ): TransformStream<Uint8Array, Uint8Array> {
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
@@ -366,6 +402,29 @@ export function createSseToolNameTransform(
   let eventBytes = 0;
 
   function uncloak(event: any): any | undefined {
+    if (transformName) {
+      let changed = false;
+      const visit = (value: unknown): void => {
+        if (!value || typeof value !== "object") return;
+        if (Array.isArray(value)) {
+          for (const item of value) visit(item);
+          return;
+        }
+        for (const [key, item] of Object.entries(value)) {
+          if (key === "name" && typeof item === "string") {
+            const next = transformName(item);
+            if (next !== item) {
+              (value as Record<string, unknown>)[key] = next;
+              changed = true;
+            }
+          } else {
+            visit(item);
+          }
+        }
+      };
+      visit(event);
+      return changed ? event : undefined;
+    }
     if (event?.type === "content_block_start") {
       const block = event.content_block;
       if (block?.type === "tool_use" && typeof block.name === "string") {
@@ -634,7 +693,7 @@ export function rewriteBody(
     sessionId?: string;
     accountId?: string;
     attributionHeader?: boolean;
-    profile?: SpoofingProfile;
+    profile?: ClaudeCodeSpoofingProfile;
   },
 ): { json: string; thinking: unknown; hasTools: boolean; model: string; sessionId?: string } {
   const profile = ctx.profile ?? SDK_CLI_PROFILE;
