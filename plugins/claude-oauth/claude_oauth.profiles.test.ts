@@ -635,10 +635,10 @@ describe("request capture: shared ordered transport", () => {
         "anthropic-version",
         "x-app",
         "x-client-request-id",
-        "x-unknown-outbound",
         "Connection",
         "Accept-Encoding",
       ]);
+      expect(request.headers["x-unknown-outbound"]).toBeUndefined();
       expect(request.headers["User-Agent"]).toBe(selected.userAgent);
       expect(request.headers.Authorization).toBe("Bearer test-access-token");
       expect(request.headers["X-Stainless-Package-Version"]).toBe(selected.stainlessPackageVersion);

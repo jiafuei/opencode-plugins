@@ -71,46 +71,14 @@ export function buildOrderedHeaders(
   return headers;
 }
 
-// Headers the plugin enforces itself. Caller-supplied entries for these are
-// always dropped when building the ordered record. Other caller headers are
-// forwarded in arrival order.
-const MANAGED_HEADER_KEYS = new Set(
-  [
-    "accept",
-    "accept-encoding",
-    "anthropic-beta",
-    "anthropic-dangerous-direct-browser-access",
-    "anthropic-version",
-    "authorization",
-    "connection",
-    "content-length",
-    "content-type",
-    "host",
-    "user-agent",
-    "x-api-key",
-    "x-app",
-    "x-client-request-id",
-    "x-claude-code-session-id",
-    // OpenCode internal session-routing headers.
-    "x-session-affinity",
-    "x-session-id",
-    "x-parent-session-id",
-    // Plugin-private transport markers, never sent on the wire. The prompt-id
-    // marker is legacy (no profile emits it anymore) but still stripped.
-    "x-claude-oauth-session-id",
-    "x-claude-oauth-request-id",
-    "x-claude-oauth-prompt-id",
-  ].map((key) => key.toLowerCase()),
-);
-
 /**
  * Build the enforced header record in the selected client's exact order:
  * Cowork uses OMP's desktop-agent order; sdk-cli uses the order observed in
- * genuine Claude CLI captures, with unknown caller headers appended before the
- * connection trailers. Host and Content-Length are inserted by the transport.
+ * genuine Claude CLI captures. Host and Content-Length are inserted by the transport.
+ * Extra/unmanaged caller headers are dropped.
  */
 export function buildEnforcedHeaders(
-  caller: Headers,
+  caller: Headers | undefined,
   fields: {
     profile: SpoofingProfile["id"];
     userAgent: string;
@@ -122,15 +90,7 @@ export function buildEnforcedHeaders(
   },
 ): Record<string, string> {
   const coworkOrder = fields.profile === "cowork";
-  const managed = new Set(MANAGED_HEADER_KEYS);
-  for (const key of Object.keys(fields.stainless)) managed.add(key.toLowerCase());
   const headers: Record<string, string> = {};
-  const extras: Record<string, string> = {};
-  caller.forEach((value, key) => {
-    if (managed.has(key.toLowerCase())) return;
-    extras[key] = value;
-  });
-  if (coworkOrder) Object.assign(headers, extras);
   headers["Accept"] = "application/json";
   if (!coworkOrder) headers["Authorization"] = fields.authorization;
   headers["Content-Type"] = "application/json";
@@ -143,7 +103,6 @@ export function buildEnforcedHeaders(
   if (coworkOrder) headers["Authorization"] = fields.authorization;
   headers["x-app"] = "cli";
   headers["x-client-request-id"] = fields.clientRequestId;
-  if (!coworkOrder) Object.assign(headers, extras);
   headers["Connection"] = "keep-alive";
   headers["Accept-Encoding"] = "gzip, deflate, br, zstd";
   return headers;

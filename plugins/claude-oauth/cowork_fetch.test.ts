@@ -113,7 +113,7 @@ describe("buildOrderedHeaders", () => {
 });
 
 describe("buildEnforcedHeaders", () => {
-  test("orders caller extras first, then the OMP enforced sequence, dropping managed keys", () => {
+  test("orders the OMP enforced sequence for cowork profile, dropping caller extras and managed keys", () => {
     const caller = new Headers({
       "content-type": "application/json",
       "user-agent": "my-client/1.0",
@@ -133,7 +133,6 @@ describe("buildEnforcedHeaders", () => {
       stainless: { "X-Stainless-Lang": "js", "X-Stainless-Package-Version": "0.94.0" },
     });
     expect(Object.keys(headers)).toEqual([
-      "x-custom-extra",
       "Accept",
       "Content-Type",
       "User-Agent",
@@ -149,6 +148,7 @@ describe("buildEnforcedHeaders", () => {
       "Connection",
       "Accept-Encoding",
     ]);
+    expect(headers["x-custom-extra"]).toBeUndefined();
     expect(headers.Authorization).toBe("Bearer real-token");
     // Managed caller keys (stale auth, api key, routing, private markers) are gone.
     for (const absent of ["x-api-key", "x-session-affinity", "x-claude-oauth-request-id", "authorization"]) {
@@ -172,7 +172,7 @@ describe("buildEnforcedHeaders", () => {
     expect("anthropic-beta" in headers).toBe(false);
   });
 
-  test("orders sdk-cli headers like the captured Claude CLI sequence, forwarding unknown caller headers", () => {
+  test("orders sdk-cli headers like the captured Claude CLI sequence, dropping unknown caller headers", () => {
     const headers = buildEnforcedHeaders(new Headers({ cookie: "private", "x-extra": "kept" }), {
       profile: "sdk-cli",
       userAgent: "claude-cli/2.1.224 (external, sdk-cli)",
@@ -195,21 +195,21 @@ describe("buildEnforcedHeaders", () => {
       "anthropic-version",
       "x-app",
       "x-client-request-id",
-      "cookie",
-      "x-extra",
       "Connection",
       "Accept-Encoding",
     ]);
+    expect(headers["cookie"]).toBeUndefined();
+    expect(headers["x-extra"]).toBeUndefined();
   });
 
-  test("continues forwarding unknown SDK CLI headers", () => {
-    const headers = buildEnforcedHeaders(new Headers({ "x-extra": "kept" }), {
+  test("drops unknown SDK CLI caller headers", () => {
+    const headers = buildEnforcedHeaders(new Headers({ "x-extra": "drop-me" }), {
       profile: "sdk-cli",
       userAgent: "claude-cli/2.1.224 (external, sdk-cli)",
       authorization: "Bearer token",
       clientRequestId: "request-1",
       stainless: {},
     });
-    expect(headers["x-extra"]).toBe("kept");
+    expect(headers["x-extra"]).toBeUndefined();
   });
 });
