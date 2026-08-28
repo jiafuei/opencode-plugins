@@ -55,18 +55,19 @@ export interface SpoofingProfile {
 
 export const COWORK_PROFILE: SpoofingProfile = {
   id: "cowork",
-  version: "2.1.220",
-  userAgent: `claude-cli/2.1.220 (external, claude-desktop)`,
+  version: "2.1.246",
+  userAgent: `claude-cli/2.1.246 (external, claude-desktop)`,
   billingEntrypoint: "claude-desktop",
   systemInstruction: "You are a Claude agent, built on Anthropic's Claude Agent SDK.",
   toolPrefix: "_",
-  stainlessPackageVersion: "0.94.0",
+  stainlessPackageVersion: "0.112.1",
   deviceDomainInstall: "omp-claude-device-id-v1:",
   deviceDomainAccount: "omp-claude-device-id-v2",
   cchMode: "raw",
   skipIdentityForHaiku: true,
   fallbackOnAllRequests: false,
   utilityBetas: [
+    OAUTH_BETA,
     INTERLEAVED_THINKING_BETA,
     THINKING_TOKEN_COUNT_BETA,
     CONTEXT_MANAGEMENT_BETA,
@@ -75,6 +76,7 @@ export const COWORK_PROFILE: SpoofingProfile = {
   ],
   agentBetas: [
     CLAUDE_CODE_20250219_BETA,
+    OAUTH_BETA,
     INTERLEAVED_THINKING_BETA,
     THINKING_TOKEN_COUNT_BETA,
     CONTEXT_MANAGEMENT_BETA,

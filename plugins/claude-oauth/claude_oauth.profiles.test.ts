@@ -71,15 +71,16 @@ describe("resolveSpoofingProfile", () => {
 
 describe("Cowork profile constants", () => {
   test("mirror OMP's current Cowork fingerprint", () => {
-    expect(COWORK_PROFILE.version).toBe("2.1.220");
-    expect(COWORK_PROFILE.userAgent).toBe("claude-cli/2.1.220 (external, claude-desktop)");
+    expect(COWORK_PROFILE.version).toBe("2.1.246");
+    expect(COWORK_PROFILE.userAgent).toBe("claude-cli/2.1.246 (external, claude-desktop)");
     expect(COWORK_PROFILE.billingEntrypoint).toBe("claude-desktop");
     expect(COWORK_PROFILE.systemInstruction).toBe("You are a Claude agent, built on Anthropic's Claude Agent SDK.");
     expect(COWORK_PROFILE.toolPrefix).toBe("_");
-    expect(COWORK_PROFILE.stainlessPackageVersion).toBe("0.94.0");
+    expect(COWORK_PROFILE.stainlessPackageVersion).toBe("0.112.1");
     expect(COWORK_PROFILE.cchMode).toBe("raw");
-    // OMP's Cowork betas omit oauth/redact entirely.
+    // OMP's Cowork betas include OAuth but omit redact.
     expect(COWORK_PROFILE.utilityBetas).toEqual([
+      "oauth-2025-04-20",
       "interleaved-thinking-2025-05-14",
       "thinking-token-count-2026-05-13",
       "context-management-2025-06-27",
@@ -88,6 +89,7 @@ describe("Cowork profile constants", () => {
     ]);
     expect(COWORK_PROFILE.agentBetas).toEqual([
       "claude-code-20250219",
+      "oauth-2025-04-20",
       "interleaved-thinking-2025-05-14",
       "thinking-token-count-2026-05-13",
       "context-management-2025-06-27",
@@ -108,7 +110,7 @@ describe("Cowork profile constants", () => {
 });
 
 describe("buildBetas with the Cowork profile", () => {
-  test("utility requests get exactly the utility list — no effort/fallback/oauth/redact", () => {
+  test("utility requests get exactly the utility list — no effort/fallback/redact", () => {
     expect(buildBetas(undefined, false, null, COWORK_PROFILE)).toEqual(COWORK_PROFILE.utilityBetas.join(","));
   });
 
@@ -229,7 +231,7 @@ describe("rewriteBody with the Cowork profile", () => {
   test("injects the Agent SDK identity and claude-desktop billing entrypoint", () => {
     const firstUserText = "hello world, this is the first user message";
     const out = parse(rewriteBody(baseBody, { profile: COWORK_PROFILE }).json);
-    expect(out.system[0].text).toContain(`cc_version=2.1.220.${expectedVersionSuffix(firstUserText)}`);
+    expect(out.system[0].text).toContain(`cc_version=2.1.246.${expectedVersionSuffix(firstUserText)}`);
     expect(out.system[0].text).toContain("cc_entrypoint=claude-desktop;");
     expect(out.system[1].text).toBe("You are a Claude agent, built on Anthropic's Claude Agent SDK.");
     expect(out.system[2].text).toBe("You are a coding agent.");
@@ -506,8 +508,8 @@ describe("request capture: cowork profile through the pinned SDK", () => {
         "Connection",
         "Accept-Encoding",
       ]);
-      expect(req.headers["User-Agent"]).toBe("claude-cli/2.1.220 (external, claude-desktop)");
-      expect(req.headers["X-Stainless-Package-Version"]).toBe("0.94.0");
+      expect(req.headers["User-Agent"]).toBe("claude-cli/2.1.246 (external, claude-desktop)");
+      expect(req.headers["X-Stainless-Package-Version"]).toBe("0.112.1");
       expect(req.headers["X-Stainless-Arch"]).toBe(mapStainlessArch(process.arch));
       expect(req.headers["Authorization"]).toBe("Bearer test-access-token");
       expect(req.headers["x-app"]).toBe("cli");
@@ -522,7 +524,7 @@ describe("request capture: cowork profile through the pinned SDK", () => {
       const body = JSON.parse(req.bodyText);
       expect(body.max_tokens).toBe(64000);
       expect(body.stream).toBe(true);
-      expect(body.system[0].text).toContain("cc_version=2.1.220.");
+      expect(body.system[0].text).toContain("cc_version=2.1.246.");
       expect(body.system[0].text).toContain("cc_entrypoint=claude-desktop;");
       expect(body.system[0].text).toMatch(/cch=[0-9a-f]{5};$/);
       expect(body.system[0].text).not.toContain("cch=00000");

@@ -125,12 +125,12 @@ describe("buildEnforcedHeaders", () => {
     });
     const headers = buildEnforcedHeaders(caller, {
       profile: "cowork",
-      userAgent: "claude-cli/2.1.220 (external, claude-desktop)",
+      userAgent: "claude-cli/2.1.246 (external, claude-desktop)",
       sessionId: "session-1",
       betas: "beta-one,beta-two",
       authorization: "Bearer real-token",
       clientRequestId: "11111111-2222-3333-4444-555555555555",
-      stainless: { "X-Stainless-Lang": "js", "X-Stainless-Package-Version": "0.94.0" },
+      stainless: { "X-Stainless-Lang": "js", "X-Stainless-Package-Version": "0.112.1" },
     });
     expect(Object.keys(headers)).toEqual([
       "Accept",
@@ -156,7 +156,7 @@ describe("buildEnforcedHeaders", () => {
     }
     expect(Object.values(headers)).not.toContain("leak-me-not");
     expect(Object.values(headers)).not.toContain("Bearer stale");
-    expect(headers["User-Agent"]).toBe("claude-cli/2.1.220 (external, claude-desktop)");
+    expect(headers["User-Agent"]).toBe("claude-cli/2.1.246 (external, claude-desktop)");
     expect(headers["x-app"]).toBe("cli");
   });
 

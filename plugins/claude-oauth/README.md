@@ -27,7 +27,7 @@ Each value selects one coherent wire identity:
 
 | Value | Reference | Version / entrypoint | CCH |
 | --- | --- | --- | --- |
-| `"cowork"` | oh-my-pi Cowork | `2.1.220` / `claude-desktop` | Raw serialized-body attestation |
+| `"cowork"` | oh-my-pi Cowork | `2.1.246` / `claude-desktop` | Raw serialized-body attestation |
 | `"sdk-cli"` | pi-black Agent SDK CLI | `2.1.224` / `sdk-cli` | Top-level model/max-token normalization |
 
 ```json
