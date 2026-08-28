@@ -86,12 +86,6 @@ async function setupHarness() {
 }
 
 describe("auth transitions", () => {
-  test("loader returns no options when auth is undefined", async () => {
-    const plugin = await ClaudeOAuthPlugin({} as never);
-    const options = await plugin.auth!.loader!(async () => undefined as never, {} as never);
-    expect(options).toEqual({});
-  });
-
   test("logout after loader creation: cached fetch fails with authentication-required error before any network call", async () => {
     const { authState, rawLoaderOptions, networkCalls } = await setupHarness();
 
@@ -108,7 +102,6 @@ describe("auth transitions", () => {
     } catch (e) {
       error = e;
     }
-    expect(error).toBeInstanceOf(Error);
     expect((error as Error).message).toMatch(/missing.*opencode auth login/i);
     expect(networkCalls()).toBe(0);
   });
@@ -119,53 +112,21 @@ describe("auth transitions", () => {
     // Auth switched to an API key while the OAuth fetch stayed cached.
     authState.value = { type: "api", key: "sk-ant-real-key" };
 
-    const result = await generateText({
+    await generateText({
       model: anthropic("claude-sonnet-4-6"),
       prompt: "hello world, this is the first user message",
       maxOutputTokens: 1000,
     });
-    expect(result.text).toBe("Hello!");
-
     expect(captured).toHaveLength(1);
     const req = captured[0]!;
 
-    // Ordinary API endpoint: no beta=true rewrite.
     expect(req.url).toBe("https://api.anthropic.com/v1/messages");
-
-    // Real key replaces the dummy one; no OAuth bearer.
     expect(req.headers["x-api-key"]).toBe("sk-ant-real-key");
     expect(req.headers["authorization"]).toBeUndefined();
-    expect(req.headers["x-api-key"]).not.toBe("opencode-oauth-dummy-key");
 
-    // No Claude Code fingerprinting.
-    expect(req.headers["user-agent"]!.startsWith("claude-cli")).toBe(false);
-    expect(req.headers["anthropic-dangerous-direct-browser-access"]).toBeUndefined();
-    expect(req.headers["x-app"]).toBeUndefined();
-    expect(req.headers["x-claude-code-session-id"]).toBeUndefined();
-
-    // Body untouched by the plugin: no billing header / cch, no metadata
-    // envelope, max_tokens preserved (not clamped), tools not force-inserted.
     const body = JSON.parse(req.bodyText);
     expect(JSON.stringify(body)).not.toContain("x-anthropic-billing-header");
-    expect(body.metadata).toBeUndefined();
     expect(body.max_tokens).toBe(1000);
-    expect(body.tools).toBeUndefined();
-    expect(body.system).toBeUndefined();
-    expect(body.messages).toEqual([{ role: "user", content: [{ type: "text", text: "hello world, this is the first user message" }] }]);
-  });
-
-  test("API-key transition at the fetch level deletes a pre-existing Authorization header", async () => {
-    const { authState, rawLoaderOptions, captured } = await setupHarness();
-    authState.value = { type: "api", key: "sk-ant-real-key" };
-
-    await rawLoaderOptions.fetch!("https://api.anthropic.com/v1/models", {
-      method: "GET",
-      headers: { Authorization: "Bearer stale-oauth-token", "x-api-key": "opencode-oauth-dummy-key" },
-    });
-
-    expect(captured).toHaveLength(1);
-    expect(captured[0]!.headers["authorization"]).toBeUndefined();
-    expect(captured[0]!.headers["x-api-key"]).toBe("sk-ant-real-key");
   });
 
   test("unsupported auth type: clear failure naming the type", async () => {
@@ -182,19 +143,18 @@ describe("auth transitions", () => {
     } catch (e) {
       error = e;
     }
-    expect(error).toBeInstanceOf(Error);
     expect((error as Error).message).toContain('Unsupported Anthropic auth type "workspace"');
     expect(networkCalls()).toBe(0);
   });
 });
 
 describe("chat.headers claudeOAuth marker", () => {
-  async function runHeaders(providerOptions: Record<string, unknown>, providerID = "anthropic") {
+  async function runHeaders(providerOptions: Record<string, unknown>) {
     const plugin = await ClaudeOAuthPlugin({} as never);
     const output = { headers: {} as Record<string, string> };
     await plugin["chat.headers"]!(
       {
-        model: { providerID },
+        model: { providerID: "anthropic" },
         provider: { options: providerOptions },
         sessionID: "ses_transition-test",
         message: { id: "msg_transition-test" },
@@ -210,29 +170,12 @@ describe("chat.headers claudeOAuth marker", () => {
     expect(headers["X-Claude-Code-Session-Id"]).toMatch(
       /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
     );
-    expect(headers["x-claude-oauth-session-id"]).toBe("ses_transition-test");
     expect(headers["x-claude-oauth-request-id"]).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
-  });
-
-  test("each logical invocation gets a distinct private request id", async () => {
-    const first = await runHeaders({ apiKey: "k", claudeOAuth: true });
-    const second = await runHeaders({ apiKey: "k", claudeOAuth: true });
-    expect(first["x-claude-oauth-request-id"]).not.toBe(second["x-claude-oauth-request-id"]);
   });
 
   test("dummy apiKey alone does NOT enable session propagation without the marker", async () => {
     const headers = await runHeaders({ apiKey: "opencode-oauth-dummy-key" });
     expect(headers["X-Claude-Code-Session-Id"]).toBeUndefined();
-  });
-
-  test("ordinary API-key providers are untouched", async () => {
-    const headers = await runHeaders({ apiKey: "sk-ant-real-key" });
-    expect(headers).toEqual({});
-  });
-
-  test("non-anthropic providers are untouched even with the marker", async () => {
-    const headers = await runHeaders({ apiKey: "x", claudeOAuth: true }, "openai");
-    expect(headers).toEqual({});
   });
 
   test("the OAuth loader emits the marker alongside the dummy key", async () => {

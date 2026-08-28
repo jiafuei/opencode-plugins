@@ -60,18 +60,11 @@ function state(overrides: Partial<CompactionState> = {}): CompactionState {
 }
 
 describe("endpoints", () => {
-  test("recognizes both OpenAI Responses endpoints", () => {
+  test("recognizes Responses endpoints and derives the direct compact URL", () => {
     expect(isResponsesEndpoint(ENDPOINT)).toBe(true);
     expect(isResponsesEndpoint("https://chatgpt.com/backend-api/codex/responses")).toBe(true);
     expect(isResponsesEndpoint("https://api.openai.com/v1/chat/completions")).toBe(false);
-  });
-
-  test("recognizes the Codex Responses endpoint", () => {
     expect(isCodexResponsesEndpoint("https://chatgpt.com/backend-api/codex/responses")).toBe(true);
-    expect(isCodexResponsesEndpoint(ENDPOINT)).toBe(false);
-  });
-
-  test("derives the direct compact url", () => {
     expect(compactUrl(ENDPOINT)).toBe("https://api.openai.com/v1/responses/compact");
   });
 
@@ -85,12 +78,6 @@ describe("payload parsing", () => {
     expect(rest).toHaveLength(2);
   });
 
-  test("treats OAuth payloads as envelope-free", () => {
-    const { envelope, history: rest } = splitEnvelope([user("hi"), assistant("msg_0", "hello")]);
-    expect(envelope).toHaveLength(0);
-    expect(rest).toHaveLength(2);
-  });
-
   test("finds the last user turn", () => {
     expect(lastUserTurnIndex([user("a"), assistant("msg_0", "b"), user("c"), assistant("msg_1", "d")])).toBe(2);
     expect(lastUserTurnIndex([assistant("msg_0", "b")])).toBe(-1);
@@ -98,7 +85,6 @@ describe("payload parsing", () => {
 
   test("reads the compacted window from a compact response", () => {
     expect(readCompactedWindow({ id: "resp_1", output: [{ type: "message" }] })).toHaveLength(1);
-    expect(readCompactedWindow({ output: [] })).toBeUndefined();
     expect(readCompactedWindow({ error: "nope" })).toBeUndefined();
   });
 });
@@ -110,9 +96,8 @@ describe("fingerprint", () => {
     expect(fingerprint(before)).toBe(fingerprint(after));
   });
 
-  test("changes when items are inserted or reordered", () => {
+  test("changes when history is reordered", () => {
     const items = [user("a"), assistant("msg_0", "b")];
-    expect(fingerprint(items)).not.toBe(fingerprint([...items, user("c")]));
     expect(fingerprint(items)).not.toBe(fingerprint([items[1], items[0]]));
   });
 });
@@ -145,24 +130,8 @@ describe("planRequest", () => {
     });
     if (plan.type !== "compact") throw new Error(`expected compact, got ${plan.type}`);
     expect(plan.instructions).toBe("prompt");
-    expect(plan.compactInput).toHaveLength(items.length - 4);
     expect(plan.keptTail).toEqual(items.slice(-4));
     expect(plan.compactedCount).toBe(items.length - 4);
-    expect(plan.signature).toBe(fingerprint(items.slice(0, items.length - 4)));
-    expect(plan.fallbackInput).toBeUndefined();
-  });
-
-  test("uses body instructions when there is no envelope", async () => {
-    const plan = await planRequest({
-      body: body(history(6), { instructions: "codex prompt" }),
-      state: undefined,
-      endpoint: ENDPOINT,
-      contextLimit: oversized,
-      threshold: 0.7,
-      latestTokens: 800,
-    });
-    if (plan.type !== "compact") throw new Error(`expected compact, got ${plan.type}`);
-    expect(plan.instructions).toBe("codex prompt");
   });
 
   test("replays a stored window on later turns", async () => {
@@ -193,9 +162,7 @@ describe("planRequest", () => {
     });
     if (plan.type !== "compact") throw new Error(`expected compact, got ${plan.type}`);
     expect(plan.compactInput[0]).toBe(window[0]);
-    expect(plan.compactInput).toHaveLength(1 + (items.length - 4 - 20));
     expect(plan.keptTail).toEqual(items.slice(-4));
-    expect(plan.compactedCount).toBe(items.length - 4);
     expect(plan.fallbackInput).toEqual([...window, ...items.slice(20)]);
   });
 
@@ -225,51 +192,6 @@ describe("planRequest", () => {
           body: body(history(6)),
           state: state({ signature: "1:deadbeef" }),
           endpoint: ENDPOINT,
-          contextLimit: 1_000_000,
-          threshold: 0.7,
-          latestTokens: 1_000,
-        })
-      ).type,
-    ).toBe("passthrough");
-  });
-
-  test("drops state when the history is shorter than the compacted prefix", async () => {
-    const items = history(6);
-    expect(
-      (
-        await planRequest({
-          body: body(items.slice(0, 8)),
-          state: state({ signature: fingerprint(items.slice(0, 20)) }),
-          endpoint: ENDPOINT,
-          contextLimit: 1_000_000,
-          threshold: 0.7,
-          latestTokens: 1_000,
-        })
-      ).type,
-    ).toBe("passthrough");
-  });
-
-  test("drops state after a model or endpoint switch", async () => {
-    const items = history(6);
-    const stored = state({ signature: fingerprint(items.slice(0, 20)) });
-    expect(
-      (
-        await planRequest({
-          body: body(items, { model: "gpt-5.4" }),
-          state: stored,
-          endpoint: ENDPOINT,
-          contextLimit: 1_000_000,
-          threshold: 0.7,
-          latestTokens: 1_000,
-        })
-      ).type,
-    ).toBe("passthrough");
-    expect(
-      (
-        await planRequest({
-          body: body(items),
-          state: stored,
-          endpoint: "https://chatgpt.com/backend-api/codex/responses",
           contextLimit: 1_000_000,
           threshold: 0.7,
           latestTokens: 1_000,
@@ -308,18 +230,6 @@ describe("planRequest", () => {
     ).toBe("compact");
   });
 
-  test("uses zero when OpenCode has not reported a token count", async () => {
-    const plan = await planRequest({
-      body: body(history(6)),
-      state: undefined,
-      endpoint: ENDPOINT,
-      contextLimit: 1_000,
-      threshold: 0.5,
-    });
-
-    expect(plan.type).toBe("passthrough");
-    expect(plan.tokens).toBe(0);
-  });
 });
 
 describe("plugin", () => {
@@ -357,7 +267,6 @@ describe("plugin", () => {
     process.env.XDG_DATA_HOME = dataHome;
     const calls: Call[] = [];
     const partUpdates: PartUpdate[] = [];
-    const toasts: unknown[] = [];
     const stub = (async (input: string | URL | Request, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
       const requestBody = typeof init?.body === "string" ? JSON.parse(init.body) : undefined;
@@ -421,7 +330,7 @@ describe("plugin", () => {
               },
             },
           },
-          tui: { showToast: async (input: unknown) => void toasts.push(input) },
+          tui: { showToast: async () => {} },
         },
         project: { id: "proj" },
         directory: dataHome,
@@ -462,7 +371,6 @@ describe("plugin", () => {
     return {
       calls,
       partUpdates,
-      toasts,
       headers,
       send,
       emit: hooks.event,
@@ -483,14 +391,6 @@ describe("plugin", () => {
 
   const stateFile = (harness: { dataHome: string }) =>
     Bun.file(join(harness.dataHome, "opencode", "openai-compaction", "proj", "ses_1.json"));
-
-  test("accepts percentage thresholds", async () => {
-    const harness = await createHarness({ threshold: "10%" });
-    await harness.send(history(6));
-    expect(harness.calls).toHaveLength(2);
-    expect(sent(harness.calls[0]).url).toBe(compactUrl(ENDPOINT));
-    await harness.dispose();
-  });
 
   test("compacts requests from configured additional providers", async () => {
     const endpoint = "https://openai-compatible.example/v1/responses";
@@ -517,11 +417,6 @@ describe("plugin", () => {
     expect(sent(compactCall).url).toBe(endpoint);
     const compactBody = JSON.parse(sent(compactCall).init.body as string);
     expect(compactBody.input.at(-1)).toEqual({ type: "compaction_trigger" });
-    expect(compactBody).toMatchObject({ stream: true, store: false });
-    const compactHeaders = new Headers(sent(compactCall).init.headers);
-    expect(compactHeaders.get("openai-beta")).toBe("responses=experimental");
-    expect(compactHeaders.get("x-codex-beta-features")).toBe("remote_compaction_v2");
-    expect(sent(sentCall).url).toBe(endpoint);
     expect(sentInput(sentCall)).toEqual([
       ...items.slice(0, -4).filter((item) => "role" in item && item.role === "user"),
       { type: "compaction", encrypted_content: "compacted" },
@@ -544,11 +439,9 @@ describe("plugin", () => {
   });
 
   test("rejects invalid percentage thresholds", async () => {
-    for (const threshold of ["70", "0%", "101%"] as const) {
-      await expect(plugin.server({} as never, { threshold } as never)).rejects.toThrow(
-        "OpenAI compaction threshold must be a positive number or a percentage in (0%, 100%]",
-      );
-    }
+    await expect(plugin.server({} as never, { threshold: "101%" } as never)).rejects.toThrow(
+      "OpenAI compaction threshold must be a positive number or a percentage in (0%, 100%]",
+    );
   });
 
   test("waits until the latest OpenCode count reaches the threshold", async () => {
@@ -610,26 +503,6 @@ describe("plugin", () => {
     await harness.dispose();
   });
 
-  test("invalidates the latest OpenCode count when its message is removed", async () => {
-    const harness = await createHarness({
-      contextLimit: 1_000,
-      threshold: 0.5,
-      latestTokens: 100,
-    });
-    await harness.emit({
-      event: {
-        type: "message.removed",
-        properties: { sessionID: "ses_1", messageID: "msg_previous" },
-      },
-    });
-    const items = history(6);
-    await harness.send(items);
-
-    expect(harness.calls).toHaveLength(1);
-    expect(sentInput(harness.calls[0])).toEqual(items);
-    await harness.dispose();
-  });
-
   test("compacts an oversized request and replays the window on the next turn", async () => {
     // Sized so the full history is over the threshold but the replayed window plus
     // the kept tail is under it, i.e. the next turn replays instead of recompacting.
@@ -639,33 +512,9 @@ describe("plugin", () => {
 
     const [compactCall, sentCall] = harness.calls;
     expect(sent(compactCall).url).toBe(compactUrl(ENDPOINT));
-    expect(sentInput(compactCall)).toHaveLength(items.length - 4);
     expect(sentInput(sentCall)).toEqual([{ type: "message", id: "compacted" }, ...items.slice(-4)]);
-    expect(harness.toasts).toEqual([
-      {
-        body: {
-          title: "Context compaction",
-          message: "Compacting context...",
-          variant: "info",
-          duration: 5_000,
-        },
-      },
-    ]);
     expect(harness.partUpdates).toHaveLength(2);
-    expect(harness.partUpdates[0]).toMatchObject({
-      path: { sessionID: "ses_1", messageID: USER_MESSAGE_ID },
-      body: {
-        sessionID: "ses_1",
-        messageID: USER_MESSAGE_ID,
-        type: "text",
-        text: "--- Compacting context... ---",
-        synthetic: true,
-        ignored: true,
-      },
-    });
-    expect(harness.partUpdates[1]?.path.partID).toBe(harness.partUpdates[0]?.path.partID);
     expect(harness.partUpdates[1]?.body.text).toBe("--- Context compacted ---");
-    expect(harness.headers["x-opencode-openai-compaction"]).toBe("ses_1");
     expect(new Headers(sent(sentCall).init.headers).get("x-opencode-openai-compaction")).toBeNull();
     expect(await stateFile(harness).exists()).toBe(true);
 

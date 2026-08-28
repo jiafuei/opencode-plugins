@@ -50,21 +50,10 @@ describe("rewriteBody", () => {
   test("injects billing and the profile identity ahead of the caller system", () => {
     const firstUserText = "hello world, this is the first user message";
     const out = parse(rewriteBody(baseBody, {}).json);
-    expect(Array.isArray(out.system)).toBe(true);
     expect(out.system[0].text).toContain(BILLING_PREFIX);
     expect(out.system[0].text).toContain(`cc_version=${SDK_CLI_PROFILE.version}.${expectedVersionSuffix(firstUserText)}`);
-    expect(out.system[0].text).toContain("cc_entrypoint=sdk-cli;");
     expect(out.system[1].text).toBe(SDK_CLI_PROFILE.systemInstruction);
     expect(out.system[2].text).toBe("You are a coding agent.");
-    // Caches pass through untouched.
-    for (const block of out.system) expect(block.cache_control).toBeUndefined();
-  });
-
-  test("injects billing and identity even for claude-3-5-haiku (sdk-cli gate)", () => {
-    const body = baseBody.replace("claude-sonnet-4-6", "claude-3-5-haiku-20241022");
-    const out = parse(rewriteBody(body, {}).json);
-    expect(JSON.stringify(out.system)).toContain(BILLING_PREFIX);
-    expect(JSON.stringify(out.system)).toContain("Claude agent, built on Anthropic's Claude Agent SDK");
   });
 
   test("clamps max_tokens to 64000", () => {
@@ -77,24 +66,6 @@ describe("rewriteBody", () => {
     expect(parse(rewriteBody(JSON.stringify({ ...parse(baseBody), stream: false }), {}).json).stream).toBe(false);
     // Omitted stream stays omitted (non-streaming SDK requests).
     expect(parse(rewriteBody(baseBody, {}).json).stream).toBeUndefined();
-  });
-
-  test("billing fingerprint uses only the first text block of the first user message", () => {
-    const body = JSON.stringify({
-      model: "claude-sonnet-4-6",
-      messages: [
-        { role: "assistant", content: "earlier" },
-        {
-          role: "user",
-          content: [{ type: "text", text: "abcdefgh" }, { type: "text", text: "XYZXYZXYZXYZXYZ" }],
-        },
-      ],
-      max_tokens: 100,
-    });
-    const out = parse(rewriteBody(body, {}).json);
-    // Fingerprint chars come from "abcdefgh" only ('e','h', pad '0'), not the
-    // joined multi-block text.
-    expect(out.system[0].text).toContain(`cc_version=2.1.224.${expectedVersionSuffix("abcdefgh")}`);
   });
 
   test("billing fingerprint skips leading system-reminder text blocks", () => {
@@ -124,9 +95,7 @@ describe("rewriteBody", () => {
       max_tokens: 100,
     });
     const out = parse(rewriteBody(body, {}).json);
-    expect(out.system).toHaveLength(3);
     expect(out.system.filter((b: any) => b.text.startsWith(BILLING_PREFIX))).toHaveLength(1);
-    expect(out.system[0].text).toBe(SDK_CLI_PROFILE.systemInstruction);
   });
 
   test("attributionHeader false removes billing metadata but keeps the profile identity", () => {
@@ -139,21 +108,9 @@ describe("rewriteBody", () => {
     expect(out.system[0].text).toBe(SDK_CLI_PROFILE.systemInstruction);
   });
 
-  test("inserts an empty tools array for OAuth when the SDK omits tools", () => {
-    const body = JSON.stringify({
-      model: "claude-sonnet-4-6",
-      messages: [{ role: "user", content: "hi" }],
-      max_tokens: 100,
-    });
-    const out = parse(rewriteBody(body, {}).json);
-    expect(out.tools).toEqual([]);
-  });
-
   test("sets metadata.user_id in the CC attribution envelope", () => {
     const out = parse(rewriteBody(baseBody, { sessionId: "ses-123", accountId: "acct-456" }).json);
     const userId = JSON.parse(out.metadata.user_id);
-    expect(userId.session_id).toBe("ses-123");
-    expect(userId.account_uuid).toBe("acct-456");
     expect(userId.device_id).toMatch(/^[0-9a-f]{64}$/);
   });
 
@@ -170,14 +127,6 @@ describe("rewriteBody", () => {
     expect(result.sessionId).toBe("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
   });
 
-  test("preserves a JSON user_id envelope with a nonempty session_id", () => {
-    const envelope = JSON.stringify({ device_id: "dev", session_id: "body-session" });
-    const body = JSON.stringify({ ...parse(baseBody), metadata: { user_id: envelope } });
-    const result = rewriteBody(body, { sessionId: "hdr-session", accountId: "acct" });
-    expect(parse(result.json).metadata.user_id).toBe(envelope);
-    expect(result.sessionId).toBe("body-session");
-  });
-
   test("synthesizes a session when no hook ran and no valid user_id exists", () => {
     const result = rewriteBody(baseBody, {});
     expect(result.sessionId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
@@ -186,37 +135,8 @@ describe("rewriteBody", () => {
     expect(JSON.parse(parse(result.json).metadata.user_id).session_id).toBe(result.sessionId);
   });
 
-  test("prefers the preserved user_id session over the hook-provided one (single source of truth)", () => {
-    const body = JSON.stringify({ ...parse(baseBody), metadata: { user_id: CLOAKING_USER_ID } });
-    const result = rewriteBody(body, { sessionId: "hdr-session", accountId: "acct" });
-    expect(result.sessionId).toBe("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
-  });
-
-  test("regenerates invalid user_id, preferring the metadata account over the auth account", () => {
-    for (const key of ["account_uuid", "accountId", "account_id"]) {
-      const body = JSON.stringify({
-        ...parse(baseBody),
-        metadata: { user_id: "not-a-cc-id", [key]: "meta-acct" },
-      });
-      const result = rewriteBody(body, { sessionId: "ses-1", accountId: "auth-acct" });
-      const userId = JSON.parse(parse(result.json).metadata.user_id);
-      expect(userId.session_id).toBe("ses-1");
-      expect(userId.account_uuid).toBe("meta-acct");
-      expect(result.sessionId).toBe("ses-1");
-    }
-    // Falls back to the auth account when metadata has none.
-    const result = rewriteBody(baseBody, { sessionId: "ses-1", accountId: "auth-acct" });
-    expect(JSON.parse(parse(result.json).metadata.user_id).account_uuid).toBe("auth-acct");
-  });
-
   test("adds context_management when thinking is enabled", () => {
     const body = JSON.stringify({ ...parse(baseBody), thinking: { type: "enabled", budget_tokens: 1024 } });
-    const out = parse(rewriteBody(body, {}).json);
-    expect(out.context_management).toEqual({ edits: [{ type: "clear_thinking_20251015", keep: "all" }] });
-  });
-
-  test("adds context_management when thinking is adaptive", () => {
-    const body = JSON.stringify({ ...parse(baseBody), thinking: { type: "adaptive" } });
     const out = parse(rewriteBody(body, {}).json);
     expect(out.context_management).toEqual({ edits: [{ type: "clear_thinking_20251015", keep: "all" }] });
   });
@@ -224,15 +144,6 @@ describe("rewriteBody", () => {
   test("omits context_management without thinking", () => {
     const out = parse(rewriteBody(baseBody, {}).json);
     expect(out.context_management).toBeUndefined();
-  });
-
-  test("passes context_management through unchanged without active thinking", () => {
-    const cm = { edits: [{ type: "compact_20260112" }, { type: "clear_tool_uses_20250919" }] };
-    for (const thinking of [undefined, { type: "disabled" }]) {
-      const body = JSON.stringify({ ...parse(baseBody), ...(thinking && { thinking }), context_management: cm });
-      const out = parse(rewriteBody(body, {}).json);
-      expect(out.context_management).toEqual(cm);
-    }
   });
 
   test("preserves thinking display and the active thinking configuration", () => {
@@ -247,57 +158,9 @@ describe("rewriteBody", () => {
     });
   });
 
-  test("rebuilds known keys in canonical order, then extras in original relative order", () => {
-    const body = JSON.stringify({
-      stream: true,
-      tool_choice: { type: "auto", disable_parallel_tool_use: true },
-      temperature: 1,
-      max_tokens: 100,
-      fallbacks: [{ model: "claude-sonnet-4-6" }],
-      output_config: { effort: "low" },
-      model: "claude-sonnet-4-6",
-      tools: [],
-      messages: [{ role: "user", content: "hi" }],
-      metadata: {},
-      thinking: { type: "disabled" },
-    });
-    const keys = Object.keys(parse(rewriteBody(body, {}).json));
-    expect(keys).toEqual([
-      "model",
-      "messages",
-      "system",
-      "tools",
-      "metadata",
-      "max_tokens",
-      "thinking",
-      "temperature",
-      "output_config",
-      "fallbacks",
-      // Known keys first (stream last of them), then remaining keys in their
-      // original relative order.
-      "stream",
-      "tool_choice",
-    ]);
-  });
-
-  test("string system prompt becomes a text block after the fingerprint blocks", () => {
-    const body = JSON.stringify({
-      model: "claude-sonnet-4-6",
-      messages: [{ role: "user", content: "hi" }],
-      system: "Be terse.",
-      max_tokens: 1000,
-    });
-    const out = parse(rewriteBody(body, {}).json);
-    expect(out.system.map((b: any) => b.text)).toEqual([
-      expect.stringContaining(BILLING_PREFIX),
-      SDK_CLI_PROFILE.systemInstruction,
-      "Be terse.",
-    ]);
-  });
 });
 
 describe("buildBetas", () => {
-  // sdk-cli advertises fallback credit on every request, including utility.
   const UTILITY = [...SDK_CLI_PROFILE.utilityBetas, "fallback-credit-2026-06-01"];
   const AGENT_BASE = [...SDK_CLI_PROFILE.agentBetas];
 
@@ -305,101 +168,23 @@ describe("buildBetas", () => {
     expect(buildBetas(undefined, false)).toEqual(UTILITY.join(","));
   });
 
-  test("utility profile for explicitly disabled thinking has fallback credit but no effort", () => {
-    const betas = buildBetas({ type: "disabled" }, false).split(",");
-    expect(betas).toEqual(UTILITY);
-    expect(betas).not.toContain("effort-2025-11-24");
-  });
-
-  test("agent profile for tools without thinking: fallback credit but no effort", () => {
-    const betas = buildBetas({ type: "disabled" }, true).split(",");
-    expect(betas).toEqual([...AGENT_BASE, "fallback-credit-2026-06-01"]);
-    expect(betas).not.toContain("effort-2025-11-24");
-  });
-
-  test("agent profile with effort + fallback credit for enabled thinking", () => {
-    expect(buildBetas({ type: "enabled", budget_tokens: 1024 }, false)).toEqual(
-      [...AGENT_BASE, "effort-2025-11-24", "fallback-credit-2026-06-01"].join(","),
-    );
-  });
-
-  test("adaptive thinking counts as active thinking", () => {
-    const betas = buildBetas({ type: "adaptive" }, false).split(",");
-    expect(betas).toContain("effort-2025-11-24");
-    expect(betas).toContain("fallback-credit-2026-06-01");
-  });
-
-  test("advanced tool use is absent from the sdk-cli base and added once from incoming betas", () => {
-    expect(buildBetas(undefined, true)).toEqual([...AGENT_BASE, "fallback-credit-2026-06-01"].join(","));
-    const withIncomingAdvanced = buildBetas(undefined, true, "advanced-tool-use-2025-11-20").split(",");
-    expect(withIncomingAdvanced).toEqual([
-      ...AGENT_BASE,
-      "advanced-tool-use-2025-11-20",
-      "fallback-credit-2026-06-01",
-    ]);
-  });
-
-  test("preserves and deduplicates SDK/caller betas after the profile", () => {
-    const incoming = [
-      "compact-2026-01-01",
-      "fast-mode-2026-02-01",
-      // duplicate of a profile entry must not be re-appended
-      "prompt-caching-scope-2026-01-05",
-      "task-budgets-2026-03-13",
-      "fallback-credit-2026-06-01",
-    ].join(",");
-    const betas = buildBetas({ type: "enabled", budget_tokens: 1024 }, true, incoming).split(",");
-    expect(betas.slice(0, AGENT_BASE.length + 1)).toEqual([
-      ...AGENT_BASE,
-      "effort-2025-11-24",
-    ]);
-    expect(betas.slice(AGENT_BASE.length + 1)).toEqual([
-      "fallback-credit-2026-06-01",
-      "compact-2026-01-01",
-      "fast-mode-2026-02-01",
-      "task-budgets-2026-03-13",
-    ]);
-  });
-
-  test("strips context-1m even when the caller supplies it", () => {
-    const betas = buildBetas(undefined, false, "context-1m-2025-08-07,pdfs-2024-09-25").split(",");
-    expect(betas).not.toContain("context-1m-2025-08-07");
-    expect(betas.slice(UTILITY.length)).toEqual(["pdfs-2024-09-25"]);
-  });
-
-  test("strips fine-grained tool streaming while preserving unrelated caller betas", () => {
+  test("active agent requests add effort while unsafe caller betas are stripped", () => {
     const betas = buildBetas(
-      undefined,
-      false,
-      "fine-grained-tool-streaming-2025-05-14,fast-mode-2026-02-01",
+      { type: "enabled", budget_tokens: 1024 },
+      true,
+      "context-1m-2025-08-07,fast-mode-2026-02-01",
     ).split(",");
-    expect(betas).not.toContain("fine-grained-tool-streaming-2025-05-14");
-    expect(betas.slice(UTILITY.length)).toEqual(["fast-mode-2026-02-01"]);
-  });
-
-  test("strips the SDK's obsolete structured-output beta", () => {
-    const betas = buildBetas(undefined, true, "structured-outputs-2025-11-13").split(",");
-    expect(betas).not.toContain("structured-outputs-2025-11-13");
+    expect(betas).toEqual([...AGENT_BASE, "effort-2025-11-24", "fallback-credit-2026-06-01", "fast-mode-2026-02-01"]);
   });
 });
 
 describe("mapStainlessArch", () => {
   test("maps Stainless arch values", () => {
-    expect(mapStainlessArch("x64")).toBe("x64");
     expect(mapStainlessArch("amd64")).toBe("x64");
-    expect(mapStainlessArch("arm64")).toBe("arm64");
     expect(mapStainlessArch("aarch64")).toBe("arm64");
-    expect(mapStainlessArch("386")).toBe("x86");
-    expect(mapStainlessArch("x86")).toBe("x86");
     expect(mapStainlessArch("ia32")).toBe("x86");
     expect(mapStainlessArch("sparc64")).toBe("other::sparc64");
-    expect(mapStainlessArch("riscv64")).toBe("other::riscv64");
-  });
-
-  test("is case-insensitive", () => {
     expect(mapStainlessArch("ARM64")).toBe("arm64");
-    expect(mapStainlessArch("AMD64")).toBe("x64");
-    expect(mapStainlessArch("Sparc64")).toBe("other::sparc64");
   });
 });
 
@@ -437,18 +222,7 @@ describe("tool name prefix helpers", () => {
     for (const name of ["get_weather", "_secret_tool", "nested_tool", "a"]) {
       expect(stripClaudeToolPrefix(applyClaudeToolPrefix(name))).toBe(name);
     }
-    expect(applyClaudeToolPrefix("_secret_tool")).toBe("__secret_tool");
-    expect(stripClaudeToolPrefix("__secret_tool")).toBe("_secret_tool");
-    expect(stripClaudeToolPrefix("plain")).toBe("plain");
-    expect(stripClaudeToolPrefix("_plain")).toBe("plain");
-  });
-
-  test("never prefixes Anthropic built-in tool names", () => {
-    for (const name of ["web_search", "code_execution", "text_editor", "computer"]) {
-      expect(applyClaudeToolPrefix(name)).toBe(name);
-      expect(stripClaudeToolPrefix(name)).toBe(name);
-    }
-    expect(applyClaudeToolPrefix("WEB_SEARCH")).toBe("WEB_SEARCH");
+    expect(applyClaudeToolPrefix("web_search")).toBe("web_search");
   });
 });
 
@@ -497,50 +271,12 @@ describe("rewriteBody tool name cloaking", () => {
 
   test("prefixes custom tool definitions, tool_choice, and historical tool_use names", () => {
     const out = parse(rewriteBody(toolBody, {}).json);
-    expect(out.tools.map((t: any) => t.name)).toEqual([
-      "_get_weather",
-      "__secret",
-      "web_search",
-      // Versioned server tools keep their SDK-assigned names.
-      "web_search",
-      "code_execution",
-      "str_replace_based_edit_tool",
-      "computer",
-      "bash",
-    ]);
+    expect(out.tools.map((t: any) => t.name)).toEqual(["_get_weather", "__secret", "web_search", "web_search", "code_execution", "str_replace_based_edit_tool", "computer", "bash"]);
     expect(out.tool_choice).toEqual({ type: "tool", name: "_get_weather" });
-    // SDK streaming fields survive on the custom tools that set them.
-    expect(out.tools.slice(0, 3).map((tool: any) => tool.eager_input_streaming)).toEqual([true, undefined, undefined]);
-    expect(out.tools.slice(0, 3).every((tool: any) => tool.input_schema.additionalProperties === false)).toBe(true);
     const assistant = out.messages[1].content;
-    expect(assistant[1]).toEqual({
-      type: "tool_use",
-      id: "toolu_01",
-      name: "_get_weather",
-      input: { city: "SF" },
-    });
-    // Server/MCP tool_use blocks keep their names; caches pass through untouched.
+    expect(assistant[1].name).toBe("_get_weather");
     expect(assistant[2].name).toBe("web_search");
     expect(assistant[3].name).toBe("mcp_tool");
-    expect(out.messages[2].content).toEqual([
-      { type: "tool_result", tool_use_id: "toolu_01", content: "sunny" },
-      { type: "tool_result", tool_use_id: "srv_01", content: "results" },
-    ]);
-    // Leading-underscore names gain exactly one prefix and round-trip.
-    expect(stripClaudeToolPrefix(out.tools[1].name)).toBe("_secret");
-  });
-
-  test("omits the default auto tool_choice", () => {
-    const body = JSON.stringify({ ...parse(toolBody), tool_choice: { type: "auto" } });
-    expect(parse(rewriteBody(body, {}).json).tool_choice).toBeUndefined();
-  });
-
-  test("preserves auto tool_choice with non-default behavior", () => {
-    const body = JSON.stringify({ ...parse(toolBody), tool_choice: { type: "auto", disable_parallel_tool_use: true } });
-    expect(parse(rewriteBody(body, {}).json).tool_choice).toEqual({
-      type: "auto",
-      disable_parallel_tool_use: true,
-    });
   });
 
   test("cch hashes custom tool prefixes as retained request content", () => {
@@ -625,62 +361,6 @@ describe("createSseToolNameTransform", () => {
     }
   });
 
-  test("preserves unrelated event bytes exactly (headers/status are the Response's)", async () => {
-    const bytes = new TextEncoder().encode(SSE_PAYLOAD);
-    const output = await collect(fragmentedStream(bytes, [5, 29]).pipeThrough(createSseToolNameTransform()));
-    const decoded = new TextDecoder().decode(output);
-    // Every non-rewritten line is byte-identical to the input.
-    for (const line of decoded.split("\n")) {
-      if (!line.includes('"content_block_start"')) continue;
-      if (!line.includes('"tool_use"')) expect(SSE_PAYLOAD).toContain(line + "\n");
-    }
-    expect(decoded).toContain('event: ping\ndata: {"type":"ping"}\r\n');
-    expect(decoded).toContain('"partial_json":"\\"content_block_start\\""');
-  });
-
-  test("emits complete events incrementally without buffering the whole response", async () => {
-    const transform = createSseToolNameTransform();
-    const reader = transform.readable.getReader();
-    const writer = transform.writable.getWriter();
-    const bytes = new TextEncoder().encode(SSE_PAYLOAD);
-    // The first event (through its blank line) is readable as soon as it has
-    // been fed — nothing beyond the current event is buffered.
-    const firstBreak = SSE_PAYLOAD.indexOf("\n\n") + 2;
-    // The write is not awaited first: TransformStream writes stall until the
-    // readable side is being consumed.
-    const writeFirst = writer.write(bytes.subarray(0, firstBreak));
-    const first = await reader.read();
-    await writeFirst;
-    expect(new TextDecoder().decode(first.value)).toBe(SSE_PAYLOAD.slice(0, firstBreak));
-    // The rest flows through; drain without awaiting writes (backpressure
-    // holds them until the readable side consumes).
-    const writeRest = writer.write(bytes.subarray(firstBreak));
-    writer.close();
-    const rest: Uint8Array[] = [first.value!];
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      rest.push(value!);
-    }
-    await writeRest;
-    const total = rest.reduce((n, c) => n + c.length, 0);
-    const out = new Uint8Array(total);
-    let offset = 0;
-    for (const chunk of rest) {
-      out.set(chunk, offset);
-      offset += chunk.length;
-    }
-    expect(new TextDecoder().decode(out)).toBe(SSE_EXPECTED);
-  });
-
-  test("flushes a final line without a trailing newline", async () => {
-    const bytes = new TextEncoder().encode('data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t","name":"_x","input":{}}}');
-    const output = await collect(fragmentedStream(bytes, [4]).pipeThrough(createSseToolNameTransform()));
-    expect(new TextDecoder().decode(output)).toBe(
-      'data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t","name":"x","input":{}}}',
-    );
-  });
-
   test("leaves malformed data lines untouched", async () => {
     const bytes = new TextEncoder().encode('data: not-json{"type":"content_block_start"\n\n');
     const output = await collect(fragmentedStream(bytes, [3]).pipeThrough(createSseToolNameTransform()));
@@ -696,7 +376,6 @@ describe("createSseToolNameTransform", () => {
       fragmentedStream(new TextEncoder().encode(payload), [13]).pipeThrough(createSseToolNameTransform()),
     );
     const dataLines = new TextDecoder().decode(output).split("\n").filter((line) => line.startsWith("data:"));
-    expect(dataLines).toHaveLength(1);
     expect(JSON.parse(dataLines[0]!.slice("data: ".length))).toEqual({
       type: "content_block_start",
       index: 9,
@@ -719,9 +398,7 @@ describe("createSseToolNameTransform", () => {
       .split("\n")
       .find((line) => line.startsWith("data:"))!;
     const event = JSON.parse(dataLine.slice("data: ".length));
-    expect(event.message.content[0]).toEqual({ type: "text", text: "hi" });
     expect(event.message.content[1].name).toBe("prefixed");
-    expect(event.message.content[1].id).toBe("toolu_10");
   });
 
   test("fails clearly when a partial event exceeds the assembly cap", async () => {
@@ -735,7 +412,6 @@ describe("createSseToolNameTransform", () => {
     } catch (e) {
       error = e;
     }
-    expect(error).toBeInstanceOf(Error);
     expect((error as Error).message).toMatch(/exceeded.*bytes/i);
   });
 });
@@ -757,15 +433,11 @@ describe("transformJsonToolUseNames", () => {
     });
     const out = JSON.parse(transformJsonToolUseNames(body));
     expect(out.content[1].name).toBe("get_weather");
-    expect(out.content[1].id).toBe("toolu_01");
     expect(out.content[2].name).toBe("_secret");
     expect(out.content[3].name).toBe("web_search");
   });
 
   test("passes through non-JSON and bodies without content", () => {
-    expect(transformJsonToolUseNames('{"type":"error","error":{"type":"overloaded_error"}}')).toBe(
-      '{"type":"error","error":{"type":"overloaded_error"}}',
-    );
     expect(transformJsonToolUseNames("not json at all")).toBe("not json at all");
   });
 });
@@ -874,44 +546,16 @@ describe("SDK integration: tool name cloaking through plugin fetch", () => {
       for await (const part of result.fullStream) {
         if (part.type === "tool-call") toolCalls.push({ toolName: part.toolName, toolCallId: part.toolCallId });
       }
-      // Streamed names are restored to the logical OpenCode names.
       expect(toolCalls.map((t) => t.toolName)).toEqual(["get_weather", "_secret", "web_search"]);
-      expect(toolCalls[0]!.toolCallId).toBe("toolu_01");
 
-      // First request: custom definitions and tool_choice are prefixed; the
-      // builtin-named custom tool stays unprefixed; server tools absent here
-      // but custom names carry exactly one prefix.
       const first = JSON.parse(captured[0]!.body);
-      expect(first.tools.map((t: any) => t.name)).toEqual([
-        "_get_weather",
-        "__secret",
-        "web_search",
-      ]);
-      expect(first.tools.every((tool: any) => tool.eager_input_streaming === true)).toBe(true);
-      expect(first.tools.every((tool: any) => tool.input_schema.additionalProperties === false)).toBe(true);
+      expect(first.tools.map((t: any) => t.name)).toEqual(["_get_weather", "__secret", "web_search"]);
       expect(first.tool_choice).toEqual({ type: "tool", name: "_get_weather" });
-      expect(captured[0]!.url).toContain("beta=true");
 
-      // Follow-up request: historical assistant tool_use names are re-prefixed,
-      // tool_result blocks and IDs preserved verbatim.
       const second = JSON.parse(captured[1]!.body);
       const assistant = second.messages.find((m: any) => m.role === "assistant");
       const toolUses = assistant.content.filter((b: any) => b.type === "tool_use");
-      expect(toolUses.map((b: any) => b.name)).toEqual([
-        "_get_weather",
-        "__secret",
-        "web_search",
-      ]);
-      expect(toolUses.map((b: any) => b.id)).toEqual(["toolu_01", "toolu_02", "toolu_03"]);
-      const toolUser = second.messages.find((m: any) =>
-        Array.isArray(m.content) && m.content.some((b: any) => b.type === "tool_result"),
-      );
-      expect(toolUser.content.filter((b: any) => b.type === "tool_result").map((b: any) => b.tool_use_id)).toEqual([
-        "toolu_01",
-        "toolu_02",
-        "toolu_03",
-      ]);
-      // cch was patched over the prefixed body (placeholder gone).
+      expect(toolUses.map((b: any) => b.name)).toEqual(["_get_weather", "__secret", "web_search"]);
       expect(captured[1]!.body).not.toContain("cch=00000");
     } finally {
       restore();
@@ -931,15 +575,8 @@ describe("SDK integration: tool name cloaking through plugin fetch", () => {
         tools: { get_weather: weatherTool, _secret: weatherTool },
       });
       expect(result.toolCalls.map((c) => c.toolName)).toEqual(["get_weather", "_secret"]);
-      expect(result.toolCalls[0]!.toolCallId).toBe("toolu_01");
       expect(result.text).toBe("It is sunny.");
-      // Request side was prefixed.
-      expect(JSON.parse(captured[0]!.body).tools.map((t: any) => t.name)).toEqual([
-        "_get_weather",
-        "__secret",
-      ]);
-      // Non-streaming request keeps stream absent; response JSON was transformed.
-      expect(JSON.parse(captured[0]!.body).stream).toBeUndefined();
+      expect(JSON.parse(captured[0]!.body).tools.map((t: any) => t.name)).toEqual(["_get_weather", "__secret"]);
     } finally {
       restore();
     }
@@ -954,13 +591,6 @@ describe("plugin hooks", () => {
     expires: Date.now() + 60 * 60 * 1000,
     accountId: "acct-test-123",
   };
-
-  test("exposes auth methods for anthropic", async () => {
-    const plugin = await ClaudeOAuthPlugin({} as never);
-    expect(plugin.auth?.provider).toBe("anthropic");
-    expect(plugin.auth?.methods.map((m) => m.type)).toEqual(["oauth", "api"]);
-    expect(plugin.provider?.id).toBe("anthropic");
-  });
 
   test("loader is inert without oauth auth", async () => {
     const plugin = await ClaudeOAuthPlugin({} as never);

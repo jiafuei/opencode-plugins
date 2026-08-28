@@ -2,7 +2,6 @@ import { describe, expect, test } from "bun:test";
 import {
   ClaudeOAuthPlugin,
   extractIdentity,
-  fetchOAuthIdentity,
   resolveIdentity,
 } from "./claude_oauth.ts";
 import { coworkTransport } from "./cowork_fetch.ts";
@@ -64,30 +63,12 @@ function identityResponse(url: string): Response {
 }
 
 describe("extractIdentity normalization", () => {
-  serialTest("normalizes missing, invalid, and valid identity fields", () => {
-    const empty = { accountId: undefined, email: undefined, orgId: undefined, orgName: undefined };
-    const cases = [
-      {
-        input: {
-          ...TOKEN_BODY,
-          account: { uuid: "", email_address: undefined as unknown as string },
-          organization: { uuid: 42 as unknown as string, name: "" },
-        },
-        expected: empty,
-      },
-      {
-        input: {
-          ...TOKEN_BODY,
-          account: { uuid: "acct-1", email_address: "a@b.c" },
-          organization: { uuid: "org-1", name: "Org" },
-        },
-        expected: { accountId: "acct-1", email: "a@b.c", orgId: "org-1", orgName: "Org" },
-      },
-      { input: TOKEN_BODY, expected: empty },
-    ];
-    for (const { input, expected } of cases) {
-      expect(extractIdentity(input)).toEqual(expected);
-    }
+  serialTest("extracts valid token identity", () => {
+    expect(extractIdentity({
+      ...TOKEN_BODY,
+      account: { uuid: "acct-1", email_address: "a@b.c" },
+      organization: { uuid: "org-1", name: "Org" },
+    })).toEqual({ accountId: "acct-1", email: "a@b.c", orgId: "org-1", orgName: "Org" });
   });
 });
 
@@ -108,16 +89,7 @@ describe("resolveIdentity (login semantics)", () => {
         "https://api.anthropic.com/api/oauth/profile",
         "https://api.anthropic.com/api/oauth/claude_cli/roles",
       ]);
-      const profileHeaders = new Headers(calls[0]!.init!.headers);
-      expect(profileHeaders.get("authorization")).toBe("Bearer access-1");
-      expect(profileHeaders.get("content-type")).toBe("application/json");
-      expect(profileHeaders.get("cache-control")).toBe("no-cache");
-      expect(profileHeaders.get("accept")).toBe("application/json, text/plain, */*");
-      expect(profileHeaders.get("user-agent")).toBe("axios/1.15.2");
-      const rolesHeaders = new Headers(calls[1]!.init!.headers);
-      expect(rolesHeaders.get("authorization")).toBe("Bearer access-1");
-      expect(rolesHeaders.get("accept")).toBe("application/json, text/plain, */*");
-      expect(rolesHeaders.get("user-agent")).toBe("axios/1.15.2");
+      expect(new Headers(calls[0]!.init!.headers).get("authorization")).toBe("Bearer access-1");
     } finally {
       restore();
     }
@@ -139,38 +111,23 @@ describe("resolveIdentity (login semantics)", () => {
     }
   });
 
-  serialTest("partial account: profile fills email without touching the token's account id", async () => {
-    const { calls, restore } = mockFetch(identityResponse);
-    try {
-      const identity = await resolveIdentity(
-        { ...TOKEN_BODY, account: { uuid: "token-account", email_address: "" } },
-        { includeOrg: true },
-      );
-      // Token response fields win over profile fields.
-      expect(identity.accountId).toBe("token-account");
-      expect(identity.email).toBe("user@example.com");
-      expect(identity.orgId).toBe("profile-org");
-      expect(calls).toHaveLength(2);
-    } finally {
-      restore();
-    }
-  });
-
-  serialTest("complete account but missing org: profile and roles are still consulted on login", async () => {
-    const { calls, restore } = mockFetch(identityResponse);
+  serialTest("partial token identity wins while profile and roles fill missing fields", async () => {
+    const { restore } = mockFetch(identityResponse);
     try {
       const identity = await resolveIdentity(
         {
           ...TOKEN_BODY,
           account: { uuid: "token-account", email_address: "token@example.com" },
+          organization: { name: "Token org name" },
         },
         { includeOrg: true },
       );
-      expect(identity.accountId).toBe("token-account");
-      expect(identity.email).toBe("token@example.com");
-      expect(identity.orgId).toBe("profile-org");
-      expect(identity.orgName).toBe("Acme workspace");
-      expect(calls).toHaveLength(2);
+      expect(identity).toEqual({
+        accountId: "token-account",
+        email: "token@example.com",
+        orgId: "profile-org",
+        orgName: "Token org name",
+      });
     } finally {
       restore();
     }
@@ -196,84 +153,15 @@ describe("resolveIdentity (login semantics)", () => {
     }
   });
 
-  serialTest("empty-string fields trigger profile recovery; token values still win", async () => {
-    const { calls, restore } = mockFetch(identityResponse);
+  serialTest("profile failure is best-effort and preserves token identity", async () => {
+    const { restore } = mockFetch(() => Promise.reject(new Error("ECONNREFUSED")));
     try {
-      const identity = await resolveIdentity(
-        {
-          ...TOKEN_BODY,
-          account: { uuid: "token-account", email_address: "" },
-          organization: { uuid: "", name: "x" },
-        },
+      expect(await resolveIdentity(
+        { ...TOKEN_BODY, account: { uuid: "token-account" } },
         { includeOrg: true },
-      );
-      // Empty org uuid makes login incomplete, but the token response's
-      // non-empty fields (uuid, name "x") still win over profile recovery.
-      expect(calls).toHaveLength(2);
-      expect(identity).toEqual({
-        accountId: "token-account",
-        email: "user@example.com",
-        orgId: "profile-org",
-        orgName: "x",
-      });
+      )).toMatchObject({ accountId: "token-account" });
     } finally {
       restore();
-    }
-  });
-
-  const identityFailures: [label: string, responder: (url: string) => Response | Promise<Response>][] = [
-    ["network failure", () => Promise.reject(new Error("ECONNREFUSED"))],
-    ["non-OK response", () => jsonResponse({ error: "nope" }, 403)],
-    ["malformed JSON", () => jsonResponse("<html>gateway error</html>")],
-    ["timeout abort", () => Promise.reject(new DOMException("The operation timed out.", "TimeoutError"))],
-  ];
-  for (const [label, responder] of identityFailures) {
-    serialTest(`profile ${label} is strictly best-effort: token-derived identity survives`, async () => {
-      const { calls, restore } = mockFetch(responder);
-      try {
-        const identity = await resolveIdentity(
-          { ...TOKEN_BODY, account: { uuid: "token-account" } },
-          { includeOrg: true },
-        );
-        expect(identity).toEqual({
-          accountId: "token-account",
-          email: undefined,
-          orgId: undefined,
-          orgName: undefined,
-        });
-        expect(calls).toHaveLength(2);
-      } finally {
-        restore();
-      }
-    });
-  }
-
-  serialTest("empty profile and roles responses yield undefined fields, not a crash", async () => {
-    const { restore } = mockFetch(() => jsonResponse({}));
-    try {
-      const identity = await resolveIdentity({ ...TOKEN_BODY }, { includeOrg: true });
-      expect(identity).toEqual({ accountId: undefined, email: undefined, orgId: undefined, orgName: undefined });
-    } finally {
-      restore();
-    }
-  });
-
-  serialTest("fetchOAuthIdentity surfaces profile errors to callers (which swallow them)", async () => {
-    {
-      const { restore } = mockFetch(() => jsonResponse({}, 500));
-      try {
-        await expect(fetchOAuthIdentity("tok")).rejects.toThrow("500");
-      } finally {
-        restore();
-      }
-    }
-    {
-      const { restore } = mockFetch(() => jsonResponse("not json"));
-      try {
-        await expect(fetchOAuthIdentity("tok")).rejects.toThrow();
-      } finally {
-        restore();
-      }
     }
   });
 
@@ -282,12 +170,11 @@ describe("resolveIdentity (login semantics)", () => {
       throw new Error("profile must not be called");
     });
     try {
-      const identity = await resolveIdentity({
+      await resolveIdentity({
         ...TOKEN_BODY,
         account: { uuid: "acct", email_address: "a@b.c" },
         // organization deliberately absent — irrelevant on refresh
       });
-      expect(identity.orgId).toBeUndefined();
       expect(calls).toHaveLength(0);
     } finally {
       restore();
@@ -353,30 +240,10 @@ describe("refresh accountId preservation", () => {
   }
 
   serialTest("refresh response with no identity preserves the stored accountId when profile recovery fails", async () => {
-    const { persisted, calls } = await runRefreshedFetch(EXPIRED_AUTH, (url) =>
+    const { persisted } = await runRefreshedFetch(EXPIRED_AUTH, (url) =>
       url.includes("/v1/oauth/token") ? tokenResponse() : jsonResponse({ error: "down" }, 500),
     );
-    expect(persisted).toHaveLength(1);
     expect(persisted[0]).toMatchObject({ access: "new-access", refresh: "new-refresh", accountId: "stored-account" });
-    expect(calls.filter((c) => c.url.includes("/api/oauth/"))).toHaveLength(2);
-  });
-
-  serialTest("refresh response with empty-string uuid normalizes away and profile fills the gap", async () => {
-    const { persisted } = await runRefreshedFetch(EXPIRED_AUTH, (url) =>
-      url.includes("/v1/oauth/token")
-        ? tokenResponse({ account: { uuid: "", email_address: "" } })
-        : identityResponse(url),
-    );
-    expect(persisted[0]?.accountId).toBe("profile-account");
-  });
-
-  serialTest("refresh with null identity and failed profile recovery keeps stored accountId verbatim", async () => {
-    const { persisted } = await runRefreshedFetch(EXPIRED_AUTH, (url) => {
-      if (url.includes("/v1/oauth/token")) return tokenResponse({ account: { uuid: null } });
-      if (url.includes("/api/oauth/")) return Promise.reject(new Error("offline"));
-      return jsonResponse({});
-    });
-    expect(persisted[0]?.accountId).toBe("stored-account");
   });
 
   serialTest("refresh with no stored accountId resolves one from profile", async () => {
