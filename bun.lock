@@ -23,14 +23,14 @@
       "name": "@jiafuei/opencode-antigravity-oauth",
       "version": "0.1.0",
       "dependencies": {
-        "@opencode-ai/plugin": "^1.18.20",
+        "@opencode-ai/plugin": "^1.18.21",
       },
     },
     "plugins/claude-oauth": {
       "name": "@jiafuei/opencode-claude-oauth",
       "version": "0.0.1",
       "dependencies": {
-        "@opencode-ai/plugin": "^1.18.20",
+        "@opencode-ai/plugin": "^1.18.21",
       },
     },
     "plugins/memory": {
