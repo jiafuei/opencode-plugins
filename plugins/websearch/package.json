@@ -1,0 +1,37 @@
+{
+  "name": "@jiafuei/opencode-websearch",
+  "version": "0.0.1",
+  "description": "Provider-native web search for OpenCode",
+  "type": "module",
+  "exports": {
+    "./server": "./websearch.ts"
+  },
+  "files": [
+    "backend.ts",
+    "openai_backend.ts",
+    "websearch.ts",
+    "websocket_fetch.ts",
+    "README.md"
+  ],
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "openai",
+    "websearch"
+  ],
+  "engines": {
+    "opencode": ">=1.18.21"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "@ai-sdk/openai": "3.0.104",
+    "@opencode-ai/plugin": "^1.18.21",
+    "ai": "6.0.168",
+    "ws": "^8.18.3"
+  },
+  "devDependencies": {
+    "@types/ws": "^8.18.1"
+  }
+}
