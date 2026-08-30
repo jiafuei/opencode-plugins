@@ -714,7 +714,7 @@ export function readInBandError(payload: unknown): InBandError | undefined {
 /** Sanitized one-line description of an in-band error (never raw bodies). */
 export function describeInBandError(error: InBandError): string {
   const detail = error.message || error.status || (typeof error.code === "number" ? String(error.code) : "unknown error");
-  return `Cloud Code Assist stream error (${error.status ?? error.code ?? "unknown"}): ${detail}`;
+  return `Cloud Code Assist error (${error.status ?? error.code ?? "unknown"}): ${detail}`;
 }
 
 /** An in-band error eligible for endpoint failover (OMP transient statuses). */

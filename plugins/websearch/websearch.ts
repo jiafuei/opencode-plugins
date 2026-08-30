@@ -1,4 +1,5 @@
 import { tool, type Plugin } from "@opencode-ai/plugin";
+import { createAntigravityBackend } from "./antigravity_backend.ts";
 import type { ProviderData, SearchBackend, SearchResult } from "./backend.ts";
 import { createOpenAIBackend } from "./openai_backend.ts";
 
@@ -47,7 +48,7 @@ function formatResult(result: SearchResult) {
 }
 
 const WebSearchPlugin: Plugin = async ({ client, directory }) => {
-  const backends: SearchBackend[] = [createOpenAIBackend(client, directory)];
+  const backends: SearchBackend[] = [createOpenAIBackend(client, directory), createAntigravityBackend()];
   const activeModels = new Map<string, ActiveModel>();
   let resolutions: Resolution[] | undefined;
 

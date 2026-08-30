@@ -1000,7 +1000,7 @@ describe("response unwrapping", () => {
     })();
     await writer.write(new TextEncoder().encode('data: {"error":{"code":403,"message":"permission denied","status":"PERMISSION_DENIED"}}\n\n'));
     await expect(read).rejects.toThrow(
-      /Cloud Code Assist stream error \(PERMISSION_DENIED\): permission denied/,
+      /Cloud Code Assist error \(PERMISSION_DENIED\): permission denied/,
     );
     expect(errors[0]).toEqual({ code: 403, message: "permission denied", status: "PERMISSION_DENIED" });
     // A failed stream never reports successful completion.

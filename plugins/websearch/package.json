@@ -7,6 +7,7 @@
     "./server": "./websearch.ts"
   },
   "files": [
+    "antigravity_backend.ts",
     "backend.ts",
     "openai_backend.ts",
     "websearch.ts",
@@ -16,6 +17,8 @@
   "keywords": [
     "opencode",
     "opencode-plugin",
+    "antigravity",
+    "google",
     "openai",
     "websearch"
   ],

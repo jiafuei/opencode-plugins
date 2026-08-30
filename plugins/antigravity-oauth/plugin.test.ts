@@ -254,6 +254,82 @@ describe("OAuth method integration", () => {
 });
 
 describe("auth loader fetch boundary", () => {
+  test("exposes the captured native web search operation", async () => {
+    const harness = await makeHarness(OAUTH_AUTH);
+    await harness.loader();
+    const bridge = (globalThis as Record<symbol, any>)[
+      Symbol.for("@jiafuei/opencode-antigravity-oauth/web-search")
+    ];
+    const mock = mockFetch(() =>
+      new Response(
+        JSON.stringify({
+          response: {
+            candidates: [
+              {
+                content: { parts: [{ thoughtSignature: "opaque" }, { text: "Grounded answer" }] },
+                groundingMetadata: {
+                  groundingChunks: [
+                    { web: { title: "Example", uri: "https://vertexaisearch.cloud.google.com/grounding-api-redirect/source" } },
+                  ],
+                },
+              },
+            ],
+          },
+        }),
+      ),
+    );
+    try {
+      const abort = new AbortController().signal;
+      const result = await bridge.search("latest news", abort);
+      expect(mock.calls[0]!.url).toBe(`${DAILY}/v1internal:generateContent`);
+      expect(mock.calls[0]!.init.signal).toBe(abort);
+      const headers = new Headers(mock.calls[0]!.init.headers);
+      expect(headers.get("authorization")).toBe("Bearer at-live");
+      expect(headers.get("user-agent")).toBe("antigravity/ide/2.5.5 (aidev_client; os_type=windows; arch=amd64)");
+      expect(JSON.parse(String(mock.calls[0]!.init.body))).toMatchObject({
+        project: "proj-42",
+        model: "gemini-3.1-flash-lite",
+        userAgent: "antigravity",
+        requestType: "web_search",
+        request: {
+          contents: [{ role: "user", parts: [{ text: "latest news" }] }],
+          systemInstruction: {
+            role: "user",
+            parts: [{ text: expect.stringContaining("You MUST perform a web search") }],
+          },
+          generationConfig: { candidateCount: 1 },
+          tools: [{ googleSearch: { enhancedContent: { imageSearch: { maxResultCount: 5 } } } }],
+        },
+      });
+      expect(result).toEqual({
+        text: "Grounded answer",
+        sources: [
+          { title: "Example", url: "https://vertexaisearch.cloud.google.com/grounding-api-redirect/source" },
+        ],
+      });
+    } finally {
+      mock.restore();
+    }
+  });
+
+  test("surfaces native web search in-band errors", async () => {
+    const harness = await makeHarness(OAUTH_AUTH);
+    await harness.loader();
+    const bridge = (globalThis as Record<symbol, any>)[
+      Symbol.for("@jiafuei/opencode-antigravity-oauth/web-search")
+    ];
+    const mock = mockFetch(() =>
+      new Response(JSON.stringify({ error: { code: 429, status: "RESOURCE_EXHAUSTED", message: "quota exhausted" } })),
+    );
+    try {
+      await expect(bridge.search("latest news", new AbortController().signal)).rejects.toThrow(
+        /Cloud Code Assist error \(RESOURCE_EXHAUSTED\): quota exhausted/,
+      );
+    } finally {
+      mock.restore();
+    }
+  });
+
   test("rejects non-official origins without dispatching anything", async () => {
     const harness = await makeHarness(OAUTH_AUTH);
     const loader = await harness.loader();
@@ -570,7 +646,7 @@ describe("auth loader fetch boundary", () => {
     try {
       const target = streamTarget("gemini-2.5-pro", { contents: [] }, {});
       const response = await loader.fetch(target.url, target.init);
-      await expect(readStream(response)).rejects.toThrow(/Cloud Code Assist stream error \(PERMISSION_DENIED\): permission denied/);
+      await expect(readStream(response)).rejects.toThrow(/Cloud Code Assist error \(PERMISSION_DENIED\): permission denied/);
       expect(mock.calls).toHaveLength(1); // no sandbox attempt
     } finally {
       mock.restore();

@@ -52,6 +52,8 @@ const OAUTH_DUMMY_KEY = "opencode-antigravity-oauth-dummy-key";
 const SESSION_MARKER_HEADER = "x-antigravity-opencode-session";
 /** Per-invocation UUID; identical values mark SDK retries of the same logical request. */
 const INVOCATION_HEADER = "x-antigravity-opencode-invocation";
+const WEB_SEARCH_SYMBOL = Symbol.for("@jiafuei/opencode-antigravity-oauth/web-search");
+const WEB_SEARCH_USER_AGENT = "antigravity/ide/2.5.5 (aidev_client; os_type=windows; arch=amd64)";
 /** Login/browser-callback wait window. */
 export const FLOW_TIMEOUT_MS = 5 * 60 * 1000;
 
@@ -104,6 +106,17 @@ interface OAuthSnapshot {
   expires: number;
   refresh: string;
   projectId?: string;
+}
+
+interface ActiveOAuthSnapshot extends OAuthSnapshot {
+  projectId: string;
+}
+
+interface WebSearchBridge {
+  search(query: string, signal: AbortSignal): Promise<{
+    sources: Array<{ title?: string; url: string }>;
+    text: string;
+  }>;
 }
 
 type AuthClassification = AuthSnapshot | OAuthSnapshot;
@@ -262,6 +275,7 @@ export const AntigravityOAuthPlugin: Plugin = async (
   const sessionStates = new Map<string, AntigravitySessionState>();
   /** Active credential identity; transitions clear per-session state. */
   let activeProjectId: string | undefined;
+  let registeredSearch: WebSearchBridge | undefined;
 
   const persistCredentials = async (credentials: { refresh: string; access: string; expires: number; projectId: string }) => {
     // `accountId` is an opaque passthrough field in OpenCode's OAuth schema;
@@ -356,40 +370,43 @@ export const AntigravityOAuthPlugin: Plugin = async (
           return sharedRefresh;
         };
 
-        return {
+        const requireOAuth = (auth: AuthClassification): ActiveOAuthSnapshot => {
+          if (auth.kind !== "oauth" || !auth.projectId || !auth.refresh) {
+            sessionStates.clear();
+            activeProjectId = undefined;
+          }
+          if (auth.kind !== "oauth") throw requireLoginError(auth);
+          if (!auth.projectId || !auth.refresh) {
+            throw new Error(
+              "Stored Google Antigravity credentials are incomplete - run `opencode auth login`, pick Google Antigravity, and sign in again.",
+            );
+          }
+          return auth as ActiveOAuthSnapshot;
+        };
+
+        const resolveAuth = async (): Promise<ActiveOAuthSnapshot> => {
+          // Re-classify on every request so logout and re-login never dispatch
+          // stale credentials.
+          let auth = requireOAuth(await classify(getAuth));
+          if (!auth.access || auth.expires < Date.now()) {
+            auth = requireOAuth(await performSharedRefresh(auth));
+          }
+
+          if (auth.projectId !== activeProjectId) {
+            sessionStates.clear();
+            activeProjectId = auth.projectId;
+          }
+          return auth as ActiveOAuthSnapshot;
+        };
+
+        const options = {
           apiKey: OAUTH_DUMMY_KEY,
           // Marker for chat.headers: identifies OAuth sessions without relying
           // on the dummy apiKey, which provider config merging can overwrite.
           antigravityOAuth: true,
 
-          async fetch(requestInput: string | URL | Request, init?: RequestInit) {
-            // Re-classify stored auth on every request so logout/re-login/API
-            // key transitions route correctly instead of dispatching stale
-            // credentials.
-            let auth = await classify(getAuth);
-
-            // Leaving OAuth (or holding broken credentials) invalidates all
-            // per-session envelope identity.
-            const leaveOAuth =
-              auth.kind !== "oauth" ||
-              (auth.kind === "oauth" && (!auth.projectId || !auth.refresh));
-            if (leaveOAuth) {
-              sessionStates.clear();
-              activeProjectId = undefined;
-            }
-            if (auth.kind !== "oauth") throw requireLoginError(auth);
-            if (!auth.projectId || !auth.refresh) {
-              throw new Error(
-                "Stored Google Antigravity credentials are incomplete - run `opencode auth login`, pick Google Antigravity, and sign in again.",
-              );
-            }
-
-            // Project transitions (fresh login against another account)
-            // start a fresh identity chain.
-            if (auth.projectId !== activeProjectId) {
-              sessionStates.clear();
-              activeProjectId = auth.projectId;
-            }
+          fetch: async (requestInput: string | URL | Request, init?: RequestInit) => {
+            const auth = await resolveAuth();
 
             const url =
               requestInput instanceof URL
@@ -406,29 +423,6 @@ export const AntigravityOAuthPlugin: Plugin = async (
               );
             }
 
-            if (!auth.access || auth.expires < Date.now()) {
-              const refreshed = await performSharedRefresh(auth);
-              if (refreshed.kind !== "oauth") {
-                sessionStates.clear();
-                activeProjectId = undefined;
-                throw requireLoginError(refreshed);
-              }
-              // Adopt the latest persisted snapshot (ours after a fenced
-              // persist, otherwise the concurrent login/logout winner).
-              auth = refreshed;
-              if (!auth.projectId || !auth.refresh) {
-                sessionStates.clear();
-                activeProjectId = undefined;
-                throw new Error(
-                  "Stored Google Antigravity credentials are incomplete - run `opencode auth login`, pick Google Antigravity, and sign in again.",
-                );
-              }
-              if (auth.projectId !== activeProjectId) {
-                sessionStates.clear();
-                activeProjectId = auth.projectId;
-              }
-            }
-
             const headers = new Headers(init?.headers);
             const opencodeSessionId = headers.get(SESSION_MARKER_HEADER) ?? undefined;
             const invocationId = headers.get(INVOCATION_HEADER) ?? undefined;
@@ -440,8 +434,6 @@ export const AntigravityOAuthPlugin: Plugin = async (
 
             const target = parseGenerateContentPath(url.pathname);
             if (!target) {
-              // Allowlisted control-plane style request: attach the bearer and
-              // forward untouched.
               headers.set("Authorization", `Bearer ${auth.access}`);
               return fetch(requestInput, { ...init, headers });
             }
@@ -465,7 +457,7 @@ export const AntigravityOAuthPlugin: Plugin = async (
             const rewritten = rewriteBodyForAntigravity({
               args,
               logicalModelId: target.logicalModelId,
-              projectId: auth.projectId!,
+              projectId: auth.projectId,
               state,
               invocationId,
             });
@@ -612,6 +604,65 @@ export const AntigravityOAuthPlugin: Plugin = async (
             throw lastError instanceof Error ? lastError : new Error("All Antigravity endpoints failed");
           },
         };
+
+        const search: WebSearchBridge = {
+          async search(query, signal) {
+            const auth = await resolveAuth();
+            const endpoint = resolveEndpointChain(endpointMode)[0]!;
+            const response = await fetch(`${endpoint}/v1internal:generateContent`, {
+              method: "POST",
+              headers: {
+                Authorization: `Bearer ${auth.access}`,
+                "Content-Type": "application/json",
+                "User-Agent": WEB_SEARCH_USER_AGENT,
+              },
+              body: JSON.stringify({
+                project: auth.projectId,
+                model: "gemini-3.1-flash-lite",
+                userAgent: "antigravity",
+                requestType: "web_search",
+                request: {
+                  contents: [{ role: "user", parts: [{ text: query }] }],
+                  systemInstruction: {
+                    role: "user",
+                    parts: [
+                      {
+                        text: "You are a search engine bot. You will be given a query from a user. Your task is to search the web for relevant information that will help the user. You MUST perform a web search. Do not respond or interact with the user, please respond as if they typed the query into a search bar.",
+                      },
+                    ],
+                  },
+                  generationConfig: { candidateCount: 1 },
+                  tools: [{ googleSearch: { enhancedContent: { imageSearch: { maxResultCount: 5 } } } }],
+                },
+              }),
+              signal,
+            });
+
+            const body = await response.text();
+            let payload: Record<string, any>;
+            try {
+              payload = JSON.parse(body);
+            } catch {
+              throw new Error(`Antigravity web search failed (HTTP ${response.status})`);
+            }
+            const inBand = readInBandError(payload);
+            if (inBand) throw new Error(describeInBandError(inBand));
+            if (!response.ok) throw new Error(`Antigravity web search failed (HTTP ${response.status})`);
+
+            const candidate = payload.response?.candidates?.[0];
+            const text = candidate?.content?.parts?.flatMap((part: Record<string, any>) =>
+              typeof part.text === "string" ? [part.text] : [],
+            ).join("") ?? "";
+            if (!text) throw new Error("Antigravity web search returned no answer");
+            const sources = candidate.groundingMetadata?.groundingChunks?.flatMap((chunk: Record<string, any>) =>
+              typeof chunk.web?.uri === "string" ? [{ title: chunk.web.title, url: chunk.web.uri }] : [],
+            ) ?? [];
+            return { sources, text };
+          },
+        };
+        registeredSearch = search;
+        (globalThis as Record<symbol, unknown>)[WEB_SEARCH_SYMBOL] = search;
+        return options;
       },
 
       methods: [
@@ -713,6 +764,8 @@ export const AntigravityOAuthPlugin: Plugin = async (
 
     dispose: async () => {
       sessionStates.clear();
+      const registry = globalThis as Record<symbol, unknown>;
+      if (registry[WEB_SEARCH_SYMBOL] === registeredSearch) delete registry[WEB_SEARCH_SYMBOL];
     },
   };
   return hooks;

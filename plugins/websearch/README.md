@@ -1,6 +1,6 @@
 # Web search
 
-Provider-native `websearch` for OpenCode. Each backend performs searching, content retrieval, and answer generation in one model request. The first backend uses OpenAI's hosted Responses API web search with a connected ChatGPT subscription.
+Provider-native `websearch` for OpenCode. Each backend performs searching, content retrieval, and answer generation in one model request. Included backends use OpenAI's hosted Responses API web search or Antigravity's native Cloud Code Assist `web_search` operation.
 
 ## Installation
 
@@ -8,7 +8,7 @@ Provider-native `websearch` for OpenCode. Each backend performs searching, conte
 opencode plugin @jiafuei/opencode-websearch
 ```
 
-Connect an OpenAI ChatGPT subscription in OpenCode before using the tool.
+Connect either an OpenAI ChatGPT subscription or the [`@jiafuei/opencode-antigravity-oauth`](../antigravity-oauth) plugin in OpenCode before using the tool. The Antigravity backend requires both plugins to be installed and a Google Antigravity OAuth login.
 
 ## Model selection
 
@@ -18,7 +18,7 @@ The plugin chooses a model in this order:
 2. The active model when its provider has a search backend.
 3. A model on any supported backend marked `"websearch": "auto"`.
 
-Pin an OpenAI search model:
+Pin a search backend through one of its provider models:
 
 ```json
 {
@@ -36,10 +36,10 @@ Pin an OpenAI search model:
 }
 ```
 
-Use the model only when the active provider is not OpenAI by changing `"always"` to `"auto"`.
+Use the model only when the active provider is unsupported by changing `"always"` to `"auto"`. For Antigravity, use the `google-antigravity` provider and any of its models; the backend dispatches the dedicated `gemini-3.1-flash-lite` search operation captured from the native client.
 
 ## Tool
 
 - `websearch`: search the live web and return grounded content with sources.
 
-The plugin does not fetch or parse web pages locally. Search backends are provider-native adapters; OpenAI is currently the only included backend.
+The plugin does not fetch or parse web pages locally. Search backends are provider-native adapters for OpenAI and Google Antigravity.
