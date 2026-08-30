@@ -60,7 +60,7 @@ const WebSearchPlugin: Plugin = async ({ client, directory }) => {
       if (input.model) activeModels.set(input.sessionID, input.model);
     },
     tool: {
-      websearch: tool({
+      "web-search": tool({
         description: "Search the live web with a provider-native search model and return grounded content with sources. Use for current information and topics beyond the model's knowledge cutoff.",
         args: {
           query: tool.schema.string().describe("The web search query."),

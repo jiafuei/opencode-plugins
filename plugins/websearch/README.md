@@ -40,6 +40,6 @@ Use the model only when the active provider is unsupported by changing `"always"
 
 ## Tool
 
-- `websearch`: search the live web and return grounded content with sources.
+- `web-search`: search the live web and return grounded content with sources.
 
 The plugin does not fetch or parse web pages locally. Search backends are provider-native adapters for OpenAI and Google Antigravity.
