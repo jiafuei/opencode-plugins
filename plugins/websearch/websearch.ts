@@ -1,9 +1,12 @@
-import { tool, type Plugin } from "@opencode-ai/plugin";
+import { tool, type Plugin, type PluginOptions } from "@opencode-ai/plugin";
 import { createAntigravityBackend } from "./antigravity_backend.ts";
 import type { ProviderData, SearchBackend, SearchResult } from "./backend.ts";
-import { createOpenAIBackend } from "./openai_backend.ts";
+import { createOpenAIBackend, type OpenAISubscriptionTransport } from "./openai_backend.ts";
 
 type ActiveModel = { modelID: string; providerID: string };
+interface WebSearchOptions extends PluginOptions {
+  openaiSubscriptionTransport?: OpenAISubscriptionTransport;
+}
 type Resolution = {
   backend: SearchBackend;
   fallbackModel?: string;
@@ -47,10 +50,28 @@ function formatResult(result: SearchResult) {
   return links.length ? `${result.text.trim()}\n\nSources:\n${links.join("\n")}` : result.text.trim();
 }
 
-const WebSearchPlugin: Plugin = async ({ client, directory }) => {
-  const backends: SearchBackend[] = [createOpenAIBackend(client, directory), createAntigravityBackend()];
+const WebSearchPlugin: Plugin = async ({ client, directory }, options?: PluginOptions | WebSearchOptions) => {
+  const pluginOptions = options as WebSearchOptions | undefined;
+  if (
+    pluginOptions?.openaiSubscriptionTransport !== undefined &&
+    pluginOptions.openaiSubscriptionTransport !== "https" &&
+    pluginOptions.openaiSubscriptionTransport !== "websocket"
+  ) {
+    throw new Error(`Unsupported OpenAI subscription transport "${String(pluginOptions.openaiSubscriptionTransport)}"`);
+  }
+  const backends: SearchBackend[] = [
+    createOpenAIBackend(client, directory, pluginOptions?.openaiSubscriptionTransport),
+    createAntigravityBackend(),
+  ];
+  const log = (level: "info" | "warn" | "error", message: string, extra?: Record<string, unknown>) =>
+    client.app.log({ body: { service: "websearch", level, message, extra }, query: { directory } }).catch(() => {});
   const activeModels = new Map<string, ActiveModel>();
   let resolutions: Resolution[] | undefined;
+
+  log("info", "Plugin initialized; web-search tool registered", {
+    backends: backends.map((backend) => backend.id),
+    openaiSubscriptionTransport: pluginOptions?.openaiSubscriptionTransport ?? "https",
+  });
 
   return {
     dispose: async () => {
@@ -73,11 +94,33 @@ const WebSearchPlugin: Plugin = async ({ client, directory }) => {
             const response = await client.config.providers({ query: { directory } });
             if (!response.data) throw new Error("Failed to retrieve search models");
             resolutions = scanProviders(response.data.providers as ProviderData[], backends);
+            log("info", "Search backends resolved", {
+              resolutions: resolutions.map(({ backend, fallbackModel, lockedModel, providerID }) => ({
+                backend: backend.id,
+                fallbackModel,
+                lockedModel,
+                providerID,
+              })),
+            });
           }
           const selected = pickResolution(resolutions, activeModels.get(context.sessionID));
-          if (!selected) throw new Error('Choose a supported model for web search with `"websearch": "always"` or `"websearch": "auto"`');
+          if (!selected) {
+            log("warn", "No search backend selected", { activeModel: activeModels.get(context.sessionID) });
+            throw new Error('Choose a supported model for web search with `"websearch": "always"` or `"websearch": "auto"`');
+          }
 
-          return formatResult(await selected.backend.search({ context, model: selected.model, query }));
+          log("info", "Search started", { backend: selected.backend.id, model: selected.model });
+          try {
+            const result = await selected.backend.search({ context, model: selected.model, query });
+            log("info", "Search completed", { backend: selected.backend.id, sources: result.sources.length });
+            return formatResult(result);
+          } catch (error) {
+            log("error", "Search failed", {
+              backend: selected.backend.id,
+              error: error instanceof Error ? error.message : String(error),
+            });
+            throw error;
+          }
         },
       }),
     },

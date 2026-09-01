@@ -8,7 +8,19 @@ Provider-native `websearch` for OpenCode. Each backend performs searching, conte
 opencode plugin @jiafuei/opencode-websearch
 ```
 
-Connect either an OpenAI ChatGPT subscription or the [`@jiafuei/opencode-antigravity-oauth`](../antigravity-oauth) plugin in OpenCode before using the tool. The Antigravity backend requires both plugins to be installed and a Google Antigravity OAuth login.
+Connect an OpenAI API key, a ChatGPT subscription, or the [`@jiafuei/opencode-antigravity-oauth`](../antigravity-oauth) plugin in OpenCode before using the tool. The Antigravity backend requires both plugins to be installed and a Google Antigravity OAuth login.
+
+OpenAI API-key and ChatGPT subscription requests use HTTPS. To opt into the persistent WebSocket transport for ChatGPT subscriptions:
+
+```jsonc
+{
+  "plugin": [
+    ["@jiafuei/opencode-websearch", { "openaiSubscriptionTransport": "websocket" }]
+  ]
+}
+```
+
+The transport option only affects ChatGPT subscriptions; OpenAI API-key requests always use HTTPS.
 
 ## Model selection
 

@@ -6,6 +6,10 @@ import type { ProviderData, SearchBackend } from "./backend.ts";
 import { createWebSocketFetch } from "./websocket_fetch.ts";
 
 type OpenAIAuth = { access?: string; accountId?: string; type?: string };
+type OpenAIConnection =
+  | { apiKey: string; type: "api" }
+  | { accountId?: string; apiKey: string; type: "subscription" };
+export type OpenAISubscriptionTransport = "https" | "websocket";
 
 const CHATGPT_BASE_URL = "https://chatgpt.com/backend-api/codex";
 
@@ -15,12 +19,18 @@ function authPath(statePath: string) {
   return join(`${statePath.slice(0, -stateMarker.length)}${dataMarker}`, "auth.json");
 }
 
+export function resolveOpenAIAuth(auth: (OpenAIAuth & { key?: string }) | undefined): OpenAIConnection {
+  if (auth?.type === "oauth" && auth.access) {
+    return { type: "subscription", apiKey: auth.access, accountId: auth.accountId };
+  }
+  if (auth?.type === "api" && auth.key) return { type: "api", apiKey: auth.key };
+  throw new Error("Connect a ChatGPT subscription or OpenAI API key before using websearch");
+}
+
 async function readAuth(client: PluginInput["client"], directory: string) {
   const response = await client.path.get({ query: { directory } });
-  const store = (await Bun.file(authPath(response.data!.state)).json()) as Record<string, OpenAIAuth>;
-  const auth = store.openai;
-  if (auth?.type !== "oauth" || !auth.access) throw new Error("Connect an OpenAI ChatGPT subscription before using websearch");
-  return { access: auth.access, accountId: auth.accountId };
+  const store = (await Bun.file(authPath(response.data!.state)).json()) as Record<string, OpenAIAuth & { key?: string }>;
+  return resolveOpenAIAuth(store.openai);
 }
 
 function residency(accessToken: string) {
@@ -36,24 +46,33 @@ function residency(accessToken: string) {
   }
 }
 
-export function createOpenAIBackend(client: PluginInput["client"], directory: string): SearchBackend {
-  const websocketFetch = createWebSocketFetch();
+export function createOpenAIBackend(
+  client: PluginInput["client"],
+  directory: string,
+  subscriptionTransport: OpenAISubscriptionTransport = "https",
+): SearchBackend {
+  const websocketFetch = subscriptionTransport === "websocket" ? createWebSocketFetch() : undefined;
 
   return {
     id: "openai",
     matches: (provider: ProviderData) => provider.id === "openai",
-    dispose: () => websocketFetch.close(),
+    dispose: () => websocketFetch?.close(),
     async search({ context, model, query }) {
       const auth = await readAuth(client, directory);
-      const location = residency(auth.access);
+      const subscription = auth.type === "subscription";
+      const location = subscription ? residency(auth.apiKey) : undefined;
       const openai = createOpenAI({
-        apiKey: auth.access,
-        baseURL: CHATGPT_BASE_URL,
-        fetch: websocketFetch,
-        headers: {
-          ...(auth.accountId ? { "ChatGPT-Account-Id": auth.accountId } : {}),
-          ...(location ? { "x-openai-internal-codex-residency": location } : {}),
-        },
+        apiKey: auth.apiKey,
+        ...(subscription ? { baseURL: CHATGPT_BASE_URL } : {}),
+        ...(subscription && websocketFetch ? { fetch: websocketFetch } : {}),
+        ...(subscription
+          ? {
+              headers: {
+                ...(auth.accountId ? { "ChatGPT-Account-Id": auth.accountId } : {}),
+                ...(location ? { "x-openai-internal-codex-residency": location } : {}),
+              },
+            }
+          : {}),
       });
       const result = streamText({
         abortSignal: context.abort,
