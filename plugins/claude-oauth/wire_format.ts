@@ -2,6 +2,13 @@ import { createHash, randomUUID } from "node:crypto";
 import { deriveDeviceId } from "./local_storage.ts";
 import { EX_MACHINA_PROFILE } from "./ex_machina_wire.ts";
 import type { ExMachinaProfile } from "./ex_machina_wire.ts";
+import {
+  applyCoworkModelCompatibility,
+  applyCoworkPromptCaching,
+  makeStringsWellFormed,
+  normalizeCoworkTools,
+  sanitizeCoworkSystem,
+} from "./cowork_wire.ts";
 
 // Beta tokens shared by the profile definitions below.
 const CLAUDE_CODE_20250219_BETA = "claude-code-20250219";
@@ -291,6 +298,7 @@ export function prefixRequestToolNames(params: Record<string, any>, profile: Cla
     for (const tool of params.tools) {
       if (!tool || typeof tool !== "object") continue;
       if (
+        profile.id !== "cowork" &&
         tool.input_schema &&
         typeof tool.input_schema === "object" &&
         !Array.isArray(tool.input_schema)
@@ -637,21 +645,21 @@ function readMetadataAccountId(metadata: unknown): string | undefined {
   return undefined;
 }
 
-function extractFirstUserText(messages: unknown): string {
+function extractFirstUserText(messages: unknown, skipSystemReminders: boolean): string {
   if (!Array.isArray(messages)) return "";
   for (const message of messages) {
     if (!message || typeof message !== "object") continue;
     const m = message as { role?: string; content?: unknown };
     if (m.role !== "user") continue;
     if (typeof m.content === "string") {
-      if (!m.content.startsWith("<system-reminder>")) return m.content;
+      if (!skipSystemReminders || !m.content.startsWith("<system-reminder>")) return m.content;
       continue;
     }
     if (Array.isArray(m.content)) {
       for (const block of m.content) {
         if (!block || typeof block !== "object" || (block as ContentBlock).type !== "text") continue;
         const text = (block as ContentBlock).text ?? "";
-        if (!text.startsWith("<system-reminder>")) return text;
+        if (!skipSystemReminders || !text.startsWith("<system-reminder>")) return text;
       }
     }
   }
@@ -671,6 +679,26 @@ const CANONICAL_BODY_KEYS = [
   "output_config",
   "fallbacks",
   "stream",
+];
+
+const COWORK_BODY_KEYS = [
+  "model",
+  "messages",
+  "system",
+  "tools",
+  "metadata",
+  "max_tokens",
+  "thinking",
+  "context_management",
+  "output_config",
+  "fallbacks",
+  "stream",
+  "temperature",
+  "top_p",
+  "top_k",
+  "stop_sequences",
+  "speed",
+  "tool_choice",
 ];
 
 /**
@@ -698,9 +726,6 @@ export function rewriteBody(
 ): { json: string; thinking: unknown; hasTools: boolean; model: string; sessionId?: string } {
   const profile = ctx.profile ?? SDK_CLI_PROFILE;
   const params = JSON.parse(body) as Record<string, any>;
-  // Cloak custom tool names before anything else, so cch hashes the
-  // already-prefixed final body.
-  prefixRequestToolNames(params, profile);
   if (
     params.tool_choice?.type === "auto" &&
     typeof params.tool_choice === "object" &&
@@ -708,6 +733,14 @@ export function rewriteBody(
   ) {
     delete params.tool_choice;
   }
+  if (profile.id === "cowork") {
+    normalizeCoworkTools(params.tools);
+    applyCoworkModelCompatibility(params);
+    applyCoworkPromptCaching(params.messages);
+  }
+  // Cloak custom tool names before anything else, so cch hashes the
+  // already-prefixed final body.
+  prefixRequestToolNames(params, profile);
   const hasTools = Array.isArray(params.tools) && params.tools.length > 0;
 
   const modelId: string = params.model ?? "";
@@ -729,6 +762,9 @@ export function rewriteBody(
   const hasBillingBlock =
     (typeof incomingSystem === "string" && incomingSystem.startsWith(BILLING_HEADER_PREFIX)) ||
     systemBlocks.some((block) => typeof block?.text === "string" && block.text.startsWith(BILLING_HEADER_PREFIX));
+  const coworkBillingBlocks = profile.id === "cowork"
+    ? systemBlocks.filter((block) => typeof block?.text === "string" && block.text.startsWith(BILLING_HEADER_PREFIX))
+    : [];
 
   if (ctx.attributionHeader === false) {
     systemBlocks = systemBlocks.filter(
@@ -736,12 +772,21 @@ export function rewriteBody(
     );
   }
 
+  if (profile.id === "cowork") {
+    systemBlocks = systemBlocks.filter(
+      (block) => block?.text !== profile.systemInstruction &&
+        (typeof block?.text !== "string" || !block.text.startsWith(BILLING_HEADER_PREFIX)),
+    );
+    systemBlocks = sanitizeCoworkSystem(systemBlocks as Array<Record<string, any>>);
+  }
+
   const hasIdentityBlock = systemBlocks.some((block) => block?.text === profile.systemInstruction);
   const fingerprintBlocks: ContentBlock[] = [];
+  if (profile.id === "cowork" && ctx.attributionHeader !== false) fingerprintBlocks.push(...coworkBillingBlocks);
   if (injectFingerprint && ctx.attributionHeader !== false && !hasBillingBlock) {
     fingerprintBlocks.push({
       type: "text",
-      text: createBillingHeader(extractFirstUserText(params.messages), profile),
+      text: createBillingHeader(extractFirstUserText(params.messages, profile.id !== "cowork"), profile),
     });
   }
   if (injectFingerprint && !hasIdentityBlock) {
@@ -766,12 +811,17 @@ export function rewriteBody(
     const envelope: Record<string, string> = {
       device_id: deriveDeviceId(accountId, profile.deviceDomainInstall, profile.deviceDomainAccount),
     };
-    if (accountId) envelope.account_uuid = accountId;
-    envelope.session_id = ctx.sessionId ?? randomUUID().toLowerCase();
+    if (profile.id === "cowork") {
+      envelope.session_id = ctx.sessionId ?? randomUUID().toLowerCase();
+      if (accountId) envelope.account_uuid = accountId;
+    } else {
+      if (accountId) envelope.account_uuid = accountId;
+      envelope.session_id = ctx.sessionId ?? randomUUID().toLowerCase();
+    }
     userId = JSON.stringify(envelope);
     sessionId = envelope.session_id;
   }
-  const metadata = { ...params.metadata, user_id: userId };
+  const metadata = profile.id === "cowork" ? { user_id: userId } : { ...params.metadata, user_id: userId };
 
   const thinking =
     params.thinking && typeof params.thinking === "object" ? { ...params.thinking } : params.thinking;
@@ -781,7 +831,7 @@ export function rewriteBody(
   let contextManagement: Record<string, any> | undefined;
   if (isActiveThinking(thinking)) {
     contextManagement = { edits: [{ type: "clear_thinking_20251015", keep: "all" }] };
-  } else if (incomingContextManagement) {
+  } else if (incomingContextManagement && profile.id !== "cowork") {
     contextManagement = incomingContextManagement;
   }
 
@@ -802,12 +852,14 @@ export function rewriteBody(
   // its original relative order. Incoming `stream` is preserved as-is (the
   // normal SDK path sends true); undefined values drop out on stringify.
   const rewritten: Record<string, any> = {};
-  for (const key of CANONICAL_BODY_KEYS) {
+  for (const key of profile.id === "cowork" ? COWORK_BODY_KEYS : CANONICAL_BODY_KEYS) {
     if (merged[key] !== undefined) rewritten[key] = merged[key];
   }
   for (const [key, value] of Object.entries(params)) {
     if (!(key in rewritten) && value !== undefined) rewritten[key] = value;
   }
+
+  if (profile.id === "cowork") makeStringsWellFormed(rewritten);
 
   const billingBlock = system.find(
     (block) =>

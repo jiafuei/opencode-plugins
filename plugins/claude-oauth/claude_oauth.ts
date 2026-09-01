@@ -15,7 +15,7 @@ import {
   uncloakedResponseHeaders,
 } from "./wire_format.ts";
 import type { SpoofingProfile } from "./wire_format.ts";
-import { opencodeDataDir } from "./local_storage.ts";
+import { deriveCoworkSessionId, opencodeDataDir } from "./local_storage.ts";
 import { buildEnforcedHeaders, coworkTransport } from "./cowork_fetch.ts";
 import {
   buildExMachinaHeaders,
@@ -59,6 +59,7 @@ const AUTHORIZE_URL = rot13("uggcf://pynhqr.pbz/pnv/bnhgu/nhgubevmr");
 const TOKEN_URL = rot13("uggcf://cyngsbez.pynhqr.pbz/i1/bnhgu/gbxra");
 const PROFILE_URL = rot13("uggcf://ncv.naguebcvp.pbz/ncv/bnhgu/cebsvyr");
 const ROLES_URL = rot13("uggcf://ncv.naguebcvp.pbz/ncv/bnhgu/pynhqr_pyv/ebyrf");
+const BOOTSTRAP_URL = rot13("uggcf://ncv.naguebcvp.pbz/ncv/pynhqr_pyv/obbgfgenc");
 const REDIRECT_URI = rot13("uggcf://cyngsbez.pynhqr.pbz/bnhgu/pbqr/pnyyonpx");
 const SCOPES =
   rot13("bet:perngr_ncv_xrl hfre:cebsvyr hfre:vasrerapr hfre:frffvbaf:pynhqr_pbqr hfre:zpc_freiref hfre:svyr_hcybnq");
@@ -283,6 +284,38 @@ export async function fetchOAuthIdentity(accessToken: string): Promise<OAuthIden
   };
 }
 
+async function fetchCoworkBootstrapIdentity(
+  accessToken: string,
+  profile: SpoofingProfile,
+): Promise<OAuthIdentity> {
+  const response = await fetch(`${BOOTSTRAP_URL}?entrypoint=cli&model=claude-opus-4-8`, {
+    method: "GET",
+    headers: {
+      Accept: AXIOS_ACCEPT,
+      Authorization: `Bearer ${accessToken}`,
+      "Content-Type": "application/json",
+      "User-Agent": `claude-code/${profile.version}`,
+      "anthropic-beta": "oauth-2025-04-20",
+    },
+    signal: AbortSignal.timeout(30_000),
+  });
+  if (!response.ok) throw new Error(`Anthropic bootstrap request failed: ${response.status}`);
+  const data = (await response.json()) as {
+    oauth_account?: {
+      account_uuid?: string;
+      account_email?: string;
+      organization_uuid?: string;
+      organization_name?: string;
+    };
+  };
+  return {
+    accountId: nonEmpty(data.oauth_account?.account_uuid),
+    email: nonEmpty(data.oauth_account?.account_email),
+    orgId: nonEmpty(data.oauth_account?.organization_uuid),
+    orgName: nonEmpty(data.oauth_account?.organization_name),
+  };
+}
+
 /**
  * Resolve account (and optionally organization) identity for a token
  * response, merging the token response over profile recovery. `includeOrg`
@@ -295,13 +328,15 @@ export async function fetchOAuthIdentity(accessToken: string): Promise<OAuthIden
  */
 export async function resolveIdentity(
   data: TokenResponse,
-  options?: { includeOrg?: boolean },
+  options?: { includeOrg?: boolean; profile?: SpoofingProfile },
 ): Promise<OAuthIdentity> {
   const identity = extractIdentity(data);
   const orgSatisfied = !options?.includeOrg || identity.orgId !== undefined;
   if (identity.accountId && identity.email && orgSatisfied) return identity;
   try {
-    const recovered = await fetchOAuthIdentity(data.access_token);
+    const recovered = options?.profile?.id === "cowork"
+      ? await fetchCoworkBootstrapIdentity(data.access_token, options.profile)
+      : await fetchOAuthIdentity(data.access_token);
     return {
       accountId: identity.accountId ?? recovered.accountId,
       email: identity.email ?? recovered.email,
@@ -318,6 +353,7 @@ async function exchangeCode(
   state: string,
   verifier: string,
   redirectUri: string,
+  profile: SpoofingProfile,
 ): Promise<{ access: string; refresh: string; expires: number; accountId?: string }> {
   const data = await postToken({
     grant_type: "authorization_code",
@@ -331,7 +367,7 @@ async function exchangeCode(
   // Login captures the full identity once: profile recovery runs whenever account
   // identity (uuid/email) or org identity is incomplete. Only accountId is
   // returned/persisted through OpenCode; email/org stay transient.
-  const identity = await resolveIdentity(data, { includeOrg: true });
+  const identity = await resolveIdentity(data, { includeOrg: true, profile });
 
   return {
     access: data.access_token,
@@ -531,6 +567,7 @@ async function performSharedRefresh(
   startAuth: { access?: string; refresh: string; accountId?: string },
   getAuth: () => Promise<any>,
   persist: (tokens: RefreshedCredential) => Promise<void>,
+  profile: SpoofingProfile,
 ): Promise<RefreshedCredential | null> {
   const credentialIdentity = `${startAuth.accountId ?? ""}:${startAuth.refresh}`;
   const key = inFlightKey(startAuth.accountId, startAuth.refresh);
@@ -565,7 +602,7 @@ async function performSharedRefresh(
       }
       // No includeOrg: never re-key organization on refresh. The stored
       // accountId survives whenever the response identity is missing/empty.
-      const identity = await resolveIdentity(tokens);
+      const identity = await resolveIdentity(tokens, { profile });
       const refreshed: RefreshedCredential = {
         refresh: tokens.refresh_token || latest.refresh,
         access: tokens.access_token,
@@ -884,15 +921,14 @@ export const ClaudeOAuthPlugin: Plugin = async (input: PluginInput, options?: Pl
   // Validated once at the option boundary; unsupported values throw here.
   const profile = resolveSpoofingProfile(pluginOptions?.spoofingProfile);
   const attributionHeader = pluginOptions?.attributionHeader !== false;
-  // Process-local stable mapping from raw OpenCode session ids to the UUIDv4
-  // session ids carried on the Claude wire (X-Claude-Code-Session-Id and
-  // metadata.user_id.session_id).
+  // Non-Cowork profiles map raw OpenCode session ids to process-local UUIDv4s.
+  // Cowork derives a restart-stable UUID-shaped id from the install and session.
   const wireSessionIds = new Map<string, string>();
 
   // Shared login-success tail for both authorize methods: exchange the code
   // and record the grant timestamp.
   const finishLogin = async (code: string, state: string, verifier: string, redirectUri: string) => {
-    const tokens = await exchangeCode(code, state, verifier, redirectUri);
+    const tokens = await exchangeCode(code, state, verifier, redirectUri, profile);
     recordAuthorizedAt(tokens.refresh, tokens.accountId);
     return { type: "success" as const, ...tokens };
   };
@@ -1019,7 +1055,7 @@ export const ClaudeOAuthPlugin: Plugin = async (input: PluginInput, options?: Pl
               if (!auth.access || auth.expires < Date.now()) {
                 // Shared across loader instances (in-process promise map) and
                 // processes (fs lease): at most one refresh per credential.
-                const refreshed = await performSharedRefresh(auth, getAuth, persist);
+                const refreshed = await performSharedRefresh(auth, getAuth, persist, profile);
                 if (refreshed) {
                   // Adopt the full rotated credential we just persisted — all
                   // fields, not only the access token.
@@ -1293,7 +1329,7 @@ export const ClaudeOAuthPlugin: Plugin = async (input: PluginInput, options?: Pl
       // markers. Marker-based so provider config apiKey merging (which replaces
       // the dummy key) cannot disable stable session propagation.
       if ((input.provider.options as Record<string, unknown>).claudeOAuth !== true) return
-      let wireSessionId = wireSessionIds.get(input.sessionID)
+      let wireSessionId = profile.id === "cowork" ? deriveCoworkSessionId(input.sessionID) : wireSessionIds.get(input.sessionID)
       if (!wireSessionId) {
         wireSessionId = randomUUID().toLowerCase()
         wireSessionIds.set(input.sessionID, wireSessionId)

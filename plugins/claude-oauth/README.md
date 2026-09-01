@@ -121,10 +121,11 @@ loader installs the selected wire transform for calls to the official
   value and never adds the query to `/v1/messages/count_tokens`.
 - Cowork and SDK CLI emit the selected profile's exact `User-Agent`, `x-app: cli`,
   a per-invocation `x-client-request-id` (stable across SDK retries), the
-  Stainless header set, and a stable per-session
-  `X-Claude-Code-Session-Id` UUID (mapped process-locally from OpenCode's
-  session id); OpenCode's internal session-routing headers are stripped before
-  dispatch. `ex-machina` pins its `User-Agent` and bearer while retaining only
+  Stainless header set, and a stable per-session `X-Claude-Code-Session-Id`
+  UUID. Cowork derives it deterministically from the install and OpenCode
+  session so it survives restarts; SDK CLI keeps a process-local mapping.
+  OpenCode's internal session-routing headers are stripped before dispatch.
+  `ex-machina` pins its `User-Agent` and bearer while retaining only
   safe inherited Anthropic/Stainless headers; it never emits the private
   request ID or Claude session ID.
 - Cowork and SDK CLI use a beta profile chosen per request shape (utility vs
@@ -134,19 +135,21 @@ loader installs the selected wire transform for calls to the official
   and `context-1m-2025-08-07` (hard-429'd for subscription credentials).
 - Cowork and SDK CLI body rewrite:
   - `system[0]` = `x-anthropic-billing-header` with the selected version and
-    entrypoint; its prompt fingerprint skips leading `<system-reminder>` text
-    blocks. `system[1]` carries the selected Agent SDK identity. Cowork skips
-    both for claude-3-5-haiku; SDK CLI does not.
-  - `metadata.user_id` = `{device_id, account_uuid, session_id}` JSON envelope.
-    Device IDs derive deterministically from this plugin's install ID and the
-    OAuth account; existing valid CC attribution is preserved verbatim, and
-    the UUIDv4 session ID is stable per OpenCode conversation within the
-    plugin process.
+    entrypoint. Cowork fingerprints the first user text like OMP; SDK CLI skips
+    leading `<system-reminder>` text blocks. `system[1]` carries the selected
+    Agent SDK identity. Cowork sanitizes OpenCode-identifying caller-system
+    lines and uses a generic coding-agent opening. Cowork skips both fingerprint
+    blocks for claude-3-5-haiku; SDK CLI does not.
+  - `metadata.user_id` uses Cowork's `{device_id, session_id, account_uuid}`
+    order and SDK CLI's `{device_id, account_uuid, session_id}` order. Device
+    IDs derive deterministically from this plugin's install ID and the OAuth
+    account, and existing valid CC attribution is preserved verbatim.
   - `max_tokens` clamped to ≤ 64000. Incoming `stream` is preserved as-is.
-  - Agent SDK fields (`thinking.display`, `eager_input_streaming`) are
-    preserved; cache breakpoints pass through untouched; active thinking emits
-    a single keep-all clear-thinking context edit replacing whatever arrived;
-    tool input schemas are closed with top-level `additionalProperties:false`.
+  - Cowork recursively normalizes tool schemas to Anthropic's accepted subset,
+    selectively enables strict schemas for OMP's supported tool set, adds short
+    prompt-cache breakpoints to the last two real messages, and applies
+    model-aware thinking, sampling, forced-tool, and context-management rules.
+    SDK CLI retains its top-level schema closure and pass-through cache behavior.
   - The redundant default `tool_choice:{type:"auto"}` is omitted.
 - Cowork and SDK CLI use the selected `cch` algorithm from the profile table, patched over the
   `cch=00000` placeholder as five lowercase hex characters.
@@ -183,8 +186,9 @@ login is never overwritten. Rotation means only one winner per credential.
 Rotated tokens are persisted back into OpenCode's auth store before use.
 Token exchanges and refreshes use Claude Code's OAuth token endpoint and
 Axios-style headers. Refresh scope excludes `org:create_api_key`; login retains
-it. Missing login identity is recovered best-effort from the OAuth profile and
-Claude CLI roles endpoints.
+it. Missing Cowork identity is recovered best-effort from the Claude CLI
+bootstrap endpoint; other profiles retain the OAuth profile and Claude CLI
+roles recovery path.
 
 Auth transitions are handled live: switching to API-key auth or logging out
 while a session runs switches the request path accordingly (no OAuth
