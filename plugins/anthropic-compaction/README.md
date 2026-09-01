@@ -86,7 +86,7 @@ Merely using Bedrock internally is not enough. A proxy that strips these fields,
 
 - OpenCode's standard `@ai-sdk/amazon-bedrock` models use Bedrock Converse and do not expose Anthropic compaction blocks through the required request and response conversion. They are not enabled by this plugin.
 - OpenCode's experimental native LLM runtime currently drops Anthropic compaction blocks. Do not enable `OPENCODE_EXPERIMENTAL_NATIVE_LLM` when using this plugin with the built-in `anthropic` provider.
-- The plugin does not automatically disable OpenCode's built-in compaction. Set its server-side trigger early enough that Anthropic compacts before OpenCode reaches its own overflow boundary.
+- On OpenCode versions with the automatic compaction decision hook, eligible sessions continue to Anthropic instead of starting the built-in compaction agent. Manual compaction and provider context-overflow recovery still use OpenCode's built-in summarizer. Older OpenCode versions ignore this hook, so set the server-side trigger early enough that Anthropic compacts before OpenCode reaches its own overflow boundary.
 - Server-side compaction adds a billed sampling iteration. The current Anthropic AI SDK aggregates compaction and message iterations into reported executor usage.
 
 ## Tests

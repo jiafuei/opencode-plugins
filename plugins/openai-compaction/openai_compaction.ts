@@ -34,12 +34,30 @@ type CompactionOptions = {
   debug?: boolean;
 };
 
+type CompactionPlugin = (
+  input: Parameters<Plugin>[0],
+  options?: Parameters<Plugin>[1],
+) => Promise<
+  Awaited<ReturnType<Plugin>> & {
+    "experimental.session.compaction.decide"?: (
+      input: {
+        sessionID: string;
+        agent: string;
+        model: { providerID: string; id: string };
+        tokens: { input: number; output: number; reasoning: number; cache: { read: number; write: number } };
+      },
+      output: { action: "compact" | "continue" },
+    ) => Promise<void>;
+  }
+>;
+
 type SessionInfo = {
   contextLimit: number;
   providerID: string;
   model: string;
   messageID: string;
   failed: boolean;
+  responsesTransport: boolean;
   latestTokens?: number;
   latestTokenMessageID?: string;
   lastDecision?: {
@@ -92,7 +110,7 @@ function totalOpenCodeTokens(tokens: {
   return tokens.input + tokens.output + tokens.reasoning + tokens.cache.read + tokens.cache.write;
 }
 
-const OpenAICompactionPlugin: Plugin = async ({ client, project, directory }, options) => {
+const OpenAICompactionPlugin: CompactionPlugin = async ({ client, project, directory }, options) => {
   const config = (options ?? {}) as PluginOptions & CompactionOptions;
   if (config.enabled === false) return {};
   const providers = new Set(["openai", ...(config.additionalProviders ?? [])]);
@@ -366,10 +384,12 @@ const OpenAICompactionPlugin: Plugin = async ({ client, project, directory }, op
     const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
     const body = JSON.parse(init.body);
     if (!isResponsesBody(body) || !isResponsesEndpoint(url)) return originalFetch(input, forward);
+    const info = sessions.get(sessionID);
+    if (info) info.responsesTransport = true;
 
     const rewritten = await rewrite(sessionID, url, body, headers).catch((error) => {
-      const info = sessions.get(sessionID);
-      if (info) info.failed = true;
+      const current = sessions.get(sessionID);
+      if (current) current.failed = true;
       log("warn", "native compaction failed, sending original request", {
         sessionID,
         error: error instanceof Error ? error.message : String(error),
@@ -438,6 +458,7 @@ const OpenAICompactionPlugin: Plugin = async ({ client, project, directory }, op
         model: input.model.id,
         messageID: input.message.id,
         failed: sameModel && previous !== undefined ? previous.failed : false,
+        responsesTransport: sameModel && previous !== undefined ? previous.responsesTransport : false,
         latestTokens: latest?.tokens,
         latestTokenMessageID: latest?.messageID,
         lastDecision: sameModel && previous !== undefined ? previous.lastDecision : undefined,
@@ -451,6 +472,29 @@ const OpenAICompactionPlugin: Plugin = async ({ client, project, directory }, op
         contextLimit: input.model.limit.context,
         latestTokens: latest?.tokens,
         tokenThreshold: threshold <= 1 ? input.model.limit.context * threshold : threshold,
+      });
+    },
+    "experimental.session.compaction.decide": async (input, output) => {
+      const info = sessions.get(input.sessionID);
+      if (
+        !info ||
+        info.providerID !== input.model.providerID ||
+        info.model !== input.model.id ||
+        !info.responsesTransport ||
+        info.failed
+      ) {
+        return;
+      }
+      const tokenThreshold = threshold <= 1 ? info.contextLimit * threshold : threshold;
+      const tokens = totalOpenCodeTokens(input.tokens);
+      if (tokenThreshold <= 0 || tokens < tokenThreshold) return;
+      output.action = "continue";
+      log("debug", "continuing to provider-native compaction", {
+        sessionID: input.sessionID,
+        providerID: info.providerID,
+        model: info.model,
+        tokens,
+        tokenThreshold,
       });
     },
     "experimental.session.compacting": async (input) => {

@@ -20,11 +20,29 @@ type CompactionOptions = {
   instructions?: string;
 };
 
+type CompactionPlugin = (
+  input: Parameters<Plugin>[0],
+  options?: Parameters<Plugin>[1],
+) => Promise<
+  Awaited<ReturnType<Plugin>> & {
+    "experimental.session.compaction.decide"?: (
+      input: {
+        sessionID: string;
+        agent: string;
+        model: { providerID: string; id: string };
+        tokens: { input: number; output: number; reasoning: number; cache: { read: number; write: number } };
+      },
+      output: { action: "compact" | "continue" },
+    ) => Promise<void>;
+  }
+>;
+
 type SessionInfo = {
   providerID: string;
   model: string;
   agent: string;
   messageID: string;
+  trigger: number;
   variant?: string;
 };
 
@@ -83,7 +101,7 @@ function precedingMessageID(messageID: string): string | undefined {
   return `msg_${(value - 1n).toString(16).padStart(12, "0")}${"z".repeat(14)}`;
 }
 
-const AnthropicCompactionPlugin: Plugin = async ({ client, directory }, options) => {
+const AnthropicCompactionPlugin: CompactionPlugin = async ({ client, directory }, options) => {
   const config = (options ?? {}) as CompactionOptions;
   if (config.enabled === false) return {};
 
@@ -175,6 +193,7 @@ const AnthropicCompactionPlugin: Plugin = async ({ client, directory }, options)
         model: input.model.id,
         agent: input.agent,
         messageID: input.message.id,
+        trigger,
         variant: (input.message.model as typeof input.message.model & { variant?: string }).variant,
       });
       const current = output.options.contextManagement as ContextManagement | undefined;
@@ -190,6 +209,25 @@ const AnthropicCompactionPlugin: Plugin = async ({ client, directory }, options)
           },
         ],
       };
+    },
+    "experimental.session.compaction.decide": async (input, output) => {
+      const info = sessions.get(input.sessionID);
+      if (
+        !info ||
+        info.providerID !== input.model.providerID ||
+        info.model !== input.model.id ||
+        info.agent !== input.agent
+      ) {
+        return;
+      }
+      const tokens =
+        input.tokens.input +
+        input.tokens.output +
+        input.tokens.reasoning +
+        input.tokens.cache.read +
+        input.tokens.cache.write;
+      if (tokens < info.trigger) return;
+      output.action = "continue";
     },
     event: async ({ event }) => {
       if (event.type === "session.deleted") {

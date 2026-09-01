@@ -45,7 +45,7 @@ opencode plugin @jiafuei/opencode-openai-compaction
 - Before replaying a window, the plugin fingerprints the history prefix it replaced. The fingerprint ignores text content — so OpenCode's tool-output pruning is harmless — but insertions, reordering, a model switch or OpenCode's own compaction invalidate it, and the plugin falls back to sending the original request.
 - If the provider rejects a request carrying a window (`400`/`422`), the stored window is discarded. A rejected *replay* is treated as an expired window, so the next turn compacts again from plain history; a window rejected the moment it was created means the provider will not accept the payload at all, so the plugin stops rewriting for the rest of the session.
 
-OpenCode's built-in compaction is deliberately left enabled. Because the wire payload shrinks, the provider reports low input token counts and OpenCode's overflow check never fires while this plugin is working; if a compact call fails, the normal summarize path is still there as a safety net.
+When OpenCode's automatic token threshold is reached, the plugin asks it to continue to the normal provider request instead of starting the built-in compaction agent. The plugin does this only after observing a compatible Responses request, once its own threshold is reached, and while native compaction has not failed. Manual compaction and provider context-overflow recovery still use OpenCode's built-in summarizer as a safety net. Older OpenCode versions without the decision hook keep their existing built-in compaction behavior.
 
 ## Limitations
 
