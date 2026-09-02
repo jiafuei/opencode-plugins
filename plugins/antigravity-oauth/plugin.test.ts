@@ -127,6 +127,7 @@ describe("config hook: provider registration", () => {
     // Effort variants map onto the captured budget tiers.
     expect(provider.models["gemini-3.1-pro"].variants.high.thinkingConfig.thinkingBudget).toBe(10001);
     expect(provider.models["gemini-3.7-flash"].variants.low.thinkingConfig.thinkingLevel).toBe("low");
+    expect(provider.models["gemini-3.8-flash"].variants.low.thinkingConfig.thinkingLevel).toBe("low");
   });
 
   test("preserves user-supplied provider and model settings", async () => {

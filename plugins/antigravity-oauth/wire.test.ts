@@ -132,6 +132,7 @@ describe("wire model routing", () => {
   test("mandatory-reasoning families clamp off to the lowest supported effort", () => {
     expect(resolveWireModelId(MODEL_SPECS["gemini-3.6-flash"]!, { effort: "off", requested: true }, "gemini-3.6-flash")).toBe("gemini-3.6-flash-low");
     expect(resolveWireModelId(MODEL_SPECS["gemini-3.7-flash"]!, { effort: "high", requested: true }, "gemini-3.7-flash")).toBe("gemini-3.7-flash-high");
+    expect(resolveWireModelId(MODEL_SPECS["gemini-3.8-flash"]!, { effort: "medium", requested: true }, "gemini-3.8-flash")).toBe("gemini-3.8-flash-medium");
     expect(resolveWireModelId(MODEL_SPECS["gemini-3-pro"]!, { effort: "minimal", requested: true }, "gemini-3-pro")).toBe("gemini-3-pro-low");
   });
 
@@ -878,6 +879,7 @@ describe("provider model registration map", () => {
       "gemini-3-flash",
       "gemini-3.6-flash",
       "gemini-3.7-flash",
+      "gemini-3.8-flash",
       "gemini-3.1-pro",
       "gemini-3-pro",
       "gemini-2.5-pro",

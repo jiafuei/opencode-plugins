@@ -261,6 +261,7 @@ export const MODEL_SPECS: Readonly<Record<string, AntigravityModelSpec>> = {
   },
   "gemini-3.6-flash": levelFlashFamily("gemini-3.6-flash", "Gemini 3.6 Flash"),
   "gemini-3.7-flash": levelFlashFamily("gemini-3.7-flash", "Gemini 3.7 Flash"),
+  "gemini-3.8-flash": levelFlashFamily("gemini-3.8-flash", "Gemini 3.8 Flash"),
   "gpt-oss-120b": {
     name: "GPT-OSS 120B",
     reasoning: true,

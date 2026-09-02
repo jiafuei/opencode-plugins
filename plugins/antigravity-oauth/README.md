@@ -35,7 +35,7 @@ All models report zero subscription cost. Reasoning variants (`minimal` / `low` 
 | Model | Context | Output | Input | Notes |
 | --- | --- | --- | --- | --- |
 | `gemini-3.5-flash`, `gemini-3-flash` | 1M | 65,536 | text+image | budget transport; high → `gemini-3-flash-agent` |
-| `gemini-3.6-flash`, `gemini-3.7-flash` | 1M | 65,536 | text+image | one wire id per thinking level |
+| `gemini-3.6-flash`, `gemini-3.7-flash`, `gemini-3.8-flash` | 1M | 65,536 | text+image | one wire id per thinking level |
 | `gemini-3.1-pro` | 1M | 65,535 | text+image | low/high efforts; high routes to `gemini-pro-agent` |
 | `gemini-3-pro` | 1M | 65,535 | text+image | level transport |
 | `gemini-2.5-pro`, `gemini-2.5-flash`, `gemini-2.5-flash-lite` | 1M | ~65k | text+image | budget transport |
