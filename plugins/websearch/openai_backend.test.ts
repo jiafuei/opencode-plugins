@@ -46,6 +46,20 @@ function responsesStream() {
   });
 }
 
+describe("OpenAI web search backend", () => {
+  test("matches any provider backed by @ai-sdk/openai", () => {
+    const backend = createOpenAIBackend({} as any, "/tmp");
+    const provider = (id: string, npm: string) => ({
+      id,
+      models: { gpt: { api: { npm }, id: "gpt", options: {} } },
+    });
+
+    expect(backend.matches(provider("openai", "@ai-sdk/openai"))).toBe(true);
+    expect(backend.matches(provider("custom-openai", "@ai-sdk/openai"))).toBe(true);
+    expect(backend.matches(provider("openai", "@ai-sdk/openai-compatible"))).toBe(false);
+  });
+});
+
 describe("OpenAI web search authentication", () => {
   test("selects ChatGPT subscription credentials", () => {
     expect(resolveOpenAIAuth({ type: "oauth", access: "subscription-token", accountId: "account" })).toEqual({

@@ -52,13 +52,6 @@ function formatResult(result: SearchResult) {
 
 const WebSearchPlugin: Plugin = async ({ client, directory }, options?: PluginOptions | WebSearchOptions) => {
   const pluginOptions = options as WebSearchOptions | undefined;
-  if (
-    pluginOptions?.openaiSubscriptionTransport !== undefined &&
-    pluginOptions.openaiSubscriptionTransport !== "https" &&
-    pluginOptions.openaiSubscriptionTransport !== "websocket"
-  ) {
-    throw new Error(`Unsupported OpenAI subscription transport "${String(pluginOptions.openaiSubscriptionTransport)}"`);
-  }
   const backends: SearchBackend[] = [
     createOpenAIBackend(client, directory, pluginOptions?.openaiSubscriptionTransport),
     createAntigravityBackend(),

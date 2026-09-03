@@ -2,6 +2,18 @@ import { describe, expect, test } from "bun:test";
 import { createAntigravityBackend } from "./antigravity_backend.ts";
 
 describe("Antigravity web search backend", () => {
+  test("matches any provider backed by @ai-sdk/google", () => {
+    const backend = createAntigravityBackend();
+    const provider = (id: string, npm: string) => ({
+      id,
+      models: { gemini: { api: { npm }, id: "gemini", options: {} } },
+    });
+
+    expect(backend.matches(provider("google", "@ai-sdk/google"))).toBe(true);
+    expect(backend.matches(provider("custom-google", "@ai-sdk/google"))).toBe(true);
+    expect(backend.matches(provider("google-antigravity", "@ai-sdk/openai"))).toBe(false);
+  });
+
   test("delegates to the Antigravity OAuth search bridge", async () => {
     const symbol = Symbol.for("@jiafuei/opencode-antigravity-oauth/web-search");
     const registry = globalThis as Record<symbol, unknown>;

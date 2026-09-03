@@ -55,7 +55,7 @@ export function createOpenAIBackend(
 
   return {
     id: "openai",
-    matches: (provider: ProviderData) => provider.id === "openai",
+    matches: (provider: ProviderData) => Object.values(provider.models).some((model) => model.api.npm === "@ai-sdk/openai"),
     dispose: () => websocketFetch?.close(),
     async search({ context, model, query }) {
       const auth = await readAuth(client, directory);

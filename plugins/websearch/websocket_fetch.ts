@@ -12,14 +12,9 @@ function normalizeHeaders(headers: HeadersInit | undefined) {
   return result;
 }
 
-function isTerminalEvent(event: unknown) {
-  if (!event || typeof event !== "object" || !("type" in event)) return false;
-  return ["response.completed", "response.done", "response.failed", "response.incomplete", "error"].includes(String(event.type));
-}
-
-function isSuccessfulEvent(event: unknown) {
-  if (!event || typeof event !== "object" || !("type" in event)) return false;
-  return event.type === "response.completed" || event.type === "response.done";
+function isTerminalEvent(event: unknown): event is { type: string } {
+  return !!event && typeof event === "object" && "type" in event && typeof event.type === "string" &&
+    ["response.completed", "response.done", "response.failed", "response.incomplete", "error"].includes(event.type);
 }
 
 export function createWebSocketFetch(url = DEFAULT_URL): WebSocketFetch {
@@ -114,12 +109,6 @@ export function createWebSocketFetch(url = DEFAULT_URL): WebSocketFetch {
     const { stream: _stream, background: _background, ...requestBody } = body;
     const encoder = new TextEncoder();
     let cancelStream = () => closeSocket();
-    let released = false;
-    const release = () => {
-      if (released) return;
-      released = true;
-      releaseQueue();
-    };
 
     return new Response(
       new ReadableStream<Uint8Array>({
@@ -131,7 +120,7 @@ export function createWebSocketFetch(url = DEFAULT_URL): WebSocketFetch {
             connection.off("error", onError);
             connection.off("close", onClose);
             init.signal?.removeEventListener("abort", onAbort);
-            release();
+            releaseQueue();
           };
           const fail = (error: unknown) => {
             if (finished) return;
@@ -164,7 +153,7 @@ export function createWebSocketFetch(url = DEFAULT_URL): WebSocketFetch {
             finished = true;
             controller.enqueue(encoder.encode("data: [DONE]\n\n"));
             cleanup();
-            if (!isSuccessfulEvent(event)) closeSocket();
+            if (event.type !== "response.completed" && event.type !== "response.done") closeSocket();
             controller.close();
           };
 

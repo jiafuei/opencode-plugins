@@ -2,7 +2,7 @@ import type { ToolContext } from "@opencode-ai/plugin";
 
 export type ProviderData = {
   id: string;
-  models: Record<string, { id: string; options: Record<string, unknown> }>;
+  models: Record<string, { api: { npm: string }; id: string; options: Record<string, unknown> }>;
 };
 
 export type SearchResult = {

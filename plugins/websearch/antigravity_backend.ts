@@ -9,7 +9,7 @@ type WebSearchBridge = {
 export function createAntigravityBackend(): SearchBackend {
   return {
     id: "antigravity",
-    matches: (provider) => provider.id === "google-antigravity",
+    matches: (provider) => Object.values(provider.models).some((model) => model.api.npm === "@ai-sdk/google"),
     dispose() {},
     async search({ context, query }) {
       const bridge = (globalThis as Record<symbol, unknown>)[WEB_SEARCH_SYMBOL] as WebSearchBridge | undefined;
