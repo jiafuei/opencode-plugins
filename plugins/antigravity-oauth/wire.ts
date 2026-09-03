@@ -92,6 +92,9 @@ export function getAntigravityUserAgent(): string {
 /** `anthropic-beta` header sent for reasoning Claude models on Antigravity. */
 export const CLAUDE_THINKING_BETA_HEADER = "interleaved-thinking-2025-05-14";
 
+/** CCA bypass accepted only when a Gemini 3 turn's first function call is unsigned. */
+const SKIP_THOUGHT_SIGNATURE = "skip_thought_signature_validator";
+
 /**
  * Headers stripped before every dispatch: the @ai-sdk/google fingerprint
  * (`x-goog-api-key`, `ai-sdk/google` client telemetry) and OpenCode's
@@ -392,8 +395,9 @@ export function readRequestedEffort(
 
 /** The single transport-native thinking control for an effort on a spec. */
 function nativeThinkingControl(spec: AntigravityModelSpec, includeThoughts: boolean, effort: Effort): Record<string, unknown> {
+  const level = effort === "minimal" && spec.routing?.minimal === spec.routing?.low ? "low" : effort;
   return spec.transport === "level"
-    ? { includeThoughts, thinkingLevel: effort.toUpperCase() }
+    ? { includeThoughts, thinkingLevel: level.toUpperCase() }
     : { includeThoughts, thinkingBudget: spec.budgets?.[effort] ?? DEFAULT_EFFORT_BUDGETS[effort] };
 }
 
@@ -601,7 +605,7 @@ export function rewriteBodyForAntigravity(options: BodyRewriteOptions): BodyRewr
   if (profile) generationConfig.maxOutputTokens = profile.maxOutputTokens;
 
   const request: Record<string, any> = {
-    contents: args.contents,
+    contents: normalizeContentsForAntigravity(args.contents, logicalModelId),
     ...(args.systemInstruction
       ? {
           // Antigravity tags system instructions with role "user".
@@ -640,6 +644,31 @@ export function rewriteBodyForAntigravity(options: BodyRewriteOptions): BodyRewr
       requestType: "agent",
     }),
   };
+}
+
+function normalizeContentsForAntigravity(contents: Record<string, any>[], logicalModelId: string): Record<string, any>[] {
+  const claude = isClaudeModel(logicalModelId);
+  const gemini3 = logicalModelId.startsWith("gemini-3");
+  if (!claude && !gemini3) return contents;
+
+  return contents.flatMap((content: Record<string, any>) => {
+    if (content.role !== "model") return [content];
+    let firstFunctionCall = true;
+    const parts = content.parts.flatMap((part: Record<string, any>) => {
+      if (claude && part.thought === true && !part.thoughtSignature) return [];
+      if (!gemini3 || !part.functionCall) return [part];
+
+      const normalized = { ...part };
+      if (firstFunctionCall) {
+        if (!normalized.thoughtSignature) normalized.thoughtSignature = SKIP_THOUGHT_SIGNATURE;
+        firstFunctionCall = false;
+      } else if (!normalized.thoughtSignature || normalized.thoughtSignature === SKIP_THOUGHT_SIGNATURE) {
+        delete normalized.thoughtSignature;
+      }
+      return [normalized];
+    });
+    return parts.length > 0 ? [{ ...content, parts }] : [];
+  });
 }
 
 function stripEmptyRole(systemInstruction: Record<string, any>): Record<string, any> {
@@ -690,7 +719,7 @@ export interface SseUnwrapHooks {
   onResponseId?: (responseId: string) => void;
   /** Called once when the stream carries an in-band error event. */
   onError?: (error: { code?: number; message?: string; status?: string }) => void;
-  /** Called after the stream completes successfully, with the last responseId. */
+  /** Called after the stream reaches a candidate finish reason, with the last responseId. */
   onComplete?: (lastResponseId: string | undefined) => void;
 }
 
@@ -734,6 +763,7 @@ export function createCcaSseUnwrap(hooks: SseUnwrapHooks = {}): TransformStream<
   const encoder = new TextEncoder();
   let buffer = "";
   let lastResponseId: string | undefined;
+  let sawFinishReason = false;
 
   const handleData = (payload: string, controller: TransformStreamDefaultController<Uint8Array>): boolean => {
     if (payload === "[DONE]") {
@@ -759,6 +789,12 @@ export function createCcaSseUnwrap(hooks: SseUnwrapHooks = {}): TransformStream<
       if (typeof responseId === "string" && responseId.length > 0) {
         lastResponseId = responseId;
         hooks.onResponseId?.(responseId);
+      }
+      if (
+        Array.isArray(parsed.response.candidates) &&
+        parsed.response.candidates.some((candidate: Record<string, any>) => candidate.finishReason)
+      ) {
+        sawFinishReason = true;
       }
       controller.enqueue(encoder.encode(`data: ${JSON.stringify(parsed.response)}\n\n`));
       return true;
@@ -791,7 +827,7 @@ export function createCcaSseUnwrap(hooks: SseUnwrapHooks = {}): TransformStream<
           return;
         }
       }
-      hooks.onComplete?.(lastResponseId);
+      if (sawFinishReason) hooks.onComplete?.(lastResponseId);
     },
   });
 }

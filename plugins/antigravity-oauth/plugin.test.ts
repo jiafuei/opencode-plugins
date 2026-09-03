@@ -535,7 +535,9 @@ describe("auth loader fetch boundary", () => {
   test("session chain advances across invocations and survives SDK retries", async () => {
     const harness = await makeHarness(OAUTH_AUTH);
     const loader = await harness.loader();
-    const mock = mockFetch(() => sseResponse([{ response: { candidates: [], responseId: "r-1" } }]));
+    const mock = mockFetch(() =>
+      sseResponse([{ response: { candidates: [{ finishReason: "STOP" }], responseId: "r-1" } }]),
+    );
     try {
       const request = (invocation: string) => {
         const target = streamTarget("claude-sonnet-4-6", { contents: [] }, {
@@ -578,7 +580,7 @@ describe("auth loader fetch boundary", () => {
     const loader = await harness.loader();
     const mock = mockFetch((url) => {
       if (url.startsWith(DAILY)) return new Response("overloaded", { status: 503 });
-      return sseResponse([{ response: { candidates: [] } }]);
+      return sseResponse([{ response: { candidates: [{ finishReason: "STOP" }] } }]);
     });
     try {
       const send = (invocation: string) => {
@@ -633,6 +635,39 @@ describe("auth loader fetch boundary", () => {
       // Successful completion commits the winner as the session's endpoint.
       await readStream(await send("p-2"));
       expect(mock.calls[2]!.url.startsWith(SANDBOX)).toBe(true);
+    } finally {
+      mock.restore();
+    }
+  });
+
+  test("truncated streams do not commit response identity or endpoint affinity", async () => {
+    const harness = await makeHarness(OAUTH_AUTH);
+    const loader = await harness.loader();
+    let firstRequest = true;
+    const mock = mockFetch((url) => {
+      if (firstRequest && url.startsWith(DAILY)) return new Response("overloaded", { status: 503 });
+      if (firstRequest) {
+        firstRequest = false;
+        return sseResponse([{ response: { candidates: [], responseId: "truncated-id" } }]);
+      }
+      return sseResponse([{ response: { candidates: [{ finishReason: "STOP" }], responseId: "complete-id" } }]);
+    });
+    const send = (invocation: string) => {
+      const target = streamTarget("gemini-3.8-flash", { contents: [] }, {
+        "x-antigravity-opencode-session": "ses-truncated",
+        "x-antigravity-opencode-invocation": invocation,
+      });
+      return loader.fetch(target.url, target.init);
+    };
+    try {
+      await readStream(await send("i-1"));
+      expect(mock.calls[0]!.url.startsWith(DAILY)).toBe(true);
+      expect(mock.calls[1]!.url.startsWith(SANDBOX)).toBe(true);
+
+      await readStream(await send("i-2"));
+      expect(mock.calls[2]!.url.startsWith(DAILY)).toBe(true);
+      const nextEnvelope = JSON.parse(String(mock.calls[2]!.init.body));
+      expect(nextEnvelope.request.labels.last_execution_id).toBeUndefined();
     } finally {
       mock.restore();
     }

@@ -335,6 +335,82 @@ describe("body rewrite", () => {
     expect(explicitOff.request.generationConfig.thinkingConfig).toEqual({ includeThoughts: false, thinkingBudget: 0 });
   });
 
+  test("emits LOW when minimal routes to a Flash low SKU", () => {
+    for (const model of ["gemini-3.6-flash", "gemini-3.7-flash", "gemini-3.8-flash"]) {
+      const body = JSON.parse(
+        rewriteBodyForAntigravity({
+          args: withThinking({ includeThoughts: true, thinkingLevel: "minimal" }),
+          logicalModelId: model,
+          projectId: "p",
+          state: createSessionState(),
+        }).body,
+      );
+      expect(body.model).toBe(`${model}-low`);
+      expect(body.request.generationConfig.thinkingConfig).toEqual({
+        includeThoughts: true,
+        thinkingLevel: "LOW",
+      });
+    }
+  });
+
+  test("normalizes Gemini 3 function-call signatures per model turn", () => {
+    const contents = [
+      {
+        role: "model",
+        parts: [
+          { functionCall: { name: "first", args: {} }, thoughtSignature: "signed" },
+          { functionCall: { name: "second", args: {} }, thoughtSignature: "skip_thought_signature_validator" },
+        ],
+      },
+      { role: "user", parts: [{ functionResponse: { name: "first", response: {} } }] },
+      { role: "model", parts: [{ functionCall: { name: "unsigned", args: {} } }] },
+    ];
+    const body = JSON.parse(
+      rewriteBodyForAntigravity({
+        args: { contents },
+        logicalModelId: "gemini-3.8-flash",
+        projectId: "p",
+        state: createSessionState(),
+      }).body,
+    );
+
+    expect(body.request.contents[0].parts[0].thoughtSignature).toBe("signed");
+    expect(body.request.contents[0].parts[1].thoughtSignature).toBeUndefined();
+    expect(body.request.contents[2].parts[0].thoughtSignature).toBe("skip_thought_signature_validator");
+  });
+
+  test("drops unsigned Claude thinking while preserving signed thinking", () => {
+    const body = JSON.parse(
+      rewriteBodyForAntigravity({
+        args: {
+          contents: [
+            {
+              role: "model",
+              parts: [
+                { text: "unsigned", thought: true },
+                { text: "signed", thought: true, thoughtSignature: "opaque" },
+                { functionCall: { name: "tool", args: {} } },
+              ],
+            },
+          ],
+        },
+        logicalModelId: "claude-sonnet-4-6",
+        projectId: "p",
+        state: createSessionState(),
+      }).body,
+    );
+
+    expect(body.request.contents).toEqual([
+      {
+        role: "model",
+        parts: [
+          { text: "signed", thought: true, thoughtSignature: "opaque" },
+          { functionCall: { name: "tool", args: {} } },
+        ],
+      },
+    ]);
+  });
+
   test("converts @ai-sdk/google parametersJsonSchema declarations like OMP", () => {
     const state = createSessionState();
     const args = baseArgs();
@@ -1006,6 +1082,14 @@ describe("response unwrapping", () => {
     );
     expect(errors[0]).toEqual({ code: 403, message: "permission denied", status: "PERMISSION_DENIED" });
     // A failed stream never reports successful completion.
+    expect(completeCount).toBe(0);
+  });
+
+  test("does not report successful completion when the stream ends without a finish reason", async () => {
+    let completeCount = 0;
+    const transformer = createCcaSseUnwrap({ onComplete: () => completeCount++ });
+    const chunk = JSON.stringify({ response: { candidates: [], responseId: "truncated" } });
+    await collect(transformer, [`data: ${chunk}\n\n`]);
     expect(completeCount).toBe(0);
   });
 
