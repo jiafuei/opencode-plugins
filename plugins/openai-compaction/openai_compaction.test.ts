@@ -4,7 +4,6 @@ import {
   fingerprint,
   isCodexResponsesEndpoint,
   isResponsesEndpoint,
-  lastUserTurnIndex,
   planRequest,
   readCompactedWindow,
   splitEnvelope,
@@ -76,11 +75,6 @@ describe("payload parsing", () => {
     const { envelope, history: rest } = splitEnvelope(input);
     expect(envelope).toHaveLength(1);
     expect(rest).toHaveLength(2);
-  });
-
-  test("finds the last user turn", () => {
-    expect(lastUserTurnIndex([user("a"), assistant("msg_0", "b"), user("c"), assistant("msg_1", "d")])).toBe(2);
-    expect(lastUserTurnIndex([assistant("msg_0", "b")])).toBe(-1);
   });
 
   test("reads the compacted window from a compact response", () => {
@@ -164,6 +158,59 @@ describe("planRequest", () => {
     expect(plan.compactInput[0]).toBe(window[0]);
     expect(plan.keptTail).toEqual(items.slice(-4));
     expect(plan.fallbackInput).toEqual([...window, ...items.slice(20)]);
+  });
+
+  test("repeatedly compacts autonomous exchanges without another user message", () => {
+    const first = [user("implement the feature"), toolCall("a", "read"), toolResult("a", "source")];
+    const latest = [
+      { type: "reasoning", id: "rs_1", encrypted_content: "reasoning" },
+      assistant("msg_1", "Inspecting two files"),
+      toolCall("b", "read"),
+      toolCall("c", "read"),
+      toolResult("c", "second file"),
+      toolResult("b", "first file"),
+    ];
+    const items = [...first, ...latest];
+    const request = { endpoint: ENDPOINT, contextLimit: oversized, threshold: 0.7, latestTokens: 800 };
+    const plan = planRequest({ ...request, body: body(items), state: undefined });
+    if (plan.type !== "compact") throw new Error(`expected compact, got ${plan.type}`);
+    expect(plan.compactInput).toEqual(first);
+    expect(plan.keptTail).toEqual(latest);
+
+    const window = [user("implement the feature"), { type: "compaction", encrypted_content: "opaque" }];
+    const stored = state({ compactedCount: plan.compactedCount, signature: plan.signature, window });
+    const unchanged = planRequest({ ...request, body: body(items), state: stored });
+    expect(unchanged.type).toBe("replay");
+    if (unchanged.type === "replay") expect(unchanged.reason).toBe("no_compactable_history");
+
+    const next = [toolCall("d", "edit"), toolResult("d", "updated")];
+    const again = planRequest({ ...request, body: body([...items, ...next]), state: stored });
+    if (again.type !== "compact") throw new Error(`expected compact, got ${again.type}`);
+    expect(again.compactInput).toEqual([...window, ...latest]);
+    expect(again.keptTail).toEqual(next);
+    expect(again.compactedCount).toBe(items.length);
+    expect(again.signature).toBe(fingerprint(items));
+  });
+
+  test("does not split unresolved parallel calls and supports history without user messages", () => {
+    const first = [toolCall("a", "read"), toolResult("a", "source")];
+    const latest = [
+      { type: "reasoning", id: "rs_1", encrypted_content: "reasoning" },
+      toolCall("b", "read"),
+      toolCall("c", "read"),
+      toolResult("b", "first file"),
+      assistant("msg_1", "Waiting for the other result"),
+      toolResult("c", "second file"),
+    ];
+    const request = { endpoint: ENDPOINT, contextLimit: oversized, threshold: 0.7, latestTokens: 800 };
+    const plan = planRequest({ ...request, body: body([...first, ...latest]), state: undefined });
+    if (plan.type !== "compact") throw new Error(`expected compact, got ${plan.type}`);
+    expect(plan.compactInput).toEqual(first);
+    expect(plan.keptTail).toEqual(latest);
+
+    const single = planRequest({ ...request, body: body([user("start"), ...latest]), state: undefined });
+    expect(single.type).toBe("passthrough");
+    if (single.type === "passthrough") expect(single.reason).toBe("no_compactable_history");
   });
 
   test("never cuts the kept tail into the opaque window", async () => {
@@ -341,6 +388,10 @@ describe("plugin", () => {
       },
     )) as {
       "chat.headers": (input: unknown, output: { headers: Record<string, string> }) => Promise<void>;
+      "experimental.session.compaction.decide": (
+        input: unknown,
+        output: { action: "compact" | "continue" },
+      ) => Promise<void>;
       event: (input: { event: unknown }) => Promise<void>;
       dispose: () => Promise<void>;
     };
@@ -374,6 +425,16 @@ describe("plugin", () => {
       headers,
       send,
       emit: hooks.event,
+      decide: async () => {
+        const output = { action: "compact" as "compact" | "continue" };
+        await hooks["experimental.session.compaction.decide"]({
+          sessionID: "ses_1",
+          agent: "build",
+          model: { providerID: "openai", id: "gpt-5.5" },
+          tokens: { input: 1_000, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+        }, output);
+        return output.action;
+      },
       dataHome,
       dispose: async () => {
         await hooks.dispose();
@@ -391,6 +452,22 @@ describe("plugin", () => {
 
   const stateFile = (harness: { dataHome: string }) =>
     Bun.file(join(harness.dataHome, "opencode", "openai-compaction", "proj", "ses_1.json"));
+
+  test("allows built-in compaction when native compaction cannot advance", async () => {
+    const harness = await createHarness();
+    try {
+      const items = [user("start"), toolCall("a", "read"), toolResult("a", "source")];
+      await harness.send(items);
+      expect(harness.calls).toHaveLength(1);
+      expect(await harness.decide()).toBe("compact");
+
+      await harness.send([...items, toolCall("b", "edit"), toolResult("b", "updated")]);
+      expect(harness.calls).toHaveLength(3);
+      expect(await harness.decide()).toBe("continue");
+    } finally {
+      await harness.dispose();
+    }
+  });
 
   test("compacts requests from configured additional providers", async () => {
     const endpoint = "https://openai-compatible.example/v1/responses";

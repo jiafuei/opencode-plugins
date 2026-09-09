@@ -481,7 +481,8 @@ const OpenAICompactionPlugin: CompactionPlugin = async ({ client, project, direc
         info.providerID !== input.model.providerID ||
         info.model !== input.model.id ||
         !info.responsesTransport ||
-        info.failed
+        info.failed ||
+        info.lastDecision?.reason === "no_compactable_history"
       ) {
         return;
       }

@@ -113,13 +113,6 @@ export function fingerprint(items: readonly unknown[]): string {
   return `${items.length}:${Bun.hash.wyhash(tokens.join("|")).toString(16)}`;
 }
 
-export function lastUserTurnIndex(items: readonly unknown[]): number {
-  for (let index = items.length - 1; index >= 0; index--) {
-    if (asItem(items[index])?.role === "user") return index;
-  }
-  return -1;
-}
-
 export function estimateTokens(value: unknown): number {
   return Math.ceil(JSON.stringify(value).length / 4);
 }
@@ -161,7 +154,24 @@ export function planRequest(input: {
   if (tokenThreshold <= 0) return settled("threshold_unavailable");
   if (tokens < tokenThreshold) return settled("below_threshold");
 
-  const tailStart = Math.max(lastUserTurnIndex(base), offset);
+  let tailStart = offset;
+  let afterToolOutput = false;
+  const pendingCalls = new Set<string>();
+  // Keep the latest exchange, including its reasoning and all parallel calls/results.
+  // Only scan live history; the stored window must remain opaque.
+  for (let index = offset; index < base.length; index++) {
+    const item = asItem(base[index]);
+    const type = typeof item?.type === "string" ? item.type : "";
+    const toolOutput = type.endsWith("_call_output");
+    if (pendingCalls.size === 0 && (item?.role === "user" || (afterToolOutput && !toolOutput))) {
+      tailStart = index;
+    }
+    if (typeof item?.call_id === "string") {
+      if (type.endsWith("_call")) pendingCalls.add(item.call_id);
+      if (toolOutput) pendingCalls.delete(item.call_id);
+    }
+    afterToolOutput = toolOutput;
+  }
   if (tailStart <= offset) return settled("no_compactable_history");
 
   const compactedCount = (state?.compactedCount ?? 0) + (tailStart - offset);

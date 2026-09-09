@@ -5,7 +5,7 @@ Replaces OpenCode's summary-based compaction with **OpenAI's server-side compact
 Instead of asking the model to write a Markdown summary of the conversation, the plugin uses OpenAI's native compaction protocol, stores the opaque Responses items it returns, and replays every later request as:
 
 ```
-[prompt envelope] + [opaque compacted window] + [live tail since the last user turn]
+[prompt envelope] + [opaque compacted window] + [latest live exchange]
 ```
 
 Compaction happens in the provider's own representation, so reasoning items, tool calls and structure survive instead of collapsing into prose. This is a port of [pi-codex-compaction](https://github.com/jordyvandomselaar/pi-codex-compaction) to OpenCode.
@@ -39,13 +39,14 @@ opencode plugin @jiafuei/opencode-openai-compaction
 
 - `chat.headers` tags each enabled provider's turns with the session ID (skipping the `title` and `compaction` agents), records the provider, model and context limit, and loads OpenCode's latest completed assistant token count. Later `message.updated` events keep that count current.
 - OpenCode's latest reported count directly decides whether to compact. If no completed assistant count is available yet, the plugin passes the request through.
+- The latest live exchange stays verbatim, including its reasoning and parallel tool calls/results. Older completed exchanges can be compacted repeatedly within a single user turn, so long autonomous tool runs do not need new user messages. A fresh user turn also starts a new live tail.
 - Before calling the compact endpoint, the plugin shows a five-second toast and adds an ignored synthetic `--- Compacting context... ---` part to the active user message. The part becomes `--- Context compacted ---` afterward and is visible in the transcript but excluded from model input. Attaching it to the existing message avoids creating a newer unanswered user turn, and the native compact request finishes before the assistant request begins.
 - The plugin wraps `globalThis.fetch` and intercepts the tagged POSTs to `…/responses`. It runs *inside* OpenCode's built-in codex plugin, so the request is already authenticated and addressed. API-key sessions use `POST /v1/responses/compact`; ChatGPT OAuth sessions negotiate Codex's streaming V2 protocol on `POST /backend-api/codex/responses`. The session header is always stripped before the request goes out.
 - Compacted windows are stored per session under `${XDG_DATA_HOME:-~/.local/share}/opencode/openai-compaction/<project>/<session>.json` and removed when the session is deleted.
 - Before replaying a window, the plugin fingerprints the history prefix it replaced. The fingerprint ignores text content — so OpenCode's tool-output pruning is harmless — but insertions, reordering, a model switch or OpenCode's own compaction invalidate it, and the plugin falls back to sending the original request.
 - If the provider rejects a request carrying a window (`400`/`422`), the stored window is discarded. A rejected *replay* is treated as an expired window, so the next turn compacts again from plain history; a window rejected the moment it was created means the provider will not accept the payload at all, so the plugin stops rewriting for the rest of the session.
 
-When OpenCode's automatic token threshold is reached, the plugin asks it to continue to the normal provider request instead of starting the built-in compaction agent. The plugin does this only after observing a compatible Responses request, once its own threshold is reached, and while native compaction has not failed. Manual compaction and provider context-overflow recovery still use OpenCode's built-in summarizer as a safety net. Older OpenCode versions without the decision hook keep their existing built-in compaction behavior.
+When OpenCode's automatic token threshold is reached, the plugin asks it to continue to the normal provider request instead of starting the built-in compaction agent. The plugin does this only after observing a compatible Responses request, once its own threshold is reached, and while native compaction has not failed. If the latest request had no compactable history above the threshold, the next automatic decision leaves built-in compaction enabled. Manual compaction and provider context-overflow recovery still use OpenCode's built-in summarizer as a safety net. Older OpenCode versions without the decision hook keep their existing built-in compaction behavior.
 
 ## Limitations
 
