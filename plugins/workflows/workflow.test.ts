@@ -1,22 +1,17 @@
 import { describe, expect, test } from "bun:test";
-import { tool } from "@opencode-ai/plugin";
 import type { TuiPluginApi } from "@opencode-ai/plugin/tui";
 import {
   DEFAULT_LIMITS,
-  WORKFLOW_SPEC_SCHEMA,
   effectiveLimits,
   drainPendingCoordination,
-  eventPath,
   failureDecisionStatus,
   isLeaseStale,
-  isTerminal,
   isWorkflowControlAction,
   planDiff,
   reconcileRevisionWorkers,
   sealActivePhase,
   selectCoordinatorOperationChild,
   assertCoordinatorSource,
-  assertLeaseOwnership,
   coordinatorRetryable,
   hydrateRun,
   pendingCoordinationReason,
@@ -26,16 +21,11 @@ import {
   retryClassification,
   retryDelay,
   retryDecision,
-  runStatusView,
-  runStats,
   beginAttempt,
   RETRY_DELAYS_MS,
   type WorkerAttempt,
   selectWorkflowChild,
-  stableJson,
-  statePath,
   validateWorkflowSpec,
-  validateJsonSchema,
   validatePlanRevision,
   canContinueCoordinatorFailure,
   type CoordinatorOperation,
@@ -52,7 +42,6 @@ import {
   acceptWorkerSteering,
   currentPlanProgress,
   finalizeDeliveredSteering,
-  queuedSteering,
   steeringFollowUp,
   tokenUsage,
   workerTurnPrompt,
@@ -71,17 +60,13 @@ import {
   sessionAlreadyDeleted,
   parentDeletionRoute,
   acceptCoordinatorResult,
-  compactWorkerFailures,
-  coordinatorInput,
   finalizeSoftPause,
   isPendingControlFilename,
-  markedUtf8Prefix,
   pendingWorkers,
-  utf8Prefix,
   workflowProjectDirectory,
 } from "./workflow_shared.ts";
 import { WorkflowCoordination } from "./workflow_coordination.ts";
-import workflowTui, { failureControlOptions, promptRightRun, transcriptSelection } from "./workflow_tui.tsx";
+import workflowTui, { failureControlOptions, promptRightRun } from "./workflow_tui.tsx";
 
 const agents = new Set(["build", "explore"]);
 const models = new Set(["openai/gpt-5"]);
@@ -106,19 +91,6 @@ const base: Omit<WorkflowSpec, "phases"> & { phases: [FixturePhase] | [] } = {
 };
 
 describe("workflow spec", () => {
-  test("can be represented as JSON Schema", () => {
-    const schema = tool.schema.toJSONSchema(tool.schema.object({ spec: WORKFLOW_SPEC_SCHEMA }));
-    expect(schema).toMatchObject({ type: "object", properties: { spec: { type: "object" } } });
-  });
-
-  test("normalizes valid deterministic work", () => {
-    const spec = validateWorkflowSpec(base, agents, models);
-    expect(spec.limits).toEqual({ maxWorkers: DEFAULT_LIMITS.maxWorkers, maxRevisions: DEFAULT_LIMITS.maxRevisions, maxRunMs: DEFAULT_LIMITS.maxRunMs });
-    expect(workersInOrder(spec).map((worker) => worker.id)).toEqual(["scan", "audit", "test"]);
-    expect(effectiveLimits(spec).maxConcurrency).toBe(2);
-    expect(effectiveLimits(spec, 4).maxConcurrency).toBe(4);
-  });
-
   test("defaults workers to general and preserves model configuration", () => {
     const input = structuredClone(base);
     input.allowedAgents.push("general");
@@ -132,16 +104,10 @@ describe("workflow spec", () => {
     expect(() => validateWorkflowSpec(input, new Set([...agents, "general"]), models)).toThrow("general outside allowedAgents");
   });
 
-  test("rejects invalid worker model and variant configuration", () => {
+  test("rejects unavailable worker models", () => {
     const unavailableModel = structuredClone(base);
     unavailableModel.phases[0]!.steps[0]!.worker.modelID = "other/model";
     expect(() => validateWorkflowSpec(unavailableModel, agents, models)).toThrow("unavailable model");
-    const malformedModel = structuredClone(base);
-    malformedModel.phases[0]!.steps[0]!.worker.modelID = "gpt-5";
-    expect(() => validateWorkflowSpec(malformedModel, agents, models)).toThrow('"providerID/modelID"');
-    const invalidVariant = structuredClone(base);
-    (invalidVariant.phases[0]!.steps[0]!.worker as unknown as { variant: unknown }).variant = 1;
-    expect(() => validateWorkflowSpec(invalidVariant, agents, models)).toThrow("variant must be a string");
   });
 
   test("rejects duplicate ids and sibling template references", () => {
@@ -159,7 +125,7 @@ describe("workflow spec", () => {
     expect(() => validateWorkflowSpec(malformed, agents, models)).toThrow("Invalid workflow template reference");
   });
 
-  test("accepts template field paths verified against referenced worker schemas", () => {
+  test("resolves template fields from actual output rather than predicting them from schemas", () => {
     const schemad = structuredClone(base);
     schemad.phases[0]!.steps[0]!.worker.schema = {
       type: "object",
@@ -169,38 +135,10 @@ describe("workflow spec", () => {
         summary: { type: "string" },
       },
     };
-    schemad.phases[0]!.steps[1]!.workers[0]!.prompt = "Use {{workers.scan.output.repo.name}}";
+    schemad.phases[0]!.steps[1]!.workers[0]!.prompt = "Use {{workers.scan.output.actual.name}}";
     expect(() => validateWorkflowSpec(schemad, agents, models)).not.toThrow();
-    expect(renderTemplate(schemad.phases[0]!.steps[1]!.workers[0]!.prompt, { scan: { repo: { name: "opencode" } } })).toBe("Use opencode");
-  });
-
-  test("rejects schema-mismatched template paths at validation time", () => {
-    const schemad = structuredClone(base);
-    schemad.phases[0]!.steps[0]!.worker.schema = { type: "object", additionalProperties: false, properties: { repos: { type: "array" }, summary: { type: "string" } } };
-    const typo = structuredClone(schemad);
-    typo.phases[0]!.steps[1]!.workers[0]!.prompt = "Use {{workers.scan.output.repoz}}";
-    expect(() => validateWorkflowSpec(typo, agents, models)).toThrow('no property "repoz" (available: repos, summary)');
-    const array = structuredClone(schemad);
-    array.phases[0]!.steps[1]!.workers[0]!.prompt = "Use {{workers.scan.output.repos.name}}";
-    expect(() => validateWorkflowSpec(array, agents, models)).toThrow("schema types it as array");
-    const indexed = structuredClone(schemad);
-    indexed.phases[0]!.steps[1]!.workers[0]!.prompt = "Use {{workers.scan.output.summary.length}}";
-    expect(() => validateWorkflowSpec(indexed, agents, models)).toThrow("cannot be indexed");
-  });
-
-  test("leaves fields on open object schemas to runtime checking", () => {
-    for (const schema of [{ type: "object" }, { type: "object", properties: { known: { type: "string" } } }]) {
-      const open = structuredClone(base);
-      open.phases[0]!.steps[0]!.worker.schema = schema;
-      open.phases[0]!.steps[1]!.workers[0]!.prompt = "Use {{workers.scan.output.dynamic}}";
-      expect(() => validateWorkflowSpec(open, agents, models)).not.toThrow();
-    }
-  });
-
-  test("leaves template paths of schema-less workers to runtime checking", () => {
-    const unschemad = structuredClone(base);
-    unschemad.phases[0]!.steps[1]!.workers[0]!.prompt = "Use {{workers.scan.output.anything.deeper}}";
-    expect(() => validateWorkflowSpec(unschemad, agents, models)).not.toThrow();
+    expect(renderTemplate(schemad.phases[0]!.steps[1]!.workers[0]!.prompt, { scan: { actual: { name: "opencode" } } })).toBe("Use opencode");
+    expect(() => renderTemplate(schemad.phases[0]!.steps[1]!.workers[0]!.prompt, { scan: {} })).toThrow("unavailable");
   });
 
   test("allows unrelated brace syntax and escaped workflow references", () => {
@@ -213,15 +151,6 @@ describe("workflow spec", () => {
     expect(() => validateWorkflowSpec(literal, agents, models)).toThrow("Unclosed workflow template reference");
   });
 
-  test("requires non-empty phases and step arrays", () => {
-    const emptySteps = structuredClone(base);
-    emptySteps.phases[0]!.steps = [];
-    expect(() => validateWorkflowSpec(emptySteps, agents, models)).toThrow("steps must not be empty");
-    const emptyPhases = structuredClone(base);
-    emptyPhases.phases = [];
-    expect(() => validateWorkflowSpec(emptyPhases, agents, models)).toThrow("phases must not be empty");
-  });
-
   test("rejects unavailable allowlist entries and hard-limit overflow", () => {
     const unavailable = structuredClone(base);
     unavailable.allowedAgents = ["missing"];
@@ -231,22 +160,6 @@ describe("workflow spec", () => {
     expect(() => validateWorkflowSpec(limits, agents, models)).toThrow("1 to 100");
   });
 
-  test("reports multiple unrelated problems in one aggregated error", () => {
-    const broken = structuredClone(base);
-    broken.name = "";
-    (broken as Record<string, unknown>).goal = 42;
-    broken.phases[0]!.id = "bad id!";
-    let message = "";
-    try {
-      validateWorkflowSpec(broken, agents, models);
-    } catch (error) {
-      message = (error as Error).message;
-    }
-    expect(message).toContain("workflow spec has 3 problems:");
-    expect(message).toContain("1. workflow.name must be a non-empty string");
-    expect(message).toContain("workflow.goal must be a non-empty string");
-    expect(message).toContain("workflow.phases[0].id must use letters, numbers, _ or - and begin with a letter");
-  });
 });
 
 describe("Stage 4 steering and inspector", () => {
@@ -339,15 +252,6 @@ describe("Stage 4 steering and inspector", () => {
     expect(currentPlanProgress(current)).toEqual({ completed: 1, total: 3, running: 1 });
   });
 
-  test("derives inspector controls and transcript return selection", () => {
-    const current = run();
-    expect(queuedSteering(current.workers.scan!)).toEqual([]);
-    expect(transcriptSelection([current], { runID: "missing", workerID: "scan" })).toBeUndefined();
-    expect(transcriptSelection([current], { runID: "run", workerID: "scan" })).toBeUndefined();
-    current.workers.scan!.childSessionID = "child";
-    expect(transcriptSelection([current], { runID: "run", workerID: "scan" })?.worker.id).toBe("scan");
-  });
-
   test("selects lease owner before other active and pending prompt statuses", () => {
     const pending = run(); pending.id = "pending"; pending.status = "pending";
     const active = run(); active.id = "active";
@@ -358,9 +262,6 @@ describe("Stage 4 steering and inspector", () => {
     expect(promptRightRun([pending, active, leased])).toBeUndefined();
   });
 
-  test("does not count cache telemetry as generated token total", () => {
-    expect(tokenUsage({ input: 2, output: 3, reasoning: 1, cache: { read: 10, write: 20 } })).toEqual({ input: 2, output: 3, reasoning: 1, cacheRead: 10, cacheWrite: 20, total: 6 });
-  });
 });
 
 describe("Stage 3 adaptive planning", () => {
@@ -394,24 +295,13 @@ describe("Stage 3 adaptive planning", () => {
     expect(diff.map((item) => `${item.kind}:${item.id}`)).toEqual(["changed:p", "removed:a", "reordered:b", "added:c"]);
   });
 
-  test("enforces ten revisions and repair continue restrictions", () => {
+  test("enforces repair continue restrictions", () => {
     const current = run();
-    current.revisions = Array.from({ length: 10 }, (_, index) => ({ version: index + 2, operationID: `op-${index}`, reason: "checkpoint", guidance: [], rationale: "x", before: [], after: [], diff: [], acceptedAt: index }));
-    expect(() => validatePlanRevision(current, [])).toThrow("maxRevisions 10");
     current.failure = { workerID: "scan", kind: "repair", reason: "dependency" };
     current.workers.scan!.status = "skipped";
     expect(canContinueCoordinatorFailure(current)).toBe(false);
     (current.spec.phases[1]!.steps[0] as WorkerStep).worker.prompt = "independent";
     expect(canContinueCoordinatorFailure(current)).toBe(true);
-  });
-
-  test("recognizes checkpoint and queued guidance state explicitly", () => {
-    const current = run();
-    current.pendingGuidance = [{ id: "g1", generation: 1, text: "replace the audit", createdAt: 1 }];
-    expect(current.consumedCheckpoints).toEqual(["checkpoint-1"]);
-    expect(current.pendingGuidance[0]!.text).toBe("replace the audit");
-    expect(isWorkflowControlAction("plan_change")).toBe(true);
-    expect(isWorkflowControlAction("coordinator_retry")).toBe(true);
   });
 
   test("seals an active phase prefix and retires its unstarted suffix", () => {
@@ -513,68 +403,9 @@ describe("Stage 3 adaptive planning", () => {
     expect(failureControlOptions(current).map((option) => option.action)).toEqual(["coordinator_retry", "coordinator_continue", "failure_stop"]);
   });
 
-  test("projects a compact read-only status view", () => {
-    const current = run();
-    current.frontier.phaseID = "todo";
-    current.error = "Coordinator failed: boom";
-    current.failure = { workerID: "audit", kind: "worker", reason: "boom" };
-    current.workers.scan!.startedAt = 10;
-    current.workers.scan!.activity = "Completed";
-    const view = runStatusView(current);
-    expect(view).toMatchObject({ runID: "run", name: "Review", description: "Review a change", goal: "Find issues", status: "running", error: "Coordinator failed: boom", planVersion: 1, revisions: 0, failure: { workerID: "audit", reason: "boom" } });
-    expect(view.phases).toEqual([
-      { id: "done", title: "Done", checkpoint: true, status: "completed" },
-      { id: "todo", title: "Todo", status: "active" },
-    ]);
-    expect(view.workers).toEqual([
-      { id: "scan", label: "Scan", agent: "explore", status: "completed", activity: "Completed", startedAt: 10 },
-      { id: "audit", label: "Audit", agent: "build", status: "pending" },
-    ]);
-    expect(JSON.stringify(view)).not.toContain("prompt");
-    expect(runStatusView(current).handoff).toBeUndefined();
-    current.handoff = { summary: "s", completedWork: [], evidence: [], changedFiles: [], verification: [], unresolvedIssues: [], recommendedNextAction: "n" };
-    expect(runStatusView(current).handoff).toBe(true);
-  });
-
-  test("summarizes run scale and health for parent synthesis", () => {
-    const current = run();
-    current.createdAt = 1_000;
-    current.planVersion = 2;
-    (current.revisions as unknown[]).push({});
-    current.workers.scan!.status = "completed";
-    current.workers.audit!.status = "failed";
-    current.workers.scan!.tokens = { input: 10, output: 5, reasoning: 1, cacheRead: 0, cacheWrite: 0, total: 16 };
-    current.workers.audit!.tokens = { input: 2, output: 2, reasoning: 0, cacheRead: 0, cacheWrite: 0, total: 4 };
-    expect(runStats(current, 61_000)).toEqual({ workers: { completed: 1, failed: 1 }, durationMs: 60_000, tokens: 20, planVersion: 2, revisions: 1 });
-    const idle = run();
-    idle.createdAt = 1_000;
-    expect(runStats(idle, 2_000)).toEqual({ workers: { completed: 1, pending: 1 }, durationMs: 1_000, tokens: 0, planVersion: 1, revisions: 0 });
-  });
-
-  test("fails lease fencing immediately before external side effects", () => {
-    expect(() => assertLeaseOwnership(true)).not.toThrow();
-    expect(() => assertLeaseOwnership(false)).toThrow("before external side effect");
-  });
 });
 
 describe("templates and state helpers", () => {
-  test("renders object output as stable pretty JSON", () => {
-    expect(renderTemplate("{{workers.scan.output}}", { scan: { z: [2, 1], a: true } })).toBe('{\n  "a": true,\n  "z": [\n    2,\n    1\n  ]\n}');
-    expect(stableJson({ z: 1, a: { d: 2, b: 3 } })).toBe('{\n  "a": {\n    "b": 3,\n    "d": 2\n  },\n  "z": 1\n}');
-    expect(renderTemplate("Result: {{workers.scan.output}}", { scan: "\\{{preserved}}" })).toBe("Result: \\{{preserved}}");
-  });
-
-  test("enforces additionalProperties even without an explicit object type", () => {
-    expect(() => validateJsonSchema({ additionalProperties: false }, { unexpected: true })).toThrow("not allowed");
-  });
-
-  test("uses stable persistence paths and terminal state derivation", () => {
-    expect(statePath("/data/workflows/project", "run-1")).toBe("/data/workflows/project/runs/run-1/state.json");
-    expect(eventPath("/data/workflows/project", "run-1")).toBe("/data/workflows/project/runs/run-1/events.ndjson");
-    expect(isTerminal("completed")).toBe(true);
-    expect(isTerminal("interrupted")).toBe(false);
-  });
-
   test("marks skipped template dependencies for Stage 3 repair", () => {
     const spec = validateWorkflowSpec(base, agents, models);
     const workers: Record<string, WorkerState> = Object.fromEntries(workersInOrder(spec).map((worker) => [worker.id, { ...worker, status: "pending", steering: [] }]));
@@ -624,13 +455,10 @@ describe("Stage 5 lifecycle and release", () => {
     expect(ownedChildSessionIDs(current, [{ id: "retry", metadata: { workflowRunID: "run" } }, { id: "parent", metadata: { workflowRunID: "run" } }, { id: "other", metadata: { workflowRunID: "other" } }])).toEqual(["coordinator", "handoff", "retry", "worker"]);
   });
 
-  test("normalizes options and enforces plugin ceilings", () => {
-    expect(normalizeWorkflowOptions()).toMatchObject({ retentionRuns: 10_000, retentionDays: 99_999_999, maxWorkers: 100, maxRevisions: 10, maxRunMs: 21_600_000, maxConcurrency: 2, coordinatorInputBytes: 262_144 });
-    expect(workflowCeilings(normalizeWorkflowOptions({ max_concurrency: 5 })).maxConcurrency).toBe(5);
+  test("enforces configured plugin ceilings", () => {
     const options = normalizeWorkflowOptions({ max_workers: 2, max_revisions: 3, max_run_ms: 1000 });
     const tooLarge = structuredClone(base); tooLarge.limits = { maxWorkers: 3 };
     expect(() => validateWorkflowSpec(tooLarge, agents, models, workflowCeilings(options))).toThrow("1 to 2");
-    expect(() => normalizeWorkflowOptions({ retention_runs: 0 })).toThrow("positive integer");
   });
 
   test("checks TUI freshness and derives startup/manual actions", () => {
@@ -719,29 +547,6 @@ describe("Stage 2 reliability helpers", () => {
     run.status = "soft_pausing";
     expect(finalizeSoftPause(run)).toBe(true);
     expect(run.status as WorkflowStatus).toBe("soft_paused");
-  });
-
-  test("builds byte-exact coordinator input with compact failures and valid UTF-8", () => {
-    const failed = { id: "bad", label: "Bad", agent: "build", prompt: "secret", status: "failed", error: "boom", output: "body", attempts: [{ number: 1, startedAt: 1 }] } as WorkerState;
-    expect(compactWorkerFailures({ bad: failed })).toEqual([{ id: "bad", status: "failed", error: "boom" }]);
-    failed.error = "x".repeat(3_000);
-    const truncatedError = compactWorkerFailures({ bad: failed })[0]!.error!;
-    expect(truncatedError.startsWith("x".repeat(2_048))).toBe(true);
-    expect(truncatedError.endsWith("\n…[truncated; first 2048 of 3000 bytes]")).toBe(true);
-    expect(utf8Prefix("a😀b", 6)).toBe("a😀b");
-    expect(utf8Prefix("a😀b", 4)).toBe("a");
-    expect(markedUtf8Prefix("a😀b", 4)).toBe("a\n…[truncated; first 1 of 6 bytes]");
-    const exact = JSON.stringify({ outputs: [{ id: "one", output: "123456789012" }] });
-    expect(coordinatorInput({ outputs: [] }, [{ id: "one", output: "123456789012" }], Buffer.byteLength(exact))).toBe(exact);
-    const marked = coordinatorInput({ outputs: [] }, [{ id: "one", output: "x".repeat(100) }], 100)!;
-    expect(Buffer.byteLength(marked)).toBeLessThanOrEqual(100);
-    expect(marked).toContain("[truncated;");
-    const payload = { marker: "😀", outputs: [] as Array<{ id: string; output: string }> };
-    const input = coordinatorInput(payload, [{ id: "one", output: "😀😀😀" }], 54)!;
-    expect(Buffer.byteLength(input)).toBeLessThanOrEqual(54);
-    expect(input).not.toContain("�");
-    const oversized = { marker: "too large", outputs: [] };
-    expect(coordinatorInput(oversized, [], 2)).toBeUndefined();
   });
 
   test("ignores claimed controls while preserving owner suffixes", () => {

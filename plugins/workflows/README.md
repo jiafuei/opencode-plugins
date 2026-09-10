@@ -21,8 +21,7 @@ To customize the server plugin, edit its entry in `opencode.json`:
   "max_workers": 100,
   "max_revisions": 10,
   "max_run_ms": 21600000,
-  "max_concurrency": 2,
-  "coordinator_input_bytes": 262144
+  "max_concurrency": 2
 }]] }
 ```
 
@@ -42,9 +41,11 @@ At startup one summary dialog lists interrupted runs with Resume, Open dashboard
 
 ## Limits and retention
 
-Plugin options are positive integers normalized at startup. Defaults are `retention_runs: 10000` and `retention_days: 99999999` — effectively unlimited retention until configured lower — plus `max_workers: 100`, `max_revisions: 10`, `max_run_ms: 21600000` (6 hours), `max_concurrency: 2`, and `coordinator_input_bytes: 262144` (256 KiB). `max_concurrency` caps how many workers of a parallel group run at once and is set only in plugin options, not in a workflow spec. A workflow may lower the worker/revision/run ceilings but cannot exceed plugin values.
+Plugin options are positive integers normalized at startup. Defaults are `retention_runs: 10000` and `retention_days: 99999999` — effectively unlimited retention until configured lower — plus `max_workers: 100`, `max_revisions: 10`, `max_run_ms: 21600000` (6 hours), and `max_concurrency: 2`. `max_concurrency` caps how many workers of a parallel group run at once and is set only in plugin options, not in a workflow spec. A workflow may lower the worker/revision/run ceilings but cannot exceed plugin values.
 
-Worker prompts may reference earlier outputs with `{{workers.workerId.output.path}}`. Other double-brace syntax, including `${{ github.ref }}`, is literal. Prefix the reserved namespace with a backslash, as in `\{{workers.example.output}}`, when it must also remain literal. Worker output schemas are locally checked for `type`, `enum`, `required`, `properties`, `additionalProperties`, and `items`; unsupported JSON Schema constraints are not enforced by the plugin.
+Worker prompts may reference earlier outputs with `{{workers.workerId.output.path}}`. Other double-brace syntax, including `${{ github.ref }}`, is literal. Prefix the reserved namespace with a backslash, as in `\{{workers.example.output}}`, when it must also remain literal. Dependency order is checked before execution; field paths are resolved against actual outputs at runtime. JSON schemas are passed to OpenCode's structured-output requests without local output revalidation.
+
+Worker outputs and failure details reach coordinators and the final handoff intact, without byte truncation or an input-size cap. Keep results concise and use artifact files for bulk data. The former `coordinator_input_bytes` option is no longer used. Identifiers retain their syntax restrictions but have no plugin-defined length cap.
 
 A worker defaults to the built-in `general` agent when `agent` is omitted; `general` must still appear in the workflow's `allowedAgents`. Specify another allowed registered agent to override it. Workers inherit the originating session's model when `modelID` is omitted, or may select an available model as `"providerID/modelID"` and a model variant directly in the spec:
 

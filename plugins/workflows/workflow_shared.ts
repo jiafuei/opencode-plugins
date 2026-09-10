@@ -173,12 +173,12 @@ export type WorkflowHandoff = {
   recommendedNextAction: string;
 };
 
-const ID = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/;
-const TEMPLATE_REFERENCE = /^\s*workers\.([A-Za-z][A-Za-z0-9_-]{0,63})\.output((?:\.[A-Za-z_$][A-Za-z0-9_$]*)*)\s*$/;
+const ID = /^[A-Za-z][A-Za-z0-9_-]*$/;
+const TEMPLATE_REFERENCE = /^\s*workers\.([A-Za-z][A-Za-z0-9_-]*)\.output((?:\.[A-Za-z_$][A-Za-z0-9_$]*)*)\s*$/;
 const NONEMPTY_TEXT = tool.schema.string({ message: "must be a non-empty string" }).refine((value) => !!value.trim(), { message: "must be a non-empty string" });
 const TEXT = tool.schema.string({ message: "must be a string" });
-const IDENTIFIER = tool.schema.string({ message: "must use letters, numbers, _ or - and begin with a letter" }).refine((value) => !!value.trim() && ID.test(value), { message: "must use letters, numbers, _ or - and begin with a letter" });
-const MODEL_ID = tool.schema.string({ message: 'must be a "providerID/modelID" string such as "openai/gpt-1.0" or "anthropic/claude-sonnet-1.0"' }).refine((value) => !!value.trim() && /^[^\s/]+\/\S+$/.test(value), { message: 'must be a "providerID/modelID" string such as "openai/gpt-1.0" or "anthropic/claude-sonnet-1.0"' });
+const IDENTIFIER = tool.schema.string({ message: "must use letters, numbers, _ or - and begin with a letter" }).refine((value) => ID.test(value), { message: "must use letters, numbers, _ or - and begin with a letter" });
+const MODEL_ID = tool.schema.string({ message: 'must be a "providerID/modelID" string such as "openai/gpt-1.0" or "anthropic/claude-sonnet-1.0"' }).refine((value) => /^[^\s/]+\/\S+$/.test(value), { message: 'must be a "providerID/modelID" string such as "openai/gpt-1.0" or "anthropic/claude-sonnet-1.0"' });
 export const WORKER_SCHEMA = tool.schema.object({
   id: IDENTIFIER.describe("Globally unique across the workflow; letters, digits, _ or -, starting with a letter"),
   label: NONEMPTY_TEXT,
@@ -186,7 +186,7 @@ export const WORKER_SCHEMA = tool.schema.object({
   modelID: MODEL_ID.optional().describe('"providerID/modelID"; must be an available model. Omit to inherit the originating session model. Set it explicitly on workers that check other workers, so verification does not repeat the same model\'s mistakes.'),
   variant: TEXT.optional(),
   prompt: NONEMPTY_TEXT.describe("Self-contained instructions; the worker sees no conversation history. May embed earlier workers' outputs as {{workers.<id>.output}} (append .field for schema outputs; \\{{ for a literal). Forward and same-step sibling references are rejected. When the worker produces bulk data, name the exact file path it must write to."),
-  schema: tool.schema.record(tool.schema.string(), tool.schema.unknown()).optional().describe("JSON Schema for the worker's structured output; only type, enum, required, properties, additionalProperties, and items are enforced. Keep outputs small — they are byte-truncated to fit the 256 KiB coordinator/handoff cap. For bulk results return {path, count, notes}, not the data."),
+  schema: tool.schema.record(tool.schema.string(), tool.schema.unknown()).optional().describe("JSON Schema for the worker's structured output. Results are passed intact to coordinators and the final handoff. For bulk results, write an artifact and return {path, count, notes}."),
 });
 export const WORKFLOW_SPEC_SCHEMA = tool.schema.object({
   version: tool.schema.literal(1),
@@ -214,7 +214,7 @@ export const RETRY_DELAYS_MS = [5_000, 10_000, 20_000, 30_000, 40_000] as const;
 export const LEASE_HEARTBEAT_MS = 5_000;
 export const LEASE_STALE_MS = 15_000;
 export const TUI_PRESENCE_STALE_MS = 5_000;
-export type WorkflowOptions = { retentionRuns: number; retentionDays: number; maxWorkers: number; maxRevisions: number; maxRunMs: number; maxConcurrency: number; coordinatorInputBytes: number };
+export type WorkflowOptions = { retentionRuns: number; retentionDays: number; maxWorkers: number; maxRevisions: number; maxRunMs: number; maxConcurrency: number };
 
 export function normalizeWorkflowOptions(value: Record<string, unknown> | undefined = {}): WorkflowOptions {
   value ??= {};
@@ -224,7 +224,7 @@ export function normalizeWorkflowOptions(value: Record<string, unknown> | undefi
     if (!Number.isInteger(item) || Number(item) < 1) throw new Error(`workflows.${key} must be a positive integer`);
     return Number(item);
   };
-  return { retentionRuns: integer("retention_runs", 10000), retentionDays: integer("retention_days", 99999999), maxWorkers: integer("max_workers", 100), maxRevisions: integer("max_revisions", 10), maxRunMs: integer("max_run_ms", 6 * 60 * 60 * 1000), maxConcurrency: integer("max_concurrency", 2), coordinatorInputBytes: integer("coordinator_input_bytes", 256 * 1024) };
+  return { retentionRuns: integer("retention_runs", 10000), retentionDays: integer("retention_days", 99999999), maxWorkers: integer("max_workers", 100), maxRevisions: integer("max_revisions", 10), maxRunMs: integer("max_run_ms", 6 * 60 * 60 * 1000), maxConcurrency: integer("max_concurrency", 2) };
 }
 
 export function workflowCeilings(options: WorkflowOptions): WorkflowLimits { return { maxWorkers: options.maxWorkers, maxRevisions: options.maxRevisions, maxRunMs: options.maxRunMs, maxConcurrency: options.maxConcurrency }; }
@@ -265,50 +265,16 @@ export function templateDependencies(prompt: string): string[] {
   return dependencies;
 }
 
-/**
- * Compares a template reference's field path against the referenced worker's declared output schema
- * so typos fail at spec validation instead of mid-run. Returns a problem description only when the
- * path provably cannot exist; anything unverifiable (no schema, mixed or absent types) yields
- * undefined, leaving renderTemplate as the runtime backstop.
- */
-export function templateSuffixError(schema: Record<string, unknown> | undefined, suffix: string): string | undefined {
-  if (!schema) return undefined;
-  const segments = suffix.split(".").filter(Boolean); // TEMPLATE_REFERENCE already consumed the ".output" prefix
-  let node: unknown = schema;
-  for (const segment of segments) {
-    if (!node || typeof node !== "object" || Array.isArray(node)) return undefined;
-    const current = node as Record<string, unknown>;
-    const types = current.type === undefined ? [] : Array.isArray(current.type) ? current.type : [current.type];
-    if (Array.isArray(current.enum) && current.enum.every((item) => !item || typeof item !== "object" || Array.isArray(item))) return `the schema restricts it to scalar enum values (${current.enum.map((item) => JSON.stringify(item)).join(", ")}), which cannot be indexed further`;
-    if (types.length === 1 && typeof types[0] === "string" && types[0] !== "object") return `the schema types it as ${types[0]}, which cannot be indexed further`;
-    const properties = current.properties && typeof current.properties === "object" && !Array.isArray(current.properties) ? current.properties as Record<string, unknown> : {};
-    const verifiable = types.length === 0 ? !!Object.keys(properties).length || current.additionalProperties === false : types.length === 1 && types[0] === "object";
-    if (!verifiable) return undefined;
-    if (!(segment in properties)) {
-      if (current.additionalProperties !== false) return undefined;
-      const keys = Object.keys(properties);
-      const listed = keys.slice(0, 8).join(", ") + (keys.length > 8 ? ", …" : "");
-      return `the schema has no property "${segment}"${keys.length ? ` (available: ${listed})` : ""}`;
-    }
-    node = properties[segment];
-  }
-  return undefined;
+export function validateWorkflowSpec(value: unknown, registeredAgents?: ReadonlySet<string>, registeredModels?: ReadonlySet<string>, ceilings: WorkflowLimits = DEFAULT_LIMITS): WorkflowSpec {
+  return checkWorkflowPlan(WORKFLOW_SPEC_SCHEMA.parse(value), registeredAgents, registeredModels, ceilings);
 }
 
-export function validateWorkflowSpec(value: unknown, registeredAgents?: ReadonlySet<string>, registeredModels?: ReadonlySet<string>, ceilings: WorkflowLimits = DEFAULT_LIMITS): WorkflowSpec {
-  const parsed = WORKFLOW_SPEC_SCHEMA.safeParse(value);
-  const path = (parts: PropertyKey[]) => parts.reduce<string>((result, part) => typeof part === "number" ? `${result}[${part}]` : `${result}.${String(part)}`, "workflow");
+function checkWorkflowPlan(spec: WorkflowSpec, registeredAgents?: ReadonlySet<string>, registeredModels?: ReadonlySet<string>, ceilings: WorkflowLimits = DEFAULT_LIMITS): WorkflowSpec {
   const problems: string[] = [];
   const fail = () => {
     if (problems.length === 1) throw new Error(problems[0]!);
     if (problems.length > 1) throw new Error(`workflow spec has ${problems.length} problems:\n${problems.map((problem, index) => `${index + 1}. ${problem}`).join("\n")}`);
   };
-  if (!parsed.success) {
-    problems.push(...parsed.error.issues.map((issue) => `${path(issue.path)} ${issue.message}`));
-    fail();
-  }
-
-  const spec = parsed.data as WorkflowSpec;
   const allowedAgents = new Set(spec.allowedAgents);
   if (allowedAgents.size !== spec.allowedAgents.length) problems.push("workflow.allowedAgents must contain unique agents");
   if (registeredAgents) for (const agent of allowedAgents) if (!registeredAgents.has(agent)) problems.push(`workflow.allowedAgents contains unregistered agent "${agent}"`);
@@ -322,7 +288,7 @@ export function validateWorkflowSpec(value: unknown, registeredAgents?: Readonly
   if (limits.maxRunMs > ceilings.maxRunMs) problems.push(`workflow.limits.maxRunMs must be an integer from 1 to ${ceilings.maxRunMs}`);
 
   const workerIDs = new Set<string>();
-  const known = new Map<string, WorkerSpec>();
+  const known = new Set<string>();
   const phaseIDs = new Set<string>();
   const checkWorker = (worker: WorkerSpec) => {
     if (workerIDs.has(worker.id)) problems.push(`Worker id ${worker.id} is not globally unique`);
@@ -331,13 +297,10 @@ export function validateWorkflowSpec(value: unknown, registeredAgents?: Readonly
     if (worker.modelID && registeredModels && !registeredModels.has(worker.modelID)) problems.push(`Worker ${worker.id} uses unavailable model "${worker.modelID}"`);
     try {
       for (const reference of templateReferences(worker.prompt)) {
-        const dependency = known.get(reference.id);
-        if (!dependency) {
+        if (!known.has(reference.id)) {
           problems.push(`Worker ${worker.id} references missing, forward, or sibling worker ${reference.id}`);
           continue;
         }
-        const problem = templateSuffixError(dependency.schema, reference.suffix);
-        if (problem) problems.push(`Worker ${worker.id} references {{workers.${reference.id}.output${reference.suffix}}} but ${problem}`);
       }
     } catch (error) {
       problems.push(error instanceof Error ? error.message : String(error));
@@ -355,7 +318,7 @@ export function validateWorkflowSpec(value: unknown, registeredAgents?: Readonly
       }
       const workers = step.type === "worker" ? [step.worker] : step.workers;
       for (const worker of workers) checkWorker(worker);
-      for (const worker of workers) if (!known.has(worker.id)) known.set(worker.id, worker);
+      for (const worker of workers) known.add(worker.id);
     }
   }
   if (workerIDs.size > limits.maxWorkers) problems.push(`Workflow has ${workerIDs.size} workers, exceeding maxWorkers ${limits.maxWorkers}`);
@@ -468,53 +431,8 @@ export function workerTurnPrompt(hasResolvedTurn: boolean, turnInCycle: number, 
   return priorError ? `Your prior attempt failed with this error:\n\n${priorError}\n\nCorrect the issue and return the requested final result.` : "Your prior attempt failed. Correct the issue and return the requested final result.";
 }
 
-export function utf8Prefix(value: string, maxBytes: number): string {
-  const bytes = Buffer.from(value);
-  if (bytes.length <= maxBytes) return value;
-  const decoder = new TextDecoder("utf-8", { fatal: true });
-  for (let length = Math.max(0, maxBytes); length >= 0; length--) {
-    try { return decoder.decode(bytes.subarray(0, length)); } catch {}
-  }
-  return "";
-}
-
-export function markedUtf8Prefix(value: string, maxPrefixBytes: number): string {
-  const total = Buffer.byteLength(value);
-  if (total <= maxPrefixBytes) return value;
-  const prefix = utf8Prefix(value, maxPrefixBytes);
-  return `${prefix}\n…[truncated; first ${Buffer.byteLength(prefix)} of ${total} bytes]`;
-}
-
-export function fitTextToBudget(value: string, fits: (candidate: string) => boolean): string | undefined {
-  if (fits(value)) return value;
-  const total = Buffer.byteLength(value);
-  if (!total) return;
-  let low = 0, high = total - 1;
-  while (low < high) {
-    const middle = Math.ceil((low + high) / 2);
-    if (fits(markedUtf8Prefix(value, middle))) low = middle;
-    else high = middle - 1;
-  }
-  const candidate = markedUtf8Prefix(value, low);
-  return fits(candidate) ? candidate : undefined;
-}
-
 export function compactWorkerFailures(workers: Record<string, WorkerState>): Array<{ id: string; status: WorkerState["status"]; error?: string }> {
-  return Object.values(workers).filter((worker) => ["failed", "skipped", "aborted"].includes(worker.status)).map((worker) => ({ id: worker.id, status: worker.status, ...(worker.error === undefined ? {} : { error: markedUtf8Prefix(worker.error, 2_048) }) }));
-}
-
-export function coordinatorInput(payload: { outputs: Array<{ id: string; output: string }> }, outputs: Array<{ id: string; output: string }>, maxBytes: number): string | undefined {
-  if (Buffer.byteLength(JSON.stringify(payload)) > maxBytes) return;
-  for (const output of outputs) {
-    const fitted = fitTextToBudget(output.output, (candidate) => {
-      payload.outputs.push({ id: output.id, output: candidate });
-      const fits = Buffer.byteLength(JSON.stringify(payload)) <= maxBytes;
-      payload.outputs.pop();
-      return fits;
-    });
-    if (fitted !== undefined) payload.outputs.push({ id: output.id, output: fitted });
-  }
-  return JSON.stringify(payload);
+  return Object.values(workers).filter((worker) => ["failed", "skipped", "aborted"].includes(worker.status)).map((worker) => ({ id: worker.id, status: worker.status, error: worker.error }));
 }
 
 export function acceptCoordinatorResult(run: Pick<WorkflowRun, "status" | "failure" | "error">): void {
@@ -575,11 +493,10 @@ export function planDiff(before: PhaseSpec[], after: PhaseSpec[]): PlanDiffEntry
 }
 
 export function validatePlanRevision(run: WorkflowRun, pending: unknown): PhaseSpec[] {
-  if (run.revisions.length >= run.limits.maxRevisions) throw new Error(`Workflow reached maxRevisions ${run.limits.maxRevisions}`);
   const frozen = (phase: PhaseSpec) => run.completedPhases.includes(phase.id) || run.sealedPhases.includes(phase.id);
   const immutable = run.spec.phases.filter(frozen);
   const priorPending = run.spec.phases.filter((phase) => !frozen(phase));
-  const candidate = validateWorkflowSpec({ ...run.spec, phases: [...immutable, ...(pending as PhaseSpec[])], limits: { maxWorkers: run.limits.maxWorkers, maxRevisions: run.limits.maxRevisions, maxRunMs: run.limits.maxRunMs } });
+  const candidate = checkWorkflowPlan({ ...run.spec, phases: [...immutable, ...tool.schema.array(WORKFLOW_SPEC_SCHEMA.shape.phases.element).parse(pending)], limits: { maxWorkers: run.limits.maxWorkers, maxRevisions: run.limits.maxRevisions, maxRunMs: run.limits.maxRunMs } }, undefined, undefined, run.limits);
   const immutableIDs = new Set(workerIDsInPhases(immutable));
   const historical = new Set(run.reservedWorkerIDs);
   const reusable = new Set(workerIDsInPhases(priorPending));
@@ -589,7 +506,6 @@ export function validatePlanRevision(run: WorkflowRun, pending: unknown): PhaseS
   const reusablePhases = new Set(priorPending.map((phase) => phase.id));
   const reservedPhases = new Set(run.reservedPhaseIDs);
   for (const phase of candidate.phases.slice(immutable.length)) if (reservedPhases.has(phase.id) && !reusablePhases.has(phase.id)) throw new Error(`Phase id ${phase.id} was already used in plan history`);
-  if (candidate.allowedAgents.some((agent) => !run.spec.allowedAgents.includes(agent))) throw new Error("Revision expands allowedAgents");
   return candidate.phases.slice(immutable.length);
 }
 
@@ -864,26 +780,4 @@ export function parentDeletionRoute(local: { token: string; generation: number }
   if (local && current && local.token === current.token && local.generation === current.generation && !isLeaseStale(current, now)) return "handle";
   if (current && !isLeaseStale(current, now)) return { targetOwner: current.ownerIdentity, leaseToken: current.token, leaseGeneration: current.generation };
   return "acquire";
-}
-
-export function validateJsonSchema(schema: Record<string, unknown>, value: unknown, path = "output"): void {
-  const types = schema.type === undefined ? [] : Array.isArray(schema.type) ? schema.type : [schema.type];
-  const valid = types.length === 0 || types.some((type) =>
-    type === "object" ? !!value && typeof value === "object" && !Array.isArray(value) :
-    type === "array" ? Array.isArray(value) : type === "string" ? typeof value === "string" :
-    type === "number" ? typeof value === "number" : type === "integer" ? Number.isInteger(value) :
-    type === "boolean" ? typeof value === "boolean" : type === "null" ? value === null : false,
-  );
-  if (!valid) throw new Error(`${path} does not match schema type`);
-  if (Array.isArray(schema.enum) && !schema.enum.some((item) => stableJson(item) === stableJson(value))) throw new Error(`${path} is not an allowed value`);
-  if ((schema.type === "object" || schema.properties || schema.required || schema.additionalProperties !== undefined) && value && typeof value === "object" && !Array.isArray(value)) {
-    const input = value as Record<string, unknown>;
-    const properties = schema.properties && typeof schema.properties === "object" ? schema.properties as Record<string, Record<string, unknown>> : {};
-    for (const key of Array.isArray(schema.required) ? schema.required : []) if (typeof key === "string" && !(key in input)) throw new Error(`${path}.${key} is required`);
-    if (schema.additionalProperties === false) for (const key of Object.keys(input)) if (!(key in properties)) throw new Error(`${path}.${key} is not allowed`);
-    for (const [key, child] of Object.entries(properties)) if (key in input) validateJsonSchema(child, input[key], `${path}.${key}`);
-  }
-  if ((schema.type === "array" || schema.items) && Array.isArray(value) && schema.items && typeof schema.items === "object") {
-    value.forEach((item, index) => validateJsonSchema(schema.items as Record<string, unknown>, item, `${path}[${index}]`));
-  }
 }

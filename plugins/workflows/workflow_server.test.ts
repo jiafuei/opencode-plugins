@@ -52,6 +52,8 @@ async function createHarness(options: Record<string, unknown> = {}) {
     created: [] as Array<{ agent?: string; model?: { providerID: string; id: string } }>,
     onPrompt: undefined as ((agent: string) => void) | undefined,
     promptDelay: undefined as ((text: string) => number) | undefined,
+    workerOutput: undefined as ((text: string) => string) | undefined,
+    prompts: [] as Array<{ agent: string; text: string }>,
   };
   const client = {
     app: { log: async () => ({}), agents: async () => { state.agentRefreshes++; return { data: state.agents.map((name) => ({ name })) }; } },
@@ -59,6 +61,7 @@ async function createHarness(options: Record<string, unknown> = {}) {
     session: {
       create: async (input: { body: { agent?: string; model?: { providerID: string; id: string } } }) => { state.created.push(input.body); return { data: { id: `session-${++state.sessions}` } }; },
       prompt: async (input: { body: { agent: string; format?: unknown; parts: Array<{ text: string }> } }) => {
+        state.prompts.push({ agent: input.body.agent, text: input.body.parts[0]!.text });
         state.inFlight++;
         state.maxInFlight = Math.max(state.maxInFlight, state.inFlight);
         await Bun.sleep(input.body.format ? 50 : state.promptDelay?.(input.body.parts[0]!.text) ?? 50);
@@ -68,7 +71,7 @@ async function createHarness(options: Record<string, unknown> = {}) {
           const structured = input.body.agent === "workflow-coordinator-internal" ? { rationale: "keep the plan", phases: [] } : handoffResult;
           return { data: { info: { structured }, parts: [] } };
         }
-        return { data: { info: {}, parts: [{ type: "text", text: `output:${input.body.agent}` }] } };
+        return { data: { info: {}, parts: [{ type: "text", text: state.workerOutput?.(input.body.parts[0]!.text) ?? `output:${input.body.agent}` }] } };
       },
       promptAsync: async (input: { body: { agent?: string; model?: { providerID: string; modelID: string }; parts: Array<{ text: string }> } }) => { state.synthetic.push(input.body.parts[0]!.text); state.syntheticBody = input.body; return { data: {} }; },
       abort: async () => ({ data: true }),
@@ -123,6 +126,24 @@ const worker = (id: string, prompt = `run ${id}`) => ({ id, label: id, agent: "b
 const workerStep = (id: string, prompt?: string) => ({ type: "worker", worker: worker(id, prompt) });
 
 describe("workflow server", () => {
+  test("passes complete large outputs and later results to the coordinator and handoff", async () => {
+    const harness = await createHarness();
+    const large = `${"Complete finding. ".repeat(20_000)}FINAL_QUALIFICATION`;
+    harness.state.workerOutput = (prompt) => prompt === "run large" ? large : "LATE_VERIFICATION_RESULT";
+    const submission = await harness.submit(spec([
+      { id: "work", title: "Work", checkpoint: true, steps: [workerStep("large"), workerStep("verify")] },
+    ]));
+    await harness.control({ runID: submission.id, action: "approve" });
+    const run = await harness.waitForRun(submission.id, (run) => run.status === "completed" || run.status === "blocked");
+    expect(run.failure).toBeUndefined();
+    expect(run.status).toBe("completed");
+    for (const agent of ["workflow-coordinator-internal", "workflow-handoff-internal"]) {
+      const prompt = harness.state.prompts.find((item) => item.agent === agent)!.text;
+      expect(prompt).toContain(large);
+      expect(prompt).toContain("LATE_VERIFICATION_RESULT");
+    }
+  }, 15_000);
+
   test("initializes while OpenCode client endpoints remain unresolved", async () => {
     const projectID = `test-${crypto.randomUUID()}`;
     const directory = "/tmp/workflow-server-test-project";

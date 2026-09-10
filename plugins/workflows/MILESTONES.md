@@ -101,7 +101,7 @@ Specification rules:
 | Maximum revisions | 10 |
 | Run window | 6 hours |
 | Retry delays | 5s, 10s, 20s, 30s, 40s |
-| Coordinator input | 256 KiB |
+| Coordinator input | Complete outputs; no plugin byte cap |
 | Retained runs | 10000 (effectively unlimited) |
 | Retention age | 99999999 days (effectively unlimited) |
 
@@ -186,7 +186,7 @@ type WorkflowHandoff = {
 }
 ```
 
-The handoff receives named worker outputs up to 256 KiB. Full outputs remain available in the journal and dashboard.
+The handoff receives complete named worker outputs. They also remain available in the journal and dashboard.
 
 Completion behavior:
 
@@ -354,7 +354,7 @@ Acceptance criteria:
 
 Final release-audit hardening makes execution leases and renewable maintenance claims mutually exclusive per run, routes parent deletion to the exact lease owner through durable generation-bound controls, records idempotent child-cleanup progress, bounds future TUI heartbeat skew, serializes TUI refreshes, and ages retention from the first terminal transition.
 
-Final defaults are effectively unlimited retention (10000 terminal runs, 99999999 days), 100 workers, 10 revisions, a 6-hour run window, concurrency 2 (configurable via `max_concurrency`), 256 KiB coordinator/handoff input, 5-second lease heartbeat, 15-second stale lease/maintenance claim, and a 5-second TUI-presence freshness window.
+Final defaults are effectively unlimited retention (10000 terminal runs, 99999999 days), 100 workers, 10 revisions, a 6-hour run window, concurrency 2 (configurable via `max_concurrency`), complete coordinator/handoff inputs without a byte cap, 5-second lease heartbeat, 15-second stale lease/maintenance claim, and a 5-second TUI-presence freshness window.
 
 Implemented files: `plugins/workflows/{MILESTONES.md,README.md,workflow_shared.ts,workflow_coordination.ts,workflow_server.ts,workflow_tui.tsx,workflow.test.ts}`, plus repository `README.md`, `package.json`, and `bun.lock` for listing and public plugin/TUI dependencies.
 
