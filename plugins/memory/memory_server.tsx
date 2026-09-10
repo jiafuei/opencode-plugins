@@ -69,7 +69,7 @@ type SourceSnapshot = {
 
 type Decision = {
   action: "create" | "replace";
-  target?: string;
+  target?: string | null;
   subject: string;
 };
 
@@ -143,7 +143,7 @@ const SETTINGS_FILE = "settings.json";
 const INDEX_BYTES = 32 * 1024;
 const TOPIC_LIMIT = 200;
 const CONSOLIDATION_BATCH = 8;
-const PROMPT_BYTES = 12 * 1024;
+const CHECKPOINT_BYTES = 12 * 1024;
 const WORKER_TIMEOUT_MS = 30_000;
 const DEFAULT_DREAM_TIMEOUT_MS = 90_000;
 const LOCK_STALE_MS = 10 * 60_000;
@@ -301,19 +301,6 @@ function resolveWorkerModel(model: ModelRef | undefined, variant: string | undef
   if (fallback) return { ...fallback, variant: variant ?? fallback.variant };
 }
 
-function limitText(value: string, bytes: number): string {
-  const buffer = Buffer.from(value);
-  return buffer.length <= bytes ? value : buffer.subarray(0, bytes).toString("utf8");
-}
-
-function pushBounded(items: string[], value: string, bytes: number): boolean {
-  const text = limitText(value.trim(), bytes);
-  if (!text) return false;
-  items.push(text);
-  while (items.length > 1 && Buffer.byteLength(items.join("\n\n")) > bytes) items.shift();
-  return true;
-}
-
 export function parseIndexLine(line: string): IndexEntry | undefined {
   const match = line.match(INDEX_ENTRY);
   if (!match) return;
@@ -410,49 +397,6 @@ ${extracted.content}
 `;
 }
 
-function validateDecisions(value: unknown): Decision[] {
-  if (!value || typeof value !== "object") throw new Error("Memory classifier returned no object");
-  const input = value as { decisions?: unknown };
-  if (!Array.isArray(input.decisions)) throw new Error("Memory classifier returned no decisions array");
-  if (input.decisions.length > MAX_DECISIONS) throw new Error("Memory classifier returned too many decisions");
-  const decisions: Decision[] = [];
-  for (const raw of input.decisions) {
-    if (!raw || typeof raw !== "object") throw new Error("Memory classifier returned an invalid decision");
-    const record = raw as Record<string, unknown>;
-    if (record.action !== "create" && record.action !== "replace") {
-      throw new Error("Memory classifier returned an invalid save action");
-    }
-    if (typeof record.subject !== "string" || !record.subject.trim()) {
-      throw new Error("Memory classifier returned a decision with no subject");
-    }
-    decisions.push({
-      action: record.action,
-      target: typeof record.target === "string" ? record.target : undefined,
-      subject: record.subject.trim(),
-    });
-  }
-  return decisions;
-}
-
-// Ordinary learning creates user-grounded types; updates to an existing insight
-// and synthesis explicitly preserve their result type.
-function validateExtraction(value: unknown, allowed: readonly StoredType[] = MEMORY_TYPES): ExtractorResult {
-  if (!value || typeof value !== "object") throw new Error("Memory extractor returned no object");
-  const input = value as Record<string, unknown>;
-  if (typeof input.title !== "string" || typeof input.summary !== "string" || typeof input.content !== "string" ||
-    typeof input.scope !== "string" ||
-    !(allowed as readonly string[]).includes(input.type as string)) {
-    throw new Error("Memory extractor returned invalid content");
-  }
-  const type = input.type as StoredType;
-  const title = input.title.trim();
-  const summary = input.summary.trim();
-  const content = input.content.trim();
-  const scope = input.scope.trim();
-  if (!title || !summary || !content || !scope) throw new Error("Memory extractor returned empty content");
-  return { title, summary, content, type, scope };
-}
-
 type DreamSource = { entry: IndexEntry; content: string; revision: string; type: StoredType };
 
 type DreamTransformManifestAction = {
@@ -482,54 +426,38 @@ type DreamManifestAction = DreamTransformManifestAction | DreamPruneManifestActi
 
 // Validates the selector's single group against the in-memory candidate view.
 // Returns undefined for a legitimate "none"; throws on malformed selections.
-function validateDreamSelection(value: unknown, candidates: Map<string, DreamSource>): {
+type DreamSelection = { action: "none" } | { action: "synthesize" | "prune"; files: string[]; reason: string };
+
+function validateDreamSelection(value: DreamSelection, candidates: Map<string, DreamSource>): {
   action: "synthesize" | "prune";
   files: string[];
   reason: string;
   type: StoredType;
 } | undefined {
-  if (!value || typeof value !== "object") throw new Error("Memory dream selector returned no object");
-  const action = (value as Record<string, unknown>).action;
-  if (action === "none") return undefined;
-  if (action !== "synthesize" && action !== "prune") {
-    throw new Error("Memory dream selector returned an invalid action");
-  }
-  const files = (value as Record<string, unknown>).files;
+  if (value.action === "none") return undefined;
+  const { action, files, reason } = value;
   const minimum = action === "prune" ? 1 : 2;
-  if (!Array.isArray(files) || files.length < minimum || files.length > CONSOLIDATION_BATCH ||
-    new Set(files).size !== files.length || !files.every((file) => typeof file === "string")) {
+  if (files.length < minimum || new Set(files).size !== files.length) {
     throw new Error("Memory dream selector returned an invalid group");
   }
   if (!files.every((file) => candidates.has(file))) {
     throw new Error("Memory dream selector named an unknown or ineligible topic");
   }
-  const reason = (value as Record<string, unknown>).reason;
-  if (typeof reason !== "string" || !reason.trim()) throw new Error("Memory dream selector returned no reason");
   const types = new Set(files.map((file) => candidates.get(file)!.type));
   return { action, files, reason: reason.trim(), type: types.size === 1 ? [...types][0]! : "insight" };
 }
 
-function validatePruneVerdicts(value: unknown, nominated: string[]): PruneVerdict[] {
-  if (!value || typeof value !== "object") throw new Error("Memory prune curator returned no object");
-  const verdicts = (value as { verdicts?: unknown }).verdicts;
-  if (!Array.isArray(verdicts) || verdicts.length !== nominated.length) {
+function validatePruneVerdicts({ verdicts }: { verdicts: PruneVerdict[] }, nominated: string[]): PruneVerdict[] {
+  if (verdicts.length !== nominated.length) {
     throw new Error("Memory prune curator returned an invalid verdict set");
   }
   const expected = new Set(nominated);
   const seen = new Set<string>();
-  return verdicts.map((raw) => {
-    if (!raw || typeof raw !== "object") throw new Error("Memory prune curator returned an invalid verdict");
-    const record = raw as Record<string, unknown>;
-    if (typeof record.file !== "string" || !expected.has(record.file) || seen.has(record.file)) {
+  return verdicts.map((record) => {
+    if (!expected.has(record.file) || seen.has(record.file)) {
       throw new Error("Memory prune curator returned an unknown or duplicate filename");
     }
     seen.add(record.file);
-    if (record.verdict !== "keep" && record.verdict !== "remove") throw new Error("Memory prune curator returned an invalid verdict");
-    if (!(PRUNE_CATEGORIES as readonly unknown[]).includes(record.category)) throw new Error("Memory prune curator returned an invalid category");
-    if (typeof record.reason !== "string" || !record.reason.trim()) throw new Error("Memory prune curator returned no reason");
-    if (!Array.isArray(record.evidence) || !record.evidence.every((item) => typeof item === "string" && item.trim())) {
-      throw new Error("Memory prune curator returned invalid evidence paths");
-    }
     const evidence = record.evidence.map((item) => item.trim());
     const requiresEvidence = record.category === "repo_recoverable_state" || record.category === "superseded";
     if (record.verdict === "remove" && (record.category === "retain" || requiresEvidence && evidence.length === 0)) {
@@ -546,7 +474,7 @@ function validatePruneVerdicts(value: unknown, nominated: string[]): PruneVerdic
     return {
       file: record.file,
       verdict: record.verdict,
-      category: record.category as PruneCategory,
+      category: record.category,
       reason: record.reason.trim(),
       evidence,
     };
@@ -604,7 +532,7 @@ Exclude current tasks, plans, procedural steps, routine completion/test/review r
 
 An existing insight remains an insight: distinguish its derived conclusions from user-stated facts.
 
-Use only the space needed for the complete topic, preserving conditions, exceptions, and rationale. Short paragraphs or bullets are welcome; omit frontmatter and absolute dates. Include a scope and a concise one-line index summary describing the topic's coverage and distinctive retrieval terms, not every fact.`;
+Use only the space needed for the complete topic, preserving conditions, exceptions, and rationale. Short paragraphs or bullets are welcome; omit frontmatter. Include a scope and a concise one-line index summary describing the topic's coverage and distinctive retrieval terms, not every fact.`;
 
 const DREAM_SELECTOR_SYSTEM = "You are a project-memory consolidation selector. Return only the requested structured result.";
 const DREAM_CURATOR_SYSTEM = "You are a project-memory curator. Return only the requested structured result.";
@@ -707,12 +635,7 @@ const MemoryPlugin: Plugin = async ({ client, directory }, options) => {
 
   const readSettings = async (): Promise<{ enabled?: boolean; dream_auto?: boolean }> => {
     const file = Bun.file(settingsPath);
-    if (!(await file.exists())) return {};
-    try {
-      return await file.json();
-    } catch {
-      return {};
-    }
+    return await file.exists() ? file.json() : {};
   };
 
   const enabled = async () => (await readSettings()).enabled !== false;
@@ -870,9 +793,7 @@ const MemoryPlugin: Plugin = async ({ client, directory }, options) => {
   };
 
   const restoreSnapshot = (state: SessionState, snapshot: SourceSnapshot) => {
-    const source = state.source;
-    source.prompts.unshift(...snapshot.prompts);
-    while (Buffer.byteLength(source.prompts.join("\n\n")) > PROMPT_BYTES) source.prompts.shift();
+    state.source.prompts.unshift(...snapshot.prompts);
   };
 
   // Queue an index update (or a null tombstone for a removed topic) for the
@@ -892,9 +813,9 @@ const MemoryPlugin: Plugin = async ({ client, directory }, options) => {
     }
   };
 
-  type WorkerActivity = "classification" | "extraction" | "maintenance" | "dream";
+  type WorkerActivity = "classification" | "extraction" | "dream";
 
-  const runWorker = async (
+  const runWorker = async <Result,>(
     parentID: string,
     model: WorkerModel,
     schema: object,
@@ -940,7 +861,7 @@ const MemoryPlugin: Plugin = async ({ client, directory }, options) => {
       });
       if (!response.data) throw new Error(`Memory worker failed: ${memoryErrorMessage(signal.aborted ? signal.reason : response.error)}`);
       completed = true;
-      return response.data.info.structured;
+      return response.data.info.structured as Result;
     } finally {
       if (!completed) {
         await workerClient.session.abort({ path: { id: sessionID }, query: { directory } }).catch(() => {});
@@ -957,14 +878,15 @@ const MemoryPlugin: Plugin = async ({ client, directory }, options) => {
     index: string;
   }) => {
     try {
-      return validateDecisions(await runWorker(
+      const result = await runWorker<{ decisions: Decision[] }>(
         input.sessionID,
         input.model,
         SAVE_CLASSIFIER_SCHEMA,
         "You are a project-memory classifier. Return only the requested structured result.",
         classifierPrompt(input),
         "classification",
-      ));
+      );
+      return result.decisions;
     } catch (error) {
       await log("warn", "Memory classification failed", { error: error instanceof Error ? error.message : String(error) });
       return undefined;
@@ -974,7 +896,6 @@ const MemoryPlugin: Plugin = async ({ client, directory }, options) => {
   const saveLearning = async (
     sessionID: string,
     decision: Decision,
-    expectedRevision: string | undefined,
     expectedContent: string | undefined,
     extracted: ExtractorResult,
   ) => {
@@ -990,7 +911,7 @@ const MemoryPlugin: Plugin = async ({ client, directory }, options) => {
         const currentFile = Bun.file(join(memoryDirectory, file));
         if (!(await currentFile.exists())) return false;
         previousContent = await currentFile.text();
-        if (revisionOf(previousContent) !== expectedRevision || previousContent !== expectedContent) return false;
+        if (previousContent !== expectedContent) return false;
       } else {
         const slug = extracted.title.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 48) || "memory";
         file = `${slug}-${crypto.randomUUID().replaceAll("-", "").slice(0, 8)}.md`;
@@ -999,7 +920,6 @@ const MemoryPlugin: Plugin = async ({ client, directory }, options) => {
       const revision = crypto.randomUUID().replaceAll("-", "");
       const updatedAt = isoDate();
       const topicPath = join(memoryDirectory, file);
-      if (!(await enabled())) return "disabled" as const;
       await atomicWrite(topicPath, topicContent(revision, extracted, sessionID, updatedAt));
       const entry: IndexEntry = {
         title: extracted.title,
@@ -1008,11 +928,6 @@ const MemoryPlugin: Plugin = async ({ client, directory }, options) => {
         metadata: { type: extracted.type, scope: extracted.scope, updated: updatedAt },
       };
       try {
-        if (!(await enabled())) {
-          if (previousContent === undefined) await rm(topicPath, { force: true });
-          else await atomicWrite(topicPath, previousContent);
-          return "disabled" as const;
-        }
         await atomicWrite(indexPath, updateIndex(currentIndex, entry, decision.action === "replace" ? file : undefined));
         queueDelta(sessionID, file, entry);
         // Ordinary creates and replacements feed the auto-dream gate. The
@@ -1035,7 +950,6 @@ const MemoryPlugin: Plugin = async ({ client, directory }, options) => {
     sessionID: string,
     decision: Decision,
     snapshot: SourceSnapshot,
-    expectedRevision?: string,
     existingContent?: string,
   ) => {
     const model = extractorModel;
@@ -1046,7 +960,7 @@ const MemoryPlugin: Plugin = async ({ client, directory }, options) => {
         ? `${subjectBlock}\n\n${sourceText(snapshot)}`
         : `${subjectBlock}\n\n<existing_topic current_type="${typeOf(existingContent)}">\n${existingContent}\n</existing_topic>\n\n${sourceText(snapshot)}`;
       const insight = existingContent !== undefined && typeOf(existingContent) === "insight";
-      const result = await runWorker(
+      const result = await runWorker<ExtractorResult>(
         sessionID,
         model,
         insight ? DREAM_OUTPUT_SCHEMA : EXTRACTOR_SCHEMA,
@@ -1054,10 +968,8 @@ const MemoryPlugin: Plugin = async ({ client, directory }, options) => {
         promptBody,
         "extraction",
       );
-      const extracted = insight
-        ? validateExtraction({ ...result as Record<string, unknown>, type: "insight" }, ["insight"])
-        : validateExtraction(result);
-      const saved = await saveLearning(sessionID, decision, expectedRevision, existingContent, extracted);
+      const extracted = insight ? { ...result, type: "insight" as const } : result;
+      const saved = await saveLearning(sessionID, decision, existingContent, extracted);
       if (saved === false) await log("info", "Skipped stale memory update", { target: decision.target });
       return saved;
     } catch (error) {
@@ -1338,9 +1250,9 @@ const MemoryPlugin: Plugin = async ({ client, directory }, options) => {
       let selection: ReturnType<typeof validateDreamSelection> = undefined;
       let rejectedSelection: string | undefined;
       for (let attempt = 0; attempt < 2; attempt++) {
-        let rawSelection: unknown;
+        let rawSelection: DreamSelection;
         try {
-          rawSelection = await runWorker(
+          rawSelection = await runWorker<DreamSelection>(
             input.sessionID,
             model,
             DREAM_SELECTOR_SCHEMA,
@@ -1388,7 +1300,7 @@ const MemoryPlugin: Plugin = async ({ client, directory }, options) => {
       if (chosen.action === "prune") {
         let verdicts: PruneVerdict[];
         try {
-          verdicts = validatePruneVerdicts(await runWorker(
+          verdicts = validatePruneVerdicts(await runWorker<{ verdicts: PruneVerdict[] }>(
             input.sessionID,
             model,
             DREAM_PRUNE_SCHEMA,
@@ -1448,10 +1360,6 @@ const MemoryPlugin: Plugin = async ({ client, directory }, options) => {
                 await rename(join(memoryDirectory, source.entry.file), join(quarantineDirectory, source.entry.file));
                 moved.push(source);
               }
-              if (!(await enabled())) {
-                await rollbackMoved();
-                return { kind: "disabled" };
-              }
               await atomicWrite(indexPath, removeFromIndex(currentIndex, new Set(removals.keys())));
             } catch (error) {
               await rollbackMoved().catch(() => {});
@@ -1498,10 +1406,10 @@ const MemoryPlugin: Plugin = async ({ client, directory }, options) => {
 
       let produced: ExtractorResult;
       try {
-        produced = validateExtraction({
-          ...(await runWorker(input.sessionID, model, DREAM_OUTPUT_SCHEMA, DREAM_CURATOR_SYSTEM, `${DREAM_SYNTHESIS_PROMPT}\n\nResult type: ${chosen.type}.\n\n${topics}`, "dream") as Record<string, unknown>),
+        produced = {
+          ...await runWorker<Omit<ExtractorResult, "type">>(input.sessionID, model, DREAM_OUTPUT_SCHEMA, DREAM_CURATOR_SYSTEM, `${DREAM_SYNTHESIS_PROMPT}\n\nResult type: ${chosen.type}.\n\n${topics}`, "dream"),
           type: chosen.type,
-        }, [chosen.type]);
+        };
       } catch (error) {
         abortReason = error instanceof Error ? error.message : String(error);
         break;
@@ -1799,16 +1707,14 @@ const MemoryPlugin: Plugin = async ({ client, directory }, options) => {
   };
 
   const launchExtraction = async (sessionID: string, decision: Decision, snapshot: SourceSnapshot): Promise<"saved" | "disabled" | false> => {
-    let expectedRevision: string | undefined;
     let existingContent: string | undefined;
     if (decision.action === "replace") {
       if (!decision.target || basename(decision.target) !== decision.target) return false;
       const target = Bun.file(join(memoryDirectory, decision.target));
       if (!(await target.exists())) return false;
       existingContent = await target.text();
-      expectedRevision = revisionOf(existingContent);
     }
-    const result = await extract(sessionID, decision, snapshot, expectedRevision, existingContent);
+    const result = await extract(sessionID, decision, snapshot, existingContent);
     if (result === "saved") {
       scheduleMaintenance(sessionID);
       track(dreamTick());
@@ -2056,17 +1962,16 @@ const MemoryPlugin: Plugin = async ({ client, directory }, options) => {
             resetState(state);
             return;
           }
-          // Checkpoint the PREVIOUSLY buffered user turns (excluding this new
-          // prompt) when interval is due, then buffer the new prompt. A turn
-          // count of at least `interval` always has buffered prompts, since
-          // every counted turn pushed one and resets clear both together; the
-          // revision check additionally requires unreviewed source.
-          if (state.turnsSinceSave >= interval && !state.saveInFlight && state.sourceRevision > state.reviewedRevision) {
+          // Checkpoint completed turns before buffering the new prompt. Size
+          // triggers an earlier checkpoint, never truncation or dropped turns.
+          const due = state.turnsSinceSave >= interval || Buffer.byteLength(state.source.prompts.join("\n\n")) >= CHECKPOINT_BYTES;
+          if (due && !state.saveInFlight && state.sourceRevision > state.reviewedRevision) {
             state.saveInFlight = true;
             checkpoint = { snapshot: takeSnapshot(state), index: await indexContext() };
             state.turnsSinceSave = 0;
           }
-          if (pushBounded(state.source.prompts, prompt, PROMPT_BYTES)) state.sourceRevision += 1;
+          state.source.prompts.push(prompt);
+          state.sourceRevision += 1;
           state.turnsSinceSave += 1;
         });
         if (checkpoint) launchSaveClassification(input.sessionID, state, checkpoint.snapshot, checkpoint.index);

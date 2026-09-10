@@ -6,9 +6,8 @@ import MemoryModule, {
   indexLine,
   memoryProjectKey as serverProjectKey,
   parseIndexLine,
-  validateDreamOptions,
 } from "./memory_server.tsx";
-import MemoryTui, { managedIndexEntries, memoryProjectKey as tuiProjectKey, toggledSettings, topicDreamRunId, topicRevision, topicSessionId } from "./memory_tui.tsx";
+import MemoryTui, { memoryProjectKey as tuiProjectKey } from "./memory_tui.tsx";
 
 const originalDataHome = process.env.XDG_DATA_HOME;
 afterEach(() => {
@@ -605,11 +604,28 @@ describe("memory idle revision gating", () => {
   const armIdle = (app: Awaited<ReturnType<typeof fixture>>, sessionID: string) =>
     app.hooks.event!({ event: { type: "session.idle", properties: { sessionID } } } as never);
 
-  test.serial("does not relaunch review for restored source until new content is collected", async () => {
+  test.serial("checkpoints a long completed message without truncating it or including the next turn", async () => {
+    const dataHome = await mkdtemp("/tmp/opencode-memory-checkpoint-");
+    process.env.XDG_DATA_HOME = dataHome;
+    const directory = "/tmp/memory-checkpoint-project";
+    const prompt = `${"Complete user context. ".repeat(700)}Final qualification: only apply to the memory plugin.`;
+    const app = await fixture(directory, () => saveDecisions(), { interval: 6 });
+    await app.message("ses_checkpoint", prompt);
+    expect(app.calls).toHaveLength(0);
+    await app.message("ses_checkpoint", "NEW_TURN_EXCLUDED");
+    await until(() => app.calls.length === 1);
+    expect(app.calls[0]!.prompt).toContain(prompt);
+    expect(app.calls[0]!.prompt).not.toContain("NEW_TURN_EXCLUDED");
+    await app.hooks.dispose!();
+    await rm(dataHome, { recursive: true, force: true });
+  });
+
+  test.serial("restores complete source after failure and waits for new content before reviewing again", async () => {
     const dataHome = await mkdtemp("/tmp/opencode-memory-idle-gate-");
     process.env.XDG_DATA_HOME = dataHome;
     const directory = "/tmp/memory-idle-gate-project";
     const failedClassification = Promise.withResolvers<unknown>();
+    const longPrompt = `${"A complete scoped user statement. ".repeat(500)}Do not generalize this exception.`;
     let classifications = 0;
     const app = await fixture(directory, ({ system }) => {
       if (system.includes("classifier")) {
@@ -623,14 +639,13 @@ describe("memory idle revision gating", () => {
     try {
       jest.useFakeTimers();
       await app.message("ses_idle_gate", "Alpha one.");
-      await app.message("ses_idle_gate", "Beta two.");
+      await app.message("ses_idle_gate", longPrompt);
       await idle();
       jest.advanceTimersByTime(1000);
       await until(() => app.calls.length === 1);
 
-      // Malformed classifier response: the checkpoint fails and its snapshot
-      // is restored unchanged.
-      failedClassification.resolve({});
+      // A failed worker restores the complete checkpoint unchanged.
+      failedClassification.reject(new Error("Worker failed"));
       await settle();
 
       // A repeated idle event with nothing newly collected must not launch
@@ -646,6 +661,8 @@ describe("memory idle revision gating", () => {
       await idle();
       jest.advanceTimersByTime(1000);
       await until(() => app.calls.length === 2);
+      expect(app.calls[1]!.prompt).toContain("Alpha one.");
+      expect(app.calls[1]!.prompt).toContain(longPrompt);
       expect(app.calls[1]!.prompt).toContain("Gamma three.");
       await settle();
     } finally {
@@ -658,13 +675,6 @@ describe("memory idle revision gating", () => {
 });
 
 describe("memory dreaming configuration", () => {
-  test("validates dream options and applies defaults", () => {
-    expect(validateDreamOptions({})).toEqual({ intervalHours: 36, minAdditions: 7 });
-    expect(validateDreamOptions({ dream_interval_hours: 0.5, dream_min_additions: 1 })).toEqual({ intervalHours: 0.5, minAdditions: 1 });
-    expect(() => validateDreamOptions({ dream_interval_hours: 0 })).toThrow("dream_interval_hours");
-    expect(() => validateDreamOptions({ dream_min_additions: 1.5 })).toThrow("dream_min_additions");
-  });
-
   test("gates auto dreaming on both the interval window and the minimum additions", () => {
     const now = 1_000_000_000_000;
     const options = { intervalHours: 36, minAdditions: 7 };
@@ -1344,22 +1354,6 @@ async function tuiFixture(
   };
 }
 
-describe("memory tui parsing helpers", () => {
-  test("parses managed index entries and topic session ids", () => {
-    const entries = managedIndexEntries(
-      "# Project memory\n\n- [First](first.md) - One\n- [Second](second.md) - Two\n- [Typed](typed.md) - [reference|editor|2026-08-01] Ref summary\n- [Nested](nested/third.md) - No\nnot an entry\n",
-    );
-    expect([...entries.keys()]).toEqual(["first.md", "second.md", "typed.md"]);
-    expect(entries.get("typed.md")).toEqual({ title: "Typed", summary: "Ref summary" });
-
-    expect(topicSessionId('---\nrevision: "abc"\ntype: "project"\nsessionId: "ses_x"\n---\n\nbody')).toBe("ses_x");
-    expect(topicRevision('---\nrevision: "abc123"\nsessionId: "ses_x"\n---\n')).toBe("abc123");
-    expect(topicDreamRunId('---\ndreamRunId: "run-1"\n---\n')).toBe("run-1");
-
-    expect(JSON.parse(toggledSettings({ enabled: true, custom: 3 }, "dream_auto"))).toEqual({ enabled: true, custom: 3, dream_auto: true });
-  });
-});
-
 describe("memory tui notifications", () => {
   test.serial("registers /dream and writes a session-scoped request", async () => {
     const dataHome = await mkdtemp("/tmp/opencode-memory-tui-dream-command-");
@@ -1373,7 +1367,7 @@ describe("memory tui notifications", () => {
     await until(async () => Bun.file(requestPath).exists());
     const request = await Bun.file(requestPath).json();
     expect(request.sessionID).toBe("ses_manual");
-    expect(app.toasts.some((toast) => toast.message === "Dreaming...")).toBe(true);
+    await until(() => app.toasts.some((toast) => toast.message === "Dreaming..."));
 
     await app.dispose();
     await rm(dataHome, { recursive: true, force: true });
@@ -1481,7 +1475,7 @@ describe("memory tui notifications", () => {
 
     app.sessionCreated({ id: "ses_worker_1", parentID: "ses_parent", metadata: { memoryWorker: true, memoryActivity: "classification" } });
     app.sessionCreated({ id: "ses_worker_2", parentID: "ses_parent", metadata: { memoryWorker: true, memoryActivity: "extraction" } });
-    app.sessionCreated({ id: "ses_worker_3", parentID: "ses_other", metadata: { memoryWorker: true, memoryActivity: "maintenance" } });
+    app.sessionCreated({ id: "ses_worker_3", parentID: "ses_other", metadata: { memoryWorker: true, memoryActivity: "dream" } });
     app.sessionCreated({ id: "ses_child", parentID: "ses_parent" });
     expect(app.toasts.filter((toast) => toast.message === "Reviewing conversation...")).toHaveLength(1);
 

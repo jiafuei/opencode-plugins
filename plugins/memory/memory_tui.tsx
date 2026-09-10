@@ -89,10 +89,10 @@ export function toggledSettings(current: unknown, key: "enabled" | "dream_auto")
 // Concise operation counts for the dream completion toast.
 export function dreamCountsMessage(counts: Record<string, unknown> | undefined): string {
   const parts: string[] = [];
-  const labels = [["synthesize", "synthesized", "synthesized"], ["prune", "pruned", "pruned"]] as const;
-  for (const [key, one, many] of labels) {
+  const labels = [["synthesize", "synthesized"], ["prune", "pruned"]] as const;
+  for (const [key, label] of labels) {
     const count = counts?.[key];
-    if (typeof count === "number" && count > 0) parts.push(`${count} ${count === 1 ? one : many}`);
+    if (typeof count === "number" && count > 0) parts.push(`${count} ${label}`);
   }
   return parts.join(", ");
 }
@@ -119,14 +119,7 @@ async function atomicWrite(filePath: string, content: string): Promise<void> {
 
 async function readSettings(directory: string): Promise<{ enabled: boolean; dream_auto: boolean; raw: unknown }> {
   const file = Bun.file(join(directory, SETTINGS_FILE));
-  let raw: unknown;
-  if (await file.exists()) {
-    try {
-      raw = await file.json();
-    } catch {
-      raw = undefined;
-    }
-  }
+  const raw: unknown = await file.exists() ? await file.json() : undefined;
   const settings = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
   return { enabled: settings.enabled !== false, dream_auto: settings.dream_auto === true, raw };
 }
@@ -531,7 +524,7 @@ const MemoryTuiPlugin: TuiPlugin = async (api) => {
       parents.delete(oldest);
     }
     // Every checkpoint runs exactly one classifier worker, so no dedupe is
-    // needed; extraction and maintenance workers stay silent.
+    // needed; extraction and dream workers stay silent.
     if (info.metadata.memoryActivity !== "classification") return;
     api.ui.toast({ variant: "info", title: "Memory", message: "Reviewing conversation..." });
   });
