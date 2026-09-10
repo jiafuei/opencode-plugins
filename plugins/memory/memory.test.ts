@@ -266,6 +266,34 @@ describe("memory persistence", () => {
     await rm(dataHome, { recursive: true, force: true });
   });
 
+  test.serial("updates a long insight without truncating facts or promoting its type", async () => {
+    const dataHome = await mkdtemp("/tmp/opencode-memory-test-");
+    process.env.XDG_DATA_HOME = dataHome;
+    const directory = "/tmp/memory-insight-update-project";
+    const facts = Array.from({ length: 80 }, (_, i) => `- Condition ${i}: retain this scoped observation and its exception.`).join("\n");
+    const existing = seededTopic("abc1234", facts, "insight");
+    const path = await store(dataHome, directory, [{ file: "insight.md", title: "Existing insight", content: existing }]);
+    const summary = "Conditions, scoped observations, and exceptions governing project memory updates; covers the distinction between derived conclusions and explicitly stated user preferences, plus their application to future work.";
+    const content = `${facts}\n\nThe user clarified that this applies to memory updates only.`;
+    const app = await fixture(directory, ({ system, prompt }) => {
+      if (system.includes("classifier")) return saveDecisions(replaceDecision("insight.md", "memory update scope"));
+      expect(prompt).toContain(existing);
+      return { title: "Updated insight", summary, content, scope: "plugins/memory" };
+    });
+    await app.message("ses_insight", "This applies to memory updates only.");
+    await app.message("ses_insight", "Keep the existing conditions and exceptions.");
+    await app.message("ses_insight", "Continue.");
+    const indexPath = join(path, "index.md");
+    await until(async () => (await Bun.file(indexPath).text()).includes("[Updated insight]"));
+    await app.hooks.dispose!();
+
+    const topic = await Bun.file(join(path, "insight.md")).text();
+    expect(topic).toContain('type: "insight"');
+    expect(topic).toContain(content);
+    expect(await Bun.file(indexPath).text()).toContain(summary);
+    await rm(dataHome, { recursive: true, force: true });
+  });
+
   test.serial("does not persist or maintain when disabled during extraction", async () => {
     const dataHome = await mkdtemp("/tmp/opencode-memory-test-");
     process.env.XDG_DATA_HOME = dataHome;
@@ -740,22 +768,24 @@ describe("memory manual dreaming", () => {
     await rm(dataHome, { recursive: true, force: true });
   });
 
-  test.serial("synthesizes replacements across iterations and retains source history only in the manifest", async () => {
+  test.serial("synthesizes complete replacements across iterations without source history", async () => {
     const dataHome = await mkdtemp("/tmp/opencode-memory-dream-run-");
     process.env.XDG_DATA_HOME = dataHome;
     const directory = "/tmp/memory-dream-run-project";
+    const sourceBody = Array.from({ length: 600 }, (_, i) => `Observation ${i}: the shared pattern has this condition and qualification.`).join("\n");
+    const synthesizedBody = Array.from({ length: 80 }, (_, i) => `- Fact ${i}: retain its distinct condition and qualification.`).join("\n");
     const path = await store(dataHome, directory, [
       { file: "a.md", title: "Alpha plan", summary: "[recap|project|2026-08-01] Alpha summary", content: seededTopic("aaaa1111", "ALPHA_BODY_ONE shared duplicate fact") },
       { file: "b.md", title: "Alpha variant", summary: "[recap|project|2026-08-01] Alpha variant summary", content: seededTopic("bbbb2222", "ALPHA_BODY_TWO shared duplicate fact") },
       { file: "c.md", title: "Gamma outcome", summary: "[recap|project|2026-08-01] Gamma summary", content: seededTopic("cccc3333", "GAMMA_BODY outdated claim") },
-      { file: "d.md", title: "Delta note", summary: "[insight|project|2026-08-01] Delta summary", content: seededTopic("dddd4444", "DELTA_BODY stable note", "insight") },
+      { file: "d.md", title: "Delta note", summary: "[insight|project|2026-08-01] Delta summary", content: seededTopic("dddd4444", sourceBody, "insight") },
     ]);
     await Bun.write(join(path, ".dream.request"), JSON.stringify({ requestID: "req-big", sessionID: "ses_dreamer" }));
 
     const findPrefix = async (prefix: string) => (await readdir(path)).find((name) => name.startsWith(prefix))!;
     let selections = 0;
     let curations = 0;
-    const app = await fixture(directory, async ({ system }) => {
+    const app = await fixture(directory, async ({ system, prompt }) => {
       if (isDreamSelector(system)) {
         selections += 1;
         if (selections === 1) return { action: "synthesize", files: ["a.md", "b.md"], reason: "duplicate alpha recaps" };
@@ -767,7 +797,8 @@ describe("memory manual dreaming", () => {
         curations += 1;
         if (curations === 1) return memoryExtraction({ title: "Merged alpha" });
         if (curations === 2) return memoryExtraction({ title: "Superseding gamma" });
-        return memoryExtraction({ title: "Cross-topic insight" });
+        expect(prompt).toContain(sourceBody);
+        return memoryExtraction({ title: "Cross-topic insight", content: synthesizedBody });
       }
       return saveDecisions();
     });
@@ -799,10 +830,11 @@ describe("memory manual dreaming", () => {
     expect(insightContent).toContain('type: "insight"');
     expect(insightContent).toContain('sessionId: "ses_dreamer"');
     expect(insightContent).not.toContain("sources:");
-    expect(manifest.actions[2].sources).toEqual([
-      { file: superseded, revision: manifest.actions[1].output.revision },
-      { file: "d.md", revision: "dddd4444" },
-    ]);
+    expect(insightContent).toContain(synthesizedBody);
+    for (const action of manifest.actions) {
+      expect(action.sources).toBeUndefined();
+      expect(action.output.revision).toBeUndefined();
+    }
 
     expect(manifest.actions[0].output.type).toBe("recap");
     expect(status.counts).toEqual({ synthesize: 3, prune: 0 });
