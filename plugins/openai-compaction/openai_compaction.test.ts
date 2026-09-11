@@ -11,6 +11,7 @@ import {
   type ResponsesBody,
 } from "./openai_compaction_shared.ts";
 import plugin from "./openai_compaction.ts";
+import { mkdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -303,7 +304,7 @@ describe("plugin", () => {
       latestTokens?: number;
       latestProviderID?: string;
       latestModelID?: string;
-      messagesFail?: boolean;
+      messagesFail?: "throw" | "response";
       threshold?: number | `${number}%`;
       providerID?: string;
       additionalProviders?: string[];
@@ -347,7 +348,8 @@ describe("plugin", () => {
           app: { log: async () => {} },
           session: {
             messages: async () => {
-              if (overrides.messagesFail) throw new Error("messages unavailable");
+              if (overrides.messagesFail === "throw") throw new Error("messages unavailable");
+              if (overrides.messagesFail === "response") return { error: new Error("messages unavailable") };
               return {
                 data: [
                   {
@@ -398,11 +400,11 @@ describe("plugin", () => {
     const patched = globalThis.fetch;
 
     const headers: Record<string, string> = {};
-    await hooks["chat.headers"](
+    const track = (messageID = USER_MESSAGE_ID) => hooks["chat.headers"](
       {
         sessionID: "ses_1",
         agent: "build",
-        message: { id: USER_MESSAGE_ID, model: { variant: "high" } },
+        message: { id: messageID, model: { variant: "high" } },
         model: {
           providerID: overrides.providerID ?? "openai",
           id: "gpt-5.5",
@@ -411,6 +413,7 @@ describe("plugin", () => {
       },
       { headers },
     );
+    await track();
 
     const send = (input: unknown[]) =>
       patched(overrides.endpoint ?? ENDPOINT, {
@@ -423,6 +426,7 @@ describe("plugin", () => {
       calls,
       partUpdates,
       headers,
+      track,
       send,
       emit: hooks.event,
       decide: async () => {
@@ -555,16 +559,22 @@ describe("plugin", () => {
     await harness.dispose();
   });
 
-  test("passes through when the latest OpenCode count cannot be loaded", async () => {
-    const harness = await createHarness({
-      contextLimit: 1_000,
-      threshold: 0.5,
-      messagesFail: true,
-    });
-    await harness.send(history(6));
-
-    expect(harness.calls).toHaveLength(1);
-    await harness.dispose();
+  test.each(["throw", "response"] as const)("surfaces usage lookup errors (%s)", async (mode) => {
+    const overrides: { messagesFail?: "throw" | "response" } = {};
+    const harness = await createHarness(overrides);
+    try {
+      overrides.messagesFail = mode;
+      await harness.emit({
+        event: {
+          type: "message.removed",
+          properties: { sessionID: "ses_1", messageID: "msg_previous" },
+        },
+      });
+      await expect(harness.track()).rejects.toThrow("messages unavailable");
+      expect(harness.calls).toHaveLength(0);
+    } finally {
+      await harness.dispose();
+    }
   });
 
   test("uses the latest OpenCode count after a model switch", async () => {
@@ -622,35 +632,93 @@ describe("plugin", () => {
     await harness.dispose();
   });
 
-  test("sends the original request when the compact endpoint fails", async () => {
-    const harness = await createHarness({ compact: () => new Response("nope", { status: 404 }) });
-    const items = history(6);
-    await harness.send(items);
+  test.each(["http", "network"])("retries failed compaction on the next user turn (%s)", async (mode) => {
+    let failed = true;
+    const harness = await createHarness({
+      compact: () => {
+        if (failed) {
+          if (mode === "network") throw new Error("connection reset");
+          return new Response("unavailable", { status: 503 });
+        }
+        return Response.json({ output: [{ type: "compaction", encrypted_content: "opaque" }] });
+      },
+    });
+    try {
+      const items = history(6);
+      await harness.send(items);
 
-    expect(harness.calls).toHaveLength(2);
-    expect(sentInput(harness.calls[1])).toEqual(items);
-    expect(harness.partUpdates.at(-1)?.body.text).toBe("--- Context compaction failed ---");
+      expect(harness.calls).toHaveLength(2);
+      expect(sentInput(harness.calls[1])).toEqual(items);
+      expect(harness.partUpdates.at(-1)?.body.text).toBe("--- Context compaction failed ---");
+      expect(await harness.decide()).toBe("compact");
 
-    harness.calls.length = 0;
-    await harness.send(items);
-    expect(harness.calls).toHaveLength(1);
-    expect(sentInput(harness.calls[0])).toEqual(items);
-    await harness.dispose();
+      failed = false;
+      harness.calls.length = 0;
+      await harness.track();
+      await harness.send(items);
+      expect(harness.calls).toHaveLength(1);
+      expect(sentInput(harness.calls[0])).toEqual(items);
+
+      harness.calls.length = 0;
+      await harness.track("msg_next_user");
+      await harness.send([...items, user("continue")]);
+      expect(harness.calls).toHaveLength(2);
+      expect(sentInput(harness.calls[1])[0]).toEqual({ type: "compaction", encrypted_content: "opaque" });
+      expect(await harness.decide()).toBe("continue");
+    } finally {
+      await harness.dispose();
+    }
   });
 
-  test("stops rewriting after the provider rejects a freshly compacted payload", async () => {
-    const harness = await createHarness({ main: () => new Response("bad request", { status: 400 }) });
-    const items = history(6);
-    await harness.send(items);
+  test.each([400, 422])("preserves and replays the window after a generic %s rejection", async (status) => {
+    const harness = await createHarness({ main: () => new Response("bad request", { status }) });
+    try {
+      const items = history(6);
+      expect((await harness.send(items)).status).toBe(status);
 
-    expect(harness.calls).toHaveLength(2);
-    expect(await stateFile(harness).exists()).toBe(false);
+      expect(harness.calls).toHaveLength(2);
+      const stored = await stateFile(harness).json();
+      const rewritten = sentInput(harness.calls[1]);
 
-    harness.calls.length = 0;
-    await harness.send(items);
-    expect(harness.calls).toHaveLength(1);
-    expect(sentInput(harness.calls[0])).toEqual(items);
-    await harness.dispose();
+      harness.calls.length = 0;
+      expect((await harness.send(items)).status).toBe(status);
+      expect(harness.calls).toHaveLength(1);
+      expect(sentInput(harness.calls[0])).toEqual(rewritten);
+      expect(await stateFile(harness).json()).toEqual(stored);
+    } finally {
+      await harness.dispose();
+    }
+  });
+
+  test("surfaces malformed state instead of treating it as absent", async () => {
+    const harness = await createHarness();
+    try {
+      await Bun.write(stateFile(harness), "{");
+      await expect(harness.send(history(6))).rejects.toBeInstanceOf(SyntaxError);
+      expect(harness.calls).toHaveLength(0);
+    } finally {
+      await harness.dispose();
+    }
+  });
+
+  test("surfaces state write errors and retries persistence instead of caching unsaved state", async () => {
+    const harness = await createHarness();
+    try {
+      await harness.send([user("start")]);
+      const path = stateFile(harness).name!;
+      await mkdir(path, { recursive: true });
+      harness.calls.length = 0;
+      await expect(harness.send(history(6))).rejects.toMatchObject({ code: "EISDIR" });
+      expect(harness.calls).toHaveLength(1);
+
+      await rm(path, { recursive: true });
+      harness.calls.length = 0;
+      await harness.send(history(6));
+      expect(harness.calls).toHaveLength(2);
+      expect(await stateFile(harness).exists()).toBe(true);
+    } finally {
+      await harness.dispose();
+    }
   });
 
   test("leaves untagged requests untouched", async () => {

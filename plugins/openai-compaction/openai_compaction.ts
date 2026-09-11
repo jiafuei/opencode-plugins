@@ -156,14 +156,17 @@ const OpenAICompactionPlugin: CompactionPlugin = async ({ client, project, direc
     if (states.has(sessionID)) return states.get(sessionID);
     const state = (await Bun.file(statePath(root, sessionID))
       .json()
-      .catch(() => undefined)) as CompactionState | undefined;
+      .catch((error) => {
+        if (error.code === "ENOENT") return undefined;
+        throw error;
+      })) as CompactionState | undefined;
     states.set(sessionID, state);
     return state;
   };
 
   const writeState = async (state: CompactionState) => {
-    states.set(state.sessionID, state);
     await Bun.write(statePath(root, state.sessionID), JSON.stringify(state));
+    states.set(state.sessionID, state);
   };
 
   const discardState = async (sessionID: string) => {
@@ -269,7 +272,7 @@ const OpenAICompactionPlugin: CompactionPlugin = async ({ client, project, direc
       return undefined;
     }
     if (info.failed) {
-      log("debug", "native compaction is disabled after an earlier failure", { sessionID });
+      log("debug", "native compaction is disabled for this turn after an earlier failure", { sessionID });
       return undefined;
     }
 
@@ -303,7 +306,7 @@ const OpenAICompactionPlugin: CompactionPlugin = async ({ client, project, direc
         originalItems: body.input.length,
         rewrittenItems: plan.input.length,
       });
-      return { body: { ...body, input: plan.input }, fresh: false };
+      return { ...body, input: plan.input };
     }
 
     showCompactionToast();
@@ -329,12 +332,10 @@ const OpenAICompactionPlugin: CompactionPlugin = async ({ client, project, direc
     try {
       window = await compact(url, headers, body, plan.compactInput, plan.instructions);
     } catch (error) {
-      if (partVisible) {
-        await writeCompactionPart(sessionID, info.messageID, partID, "--- Context compaction failed ---").catch(
-          () => {},
-        );
-      }
-      throw error;
+      log("warn", "native compaction request failed", {
+        sessionID,
+        error: error instanceof Error ? error.message : String(error),
+      });
     }
     if (partVisible) {
       await writeCompactionPart(
@@ -346,7 +347,7 @@ const OpenAICompactionPlugin: CompactionPlugin = async ({ client, project, direc
     }
     if (!window) {
       info.failed = true;
-      return plan.fallbackInput ? { body: { ...body, input: plan.fallbackInput }, fresh: false } : undefined;
+      return plan.fallbackInput ? { ...body, input: plan.fallbackInput } : undefined;
     }
 
     await writeState({
@@ -365,7 +366,7 @@ const OpenAICompactionPlugin: CompactionPlugin = async ({ client, project, direc
       windowItems: window.length,
       rewrittenItems: input.length,
     });
-    return { body: { ...body, input }, fresh: true };
+    return { ...body, input };
   };
 
   // Wrapping the global fetch keeps this transform innermost: opencode's built-in
@@ -387,33 +388,10 @@ const OpenAICompactionPlugin: CompactionPlugin = async ({ client, project, direc
     const info = sessions.get(sessionID);
     if (info) info.responsesTransport = true;
 
-    const rewritten = await rewrite(sessionID, url, body, headers).catch((error) => {
-      const current = sessions.get(sessionID);
-      if (current) current.failed = true;
-      log("warn", "native compaction failed, sending original request", {
-        sessionID,
-        error: error instanceof Error ? error.message : String(error),
-      });
-      return undefined;
-    });
+    const rewritten = await rewrite(sessionID, url, body, headers);
     if (!rewritten) return originalFetch(input, forward);
 
-    const response = await originalFetch(input, { ...forward, body: JSON.stringify(rewritten.body) });
-    // A payload-shaped rejection means the window is unusable, so drop it either way.
-    // A rejected replay is usually an expired window and worth retrying next turn; a
-    // window rejected the moment it was created means this provider will not take our
-    // payload at all, so stop rewriting for the rest of the session.
-    if (response.status === 400 || response.status === 422) {
-      await discardState(sessionID);
-      const info = sessions.get(sessionID);
-      if (info && rewritten.fresh) info.failed = true;
-      log("warn", "provider rejected the compacted payload, discarding stored window", {
-        sessionID,
-        status: response.status,
-        fresh: rewritten.fresh,
-      });
-    }
-    return response;
+    return originalFetch(input, { ...forward, body: JSON.stringify(rewritten) });
   };
   globalThis.fetch = patchedFetch as typeof globalThis.fetch;
 
@@ -429,7 +407,7 @@ const OpenAICompactionPlugin: CompactionPlugin = async ({ client, project, direc
       }
       const previous = sessions.get(input.sessionID);
       const sameModel = previous?.providerID === input.model.providerID && previous.model === input.model.id;
-      const latest = sameModel && previous !== undefined && previous.latestTokens !== undefined
+      const latest = sameModel && previous.latestTokens !== undefined
         ? {
             tokens: previous.latestTokens,
             messageID: previous.latestTokenMessageID,
@@ -437,7 +415,8 @@ const OpenAICompactionPlugin: CompactionPlugin = async ({ client, project, direc
         : await client.session
             .messages({ path: { id: input.sessionID }, query: { directory, limit: 20 } })
             .then((result) => {
-              const messages = result.data ?? [];
+              if (!result.data) throw result.error;
+              const messages = result.data;
               for (let index = messages.length - 1; index >= 0; index--) {
                 const message = messages[index]?.info;
                 if (message?.role !== "assistant" || message.summary) continue;
@@ -450,18 +429,17 @@ const OpenAICompactionPlugin: CompactionPlugin = async ({ client, project, direc
                 }
               }
               return { tokens: 0 };
-            })
-            .catch(() => undefined);
+            });
       sessions.set(input.sessionID, {
         contextLimit: input.model.limit.context,
         providerID: input.model.providerID,
         model: input.model.id,
         messageID: input.message.id,
-        failed: sameModel && previous !== undefined ? previous.failed : false,
-        responsesTransport: sameModel && previous !== undefined ? previous.responsesTransport : false,
-        latestTokens: latest?.tokens,
-        latestTokenMessageID: latest?.messageID,
-        lastDecision: sameModel && previous !== undefined ? previous.lastDecision : undefined,
+        failed: sameModel && previous.messageID === input.message.id ? previous.failed : false,
+        responsesTransport: sameModel ? previous.responsesTransport : false,
+        latestTokens: latest.tokens,
+        latestTokenMessageID: latest.messageID,
+        lastDecision: sameModel ? previous.lastDecision : undefined,
       });
       output.headers[SESSION_HEADER] = input.sessionID;
       log("debug", "tracking session request", {
@@ -470,7 +448,7 @@ const OpenAICompactionPlugin: CompactionPlugin = async ({ client, project, direc
         model: input.model.id,
         agent: input.agent,
         contextLimit: input.model.limit.context,
-        latestTokens: latest?.tokens,
+        latestTokens: latest.tokens,
         tokenThreshold: threshold <= 1 ? input.model.limit.context * threshold : threshold,
       });
     },
