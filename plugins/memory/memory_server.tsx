@@ -112,7 +112,7 @@ type ApiResult<Value> = {
 type WorkerClient = {
   session: {
     create(options: unknown): Promise<ApiResult<{ id: string }>>;
-    prompt(options: unknown): Promise<ApiResult<{ info: { structured?: unknown } }>>;
+    prompt(options: unknown): Promise<ApiResult<{ info: { structured?: unknown; error?: unknown } }>>;
     abort(options: unknown): Promise<ApiResult<boolean>>;
     delete(options: unknown): Promise<ApiResult<boolean>>;
   };
@@ -860,6 +860,8 @@ const MemoryPlugin: Plugin = async ({ client, directory }, options) => {
         signal,
       });
       if (!response.data) throw new Error(`Memory worker failed: ${memoryErrorMessage(signal.aborted ? signal.reason : response.error)}`);
+      if (response.data.info.error) throw new Error(`Memory worker failed: ${memoryErrorMessage(response.data.info.error)}`);
+      if (response.data.info.structured === undefined) throw new Error("Memory worker returned no structured output");
       completed = true;
       return response.data.info.structured as Result;
     } finally {

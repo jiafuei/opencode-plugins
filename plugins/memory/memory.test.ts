@@ -150,6 +150,47 @@ describe("memory index lines", () => {
 });
 
 describe("memory persistence", () => {
+  test.serial("reports failed worker responses and cleans up their sessions", async () => {
+    const dataHome = await mkdtemp("/tmp/opencode/memory-worker-errors-");
+    process.env.XDG_DATA_HOME = dataHome;
+    const directory = "/tmp/memory-worker-errors-project";
+    for (const info of [
+      { error: { name: "APIError", data: { message: "Expected OutputFormatJsonSchema" } } },
+      {},
+    ]) {
+      const logs: Array<{ message: string; extra: { error: string } }> = [];
+      const cleanup: string[] = [];
+      const client = {
+        session: {
+          create: async () => ({ data: { id: "ses_worker" } }),
+          prompt: async () => ({ data: { info } }),
+          abort: async () => { cleanup.push("abort"); return { data: true }; },
+          delete: async () => { cleanup.push("delete"); return { data: true }; },
+        },
+        app: { log: async (options: { body: typeof logs[number] }) => { logs.push(options.body); } },
+      };
+      const hooks = await MemoryModule.server!({ client, directory } as never, { interval: 2 } as never);
+      try {
+        await hooks.config!({ small_model: "test/small" } as never);
+        for (const text of ["Remember this project rule.", "Keep it for future work.", "Continue."]) {
+          await hooks["chat.message"]!({ sessionID: "ses_origin" } as never, {
+            message: { id: crypto.randomUUID() }, parts: [{ type: "text", text }],
+          } as never);
+        }
+        await until(() => logs.some((log) => log.message === "Memory classification failed"));
+        expect(logs.find((log) => log.message === "Memory classification failed")!.extra.error).toBe(
+          "error" in info
+            ? "Memory worker failed: APIError: Expected OutputFormatJsonSchema"
+            : "Memory worker returned no structured output",
+        );
+        expect(cleanup).toEqual(["abort", "delete"]);
+      } finally {
+        await hooks.dispose!();
+      }
+    }
+    await rm(dataHome, { recursive: true, force: true });
+  });
+
   test.serial("sends configured variants with classifier and extractor worker calls", async () => {
     const dataHome = await mkdtemp("/tmp/opencode-memory-variants-");
     process.env.XDG_DATA_HOME = dataHome;
