@@ -1,4 +1,7 @@
 import type { Config, Hooks, Plugin, PluginInput, PluginOptions } from "@opencode-ai/plugin";
+import { homedir } from "node:os";
+import { join } from "node:path";
+import { discoverModels } from "./discovery.ts";
 import {
   ANTIGRAVITY_DAILY_ENDPOINT,
   ANTIGRAVITY_SANDBOX_ENDPOINT,
@@ -27,6 +30,7 @@ import {
   CALLBACK_PATH,
   CALLBACK_PORT,
   REDIRECT_URI,
+  accountVerificationMessage,
   buildAuthUrl,
   exchangeToken,
   extractPastedCode,
@@ -297,6 +301,15 @@ export const AntigravityOAuthPlugin: Plugin = async (
     }
   };
 
+  const refreshAndPersist = async (current: OAuthSnapshot, getAuth: () => Promise<any>): Promise<AuthClassification> => {
+    const credentials = await refreshAccessToken(current.refresh, current.projectId ?? "");
+    // Re-read before saving so a completed logout/re-login wins over this refresh.
+    const latest = await classify(getAuth);
+    if (latest.kind !== "oauth" || latest.refresh !== current.refresh) return latest;
+    await persistCredentials(credentials);
+    return classify(getAuth);
+  };
+
   const authFailure = (method: string, error: unknown): never => {
     const detail = error instanceof Error ? error.message : String(error);
     try {
@@ -316,11 +329,33 @@ export const AntigravityOAuthPlugin: Plugin = async (
   const hooks: Hooks = {
     config: async (config: Config) => {
       config.provider ??= {};
+      const staticModels = providerModels();
+      let models = staticModels;
+      // Config runs before the auth loader. Read core's credential source here
+      // so discovery can update the list before OpenCode constructs its catalog.
+      const getStoredAuth = async () => {
+        if (process.env.OPENCODE_AUTH_CONTENT) return JSON.parse(process.env.OPENCODE_AUTH_CONTENT)[PROVIDER_ID];
+        const file = Bun.file(join(process.env.XDG_DATA_HOME ?? join(homedir(), ".local", "share"), "opencode", "auth.json"));
+        if (!await file.exists()) return undefined;
+        return (await file.json())[PROVIDER_ID];
+      };
+      try {
+        let auth = await classify(getStoredAuth);
+        if (auth.kind === "oauth" && auth.projectId && auth.refresh) {
+          if (!auth.access || auth.expires < Date.now()) auth = await refreshAndPersist(auth, getStoredAuth);
+          if (auth.kind === "oauth") {
+            const available = await discoverModels(auth.access, resolveEndpointChain(endpointMode));
+            if (available !== undefined) models = providerModels(available);
+          }
+        }
+      } catch {
+        // Keep static defaults when startup discovery or credential refresh fails.
+      }
       const defaults = {
         npm: "@ai-sdk/google",
         name: "Google Antigravity",
         options: { baseURL: ANTIGRAVITY_DAILY_ENDPOINT },
-        models: providerModels(),
+        models,
       };
       const existing = config.provider[PROVIDER_ID] as Record<string, any> | undefined;
       if (!existing) {
@@ -331,13 +366,14 @@ export const AntigravityOAuthPlugin: Plugin = async (
       existing.name ??= defaults.name;
       existing.npm ??= defaults.npm;
       existing.options = { ...defaults.options, ...(existing.options ?? {}) };
-      const models = { ...defaults.models };
+      models = { ...defaults.models };
       for (const [modelID, userModel] of Object.entries(existing.models ?? {})) {
+        const baseModel = models[modelID] ?? staticModels[modelID];
         models[modelID] = {
-          ...models[modelID],
+          ...baseModel,
           ...(userModel as Record<string, unknown>),
           variants: {
-            ...(models[modelID]?.variants as Record<string, unknown> | undefined),
+            ...(baseModel?.variants as Record<string, unknown> | undefined),
             ...((userModel as Record<string, any>).variants as Record<string, unknown> | undefined),
           },
         };
@@ -351,19 +387,9 @@ export const AntigravityOAuthPlugin: Plugin = async (
       async loader(getAuth) {
         let sharedRefresh: Promise<AuthClassification> | undefined;
 
-        const refreshAndPersist = async (current: OAuthSnapshot): Promise<AuthClassification> => {
-          const credentials = await refreshAccessToken(current.refresh, current.projectId ?? "");
-          // Fence against concurrent logout / re-login: re-read stored auth
-          // before persisting and never overwrite a newer credential.
-          const latest = await classify(getAuth);
-          if (latest.kind !== "oauth" || latest.refresh !== current.refresh) return latest;
-          await persistCredentials(credentials);
-          return classify(getAuth);
-        };
-
         const performSharedRefresh = (current: OAuthSnapshot): Promise<AuthClassification> => {
           if (!sharedRefresh) {
-            sharedRefresh = refreshAndPersist(current).finally(() => {
+            sharedRefresh = refreshAndPersist(current, getAuth).finally(() => {
               sharedRefresh = undefined;
             });
           }
@@ -526,7 +552,16 @@ export const AntigravityOAuthPlugin: Plugin = async (
                 lastError = new Error(`Cloud Code Assist API error (${response.status}) from ${endpoint}`);
                 continue;
               }
-              if (!response.ok) return response;
+              if (!response.ok) {
+                const payload = await response.clone().json().catch(() => undefined);
+                const verification = accountVerificationMessage(payload, "retry your request");
+                if (!verification) return response;
+                return new Response(JSON.stringify({ error: { ...payload.error, message: verification } }), {
+                  status: response.status,
+                  statusText: response.statusText,
+                  headers: unwrappedResponseHeaders(response),
+                });
+              }
 
               if (target.kind === "nonstream") {
                 const text = await response.text();
@@ -645,6 +680,8 @@ export const AntigravityOAuthPlugin: Plugin = async (
             } catch {
               throw new Error(`Antigravity web search failed (HTTP ${response.status})`);
             }
+            const verification = accountVerificationMessage(payload, "retry your request");
+            if (verification) throw new Error(verification);
             const inBand = readInBandError(payload);
             if (inBand) throw new Error(describeInBandError(inBand));
             if (!response.ok) throw new Error(`Antigravity web search failed (HTTP ${response.status})`);

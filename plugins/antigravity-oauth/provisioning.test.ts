@@ -33,6 +33,18 @@ function jsonResponse(payload: unknown, status = 200): Response {
 const immediateTiming = { pollIntervalMs: 1, timeoutMs: 30_000, sleep: async () => {} };
 
 describe("project discovery", () => {
+  test("HTTP account challenges surface only the verification URL and recovery action", async () => {
+    const { fetcher } = scriptedFetcher([
+      () => jsonResponse({ error: {
+        message: "sensitive upstream diagnostic",
+        details: [{ reason: "VALIDATION_REQUIRED", metadata: { validation_url: "https://accounts.google.com/verify" } }],
+      } }, 403),
+    ]);
+    await expect(discoverProject("t", fetcher)).rejects.toThrow(
+      "Account verification required. Visit https://accounts.google.com/verify to continue, then sign in again.",
+    );
+  });
+
   test("existing accounts resolve the project with native metadata", async () => {
     const { fetcher, calls } = scriptedFetcher([
       // Initial load: current tier already present (with paidTier, so no

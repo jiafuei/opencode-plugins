@@ -28,9 +28,13 @@ opencode auth login
 
 The flow uses Google's installed-app OAuth client with offline access and consent prompt. It does **not** use PKCE — the current native flow does not either; CSRF protection is the `state` parameter, which is validated locally before any token exchange.
 
+If Google requires account verification, login errors show the verification URL and ask you to sign in again after completing it. Inference errors show the same URL with an instruction to retry the request.
+
 ## Supported models
 
 All models report zero subscription cost. Reasoning variants (`minimal` / `low` / `medium` / `high`) map onto upstream effort tiers exactly like the native client:
+
+The table below is the static fallback. During startup, an existing OAuth login enables live `fetchAvailableModels` discovery (daily then sandbox, or the pinned endpoint; 5-second timeout per endpoint). Discovery filters the list to supported models whose default wire route is available, disables unavailable reasoning variants, and updates context/output limits and image support. Explicit model configuration still wins. Failed discovery retains the defaults; a successful empty list removes them. Unknown and internal models are not automatically added. Restart OpenCode to refresh availability.
 
 | Model | Context | Output | Input | Notes |
 | --- | --- | --- | --- | --- |
@@ -38,12 +42,13 @@ All models report zero subscription cost. Reasoning variants (`minimal` / `low` 
 | `gemini-3.6-flash`, `gemini-3.7-flash`, `gemini-3.8-flash` | 1M | 65,536 | text+image | one wire id per thinking level |
 | `gemini-3.1-pro` | 1M | 65,535 | text+image | low/high efforts; high routes to `gemini-pro-agent` |
 | `gemini-3-pro` | 1M | 65,535 | text+image | level transport |
-| `gemini-2.5-pro`, `gemini-2.5-flash`, `gemini-2.5-flash-lite` | 1M | ~65k | text+image | budget transport |
+| `gemini-2.5-flash`, `gemini-2.5-flash-lite` | 1M | ~65k | text+image | budget transport |
 | `claude-opus-4-6`, `claude-sonnet-4-6` | 250k / 250k | 64,000 | text+image | asymmetric upstream wire ids |
 | `claude-opus-4-5`, `claude-sonnet-4-5` | 200k / 1M | 64,000 | text+image | `-thinking` wire ids for reasoning efforts |
 | `gpt-oss-120b` | 131k | 32,768 | text | constant medium wire id |
 
 Checkpoint-only ids (`gemini-3.1-flash-lite`, tab completion previews) are intentionally absent: this provider only serves agent requests.
+`gemini-2.5-pro` is excluded, matching OMP's discovery exclusions.
 
 ## Configuration
 

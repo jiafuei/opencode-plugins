@@ -266,6 +266,15 @@ interface CloudCodeRequest {
   timeoutMs: number;
 }
 
+/** Google's structured account challenge can accompany any CCA HTTP error. */
+export function accountVerificationMessage(payload: any, nextAction: string): string | undefined {
+  const details = payload?.error?.details;
+  if (!Array.isArray(details)) return undefined;
+  const detail = details.find((entry) => entry?.reason === "VALIDATION_REQUIRED" && typeof entry.metadata?.validation_url === "string");
+  if (!detail) return undefined;
+  return `Account verification required. Visit ${detail.metadata.validation_url} to continue, then ${nextAction}.`;
+}
+
 async function cloudCodeAssistRequest(request: CloudCodeRequest, fetcher: typeof fetch): Promise<unknown> {
   const init: RequestInit = {
     method: request.method,
@@ -275,6 +284,9 @@ async function cloudCodeAssistRequest(request: CloudCodeRequest, fetcher: typeof
   if (request.method === "POST") init.body = JSON.stringify(request.body ?? {});
   const response = await fetcher(request.url, init);
   if (response.status !== 200) {
+    const payload = await response.json().catch(() => undefined);
+    const verification = accountVerificationMessage(payload, "sign in again");
+    if (verification) throw new Error(verification);
     throw new Error(`${request.label} failed: HTTP ${response.status}`);
   }
   return response.json();

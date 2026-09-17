@@ -958,7 +958,7 @@ describe("provider model registration map", () => {
       "gemini-3.8-flash",
       "gemini-3.1-pro",
       "gemini-3-pro",
-      "gemini-2.5-pro",
+      "gemini-2.5-flash-lite",
       "claude-opus-4-5",
       "claude-opus-4-6",
       "claude-sonnet-4-5",
@@ -998,7 +998,7 @@ describe("provider model registration map", () => {
     // Realistic OpenCode config processing: merge derived + configured
     // variants, then drop disabled entries. Only Gemini 2.5 ids derive a
     // `max` variant.
-    for (const id of ["gemini-2.5-pro", "gemini-3.1-pro"]) {
+    for (const id of ["gemini-2.5-flash-lite", "gemini-3.1-pro"]) {
       const derived = id.includes("2.5")
         ? { high: {}, max: { thinkingConfig: { includeThoughts: true, thinkingBudget: 32_768 } } }
         : {};

@@ -1,9 +1,19 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { AntigravityOAuthPlugin } from "./antigravity_oauth.ts";
 import type { Config } from "@opencode-ai/plugin";
 
 // Prevent live manifest discovery during plugin instantiation.
 process.env.OPENCODE_ANTIGRAVITY_VERSION ??= "2.8.0";
+
+let previousAuthContent: string | undefined;
+beforeEach(() => {
+  previousAuthContent = process.env.OPENCODE_AUTH_CONTENT;
+  process.env.OPENCODE_AUTH_CONTENT = "{}";
+});
+afterEach(() => {
+  if (previousAuthContent === undefined) delete process.env.OPENCODE_AUTH_CONTENT;
+  else process.env.OPENCODE_AUTH_CONTENT = previousAuthContent;
+});
 
 const DAILY = "https://daily-cloudcode-pa.googleapis.com";
 const SANDBOX = "https://daily-cloudcode-pa.sandbox.googleapis.com";
@@ -111,6 +121,54 @@ async function readStream(response: Response): Promise<string> {
 }
 
 describe("config hook: provider registration", () => {
+  test("live discovery updates supported routes and preserves explicit model overrides", async () => {
+    process.env.OPENCODE_AUTH_CONTENT = JSON.stringify({ "google-antigravity": OAUTH_AUTH });
+    const mock = mockFetch((url, init) => {
+      expect(url).toBe(`${DAILY}/v1internal:fetchAvailableModels`);
+      expect(new Headers(init.headers).get("authorization")).toBe("Bearer at-live");
+      expect(init.body).toBe("{}");
+      return Response.json({ models: {
+        "gemini-3.1-pro-low": { maxTokens: 800_000, maxOutputTokens: 65_535, supportsImages: true },
+        "claude-opus-4-6-thinking": { maxTokens: 250_000 },
+        "gemini-3.7-flash-low": { isInternal: true },
+        "gemini-2.5-pro": {},
+        "unmapped-model": {},
+      } });
+    });
+    try {
+      const config: Config = { provider: { "google-antigravity": { models: {
+        "gemini-3.1-pro": { name: "My Pro" },
+        "claude-sonnet-4-6": { name: "Explicit Sonnet" },
+      } } } };
+      await (await makeHarness(OAUTH_AUTH).plugin()).config!(config);
+      const models = config.provider!["google-antigravity"]!.models!;
+      expect(Object.keys(models).sort()).toEqual(["claude-opus-4-6", "claude-sonnet-4-6", "gemini-3.1-pro"]);
+      expect(models["gemini-3.1-pro"]!.name).toBe("My Pro");
+      expect(models["gemini-3.1-pro"]!.limit!.context).toBe(800_000);
+      expect(models["gemini-3.1-pro"]!.variants!.high).toEqual({ disabled: true });
+      expect(models["gemini-3.1-pro"]!.variants!.low).toBeDefined();
+    } finally {
+      mock.restore();
+    }
+  });
+
+  test("discovery fails over and keeps static defaults when both endpoints fail", async () => {
+    process.env.OPENCODE_AUTH_CONTENT = JSON.stringify({ "google-antigravity": OAUTH_AUTH });
+    const mock = mockFetch(() => new Response("unavailable", { status: 503 }));
+    try {
+      const config: Config = {};
+      await (await makeHarness(OAUTH_AUTH).plugin()).config!(config);
+      expect(mock.calls.map((call) => call.url)).toEqual([
+        `${DAILY}/v1internal:fetchAvailableModels`, `${SANDBOX}/v1internal:fetchAvailableModels`,
+      ]);
+      const models = config.provider!["google-antigravity"]!.models!;
+      expect(models["gemini-3.1-pro"]).toBeDefined();
+      expect(models["gemini-2.5-pro"]).toBeUndefined();
+    } finally {
+      mock.restore();
+    }
+  });
+
   test("registers the standalone provider backed by bundled @ai-sdk/google", async () => {
     const harness = await makeHarness(undefined);
     const config: Config = {};

@@ -443,24 +443,46 @@ function buildVariants(logicalId: string, spec: AntigravityModelSpec): Record<st
 }
 
 /** Build the config-provider `models` map registered through the config hook. */
-export function providerModels(): Record<string, Record<string, unknown>> {
+export interface DiscoveredModel {
+  maxTokens?: number;
+  maxOutputTokens?: number;
+  supportsImages?: boolean;
+  isInternal?: boolean;
+}
+
+export function providerModels(available?: Record<string, DiscoveredModel>): Record<string, Record<string, unknown>> {
   return Object.fromEntries(
-    Object.entries(MODEL_SPECS).map(([id, spec]) => [
-      id,
-      {
-        name: spec.name,
-        reasoning: spec.reasoning,
-        tool_call: true,
-        attachment: spec.imageInput,
-        modalities: {
-          input: spec.imageInput ? ["text", "image"] : ["text"],
-          output: ["text"],
+    Object.entries(MODEL_SPECS).flatMap(([id, spec]) => {
+      if (id === "gemini-2.5-pro") return []; // OMP excludes this deployment from discovery.
+      const wireId = resolveWireModelId(spec, { effort: "off", requested: false }, id);
+      const discovered = available?.[wireId];
+      // The default route must work even when no reasoning variant is selected.
+      if (available && (!discovered || discovered.isInternal)) return [];
+      const variants = buildVariants(id, spec);
+      if (available) {
+        for (const effort of EFFORT_ORDER) {
+          const route = resolveWireModelId(spec, { effort, requested: true }, id);
+          if (!available[route] || available[route].isInternal) variants[effort] = { disabled: true };
+        }
+      }
+      const imageInput = discovered?.supportsImages ?? spec.imageInput;
+      return [[
+        id,
+        {
+          name: spec.name,
+          reasoning: spec.reasoning,
+          tool_call: true,
+          attachment: imageInput,
+          modalities: {
+            input: imageInput ? ["text", "image"] : ["text"],
+            output: ["text"],
+          },
+          cost: { input: 0, output: 0, cache_read: 0, cache_write: 0 },
+          limit: { context: discovered?.maxTokens ?? spec.contextWindow, output: discovered?.maxOutputTokens ?? spec.outputLimit },
+          variants,
         },
-        cost: { input: 0, output: 0, cache_read: 0, cache_write: 0 },
-        limit: { context: spec.contextWindow, output: spec.outputLimit },
-        variants: buildVariants(id, spec),
-      },
-    ]),
+      ]];
+    }),
   );
 }
 
