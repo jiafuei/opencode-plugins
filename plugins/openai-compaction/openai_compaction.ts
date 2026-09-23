@@ -329,13 +329,22 @@ const OpenAICompactionPlugin: CompactionPlugin = async ({ client, project, direc
     );
 
     let window: unknown[] | undefined;
-    try {
-      window = await compact(url, headers, body, plan.compactInput, plan.instructions);
-    } catch (error) {
-      log("warn", "native compaction request failed", {
-        sessionID,
-        error: error instanceof Error ? error.message : String(error),
-      });
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      if (attempt > 1) {
+        const delay = (attempt - 1) * 1_000;
+        log("warn", "retrying native compaction request", { sessionID, attempt, delay });
+        await Bun.sleep(delay);
+      }
+      try {
+        window = await compact(url, headers, body, plan.compactInput, plan.instructions);
+      } catch (error) {
+        log("warn", "native compaction request failed", {
+          sessionID,
+          attempt,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+      if (window) break;
     }
     if (partVisible) {
       await writeCompactionPart(

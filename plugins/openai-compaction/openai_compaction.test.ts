@@ -632,7 +632,49 @@ describe("plugin", () => {
     await harness.dispose();
   });
 
-  test.each(["http", "network"])("retries failed compaction on the next user turn (%s)", async (mode) => {
+  test.each(["http", "network", "empty"])("recovers on the third compaction attempt before inference (%s)", async (mode) => {
+    let attempts = 0;
+    const harness = await createHarness({
+      compact: () => {
+        attempts++;
+        if (attempts < 3) {
+          if (mode === "network") throw new Error("connection reset");
+          if (mode === "empty") return Response.json({ output: [] });
+          return new Response("unavailable", { status: 503 });
+        }
+        return Response.json({ output: [{ type: "compaction", encrypted_content: "opaque" }] });
+      },
+      main: () => {
+        expect(attempts).toBe(3);
+        return Response.json({});
+      },
+    });
+    try {
+      const items = history(6);
+      await harness.send(items);
+
+      expect(harness.calls).toHaveLength(4);
+      expect(harness.calls.slice(0, 3).map((call) => call.url)).toEqual(Array(3).fill(compactUrl(ENDPOINT)));
+      expect(harness.calls[1]?.init.body).toBe(harness.calls[0]?.init.body);
+      expect(harness.calls[2]?.init.body).toBe(harness.calls[0]?.init.body);
+      expect(sentInput(harness.calls[3])).toEqual([
+        { type: "compaction", encrypted_content: "opaque" },
+        ...items.slice(-4),
+      ]);
+      expect(harness.partUpdates.map((part) => part.body.text)).toEqual([
+        "--- Compacting context... ---",
+        "--- Context compacted ---",
+      ]);
+      expect((await stateFile(harness).json()).window).toEqual([
+        { type: "compaction", encrypted_content: "opaque" },
+      ]);
+      expect(await harness.decide()).toBe("continue");
+    } finally {
+      await harness.dispose();
+    }
+  });
+
+  test.each(["http", "network"])("falls back after three attempts and retries on the next user turn (%s)", async (mode) => {
     let failed = true;
     const harness = await createHarness({
       compact: () => {
@@ -647,8 +689,10 @@ describe("plugin", () => {
       const items = history(6);
       await harness.send(items);
 
-      expect(harness.calls).toHaveLength(2);
-      expect(sentInput(harness.calls[1])).toEqual(items);
+      expect(harness.calls).toHaveLength(4);
+      expect(harness.calls.slice(0, 3).map((call) => call.url)).toEqual(Array(3).fill(compactUrl(ENDPOINT)));
+      expect(sentInput(harness.calls[3])).toEqual(items);
+      expect(await stateFile(harness).exists()).toBe(false);
       expect(harness.partUpdates.at(-1)?.body.text).toBe("--- Context compaction failed ---");
       expect(await harness.decide()).toBe("compact");
 
