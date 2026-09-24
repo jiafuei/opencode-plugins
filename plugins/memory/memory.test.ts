@@ -19,29 +19,31 @@ type WorkerCall = { prompt: string; model?: { providerID: string; id: string; va
 type FakeMessage = { id: string; role: string; content: Array<{ type: string; text: string }> };
 type DreamStatus = { requestID: string | null; runID: string; state: string; sessionID?: string; counts?: Record<string, number>; message?: string };
 type Hook = (event: never) => Promise<void> | void;
+type MemoryTool = { execute: (input: unknown, context: { sessionID: string; agent: string }) => Promise<{ content: string }> };
 
 async function fixture(
   directory: string,
   respond: (call: WorkerCall) => unknown,
   options: {
-    classifier_model?: string;
-    extractor_model?: string;
+    reflect_model?: string;
     dream_model?: string;
-    interval?: number;
     idle_delay_ms?: number;
     dream_interval_hours?: number;
     dream_min_additions?: number;
   } = {},
+  storage = new Map<string, unknown>(),
 ) {
   const calls: WorkerCall[] = [];
   const emitted: Array<{ name: string; data: Record<string, unknown> }> = [];
   const hooks = new Map<string, Hook>();
   const queue: unknown[] = [];
+  const histories = new Map<string, unknown[]>();
   let wake: (() => void) | undefined;
   let dream: ((input: { requestID: string; sessionID?: string }) => Promise<unknown>) | undefined;
+  let tool: MemoryTool | undefined;
   const ctx = {
     location: { directory },
-    options: { interval: 2, ...options },
+    options,
     generate: {
       text: async (input: WorkerCall) => {
         calls.push(input);
@@ -54,7 +56,21 @@ async function fixture(
         return { events: { emit: async (name: string, data: Record<string, unknown>) => { emitted.push({ name, data }); } } };
       },
     },
-    session: { hook: async (name: string, callback: Hook) => { hooks.set(name, callback); } },
+    storage: {
+      get: async (key: string) => storage.get(key),
+      set: async (key: string, value: unknown) => { storage.set(key, structuredClone(value)); },
+      remove: async (key: string) => { storage.delete(key); },
+    },
+    tool: { transform: async (callback: (editor: { add: (value: MemoryTool) => void }) => void) => callback({ add: (value) => { tool = value; } }) },
+    session: {
+      hook: async (name: string, callback: Hook) => { hooks.set(name, callback); },
+      get: async ({ sessionID }: { sessionID: string }) => ({
+        id: sessionID,
+        ...(sessionID.startsWith("ses_sub") ? { parentID: "ses_parent" } : {}),
+        metadata: sessionID.startsWith("ses_worker") ? { workflowWorkerID: "worker" } : {},
+      }),
+      context: async ({ sessionID }: { sessionID: string }) => histories.get(sessionID) ?? [],
+    },
     permission: { hook: async (name: string, callback: Hook) => { hooks.set(`permission.${name}`, callback); } },
     event: {
       subscribe: ({ signal }: { signal: AbortSignal }) => (async function* () {
@@ -71,16 +87,19 @@ async function fixture(
     dispose: cleanup,
     statuses: () => emitted.flatMap((event) => event.name === "dream" ? [event.data as DreamStatus] : []),
     saved: () => emitted.flatMap((event) => event.name === "saved" ? [event.data] : []),
+    save: (sessionID: string, input: Record<string, unknown>) => tool!.execute({ action: "save", ...input }, { sessionID, agent: "build" }),
+    history: (sessionID: string, messages: unknown[]) => histories.set(sessionID, messages),
     message: async (sessionID: string, text: string) => {
       const messageID = `msg_${crypto.randomUUID()}`;
       await hooks.get("prompt")!({ sessionID, messageID, prompt: { text }, delivery: "steer" } as never);
       return messageID;
     },
     context: async (sessionID: string, messages: FakeMessage[] = []) => {
-      const event = { sessionID, system: [] as Array<{ type: string; text: string }>, messages };
+      const event = { sessionID, agent: "build", tools: { memory: {} } as Record<string, unknown>, system: [] as Array<{ type: string; text: string }>, messages };
       await hooks.get("context")!(event as never);
       return event;
     },
+    compaction: (sessionID: string) => hooks.get("compaction")!({ sessionID } as never),
     permission: async (action: string, resources: string[]) => {
       const event = { sessionID: "ses_permission", action, resources, effect: "ask" };
       await hooks.get("permission.evaluate")!(event as never);
@@ -123,9 +142,7 @@ const memoryExtraction = (overrides: Partial<Extraction> = {}): Extraction => ({
   ...overrides,
 });
 
-const createDecision = (subject: string) => ({ action: "create", target: null, subject });
-const replaceDecision = (target: string, subject: string) => ({ action: "replace", target, subject });
-const saveDecisions = (...items: Array<ReturnType<typeof createDecision> | ReturnType<typeof replaceDecision>>) => ({ decisions: items });
+const noMemories = () => ({ memories: [] });
 
 // Builds a seeded topic file body with plugin-owned frontmatter. Revisions
 // must satisfy the server's `[a-f0-9-]+` revision pattern to exercise real
@@ -133,7 +150,7 @@ const saveDecisions = (...items: Array<ReturnType<typeof createDecision> | Retur
 const seededTopic = (revision: string, body: string, type = "recap") =>
   `---\nrevision: "${revision}"\ntype: "${type}"\nscope: "project"\nsessionId: "ses_seed"\nupdatedAt: "2026-08-01"\n---\n\n${body}\n`;
 
-const isClassifier = (call: WorkerCall) => call.prompt.startsWith("You are a project-memory classifier");
+const isReflection = (call: WorkerCall) => call.prompt.startsWith("You are a project-memory reviewer");
 const isDreamSelector = (call: WorkerCall) => call.prompt.startsWith("You are a project-memory consolidation selector");
 const isDreamCurator = (call: WorkerCall) => call.prompt.startsWith("You are a project-memory curator");
 
@@ -142,7 +159,7 @@ async function until(condition: () => boolean | Promise<boolean>) {
 }
 
 // Flush pending microtask and filesystem callbacks without waiting on real
-// time (safe under fake timers), so background restore/cleanup work settles.
+// time (safe under fake timers), so background work settles.
 async function settle() {
   for (let i = 0; i < 25; i++) await new Promise<void>((resolve) => setImmediate(resolve));
 }
@@ -171,155 +188,39 @@ describe("memory index lines", () => {
 });
 
 describe("memory persistence", () => {
-  test.serial("sends configured models and variants with classifier and extractor calls", async () => {
-    const dataHome = await mkdtemp("/tmp/opencode-memory-variants-");
+  test.serial("memory tool saves a topic and queues its delta only for other sessions", async () => {
+    const dataHome = await mkdtemp("/tmp/opencode-memory-tool-");
     process.env.XDG_DATA_HOME = dataHome;
-    const directory = "/tmp/memory-variant-project";
-    const app = await fixture(directory, (call) =>
-      isClassifier(call)
-        ? saveDecisions(createDecision("the completed parser migration"))
-        : memoryExtraction(), {
-      classifier_model: "test/small#fast",
-      extractor_model: "test/small#thorough",
+    const directory = "/tmp/memory-tool-project";
+    const path = await store(dataHome, directory, [{ file: "first.md", title: "First", summary: "First summary", content: "first" }]);
+    const app = await fixture(directory, noMemories);
+
+    // Both sessions snapshot the index before the save.
+    const before = await app.context("ses_origin");
+    await app.context("ses_other");
+    const result = await app.save("ses_origin", {
+      title: "Focused tests first",
+      summary: "Run the focused Bun test before the full suite.",
+      content: "Run the affected plugin's focused Bun test before the full suite.",
+      type: "instruction",
+      scope: "testing",
     });
+    const file = result.content.replace("Saved ", "");
+    const topic = await Bun.file(join(path, file)).text();
+    expect(topic).toContain('type: "instruction"');
+    expect(topic).toContain('sessionId: "ses_origin"');
+    expect(await Bun.file(join(path, "index.md")).text()).toContain(`- [Focused tests first](${file}) - [instruction|testing|`);
+    expect(app.saved()).toEqual([{ sessionID: "ses_origin", title: "Focused tests first" }]);
 
-    await app.message("ses_variants", "The parser migration is complete.");
-    await app.message("ses_variants", "The focused tests pass.");
-    await app.message("ses_variants", "Continue.");
-    await until(() => app.calls.length >= 2);
+    const other = await app.message("ses_other", "Next.");
+    const otherRequest = await app.context("ses_other", [userMessage(other)]);
+    expect(otherRequest.messages[0]!.content[1]!.text).toContain(`- [Focused tests first](${file})`);
+
+    const origin = await app.message("ses_origin", "Next.");
+    const originRequest = await app.context("ses_origin", [userMessage(origin)]);
+    expect(originRequest.messages[0]!.content).toHaveLength(1);
+    expect(originRequest.system).toEqual(before.system);
     await app.dispose();
-
-    expect(app.calls[0]!.model).toEqual({ providerID: "test", id: "small", variant: "fast" });
-    expect(app.calls[1]!.model).toEqual({ providerID: "test", id: "small", variant: "thorough" });
-    await rm(dataHome, { recursive: true, force: true });
-  });
-
-  test.serial("creates typed memory with the originating session as last writer", async () => {
-    const dataHome = await mkdtemp("/tmp/opencode-memory-test-");
-    process.env.XDG_DATA_HOME = dataHome;
-    const directory = "/tmp/memory-plugin-project";
-    const app = await fixture(directory, (call) => isClassifier(call)
-      ? saveDecisions(createDecision("confirmed focused test approach"))
-      : {
-        title: "Confirmed test approach",
-        summary: "Use the confirmed focused test approach.",
-        type: "instruction",
-        scope: "testing",
-        content: "Run the affected plugin's focused Bun test before the full suite.",
-      });
-
-    await app.message("ses_origin", "For future testing, run the affected plugin's focused Bun test before the full suite.");
-    await app.message("ses_origin", "Keep that as a testing instruction.");
-    await app.message("ses_origin", "Continue.");
-    const memoryDirectory = join(dataHome, "opencode", "memory", serverProjectKey(directory));
-    await until(async () => Bun.file(join(memoryDirectory, "index.md")).exists());
-    await app.dispose();
-
-    const topic = (await readdir(memoryDirectory)).find((name) => name.endsWith(".md") && name !== "index.md")!;
-    const content = await Bun.file(join(memoryDirectory, topic)).text();
-    expect(content).toContain('type: "instruction"');
-    expect(content).toContain('sessionId: "ses_origin"');
-    const index = await Bun.file(join(memoryDirectory, "index.md")).text();
-    expect(index).toContain("[Confirmed test approach]");
-    expect(app.saved()).toEqual([{ sessionID: "ses_origin", title: "Confirmed test approach" }]);
-
-    expect(app.calls[0]!.prompt).toContain("For future testing");
-    expect(app.calls[0]!.prompt).not.toContain("Continue.");
-    expect(app.calls[1]!.prompt).toContain("confirmed focused test approach");
-    await rm(dataHome, { recursive: true, force: true });
-  });
-
-  test.serial("replaces a legacy topic with typed last-writer metadata", async () => {
-    const dataHome = await mkdtemp("/tmp/opencode-memory-test-");
-    process.env.XDG_DATA_HOME = dataHome;
-    const directory = "/tmp/memory-legacy-project";
-    const path = await store(dataHome, directory, [{
-      file: "legacy.md",
-      title: "Legacy",
-      content: '---\nrevision: "old"\n---\n\nOld durable rule.\n',
-    }]);
-    let classifications = 0;
-    const app = await fixture(directory, (call) => {
-      if (isClassifier(call)) {
-        return classifications++ === 0 ? saveDecisions() : saveDecisions(replaceDecision("legacy.md", "the established rule"));
-      }
-      return memoryExtraction({ title: "Updated legacy" });
-    });
-    await app.message("ses_latest", "Load memory.");
-    await app.message("ses_latest", "Update the established rule.");
-    await app.message("ses_latest", "Continue.");
-    await until(() => app.calls.length >= 1);
-    // Let the first checkpoint finish clearing the in-flight marker before
-    // driving the next one.
-    await Bun.sleep(50);
-    await app.message("ses_latest", "Apply the update.");
-    await app.message("ses_latest", "Make it durable.");
-    const indexPath = join(path, "index.md");
-    await until(async () => (await Bun.file(indexPath).text()).includes("[Updated legacy](legacy.md)"));
-    await app.dispose();
-
-    const topic = await Bun.file(join(path, "legacy.md")).text();
-    expect(topic).toContain('type: "recap"');
-    expect(topic).toContain('sessionId: "ses_latest"');
-    await rm(dataHome, { recursive: true, force: true });
-  });
-
-  test.serial("updates a long insight without truncating facts or promoting its type", async () => {
-    const dataHome = await mkdtemp("/tmp/opencode-memory-test-");
-    process.env.XDG_DATA_HOME = dataHome;
-    const directory = "/tmp/memory-insight-update-project";
-    const facts = Array.from({ length: 80 }, (_, i) => `- Condition ${i}: retain this scoped observation and its exception.`).join("\n");
-    const existing = seededTopic("abc1234", facts, "insight");
-    const path = await store(dataHome, directory, [{ file: "insight.md", title: "Existing insight", content: existing }]);
-    const summary = "Conditions, scoped observations, and exceptions governing project memory updates; covers the distinction between derived conclusions and explicitly stated user preferences, plus their application to future work.";
-    const content = `${facts}\n\nThe user clarified that this applies to memory updates only.`;
-    const app = await fixture(directory, (call) => {
-      if (isClassifier(call)) return saveDecisions(replaceDecision("insight.md", "memory update scope"));
-      expect(call.prompt).toContain(existing);
-      return { title: "Updated insight", summary, content, scope: "plugins/memory" };
-    });
-    await app.message("ses_insight", "This applies to memory updates only.");
-    await app.message("ses_insight", "Keep the existing conditions and exceptions.");
-    await app.message("ses_insight", "Continue.");
-    const indexPath = join(path, "index.md");
-    await until(async () => (await Bun.file(indexPath).text()).includes("[Updated insight]"));
-    await app.dispose();
-
-    const topic = await Bun.file(join(path, "insight.md")).text();
-    expect(topic).toContain('type: "insight"');
-    expect(topic).toContain(content);
-    expect(await Bun.file(indexPath).text()).toContain(summary);
-    await rm(dataHome, { recursive: true, force: true });
-  });
-
-  test.serial("does not persist or maintain when disabled during extraction", async () => {
-    const dataHome = await mkdtemp("/tmp/opencode-memory-test-");
-    process.env.XDG_DATA_HOME = dataHome;
-    const directory = "/tmp/memory-disabled-project";
-    const extraction = Promise.withResolvers<unknown>();
-    const started = Promise.withResolvers<void>();
-    let selections = 0;
-    const app = await fixture(directory, (call) => {
-      if (isClassifier(call)) return saveDecisions(createDecision("a durable rule"));
-      if (isDreamSelector(call)) {
-        selections += 1;
-        return { action: "none" };
-      }
-      started.resolve();
-      return extraction.promise;
-    });
-    await app.message("ses_disabled", "First.");
-    await app.message("ses_disabled", "Remember this durable rule.");
-    await app.message("ses_disabled", "Continue.");
-    await started.promise;
-    const path = join(dataHome, "opencode", "memory", serverProjectKey(directory));
-    await Bun.write(join(path, "settings.json"), JSON.stringify({ enabled: false }));
-    extraction.resolve(memoryExtraction());
-    await app.dispose();
-
-    const names = await readdir(path);
-    expect(names.filter((name) => name.endsWith(".md") && name !== "index.md")).toEqual([]);
-    expect(selections).toBe(0);
     await rm(dataHome, { recursive: true, force: true });
   });
 
@@ -332,7 +233,7 @@ describe("memory persistence", () => {
       { file: "missing.md" },
     ]);
     await Bun.write(join(path, "orphan.md"), "orphan");
-    const app = await fixture(directory, () => saveDecisions());
+    const app = await fixture(directory, noMemories);
     await app.message("ses_repair", "Use memory.");
     await until(async () => !(await Bun.file(join(path, "orphan.md")).exists()));
     await app.dispose();
@@ -362,7 +263,7 @@ describe("memory persistence", () => {
         consolidationPrompt = call.prompt;
         return memoryExtraction({ title: "Consolidated topic" });
       }
-      return saveDecisions();
+      return noMemories();
     });
     await app.message("ses_maintenance_writer", "Use memory.");
     await until(() => app.statuses().some((status) => status.state === "changed"));
@@ -383,40 +284,41 @@ describe("memory persistence", () => {
     const dataHome = await mkdtemp("/tmp/opencode-memory-test-");
     process.env.XDG_DATA_HOME = dataHome;
     const directory = "/tmp/memory-concurrent-project";
-    const make = (title: string) => fixture(directory, (call) => isClassifier(call)
-      ? saveDecisions(createDecision(`${title} durable fact`))
-      : memoryExtraction({ title }));
-    const [first, second] = await Promise.all([make("First writer"), make("Second writer")]);
+    const [first, second] = await Promise.all([fixture(directory, noMemories), fixture(directory, noMemories)]);
     await Promise.all([
-      first.message("ses_first", "First.").then(() => first.message("ses_first", "Save first.")).then(() => first.message("ses_first", "Continue.")),
-      second.message("ses_second", "First.").then(() => second.message("ses_second", "Save second.")).then(() => second.message("ses_second", "Continue.")),
+      first.save("ses_first", memoryExtraction({ title: "First writer" })),
+      second.save("ses_second", memoryExtraction({ title: "Second writer" })),
     ]);
-    const path = join(dataHome, "opencode", "memory", serverProjectKey(directory));
-    await until(async () => {
-      const file = Bun.file(join(path, "index.md"));
-      if (!(await file.exists())) return false;
-      const index = await file.text();
-      return index.includes("First writer") && index.includes("Second writer");
-    });
+    const index = await Bun.file(join(dataHome, "opencode", "memory", serverProjectKey(directory), "index.md")).text();
+    expect(index).toContain("First writer");
+    expect(index).toContain("Second writer");
     await Promise.all([first.dispose(), second.dispose()]);
     await rm(dataHome, { recursive: true, force: true });
   });
 
-  test.serial("adds the complete current index and directory to main-model system context", async () => {
+  test.serial("adds the index to primary context and a compact user-stated index to restricted sessions", async () => {
     const dataHome = await mkdtemp("/tmp/opencode-memory-test-");
     process.env.XDG_DATA_HOME = dataHome;
     const directory = "/tmp/memory-system-context";
     const path = await store(dataHome, directory, [
       { file: "first.md", title: "First", summary: "First summary", content: "first" },
-      { file: "second.md", title: "Second", summary: "Second summary", content: "second" },
+      { file: "second.md", title: "Second", summary: "[instruction|testing|2026-08-01] Second summary", content: "second" },
       { file: "third.md", title: "Typed", summary: "[reference|editor|2026-08-01] Typed reference summary", content: "third" },
     ]);
-    const app = await fixture(directory, () => saveDecisions());
+    const app = await fixture(directory, noMemories);
 
     const output = await app.context("ses_index");
     expect(output.system[0]!.text).toContain(path);
     expect(output.system[0]!.text).toContain("[First](first.md) - First summary");
     expect(output.system[0]!.text).toContain("[Typed](third.md) - [reference|editor|2026-08-01] Typed reference summary");
+    expect(output.tools.memory).toBeDefined();
+
+    for (const restricted of [await app.context("ses_sub"), await app.context("ses_worker_1")]) {
+      expect(restricted.system[0]!.text).toContain("[Second](second.md)");
+      expect(restricted.system[0]!.text).not.toContain("first.md");
+      expect(restricted.system[0]!.text).not.toContain("third.md");
+      expect(restricted.tools.memory).toBeUndefined();
+    }
 
     await Bun.write(join(path, "index.md"), "# Project memory\n\n- [Third](third.md) - Third summary\n");
     expect((await app.context("ses_index")).system).toEqual(output.system);
@@ -433,7 +335,7 @@ describe("memory persistence", () => {
     process.env.XDG_DATA_HOME = dataHome;
     const directory = "/tmp/memory-permission";
     const path = await store(dataHome, directory, [{ file: "topic.md", content: "topic" }]);
-    const app = await fixture(directory, () => saveDecisions());
+    const app = await fixture(directory, noMemories);
 
     expect(await app.permission("external_directory", [join(path, "*")])).toBe("allow");
     expect(await app.permission("external_directory", [`${path}-sibling/*`])).toBe("ask");
@@ -443,74 +345,19 @@ describe("memory persistence", () => {
     await rm(dataHome, { recursive: true, force: true });
   });
 
-  test.serial("queues compact deltas for the next user message without changing the system snapshot", async () => {
-    const dataHome = await mkdtemp("/tmp/opencode-memory-delta-");
-    process.env.XDG_DATA_HOME = dataHome;
-    const directory = "/tmp/memory-delta-project";
-    const path = await store(dataHome, directory, [
-      { file: "first.md", title: "First", summary: "First summary", content: "first" },
-    ]);
-    const app = await fixture(directory, (call) => {
-      if (isClassifier(call)) return saveDecisions(createDecision("editor reply preference"));
-      return memoryExtraction({
-        title: "Concise replies",
-        summary: "Prefer concise replies.",
-        type: "preference",
-        scope: "editor",
-        content: "Keep replies short unless asked for detail.",
-      });
-    });
-
-    // Snapshot the system context before any save; it must stay immutable.
-    const before = await app.context("ses_delta");
-    await app.message("ses_delta", "One.");
-    await app.message("ses_delta", "Two.");
-    await app.message("ses_delta", "Three.");
-    const indexPath = join(path, "index.md");
-    // The saved event follows the queued delta.
-    await until(() => app.saved().length === 1);
-
-    // The next genuine user message carries a compact delta text part.
-    const next = await app.message("ses_delta", "Next question");
-    const after = await app.context("ses_delta", [userMessage(next)]);
-    expect(after.system).toEqual(before.system);
-    const part = after.messages[0]!.content[1]!;
-    expect(part.text).toContain("- [Concise replies](");
-    expect(part.text).not.toContain("First summary");
-    expect(part.text).not.toContain("Keep replies short");
-    await app.dispose();
-    await rm(dataHome, { recursive: true, force: true });
-  });
-
   test.serial("freezes deltas at the first request of a user message and defers mid-turn saves", async () => {
     const dataHome = await mkdtemp("/tmp/opencode-memory-freeze-");
     process.env.XDG_DATA_HOME = dataHome;
     const directory = "/tmp/memory-freeze-project";
-    const path = await store(dataHome, directory, []);
-    const extraction = Promise.withResolvers<Extraction>();
-    const started = Promise.withResolvers<void>();
-    const app = await fixture(directory, (call) => {
-      if (isClassifier(call)) return saveDecisions(createDecision("deferred durable rule"));
-      started.resolve();
-      return extraction.promise;
-    });
+    await store(dataHome, directory, []);
+    const app = await fixture(directory, noMemories);
 
-    await app.message("ses_freeze", "One.");
-    await app.message("ses_freeze", "Two.");
     const third = await app.message("ses_freeze", "Three.");
-    await started.promise;
-
     // First request for this message: nothing committed yet, nothing injected.
     expect((await app.context("ses_freeze", [userMessage(third)])).messages[0]!.content).toHaveLength(1);
 
-    // The save commits mid-turn; it must not be injected into the same message.
-    extraction.resolve(memoryExtraction({
-      title: "Deferred rule",
-      summary: "A deferred durable rule.",
-      type: "instruction",
-      content: "Always defer mid-turn memory saves to the next genuine turn.",
-    }));
-    await until(() => app.saved().length === 1);
+    // Another session's save commits mid-turn; it must not be injected into the same message.
+    await app.save("ses_writer", memoryExtraction({ title: "Deferred rule", type: "instruction" }));
     expect((await app.context("ses_freeze", [userMessage(third)])).messages[0]!.content).toHaveLength(1);
 
     // A synthetic latest user message never receives the pending delta.
@@ -519,8 +366,7 @@ describe("memory persistence", () => {
 
     // The next genuine user message receives the frozen delta.
     const fourth = await app.message("ses_freeze", "Four.");
-    const history = [userMessage(third), userMessage(fourth)];
-    const request = await app.context("ses_freeze", history);
+    const request = await app.context("ses_freeze", [userMessage(third), userMessage(fourth)]);
     expect(request.messages[1]!.content).toHaveLength(2);
     expect(request.messages[1]!.content[1]!.text).toContain("Deferred rule");
 
@@ -531,67 +377,86 @@ describe("memory persistence", () => {
     await rm(dataHome, { recursive: true, force: true });
   });
 
-});
-
-describe("memory idle revision gating", () => {
-  test.serial("checkpoints a long completed message without truncating it or including the next turn", async () => {
-    const dataHome = await mkdtemp("/tmp/opencode-memory-checkpoint-");
+  test.serial("restores the identical system block and frozen delta after a restart, and refreshes after compaction", async () => {
+    const dataHome = await mkdtemp("/tmp/opencode-memory-restore-");
     process.env.XDG_DATA_HOME = dataHome;
-    const directory = "/tmp/memory-checkpoint-project";
-    const prompt = `${"Complete user context. ".repeat(700)}Final qualification: only apply to the memory plugin.`;
-    const app = await fixture(directory, () => saveDecisions(), { interval: 6 });
-    await app.message("ses_checkpoint", prompt);
-    expect(app.calls).toHaveLength(0);
-    await app.message("ses_checkpoint", "NEW_TURN_EXCLUDED");
-    await until(() => app.calls.length === 1);
-    expect(app.calls[0]!.prompt).toContain(prompt);
-    expect(app.calls[0]!.prompt).not.toContain("NEW_TURN_EXCLUDED");
+    const directory = "/tmp/memory-restore-project";
+    const path = await store(dataHome, directory, [{ file: "first.md", title: "First", summary: "First summary", content: "first" }]);
+    const storage = new Map<string, unknown>();
+    let app = await fixture(directory, noMemories, {}, storage);
+
+    const initial = await app.context("ses_restore");
+    await app.save("ses_writer", memoryExtraction({ title: "Restored rule", type: "instruction" }));
+    const next = await app.message("ses_restore", "Next.");
+    const history = () => [userMessage("msg_old"), userMessage(next)];
+    const request = await app.context("ses_restore", history());
+    await app.dispose();
+
+    // The index changes on disk; the restored session still renders its snapshot.
+    await Bun.write(join(path, "index.md"), "# Project memory\n\n- [Changed](changed.md) - Changed summary\n");
+    app = await fixture(directory, noMemories, {}, storage);
+    const restored = await app.context("ses_restore", history());
+    expect(restored.system).toEqual(initial.system);
+    expect(restored.messages).toEqual(request.messages);
+
+    await app.compaction("ses_restore");
+    const compacted = await app.context("ses_restore", history());
+    expect(compacted.system[0]!.text).toContain("Changed summary");
+    expect(compacted.messages[1]!.content).toHaveLength(1);
     await app.dispose();
     await rm(dataHome, { recursive: true, force: true });
   });
 
-  test.serial("restores complete source after failure and waits for new content before reviewing again", async () => {
-    const dataHome = await mkdtemp("/tmp/opencode-memory-idle-gate-");
+  test.serial("reflection commits a returned memory and advances its cursor", async () => {
+    const dataHome = await mkdtemp("/tmp/opencode-memory-reflect-");
     process.env.XDG_DATA_HOME = dataHome;
-    const directory = "/tmp/memory-idle-gate-project";
-    const longPrompt = `${"A complete scoped user statement. ".repeat(500)}Do not generalize this exception.`;
-    let classifications = 0;
-    // The first classification returns malformed output, which fails loudly.
-    const app = await fixture(directory, (call) => {
-      if (isClassifier(call)) return ++classifications === 1 ? { decisions: "invalid" } : saveDecisions();
-      return memoryExtraction();
-    }, { idle_delay_ms: 1000 });
-    const idle = () => app.emit("session.execution.succeeded", "ses_idle_gate");
+    const directory = "/tmp/memory-reflect-project";
+    const path = await store(dataHome, directory, []);
+    const app = await fixture(directory, (call) => isReflection(call)
+      ? { memories: [{ ...memoryExtraction({ title: "Redis fixture diagnosis" }) }] }
+      : noMemories(), { idle_delay_ms: 1000, reflect_model: "test/small#low" });
+    const assistant = (id: string, text: string, output: string) => ({
+      id, type: "assistant", content: [
+        { type: "text", text },
+        { type: "tool", name: "bash", state: { status: "completed", input: { command: "bun test" }, content: [{ type: "text", text: output }] } },
+      ],
+    });
+    await app.context("ses_reflect");
+    app.history("ses_reflect", [
+      { id: "msg_1", type: "user", text: "Why is the login test flaky?" },
+      assistant("msg_2", "The shared Redis fixture leaks state.", `START${"x".repeat(5000)}END`),
+    ]);
 
     try {
       jest.useFakeTimers();
-      await app.message("ses_idle_gate", "Alpha one.");
-      await app.message("ses_idle_gate", longPrompt);
-      await idle();
+      await app.emit("session.execution.succeeded", "ses_reflect");
       jest.advanceTimersByTime(1000);
-      await until(() => app.calls.length === 1);
-      await settle();
-
-      // A repeated idle event with nothing newly collected must not launch
-      // another review of the restored buffer.
-      await idle();
-      jest.advanceTimersByTime(1000);
+      await until(() => app.saved().length === 1);
       await settle();
       expect(app.calls).toHaveLength(1);
+      expect(app.calls[0]!.model).toEqual({ providerID: "test", id: "small", variant: "low" });
+      expect(app.calls[0]!.prompt).toContain("Why is the login test flaky?");
+      expect(app.calls[0]!.prompt).toContain("The shared Redis fixture leaks state.");
+      expect(app.calls[0]!.prompt).toContain("START");
+      expect(app.calls[0]!.prompt).not.toContain("END");
 
-      // A new genuine prompt makes the source reviewable again; the second
-      // review sees the restored turns merged with the new one.
-      await app.message("ses_idle_gate", "Gamma three.");
-      await idle();
+      // Only messages after the cursor are reviewed; the earlier save is listed.
+      app.history("ses_reflect", [
+        { id: "msg_1", type: "user", text: "Why is the login test flaky?" },
+        assistant("msg_2", "The shared Redis fixture leaks state.", "ok"),
+        { id: "msg_3", type: "user", text: "Thanks, now rename the helper." },
+      ]);
+      await app.emit("session.execution.succeeded", "ses_reflect");
       jest.advanceTimersByTime(1000);
       await until(() => app.calls.length === 2);
-      expect(app.calls[1]!.prompt).toContain("Alpha one.");
-      expect(app.calls[1]!.prompt).toContain(longPrompt);
-      expect(app.calls[1]!.prompt).toContain("Gamma three.");
       await settle();
+      expect(app.calls[1]!.prompt).toContain("Thanks, now rename the helper.");
+      expect(app.calls[1]!.prompt).not.toContain("Why is the login test flaky?");
+      expect(app.calls[1]!.prompt).toContain("- Redis fixture diagnosis (redis-fixture-diagnosis-");
     } finally {
       jest.useRealTimers();
     }
+    expect(await Bun.file(join(path, "index.md")).text()).toContain("[Redis fixture diagnosis]");
     await app.dispose();
     await rm(dataHome, { recursive: true, force: true });
   });
@@ -621,7 +486,7 @@ describe("memory auto dreaming", () => {
       { file: "three.md", title: "Three", content: seededTopic("ccc3333", "Three body") },
     ]);
     await Bun.write(join(path, "settings.json"), JSON.stringify({ dream_auto: true }));
-    const app = await fixture(directory, () => saveDecisions());
+    const app = await fixture(directory, () => noMemories());
     await app.message("ses_auto_init", "Use memory.");
     const statePath = join(path, ".dream.json");
     await until(async () => Bun.file(statePath).exists());
@@ -643,7 +508,7 @@ describe("memory auto dreaming", () => {
     ]);
     const statePath = join(path, ".dream.json");
     await Bun.write(join(path, "settings.json"), JSON.stringify({ dream_auto: true }));
-    const app = await fixture(directory, (call) => (isDreamSelector(call) ? { action: "none" } : saveDecisions()));
+    const app = await fixture(directory, (call) => (isDreamSelector(call) ? { action: "none" } : noMemories()));
     await Bun.write(statePath, JSON.stringify({ auto: true, additions: 7, since: Date.now() - 37 * 3_600_000 }));
     await app.message("ses_gate", "Use memory.");
     await until(() => app.statuses().some((status) => status.state === "noop"));
@@ -670,7 +535,7 @@ describe("memory manual dreaming", () => {
     ]);
     const app = await fixture(
       directory,
-      (call) => isDreamSelector(call) ? { action: "none" } : saveDecisions(),
+      (call) => isDreamSelector(call) ? { action: "none" } : noMemories(),
       { dream_model: "test/deep-model#deep" },
     );
 
@@ -716,7 +581,7 @@ describe("memory manual dreaming", () => {
         expect(call.prompt).toContain(sourceBody);
         return memoryExtraction({ title: "Cross-topic insight", content: synthesizedBody });
       }
-      return saveDecisions();
+      return noMemories();
     });
 
     await app.dream("req-big", "ses_dreamer");
@@ -772,7 +637,7 @@ describe("memory manual dreaming", () => {
           evidence: ["plugins/memory/memory.test.ts"],
         }] };
       }
-      return saveDecisions();
+      return noMemories();
     });
 
     await app.dream("req-prune", "ses_prune");
@@ -816,7 +681,7 @@ describe("memory manual dreaming", () => {
         reason: "Probably visible in the repository.",
         evidence: [],
       }] };
-      return saveDecisions();
+      return noMemories();
     });
 
     await app.dream("req-keep", "ses_keep");
@@ -844,7 +709,7 @@ describe("memory manual dreaming", () => {
         ? { action: "prune", files: ["source.md"], reason: "receipt" }
         : { action: "none" };
       if (isDreamCurator(call)) return { verdicts: [{ file: "source.md", verdict: "remove", category: "task_receipt", reason: "Only a test receipt.", evidence: [] }] };
-      return saveDecisions();
+      return noMemories();
     });
 
     await app.dream("req-cascade", "ses_cascade");
@@ -869,7 +734,7 @@ describe("memory manual dreaming", () => {
     let app = await fixture(directory, (call) => {
       if (isDreamSelector(call)) return { action: "prune", files: ["old.md"], reason: "receipt" };
       if (isDreamCurator(call)) return { verdicts: [{ file: "old.md", verdict: "remove", category: "task_receipt", reason: "Receipt only.", evidence: [] }] };
-      return saveDecisions();
+      return noMemories();
     });
     await app.dream("req-trash-1", "ses_trash");
     await finished(app, "changed");
@@ -880,7 +745,7 @@ describe("memory manual dreaming", () => {
     await Bun.write(join(path, "new.md"), seededTopic("def2222", "Still durable."));
     await Bun.write(join(path, "index.md"), "# Project memory\n\n- [New](new.md) - Stored topic\n");
 
-    app = await fixture(directory, (call) => isDreamSelector(call) ? { action: "prune", files: [], reason: "malformed" } : saveDecisions());
+    app = await fixture(directory, (call) => isDreamSelector(call) ? { action: "prune", files: [], reason: "malformed" } : noMemories());
     await app.dream("req-trash-2", "ses_trash");
     await finished(app, "failed");
     await app.dispose();
@@ -891,7 +756,7 @@ describe("memory manual dreaming", () => {
     await Bun.write(join(path, ".trash", corruptRun, "recoverable.md"), "quarantined");
     await Bun.write(join(path, ".dreams", `${corruptRun}.json`), "{");
 
-    app = await fixture(directory, (call) => isDreamSelector(call) ? { action: "none" } : saveDecisions());
+    app = await fixture(directory, (call) => isDreamSelector(call) ? { action: "none" } : noMemories());
     await app.dream("req-trash-3", "ses_trash");
     await finished(app, "noop");
     await app.dispose();
@@ -918,7 +783,7 @@ describe("memory manual dreaming", () => {
         started.resolve();
         return gate.promise;
       }
-      return saveDecisions();
+      return noMemories();
     });
 
     await app.dream("req-stale", "ses_dreamer");
@@ -955,9 +820,9 @@ describe("memory manual dreaming", () => {
         started.resolve();
         return release.promise.then(() => ({ action: "none" }));
       }
-      return saveDecisions();
+      return noMemories();
     });
-    const second = await fixture(directory, (call) => isDreamSelector(call) ? { action: "none" } : saveDecisions());
+    const second = await fixture(directory, (call) => isDreamSelector(call) ? { action: "none" } : noMemories());
 
     await first.dream("req-lock-1", "ses_lock");
     await started.promise;
@@ -983,12 +848,15 @@ describe("memory manual dreaming", () => {
     const app = await fixture(directory, (call) => {
       if (isDreamSelector(call)) return { action: "synthesize", files: ["x.md", "y.md"], reason: "duplicate topics" };
       if (isDreamCurator(call)) return memoryExtraction({ title: "Unified story" });
-      return saveDecisions();
+      return noMemories();
     });
 
-    // Live sessions first, so their delta queues exist before the dream.
+    // Live sessions snapshot first, so their delta queues exist before the dream.
     const messages = new Map<string, string>();
-    for (const sessionID of ["ses_one", "ses_two", "ses_three"]) messages.set(sessionID, await app.message(sessionID, "Hello."));
+    for (const sessionID of ["ses_one", "ses_two", "ses_three"]) {
+      await app.context(sessionID);
+      messages.set(sessionID, await app.message(sessionID, "Hello."));
+    }
     await app.dream("req-broadcast", "ses_three");
     await finished(app, "changed");
     await app.dispose();
@@ -1013,28 +881,20 @@ describe("memory manual dreaming", () => {
 
     const curatorGate = Promise.withResolvers<Extraction>();
     const curatorStarted = Promise.withResolvers<void>();
-    let classifications = 0;
     const app = await fixture(directory, (call) => {
       if (isDreamSelector(call)) return { action: "synthesize", files: ["x.md", "y.md"], reason: "duplicate topics" };
       if (isDreamCurator(call)) {
         curatorStarted.resolve();
         return curatorGate.promise;
       }
-      if (isClassifier(call)) {
-        classifications += 1;
-        return saveDecisions(createDecision("a rule saved during the dream"));
-      }
-      return memoryExtraction();
+      return noMemories();
     });
 
     await app.dream("req-keep", "ses_keep");
     await curatorStarted.promise;
-    // An ordinary checkpoint save commits while the dream is parked mid-run.
-    await app.message("ses_keep", "Start dreaming.");
-    await app.message("ses_keep", "Remember something during the dream.");
-    await app.message("ses_keep", "Second turn.");
-    await until(() => classifications >= 1);
-    await until(async () => ((await Bun.file(join(path, ".dream.json")).json()) as { additions?: number }).additions === 5);
+    // An ordinary save commits while the dream is parked mid-run.
+    await app.save("ses_keep", memoryExtraction({ title: "Saved during the dream" }));
+    expect(((await Bun.file(join(path, ".dream.json")).json()) as { additions?: number }).additions).toBe(5);
     curatorGate.resolve(memoryExtraction({ title: "Merged keep" }));
     await finished(app, "changed");
     await app.dispose();
