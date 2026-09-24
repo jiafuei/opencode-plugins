@@ -1,21 +1,23 @@
-import type { Plugin, PluginOptions } from "@opencode-ai/plugin";
+import { Plugin, type PluginOptions } from "@opencode/plugin";
 
 // Configure the package in `opencode.json` like:
 //
 // {
-//   "plugin": [
-//     ["@jiafuei/opencode-redact-keys", {
-//       "files": ["**/.env", "**/.config.json", "**/.config.yaml"],
-//       "exclude": ["**/.env.example", "**/.env.sample"],
-//       "patterns": [
-//         "sk-(?:proj-)?[A-Za-z0-9_-]{20,}",
-//         "sk-ant-[A-Za-z0-9_-]{20,}",
-//         "ghp_[A-Za-z0-9]{36}"
-//       ]
-//     }]
+//   "plugins": [
+//     {
+//       "package": "@jiafuei/opencode-redact-keys",
+//       "options": {
+//         "files": ["**/.env", "**/.config.json", "**/.config.yaml"],
+//         "exclude": ["**/.env.example", "**/.env.sample"],
+//         "patterns": [
+//           "sk-(?:proj-)?[A-Za-z0-9_-]{20,}",
+//           "sk-ant-[A-Za-z0-9_-]{20,}",
+//           "ghp_[A-Za-z0-9]{36}"
+//         ]
+//       }
+//     }
 //   ]
 // }
-
 
 type RedactKeysOptions = {
   files?: string[];
@@ -38,22 +40,22 @@ type PlaceholderStore = {
   placeholders: Map<string, PlaceholderEntry>;
 };
 
-type ReadArgs = {
-  filePath: string;
+type ReadInput = {
+  path: string;
 };
 
-type WriteArgs = {
-  filePath: string;
+type WriteInput = {
+  path: string;
   content: string;
 };
 
-type EditArgs = {
-  filePath: string;
+type EditInput = {
+  path: string;
   oldString: string;
   newString: string;
 };
 
-type ApplyPatchArgs = {
+type PatchInput = {
   patchText: string;
 };
 
@@ -71,7 +73,6 @@ const DEFAULT_PATTERNS = [
   String.raw`github_pat_[A-Za-z0-9_]{20,}`,
 ];
 
-const CONTENT_BLOCK = /<content>\n([\s\S]*?)\n<\/content>/;
 const NUMBERED_LINE = /^(\d+:\s?)(.*)$/;
 
 function createPlaceholderStore(): PlaceholderStore {
@@ -99,19 +100,13 @@ function shouldProtectFile(filePath: string, options: CompiledOptions): boolean 
   );
 }
 
-function redactReadOutput(
-  output: string,
+function redactReadContent(
+  content: string,
   filePath: string,
   options: CompiledOptions,
   store: PlaceholderStore,
 ): string {
-  const contentMatch = output.match(CONTENT_BLOCK);
-  if (!contentMatch) {
-    return output;
-  }
-
-  const originalContent = contentMatch[1]!;
-  const redactedContent = originalContent
+  return content
     .split("\n")
     .map((line) => {
       const numberedLine = line.match(NUMBERED_LINE);
@@ -120,24 +115,22 @@ function redactReadOutput(
       }
 
       const prefix = numberedLine[1]!;
-      let content = numberedLine[2]!;
+      let text = numberedLine[2]!;
 
       for (const pattern of options.patterns) {
-        for (const matched of [...content.matchAll(pattern)].reverse()) {
+        for (const matched of [...text.matchAll(pattern)].reverse()) {
           const value = matched[0]!;
           const start = matched.index!;
 
           const placeholder = `<redacted_${Bun.hash.wyhash(value).toString(16).slice(0, 8)}>`;
           store.placeholders.set(placeholder, { value, filePath });
-          content = `${content.slice(0, start)}${placeholder}${content.slice(start + value.length)}`;
+          text = `${text.slice(0, start)}${placeholder}${text.slice(start + value.length)}`;
         }
       }
 
-      return `${prefix}${content}`;
+      return `${prefix}${text}`;
     })
     .join("\n");
-
-  return redactedContent === originalContent ? output : output.replace(originalContent, redactedContent);
 }
 
 function restorePlaceholders(text: string, store: PlaceholderStore): string {
@@ -150,56 +143,53 @@ function restorePlaceholders(text: string, store: PlaceholderStore): string {
   return text.replace(pattern, (token) => store.placeholders.get(token)!.value);
 }
 
-const RedactKeysPlugin: Plugin = async (_input, options) => {
-  const compiled = compileOptions(options);
-  const store = createPlaceholderStore();
+export default Plugin.define({
+  id: "redact_keys",
+  setup: async (ctx) => {
+    const compiled = compileOptions(ctx.options);
+    const store = createPlaceholderStore();
 
-  return {
-    "tool.execute.before": async (input, output) => {
-      switch (input.tool) {
+    await ctx.tool.hook("execute.before", (event) => {
+      switch (event.tool) {
         case "write": {
-          const args = output.args as WriteArgs;
-          if (!shouldProtectFile(args.filePath, compiled)) {
+          const input = event.input as WriteInput;
+          if (!shouldProtectFile(input.path, compiled)) {
             return;
           }
 
-          args.content = restorePlaceholders(args.content, store);
+          input.content = restorePlaceholders(input.content, store);
           return;
         }
 
         case "edit": {
-          const args = output.args as EditArgs;
-          if (!shouldProtectFile(args.filePath, compiled)) {
+          const input = event.input as EditInput;
+          if (!shouldProtectFile(input.path, compiled)) {
             return;
           }
 
-          args.oldString = restorePlaceholders(args.oldString, store);
-          args.newString = restorePlaceholders(args.newString, store);
+          input.oldString = restorePlaceholders(input.oldString, store);
+          input.newString = restorePlaceholders(input.newString, store);
           return;
         }
 
-        case "apply_patch": {
-          const args = output.args as ApplyPatchArgs;
-          args.patchText = restorePlaceholders(args.patchText, store);
+        case "patch": {
+          const input = event.input as PatchInput;
+          input.patchText = restorePlaceholders(input.patchText, store);
         }
       }
-    },
-    "tool.execute.after": async (input, output) => {
-      if (input.tool !== "read") {
+    });
+
+    await ctx.tool.hook("execute.after", (event) => {
+      if (event.tool !== "read" || event.status !== "completed" || typeof event.result.content !== "string") {
         return;
       }
 
-      const args = input.args as ReadArgs;
-      if (!shouldProtectFile(args.filePath, compiled)) {
+      const input = event.input as ReadInput;
+      if (!shouldProtectFile(input.path, compiled)) {
         return;
       }
 
-      output.output = redactReadOutput(output.output, args.filePath, compiled, store);
-    },
-  };
-};
-
-export default {
-  id: "redact_keys",
-  server: RedactKeysPlugin,
-};
+      event.result = { ...event.result, content: redactReadContent(event.result.content, input.path, compiled, store) };
+    });
+  },
+});

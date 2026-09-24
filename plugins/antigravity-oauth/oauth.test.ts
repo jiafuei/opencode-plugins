@@ -150,10 +150,9 @@ describe("token refresh", () => {
     const { fetcher, calls } = scriptedFetcher([
       () => jsonResponse({ access_token: "at-2", refresh_token: "rt-rotated", expires_in: 3600 }),
     ]);
-    const credentials = await refreshToken("rt-old", "proj-9", fetcher);
+    const credentials = await refreshToken("rt-old", fetcher);
     expect(credentials.refresh).toBe("rt-rotated");
     expect(credentials.access).toBe("at-2");
-    expect(credentials.projectId).toBe("proj-9");
     expect(credentials.expires).toBeGreaterThan(Date.now() + 3600_000 - EXPIRY_SKEW_MS - 1000);
 
     const body = new URLSearchParams(String(calls[0]!.init.body));
@@ -163,7 +162,7 @@ describe("token refresh", () => {
 
   test("keeps the previous refresh token when upstream does not rotate", async () => {
     const { fetcher } = scriptedFetcher([() => jsonResponse({ access_token: "at-3", expires_in: 3600 })]);
-    const credentials = await refreshToken("rt-keep", "p", fetcher);
+    const credentials = await refreshToken("rt-keep", fetcher);
     expect(credentials.refresh).toBe("rt-keep");
   });
 });

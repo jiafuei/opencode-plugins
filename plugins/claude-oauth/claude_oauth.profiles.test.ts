@@ -1,25 +1,13 @@
 import { describe, expect, test } from "bun:test";
-import { streamText } from "ai";
-import { createAnthropic } from "@ai-sdk/anthropic";
 import {
   buildBetas,
-  countTokensBetas,
   COWORK_PROFILE,
   rewriteBody,
   resolveSpoofingProfile,
   SDK_CLI_PROFILE,
 } from "./wire_format.ts";
-import { ClaudeOAuthPlugin } from "./claude_oauth.ts";
 import { deriveDeviceId } from "./local_storage.ts";
-import { coworkTransport } from "./cowork_fetch.ts";
-
-const OAUTH_AUTH = {
-  type: "oauth" as const,
-  access: "test-access-token",
-  refresh: "test-refresh-token",
-  expires: Date.now() + 60 * 60 * 1000,
-  accountId: "acct-test-123",
-};
+import { setupPlugin } from "./test_harness.ts";
 
 const baseBody = JSON.stringify({
   model: "claude-sonnet-4-6",
@@ -55,15 +43,6 @@ describe("resolveSpoofingProfile", () => {
 describe("buildBetas with the Cowork profile", () => {
   test("utility requests get exactly the utility list — no effort/fallback/redact", () => {
     expect(buildBetas(undefined, false, null, COWORK_PROFILE)).toEqual(COWORK_PROFILE.utilityBetas.join(","));
-  });
-
-});
-
-describe("countTokensBetas", () => {
-  test("Cowork uses its utility profile plus token counting", () => {
-    expect(countTokensBetas(COWORK_PROFILE)).toBe(
-      [...COWORK_PROFILE.utilityBetas, "token-counting-2024-11-01"].join(","),
-    );
   });
 
 });
@@ -305,125 +284,37 @@ describe("rewriteBody with the Cowork profile", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Integration through the real pinned @ai-sdk/anthropic path
+// Integration through the plugin's session hooks
 // ---------------------------------------------------------------------------
 
-interface CapturedRequest {
-  url: string;
-  method?: string;
-  /** The exact ordered record handed to the transport. */
-  headers: Record<string, string>;
-  isHeaderRecord: boolean;
-  bodyText: string;
-}
+describe("request capture: cowork profile through the session hooks", () => {
+  test("reaches the wire with the Cowork header set and wire shape", async () => {
+    const { send } = await setupPlugin({ spoofingProfile: "cowork" });
+    const { request, bodyText } = await send({ ...parse(baseBody), stream: true });
 
-function sseResponse(): Response {
-  const events: Array<[string, unknown]> = [
-    ["message_start", { type: "message_start", message: { id: "msg_test", role: "assistant", content: [], model: "claude-sonnet-4-6", stop_reason: null, stop_sequence: null, usage: { input_tokens: 10, output_tokens: 1 } } }],
-    ["content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }],
-    ["content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "Hello!" } }],
-    ["content_block_stop", { type: "content_block_stop", index: 0 }],
-    ["message_delta", { type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: 2 } }],
-    ["message_stop", { type: "message_stop" }],
-  ];
-  const payload = events.map(([event, data]) => `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`).join("");
-  return new Response(payload, { status: 200, headers: { "content-type": "text/event-stream" } });
-}
-
-async function setupProfileHarness(spoofingProfile: "cowork" | "sdk-cli" = "cowork") {
-  const plugin = await ClaudeOAuthPlugin({ client: { auth: { set: async () => {} } } } as never, {
-    spoofingProfile,
-  });
-  const rawLoaderOptions = await plugin.auth!.loader!(async () => OAUTH_AUTH as never, {} as never);
-
-  const captured: CapturedRequest[] = [];
-  const originalImpl = coworkTransport.impl;
-  coworkTransport.impl = (async (input: string | URL | Request, init?: RequestInit) => {
-    captured.push({
-      url: String(input),
-      method: init?.method,
-      headers: init?.headers as Record<string, string>,
-      isHeaderRecord: !(init?.headers instanceof Headers) && !Array.isArray(init?.headers),
-      bodyText: typeof init?.body === "string" ? init.body : new TextDecoder().decode(init?.body as Uint8Array),
-    });
-    return captured[0]!.bodyText.includes('"stream":true')
-      ? sseResponse()
-      : new Response(
-          JSON.stringify({ id: "msg_test", type: "message", role: "assistant", model: "claude-sonnet-4-6", content: [{ type: "text", text: "Hello!" }], stop_reason: "end_turn", stop_sequence: null, usage: { input_tokens: 10, output_tokens: 2 } }),
-          { status: 200, headers: { "content-type": "application/json" } },
-        );
-  }) as typeof coworkTransport.impl;
-
-  return {
-    plugin,
-    rawLoaderOptions,
-    captured,
-    restore: () => {
-      coworkTransport.impl = originalImpl;
-    },
-  };
-}
-
-describe("request capture: cowork profile through the pinned SDK", () => {
-  test("reaches the transport with OMP-ordered headers and the Cowork wire shape", async () => {
-    const { rawLoaderOptions, captured, restore } = await setupProfileHarness();
-    try {
-      const anthropic = createAnthropic({
-        name: "anthropic",
-        apiKey: rawLoaderOptions.apiKey!,
-        fetch: rawLoaderOptions.fetch as typeof fetch,
-      });
-      const result = streamText({
-        model: anthropic("claude-sonnet-4-6"),
-        system: "You are a coding agent.",
-        prompt: "hello world, this is the first user message",
-        maxOutputTokens: 128000,
-        headers: {
-          "X-Claude-Code-Session-Id": "session-cowork-1",
-          "x-session-affinity": "ses_opencode",
-          "x-session-id": "ses_opencode",
-          "x-parent-session-id": "ses_parent",
-          "x-api-key": "dummy-must-not-leak",
-        },
-      });
-      expect(await result.text).toBe("Hello!");
-
-      const req = captured[0]!;
-
-      expect(req.isHeaderRecord).toBe(true);
-      expect(req.url).toBe("https://api.anthropic.com/v1/messages?beta=true");
-      expect(req.headers["User-Agent"]).toBe("claude-cli/2.1.246 (external, claude-desktop)");
-      expect(req.headers["Authorization"]).toBe("Bearer test-access-token");
-      expect(req.headers["anthropic-beta"]).toBe(COWORK_PROFILE.utilityBetas.join(","));
-      for (const absent of ["x-api-key", "x-session-affinity", "x-session-id", "x-parent-session-id", "x-claude-oauth-request-id"]) {
-        expect(req.headers[absent]).toBeUndefined();
-      }
-
-      const body = JSON.parse(req.bodyText);
-      expect(body.max_tokens).toBe(64000);
-      expect(body.system[0].text).toContain("cc_entrypoint=claude-desktop;");
-      expect(req.bodyText).not.toContain("cc_prev_req=");
-    } finally {
-      restore();
+    expect(request.url).toBe("https://api.anthropic.com/v1/messages?beta=true");
+    expect(request.headers.get("user-agent")).toBe("claude-cli/2.1.246 (external, claude-desktop)");
+    expect(request.headers.get("authorization")).toBe("Bearer test-access-token");
+    expect(request.headers.get("anthropic-beta")).toBe(COWORK_PROFILE.utilityBetas.join(","));
+    for (const absent of ["x-api-key", "x-session-affinity", "x-session-id", "x-opencode-session"]) {
+      expect(request.headers.get(absent)).toBeNull();
     }
+
+    const body = JSON.parse(bodyText);
+    expect(body.max_tokens).toBe(64000);
+    expect(body.system[0].text).toContain("cc_entrypoint=claude-desktop;");
+    expect(bodyText).not.toContain("cc_prev_req=");
   });
 
   test("rejects unsupported spoofingProfile option values at the boundary", async () => {
-    await expect(
-      ClaudeOAuthPlugin({} as never, { spoofingProfile: "deskmate" } as never),
-    ).rejects.toThrow(/spoofingProfile/);
+    await expect(setupPlugin({ spoofingProfile: "deskmate" })).rejects.toThrow(/spoofingProfile/);
   });
 
   test("derives restart-stable Cowork UUIDs", async () => {
     const sessionId = async (raw: string) => {
-      const plugin = await ClaudeOAuthPlugin({ client: {} } as never, { spoofingProfile: "cowork" });
-      const output = { headers: {} as Record<string, string> };
-      await plugin["chat.headers"]!({
-        model: { providerID: "anthropic" },
-        provider: { options: { claudeOAuth: true } },
-        sessionID: raw,
-      } as never, output as never);
-      return { plugin, id: output.headers["X-Claude-Code-Session-Id"]! };
+      const plugin = await setupPlugin({ spoofingProfile: "cowork" });
+      const { request } = await plugin.send(parse(baseBody), undefined, raw);
+      return { plugin, id: request.headers.get("x-claude-code-session-id")! };
     };
     const coworkA = await sessionId("ses-a");
     const coworkA2 = await sessionId("ses-a");
@@ -431,7 +322,7 @@ describe("request capture: cowork profile through the pinned SDK", () => {
     expect(coworkA.id).toBe(coworkA2.id);
     expect(coworkB.id).not.toBe(coworkA.id);
     expect(coworkA.id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
-    await coworkA.plugin.event!({ event: { type: "session.deleted", properties: { info: { id: "ses-a" } } } } as never);
+    await coworkA.plugin.emit({ type: "session.deleted", data: { sessionID: "ses-a" } });
     const coworkAfterDelete = await sessionId("ses-a");
     expect(coworkAfterDelete.id).toBe(coworkA.id);
   });

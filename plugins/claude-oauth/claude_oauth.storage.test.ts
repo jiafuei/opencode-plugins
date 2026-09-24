@@ -1,16 +1,15 @@
 import { describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
 // ---------------------------------------------------------------------------
-// Local identity + sidecar durability: exclusive install-ID creation with
-// cross-process convergence, and lock-protected grants.json merges across
-// processes. Subprocesses exercise real concurrent filesystem races that
-// cannot be reproduced in-process.
+// Local identity durability: exclusive install-ID creation with
+// cross-process convergence. Subprocesses exercise real concurrent
+// filesystem races that cannot be reproduced in-process.
 // ---------------------------------------------------------------------------
 
-const MODULE_PATH = new URL("./claude_oauth.ts", import.meta.url).pathname;
+const MODULE_PATH = new URL("./wire_format.ts", import.meta.url).pathname;
 
 function isolatedDataDir(prefix: string): { dir: string; restore: () => void } {
   const dir = mkdtempSync(path.join(tmpdir(), prefix));
@@ -89,28 +88,6 @@ describe("install id (stable local identity)", () => {
         .update("b".repeat(32))
         .digest("hex");
       expect(deviceId).toBe(expected);
-    } finally {
-      restore();
-    }
-  });
-});
-
-describe("grants sidecar cross-process merge", () => {
-  const SCRIPT = `
-    const mod = await import(process.env.MODULE_PATH);
-    mod.recordAuthorizedAt("refresh-" + process.env.RACER_INDEX, "account-" + process.env.RACER_INDEX);
-    console.log("ok");
-  `;
-
-  test("parallel login recordings in separate processes all land (no lost updates)", async () => {
-    const { dir, restore } = isolatedDataDir("claude-oauth-grantsmerge-");
-    try {
-      const procs = spawnRacers(SCRIPT, dir, 4);
-      await settle(procs);
-      const grants = JSON.parse(
-        readFileSync(path.join(dir, "opencode", "claude-oauth", "grants.json"), "utf8"),
-      ) as Record<string, number>;
-      expect(Object.keys(grants).sort()).toEqual(["account-0", "account-1", "account-2", "account-3"]);
     } finally {
       restore();
     }

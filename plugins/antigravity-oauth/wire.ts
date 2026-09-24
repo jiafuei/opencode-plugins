@@ -8,7 +8,10 @@
  * routing, tool schema normalization, and SSE response unwrapping.
  */
 
+import { Model, Provider } from "@opencode/plugin";
 import { normalizeSchemaForCCA, normalizeToolSchemaForCCA } from "./schema.ts";
+
+export const PROVIDER_ID = Provider.ID.make("google-antigravity");
 
 // ---------------------------------------------------------------------------
 // Endpoints & captured constants
@@ -108,6 +111,9 @@ const STRIPPED_REQUEST_HEADERS: Readonly<Record<string, true>> = {
   "x-session-affinity": true,
   "x-session-id": true,
   "x-parent-session-id": true,
+  "x-opencode-project": true,
+  "x-opencode-session": true,
+  "x-opencode-client": true,
 };
 
 /** Delete SDK/OpenCode/private routing headers from an outgoing header set. */
@@ -419,30 +425,9 @@ export function resolveWireModelId(spec: AntigravityModelSpec, requested: Resolv
 }
 
 // ---------------------------------------------------------------------------
-// Config-facing model registration
+// Provider model registration
 // ---------------------------------------------------------------------------
 
-function buildVariants(logicalId: string, spec: AntigravityModelSpec): Record<string, Record<string, unknown>> {
-  if (!spec.reasoning) return {};
-  const variants: Record<string, Record<string, unknown>> = {};
-  for (const effort of EFFORT_ORDER) {
-    const clamped = clampEffort(spec, effort);
-    variants[effort] = {
-      thinkingConfig:
-        spec.transport === "level"
-          ? { includeThoughts: true, thinkingLevel: clamped }
-          : { includeThoughts: true, thinkingBudget: spec.budgets?.[clamped] ?? DEFAULT_EFFORT_BUDGETS[clamped] },
-    };
-  }
-  // OpenCode derives a "max" variant with an invented budget for Gemini 2.5
-  // ids; explicitly disable it rather than registering a made-up value.
-  if (logicalId.includes("2.5")) {
-    variants["max"] = { disabled: true };
-  }
-  return variants;
-}
-
-/** Build the config-provider `models` map registered through the config hook. */
 export interface DiscoveredModel {
   maxTokens?: number;
   maxOutputTokens?: number;
@@ -450,40 +435,41 @@ export interface DiscoveredModel {
   isInternal?: boolean;
 }
 
-export function providerModels(available?: Record<string, DiscoveredModel>): Record<string, Record<string, unknown>> {
-  return Object.fromEntries(
-    Object.entries(MODEL_SPECS).flatMap(([id, spec]) => {
-      if (id === "gemini-2.5-pro") return []; // OMP excludes this deployment from discovery.
-      const wireId = resolveWireModelId(spec, { effort: "off", requested: false }, id);
-      const discovered = available?.[wireId];
-      // The default route must work even when no reasoning variant is selected.
-      if (available && (!discovered || discovered.isInternal)) return [];
-      const variants = buildVariants(id, spec);
-      if (available) {
-        for (const effort of EFFORT_ORDER) {
-          const route = resolveWireModelId(spec, { effort, requested: true }, id);
-          if (!available[route] || available[route].isInternal) variants[effort] = { disabled: true };
-        }
-      }
-      const imageInput = discovered?.supportsImages ?? spec.imageInput;
-      return [[
-        id,
-        {
-          name: spec.name,
-          reasoning: spec.reasoning,
-          tool_call: true,
-          attachment: imageInput,
-          modalities: {
-            input: imageInput ? ["text", "image"] : ["text"],
-            output: ["text"],
-          },
-          cost: { input: 0, output: 0, cache_read: 0, cache_write: 0 },
-          limit: { context: discovered?.maxTokens ?? spec.contextWindow, output: discovered?.maxOutputTokens ?? spec.outputLimit },
-          variants,
-        },
-      ]];
-    }),
-  );
+/** Build the provider catalog; a discovered inventory drops unavailable models and effort variants. */
+export function providerModels(available?: Record<string, DiscoveredModel>): Model.Info[] {
+  const usable = (wireId: string) => !available || (available[wireId] !== undefined && !available[wireId].isInternal);
+  return Object.entries(MODEL_SPECS).flatMap(([id, spec]) => {
+    if (id === "gemini-2.5-pro") return []; // OMP excludes this deployment from discovery.
+    const wireId = resolveWireModelId(spec, { effort: "off", requested: false }, id);
+    // The default route must work even when no reasoning variant is selected.
+    if (!usable(wireId)) return [];
+    const discovered = available?.[wireId];
+    const imageInput = discovered?.supportsImages ?? spec.imageInput;
+    const variants = spec.reasoning
+      ? EFFORT_ORDER.flatMap((effort) => {
+          if (!usable(resolveWireModelId(spec, { effort, requested: true }, id))) return [];
+          const clamped = clampEffort(spec, effort);
+          const thinkingConfig =
+            spec.transport === "level"
+              ? { includeThoughts: true, thinkingLevel: clamped }
+              : { includeThoughts: true, thinkingBudget: spec.budgets?.[clamped] ?? DEFAULT_EFFORT_BUDGETS[clamped] };
+          return [{ id: Model.VariantID.make(effort), settings: { thinkingConfig } }];
+        })
+      : [];
+    return [{
+      id: Model.ID.make(id),
+      modelID: Model.ID.make(id),
+      providerID: PROVIDER_ID,
+      name: spec.name,
+      capabilities: { tools: true, input: imageInput ? ["text", "image"] : ["text"], output: ["text"] },
+      variants,
+      time: { released: 0 },
+      cost: [],
+      status: "active" as const,
+      enabled: true,
+      limit: { context: discovered?.maxTokens ?? spec.contextWindow, output: discovered?.maxOutputTokens ?? spec.outputLimit },
+    }];
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -509,7 +495,7 @@ export interface AntigravitySessionState {
   stepIndex: number;
   lastExecutionId?: string;
   lastGoodEndpoint?: string;
-  /** Last chat.headers invocation id seen; identical ids reuse the envelope so SDK retries do not advance steps. */
+  /** Last model.request invocation id seen; identical ids reuse the envelope so SDK retries do not advance steps. */
   lastInvocationId?: string;
   lastEnvelope?: { requestId: string; step: number; labels: Record<string, string> };
 }
@@ -574,7 +560,7 @@ export interface BodyRewriteOptions {
   logicalModelId: string;
   projectId: string;
   state: AntigravitySessionState;
-  /** Per-invocation id from chat.headers; retries present the same id. */
+  /** Per-invocation id from the model.request hook; retries present the same id. */
   invocationId?: string;
 }
 

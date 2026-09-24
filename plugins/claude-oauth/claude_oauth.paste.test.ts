@@ -1,11 +1,10 @@
 import { describe, expect, test } from "bun:test";
-import { setSystemTime } from "bun:test";
 import { createHash } from "node:crypto";
-import { ClaudeOAuthPlugin } from "./claude_oauth.ts";
+import { setupPlugin } from "./test_harness.ts";
 
 // ---------------------------------------------------------------------------
-// Paste-code login: local state validation before token exchange, the
-// five-minute authorization window, and error sanitization.
+// Paste-code login: local state validation before token exchange, identity
+// metadata, and refresh rotation.
 // ---------------------------------------------------------------------------
 
 interface TokenCall {
@@ -13,15 +12,14 @@ interface TokenCall {
 }
 
 interface Harness {
-  result: { url: string; callback: (pasted: string) => Promise<{ type: string }> };
+  method: any;
+  result: { url: string; expiresAt: number; callback: (pasted: string) => Promise<any> };
   tokenCalls: TokenCall[];
-  warnings: string[];
   restore: () => void;
 }
 
 async function makePasteHarness(): Promise<Harness> {
   const tokenCalls: TokenCall[] = [];
-  const warnings: string[] = [];
   const originalFetch = globalThis.fetch;
   globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
     const url = String(input instanceof Request ? input.url : input);
@@ -32,7 +30,7 @@ async function makePasteHarness(): Promise<Harness> {
           access_token: "at-1",
           refresh_token: "rt-1",
           expires_in: 3600,
-          account: { uuid: "acct-uuid" },
+          account: { uuid: "acct-uuid", email_address: "user@example.com" },
           organization: { uuid: "org-uuid" },
         }),
         { status: 200, headers: { "content-type": "application/json" } },
@@ -41,18 +39,9 @@ async function makePasteHarness(): Promise<Harness> {
     return originalFetch(input, init);
   }) as typeof fetch;
   try {
-    const plugin = await ClaudeOAuthPlugin({
-      client: {
-        app: {
-          log: async ({ body }: { body: { message: string } }) => {
-            warnings.push(body.message);
-          },
-        },
-      },
-    } as never);
-    const pasteMethod = plugin.auth!.methods!.find((m) => m.label === "Claude Pro/Max")!;
-    const result = (await pasteMethod.authorize!()) as Harness["result"];
-    return { result, tokenCalls, warnings, restore: () => (globalThis.fetch = originalFetch) };
+    const { method } = await setupPlugin({}, null);
+    const result = (await method.authorize({})) as Harness["result"];
+    return { method, result, tokenCalls, restore: () => (globalThis.fetch = originalFetch) };
   } catch (error) {
     globalThis.fetch = originalFetch;
     throw error;
@@ -83,7 +72,7 @@ describe("paste code flow", () => {
     const h = await makePasteHarness();
     try {
       const { state } = authorizeParams(h.result.url);
-      expect((await h.result.callback(`good-code#${state}`)).type).toBe("success");
+      expect((await h.result.callback(`good-code#${state}`)).type).toBe("oauth");
       const verifier = h.tokenCalls[0]!.body.code_verifier as string;
       expect(verifier).toMatch(/^[A-Za-z0-9_-]{43}$/);
       expect(new URL(h.result.url).searchParams.get("code_challenge")).toBe(
@@ -104,13 +93,11 @@ describe("paste code flow", () => {
           format === "redirect"
             ? `${redirectUri}?${new URLSearchParams({ code: "real-code", state: wrongState })}`
             : `real-code#${wrongState}`;
-        const result = await h.result.callback(pasted);
-        expect(result.type).toBe("failed");
+        const error = (await h.result.callback(pasted).catch((error: Error) => error)) as Error;
+        expect(error.message).toMatch(/state does not match/i);
+        expect(error.message).not.toContain("real-code");
+        expect(error.message).not.toContain(wrongState);
         expect(h.tokenCalls).toHaveLength(0);
-        const logged = h.warnings.join("\n");
-        expect(logged).toMatch(/state does not match/i);
-        expect(logged).not.toContain("real-code");
-        expect(logged).not.toContain(wrongState);
       } finally {
         h.restore();
       }
@@ -127,7 +114,14 @@ describe("paste code flow", () => {
             ? `${redirectUri}?${new URLSearchParams({ code: "good-code", state })}`
             : `good-code#${state}`;
         const result = await h.result.callback(pasted);
-        expect(result.type).toBe("success");
+        expect(result).toMatchObject({
+          type: "oauth",
+          methodID: "claude-pro-max",
+          access: "at-1",
+          refresh: "rt-1",
+          metadata: { accountId: "acct-uuid", email: "user@example.com", orgId: "org-uuid" },
+        });
+        expect(h.method.label(result)).toBe("user@example.com");
         expect(h.tokenCalls).toHaveLength(1);
         expect(h.tokenCalls[0]!.body.code).toBe("good-code");
         expect(h.tokenCalls[0]!.body.state).toBe(state);
@@ -138,32 +132,33 @@ describe("paste code flow", () => {
     }
   });
 
-  test("pasting after the five-minute window fails without a token exchange", async () => {
+  test("the authorization expires after five minutes", async () => {
     const h = await makePasteHarness();
     try {
-      const { redirectUri, state } = authorizeParams(h.result.url);
-      // Jump just past the five-minute authorization window.
-      setSystemTime(Date.now() + 5 * 60 * 1000 + 1);
-      const result = await h.result.callback(`${redirectUri}?${new URLSearchParams({ code: "late-code", state })}`);
-      expect(result.type).toBe("failed");
-      expect(h.tokenCalls).toHaveLength(0);
-      expect(h.warnings.join("\n")).toMatch(/window expired/i);
+      expect(h.result.expiresAt - Date.now()).toBeGreaterThan(4 * 60 * 1000);
+      expect(h.result.expiresAt - Date.now()).toBeLessThanOrEqual(5 * 60 * 1000);
     } finally {
-      setSystemTime(); // restore real time
       h.restore();
     }
   });
 
-  test("within the window, a valid paste still succeeds (expiry is not over-eager)", async () => {
+  test("refresh rotates tokens and keeps login identity", async () => {
     const h = await makePasteHarness();
     try {
-      const { redirectUri, state } = authorizeParams(h.result.url);
-      setSystemTime(Date.now() + 4 * 60 * 1000);
-      const result = await h.result.callback(`${redirectUri}?${new URLSearchParams({ code: "in-time", state })}`);
-      expect(result.type).toBe("success");
-      expect(h.tokenCalls).toHaveLength(1);
+      const credential = {
+        type: "oauth",
+        methodID: "claude-pro-max",
+        access: "old",
+        refresh: "old-refresh",
+        expires: 0,
+        metadata: { accountId: "kept" },
+      };
+      const refreshed = await h.method.refresh(credential);
+      expect(h.tokenCalls[0]!.body).toMatchObject({ grant_type: "refresh_token", refresh_token: "old-refresh" });
+      expect(h.tokenCalls[0]!.body.scope).not.toContain("org:create_api_key");
+      expect(refreshed).toMatchObject({ access: "at-1", refresh: "rt-1", metadata: { accountId: "kept" } });
+      expect(refreshed.expires).toBeGreaterThan(Date.now());
     } finally {
-      setSystemTime(); // restore real time
       h.restore();
     }
   });

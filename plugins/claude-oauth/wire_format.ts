@@ -23,13 +23,12 @@ const MID_CONVERSATION_SYSTEM_BETA = "mid-conversation-system-2026-04-07";
 const ADVANCED_TOOL_USE_BETA = "advanced-tool-use-2025-11-20";
 const EFFORT_BETA = "effort-2025-11-24";
 const FALLBACK_CREDIT_BETA = "fallback-credit-2026-06-01";
-const TOKEN_COUNTING_BETA = "token-counting-2024-11-01";
 
 // Claude client wire-format behavior: beta profiles, Stainless
 // headers, tool-name cloaking, bounded response uncloaking, and /v1/messages
 // body rewriting (billing fingerprint, cch attestation, metadata.user_id
 // attribution). Nothing here touches OpenCode's plugin API; claude_oauth.ts
-// wires these pieces into the OAuth auth fetch.
+// wires these pieces into the session HTTP hooks.
 
 /**
  * One client identity on the Anthropic wire. `cowork` mirrors oh-my-pi's
@@ -163,11 +162,6 @@ export function resolveSpoofingProfile(value: unknown): SpoofingProfile {
   return profile;
 }
 
-/** Token-counting beta header for a profile: its utility list plus token counting. */
-export function countTokensBetas(profile: ClaudeCodeSpoofingProfile = SDK_CLI_PROFILE): string {
-  return [...profile.utilityBetas, TOKEN_COUNTING_BETA].join(",");
-}
-
 // These caller-supplied betas are absent from the supported wire profiles.
 // context-1m additionally hard-429s OAuth subscription requests.
 const STRIPPED_BETAS = new Set([
@@ -250,9 +244,29 @@ export const STAINLESS_HEADERS: Record<string, string> = {
   "X-Stainless-Timeout": "600",
 };
 
-/** Stainless header set for a profile; only the package version varies. */
-export function stainlessHeaders(profile: ClaudeCodeSpoofingProfile): Record<string, string> {
-  return { ...STAINLESS_HEADERS, "X-Stainless-Package-Version": profile.stainlessPackageVersion };
+/**
+ * The complete /v1/messages header set for a Claude Code profile. Every
+ * caller header not listed here (OpenCode's session routing, project/client
+ * markers, its User-Agent) is dropped.
+ */
+export function buildEnforcedHeaders(
+  profile: ClaudeCodeSpoofingProfile,
+  fields: { sessionId: string; betas: string; authorization: string; clientRequestId: string },
+): Headers {
+  return new Headers({
+    Accept: "application/json",
+    Authorization: fields.authorization,
+    "Content-Type": "application/json",
+    "User-Agent": profile.userAgent,
+    "X-Claude-Code-Session-Id": fields.sessionId,
+    ...STAINLESS_HEADERS,
+    "X-Stainless-Package-Version": profile.stainlessPackageVersion,
+    "anthropic-beta": fields.betas,
+    "anthropic-dangerous-direct-browser-access": "true",
+    "anthropic-version": "2023-06-01",
+    "x-app": "cli",
+    "x-client-request-id": fields.clientRequestId,
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -334,52 +348,8 @@ export function prefixRequestToolNames(params: Record<string, any>, profile: Cla
 }
 
 // ---------------------------------------------------------------------------
-// Bounded response uncloaking (non-streaming JSON + incremental SSE)
+// Bounded response uncloaking (incremental SSE)
 // ---------------------------------------------------------------------------
-
-/** Strip the cloaking prefix from `content[].type === "tool_use"` names in a non-streaming JSON response body. */
-export function transformJsonToolUseNames(
-  body: string,
-  prefix: string = TOOL_PREFIX,
-  transformName?: (name: string) => string,
-): string {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(body);
-  } catch {
-    return body;
-  }
-  if (transformName) {
-    let changed = false;
-    const visit = (value: unknown): void => {
-      if (!value || typeof value !== "object") return;
-      if (Array.isArray(value)) {
-        for (const item of value) visit(item);
-        return;
-      }
-      for (const [key, item] of Object.entries(value)) {
-        if (key === "name" && typeof item === "string") {
-          const next = transformName(item);
-          if (next !== item) {
-            (value as Record<string, unknown>)[key] = next;
-            changed = true;
-          }
-        } else {
-          visit(item);
-        }
-      }
-    };
-    visit(parsed);
-    return changed ? JSON.stringify(parsed) : body;
-  }
-  if (!parsed || typeof parsed !== "object" || !Array.isArray((parsed as Record<string, any>).content)) return body;
-  for (const block of (parsed as Record<string, any>).content) {
-    if (block?.type === "tool_use" && typeof block.name === "string") {
-      block.name = stripClaudeToolPrefix(block.name, prefix);
-    }
-  }
-  return JSON.stringify(parsed);
-}
 
 // One complete SSE event may be buffered while it is assembled across chunks.
 // Anthropic messages events sit far below this; exceeding it means the stream
@@ -529,30 +499,6 @@ export function createSseToolNameTransform(
       dispatch(controller);
     },
   });
-}
-
-// Non-streaming JSON bodies are read whole but bounded: a legitimate message
-// response stays far below this; anything larger is a protocol error, not
-// something to buffer indefinitely.
-const MAX_JSON_RESPONSE_CHARS = 64 * 1024 * 1024;
-
-export async function readBoundedJsonText(response: Response): Promise<string> {
-  const reader = response.body?.getReader();
-  if (!reader) return "";
-  const decoder = new TextDecoder();
-  let text = "";
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    text += decoder.decode(value, { stream: true });
-    if (text.length > MAX_JSON_RESPONSE_CHARS) {
-      reader.cancel().catch(() => {});
-      throw new Error(
-        `claude-oauth: non-streaming JSON response exceeds the ${MAX_JSON_RESPONSE_CHARS}-character uncloaking bound`,
-      );
-    }
-  }
-  return text;
 }
 
 /**
@@ -723,7 +669,7 @@ export function rewriteBody(
     attributionHeader?: boolean;
     profile?: ClaudeCodeSpoofingProfile;
   },
-): { json: string; thinking: unknown; hasTools: boolean; model: string; sessionId?: string } {
+): { json: string; thinking: unknown; hasTools: boolean; model: string; sessionId: string } {
   const profile = ctx.profile ?? SDK_CLI_PROFILE;
   const params = JSON.parse(body) as Record<string, any>;
   if (

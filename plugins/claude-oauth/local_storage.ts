@@ -3,12 +3,8 @@ import { chmodSync, mkdirSync, readFileSync, statSync, writeFileSync } from "nod
 import os from "node:os";
 import path from "node:path";
 
-export function opencodeDataDir(): string {
-  return path.join(process.env.XDG_DATA_HOME ?? path.join(os.homedir(), ".local", "share"), "opencode");
-}
-
 function getInstallId(): string {
-  const dir = opencodeDataDir();
+  const dir = path.join(process.env.XDG_DATA_HOME ?? path.join(os.homedir(), ".local", "share"), "opencode");
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   const file = path.join(dir, "claude-oauth-install-id");
   let existing = "";

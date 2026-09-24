@@ -5,21 +5,17 @@ import {
   EX_MACHINA_PROFILE,
   mergeExMachinaBetas,
   rewriteExMachinaBody,
-  rewriteExMachinaUrl,
   sanitizeExMachinaSystemText,
   unprefixExMachinaName,
 } from "./ex_machina_wire.ts";
 import {
   createSseToolNameTransform,
   COWORK_PROFILE,
-  readBoundedJsonText,
   resolveSpoofingProfile,
   SDK_CLI_PROFILE,
-  transformJsonToolUseNames,
   uncloakedResponseHeaders,
 } from "./wire_format.ts";
-import { ClaudeOAuthPlugin } from "./claude_oauth.ts";
-import { coworkTransport } from "./cowork_fetch.ts";
+import { setupPlugin } from "./test_harness.ts";
 
 describe("ex-machina profile", () => {
   test("resolver keeps the existing default and accepts all three profile IDs", () => {
@@ -150,18 +146,9 @@ describe("ex-machina request transforms", () => {
     expect(rewriteExMachinaBody("not-json")).toBe("not-json");
   });
 
-  test("only messages gains a missing beta query", () => {
-    expect(rewriteExMachinaUrl(new URL("https://api.anthropic.com/v1/messages")).search).toBe("?beta=true");
-    expect(rewriteExMachinaUrl(new URL("https://api.anthropic.com/v1/messages?beta=false")).search).toBe(
-      "?beta=false",
-    );
-    expect(rewriteExMachinaUrl(new URL("https://api.anthropic.com/v1/messages/count_tokens")).search).toBe("");
-  });
-
   test("strict headers retain only the safe allowlist and pin OAuth values", () => {
     const headers = buildExMachinaHeaders(
-      "https://api.anthropic.com/v1/messages",
-      {
+      new Headers({
         Accept: "application/json",
         "Content-Type": "application/json",
         "anthropic-version": "2023-06-01",
@@ -169,14 +156,13 @@ describe("ex-machina request transforms", () => {
         "anthropic-beta": "caller-beta,oauth-2025-04-20",
         "x-app": "cli",
         "x-stainless-lang": "js",
-        Authorization: "Bearer stale",
+        Authorization: "Bearer access-token",
         "x-api-key": "stale",
         Cookie: "secret",
         "x-client-request-id": "private",
         "x-claude-code-session-id": "private",
         "x-unknown": "drop",
-      },
-      "access-token",
+      }),
     );
     expect(Object.fromEntries(headers)).toEqual({
       accept: "application/json",
@@ -193,19 +179,6 @@ describe("ex-machina request transforms", () => {
 });
 
 describe("ex-machina response transforms", () => {
-  test("recursively uncloaks JSON name properties including StructuredOutput", () => {
-    const body = JSON.stringify({
-      name: "mcp_Bash",
-      nested: [{ name: "mcp_Read_file" }, { input: { name: "mcp_StructuredOutput" } }],
-      untouched: { name: "ordinary" },
-    });
-    expect(JSON.parse(transformJsonToolUseNames(body, "mcp_", unprefixExMachinaName))).toEqual({
-      name: "bash",
-      nested: [{ name: "read_file" }, { input: { name: "StructuredOutput" } }],
-      untouched: { name: "ordinary" },
-    });
-  });
-
   test("handles arbitrary fragmented SSE and removes stale transformed-response headers", async () => {
     const source = 'event: custom\ndata: {"outer":{"name":"mcp_Bash"},"items":[{"name":"mcp_StructuredOutput"}]}\n\n';
     const input = new ReadableStream<Uint8Array>({
@@ -223,8 +196,6 @@ describe("ex-machina response transforms", () => {
     const response = new Response("{}", {
       headers: { "content-type": "application/json", "content-length": "2", etag: "old", "x-safe": "yes" },
     });
-    const bounded = await readBoundedJsonText(response.clone());
-    expect(bounded).toBe("{}");
     const headers = uncloakedResponseHeaders(response);
     expect(headers.get("content-length")).toBeNull();
     expect(headers.get("etag")).toBeNull();
@@ -233,57 +204,30 @@ describe("ex-machina response transforms", () => {
 });
 
 describe("ex-machina integration dispatch", () => {
-  test("uses global fetch, never coworkTransport, and recursively transforms JSON", async () => {
-    const originalFetch = globalThis.fetch;
-    const originalTransport = coworkTransport.impl;
-    let captured: { url: string; init?: RequestInit } | undefined;
-    let coworkCalls = 0;
-    coworkTransport.impl = async () => {
-      coworkCalls++;
-      throw new Error("cowork transport must not run");
-    };
-    globalThis.fetch = (async (input, init) => {
-      captured = { url: String(input), init };
-      return new Response(JSON.stringify({ nested: { name: "mcp_Read_file" } }), {
-        headers: { "content-type": "application/json", etag: "stale" },
-      });
-    }) as typeof fetch;
-    try {
-      const plugin = await ClaudeOAuthPlugin(
-        { client: { auth: { set: async () => {} } } } as never,
-        { spoofingProfile: "ex-machina" },
-      );
-      const loader = await plugin.auth!.loader!(
-        async () => ({
-          type: "oauth",
-          access: "access-token",
-          refresh: "refresh-token",
-          expires: Date.now() + 60_000,
-        }) as never,
-        {} as never,
-      );
-      const response = await loader.fetch!("https://api.anthropic.com/v1/messages?beta=false", {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          "x-claude-code-session-id": "drop",
-          "x-client-request-id": "drop",
-        },
-        body: JSON.stringify({
-          messages: [{ role: "user", content: "hello world test message" }],
-          max_tokens: 100000,
+  test("keeps the allowlisted headers and uncloaks the SSE response", async () => {
+    const { send } = await setupPlugin({ spoofingProfile: "ex-machina" });
+    const { request, bodyText, response } = await send(
+      {
+        model: "claude-sonnet-4-6",
+        messages: [{ role: "user", content: "hello world test message" }],
+        tools: [{ name: "read_file", input_schema: { type: "object" } }],
+        max_tokens: 100000,
+        stream: true,
+      },
+      () =>
+        new Response('data: {"type":"content_block_start","content_block":{"type":"tool_use","name":"mcp_Read_file"}}\n\n', {
+          headers: { "content-type": "text/event-stream", etag: "stale" },
         }),
-      });
-      expect(coworkCalls).toBe(0);
-      expect(captured!.url).toBe("https://api.anthropic.com/v1/messages?beta=false");
-      expect(new Headers(captured!.init!.headers).get("x-claude-code-session-id")).toBeNull();
-      expect(new Headers(captured!.init!.headers).get("x-client-request-id")).toBeNull();
-      expect(JSON.parse(captured!.init!.body as string).max_tokens).toBe(100000);
-      expect(await response.json()).toEqual({ nested: { name: "read_file" } });
-      expect(response.headers.get("etag")).toBeNull();
-    } finally {
-      globalThis.fetch = originalFetch;
-      coworkTransport.impl = originalTransport;
-    }
+    );
+    expect(request.headers.get("x-claude-code-session-id")).toBeNull();
+    expect(request.headers.get("x-client-request-id")).toBeNull();
+    expect(request.headers.get("x-session-affinity")).toBeNull();
+    expect(request.headers.get("authorization")).toBe("Bearer test-access-token");
+    expect(request.headers.get("user-agent")).toBe(EX_MACHINA_PROFILE.userAgent);
+    const body = JSON.parse(bodyText);
+    expect(body.max_tokens).toBe(100000);
+    expect(body.tools[0].name).toBe("mcp_Read_file");
+    expect(await response.text()).toContain('"name":"read_file"');
+    expect(response.headers.get("etag")).toBeNull();
   });
 });

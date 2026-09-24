@@ -1,53 +1,25 @@
-import type { Hooks, Plugin, PluginInput, PluginOptions } from "@opencode-ai/plugin";
-import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
-import path from "node:path";
+import { Integration, Plugin, type Credential } from "@opencode/plugin";
+import { randomBytes, randomUUID } from "node:crypto";
 import {
   buildBetas,
-  countTokensBetas,
+  buildEnforcedHeaders,
   createSseToolNameTransform,
-  prefixRequestToolNames,
-  readBoundedJsonText,
   resolveSpoofingProfile,
   rewriteBody,
-  stainlessHeaders,
-  transformJsonToolUseNames,
   uncloakedResponseHeaders,
 } from "./wire_format.ts";
 import type { SpoofingProfile } from "./wire_format.ts";
-import { deriveCoworkSessionId, opencodeDataDir } from "./local_storage.ts";
-import { buildEnforcedHeaders, coworkTransport } from "./cowork_fetch.ts";
-import {
-  buildExMachinaHeaders,
-  rewriteExMachinaBody,
-  rewriteExMachinaUrl,
-  unprefixExMachinaName,
-} from "./ex_machina_wire.ts";
-
-// Preserve the historical public API: tests and package consumers import these
-// from the plugin entry.
-export {
-  applyClaudeToolPrefix,
-  buildBetas,
-  createSseToolNameTransform,
-  mapStainlessArch,
-  rewriteBody,
-  stripClaudeToolPrefix,
-  transformJsonToolUseNames,
-} from "./wire_format.ts";
-export { resolveSpoofingProfile } from "./wire_format.ts";
-export type { SpoofingProfile } from "./wire_format.ts";
-export { EX_MACHINA_PROFILE } from "./ex_machina_wire.ts";
+import { deriveCoworkSessionId } from "./local_storage.ts";
+import { buildExMachinaHeaders, rewriteExMachinaBody, unprefixExMachinaName } from "./ex_machina_wire.ts";
 
 // Configure in `opencode.json` like:
 //
 // {
-//   "plugin": ["@jiafuei/opencode-claude-oauth"]
+//   "plugins": ["@jiafuei/opencode-claude-oauth"]
 // }
 //
-// Then run `opencode auth login`, pick Anthropic, and choose Claude Pro/Max.
-// Requests to the Anthropic provider are then
-// fingerprinted to look exactly like Claude Code (claude-cli) subscription
+// Then connect Anthropic and choose Claude Pro/Max. Requests to the Anthropic
+// provider are then fingerprinted to look like Claude Code subscription
 // traffic, so your Pro/Max subscription is used instead of API credits.
 
 function rot13(value: string): string {
@@ -67,32 +39,20 @@ const REFRESH_SCOPES = rot13("hfre:cebsvyr hfre:vasrerapr hfre:frffvbaf:pynhqr_p
 
 const AXIOS_USER_AGENT = "axios/1.15.2";
 const AXIOS_ACCEPT = "application/json, text/plain, */*";
-const OAUTH_DUMMY_KEY = "opencode-oauth-dummy-key";
-const SESSION_ID_HEADER = "x-claude-code-session-id";
-const OPENCODE_SESSION_ID_HEADER = "x-claude-oauth-session-id";
-// Plugin-only transport header: carries the per-invocation request id from
-// chat.headers into the auth fetch. Like the session marker, it is stripped
-// before anything hits the wire. The prompt-id marker is legacy (no profile
-// emits it anymore) but stale values are still stripped defensively.
-const REQUEST_ID_HEADER = "x-claude-oauth-request-id";
-const PROMPT_ID_HEADER = "x-claude-oauth-prompt-id";
+const SESSION_ID_HEADER = "X-Claude-Code-Session-Id";
+const REQUEST_ID_HEADER = "x-client-request-id";
+const METHOD_ID = Integration.MethodID.make("claude-pro-max");
+const FLOW_TIMEOUT_MS = 5 * 60 * 1000;
 
 // ---------------------------------------------------------------------------
 // PKCE + token plumbing
 // ---------------------------------------------------------------------------
 
-interface PkceCodes {
-  verifier: string;
-  challenge: string;
-}
-
 function base64UrlEncode(buffer: ArrayBuffer): string {
-  const bytes = new Uint8Array(buffer);
-  const binary = String.fromCharCode(...bytes);
-  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  return Buffer.from(buffer).toString("base64url");
 }
 
-async function generatePKCE(): Promise<PkceCodes> {
+async function generatePKCE(): Promise<{ verifier: string; challenge: string }> {
   const verifier = randomBytes(32).toString("base64url");
   const challenge = base64UrlEncode(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier)));
   return { verifier, challenge };
@@ -100,18 +60,16 @@ async function generatePKCE(): Promise<PkceCodes> {
 
 interface TokenResponse {
   access_token: string;
-  refresh_token: string;
+  refresh_token?: string;
   expires_in: number;
   account?: { uuid?: string; email_address?: string };
   organization?: { uuid?: string; name?: string };
 }
 
 /**
- * Account + organization identity slice resolved from the token response
- * and/or the OAuth profile and Claude CLI roles endpoints.
- * OpenCode's auth schema persists only `accountId`; email/org are resolved
- * transiently and clearly typed here for future use — there is deliberately
- * no second credential store.
+ * Account + organization identity resolved from the token response and/or
+ * the OAuth profile, Claude CLI roles, or Cowork bootstrap endpoints. Stored
+ * as the credential's metadata.
  */
 export interface OAuthIdentity {
   accountId?: string;
@@ -134,107 +92,29 @@ export function extractIdentity(data: TokenResponse): OAuthIdentity {
   };
 }
 
-// Only this origin may receive OAuth bearer traffic or token mutations.
-const OAUTH_ALLOWED_ORIGIN = rot13("uggcf://ncv.naguebcvp.pbz");
-
-// Error bodies are read only up to this bound before parsing; the raw body is
-// never embedded into thrown errors (it can be huge and may echo credentials).
-const TOKEN_ERROR_BODY_LIMIT = 16 * 1024;
-
-async function readBoundedText(response: Response, limit: number): Promise<string> {
-  const reader = response.body?.getReader();
-  if (!reader) return "";
-  const decoder = new TextDecoder();
-  let text = "";
-  while (text.length < limit) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    text += decoder.decode(value, { stream: true });
-  }
-  reader.cancel().catch(() => {});
-  return text.slice(0, limit);
-}
-
-/** Extract a string OAuth error code from the common error-body shapes. */
-function extractOauthError(parsed: unknown): string | undefined {
-  if (!parsed || typeof parsed !== "object") return undefined;
-  const error = (parsed as Record<string, unknown>).error;
-  if (typeof error === "string") return nonEmpty(error);
-  // Nested variants: {error: {type: "invalid_grant"}} / {error: {error/code: "..."}}.
-  if (error && typeof error === "object") {
-    const nested = error as Record<string, unknown>;
-    return nonEmpty(nested.type) ?? nonEmpty(nested.error) ?? nonEmpty(nested.code);
-  }
-  return undefined;
-}
-
 /**
- * POST to the official token endpoint and validate the envelope at the
- * network boundary: a 200 response without the required fields throws here,
- * long before identity resolution, persistence, or dispatch. Initial
- * exchanges require a nonempty refresh_token; refreshes may omit it (callers
- * keep the previous value). Thrown errors carry only the status plus the
- * parsed `error`/`error_description` fields — never the raw body or any
- * credential material.
+ * POST to the official token endpoint. Thrown errors carry only the status
+ * plus the parsed `error`/`error_description` fields — never the raw body or
+ * any credential material.
  */
-async function postToken(
-  body: Record<string, string>,
-  extraHeaders?: Record<string, string>,
-  requireRefreshToken = true,
-): Promise<TokenResponse> {
+async function postToken(body: Record<string, string>): Promise<TokenResponse> {
   const response = await fetch(TOKEN_URL, {
     method: "POST",
-    headers: {
-      Accept: AXIOS_ACCEPT,
-      "User-Agent": AXIOS_USER_AGENT,
-      ...extraHeaders,
-      "Content-Type": "application/json",
-    },
+    headers: { Accept: AXIOS_ACCEPT, "User-Agent": AXIOS_USER_AGENT, "Content-Type": "application/json" },
     body: JSON.stringify(body),
     signal: AbortSignal.timeout(30_000),
   });
-  if (!response.ok) {
-    const text = await readBoundedText(response, TOKEN_ERROR_BODY_LIMIT);
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(text);
-    } catch {}
-    const oauthError = extractOauthError(parsed);
-    const description = nonEmpty((parsed as Record<string, unknown> | undefined)?.error_description)?.slice(0, 300);
-    // Structured fields so callers can classify terminal refresh failures
-    // (e.g. invalid_grant) without re-parsing the message.
-    const error = new Error(
-      `Anthropic OAuth token request failed (HTTP ${response.status}${oauthError ? `, ${oauthError}` : ""})` +
-        (description ? `: ${description}` : ""),
-    ) as Error & { status?: number; oauthError?: string };
-    error.status = response.status;
-    error.oauthError = oauthError;
-    throw error;
-  }
-  let data: unknown;
-  try {
-    data = JSON.parse(await response.text());
-  } catch {
-    throw new Error("Anthropic OAuth token endpoint returned invalid JSON with a 200 status");
-  }
-  const record = (data ?? {}) as Record<string, unknown>;
-  const accessToken = nonEmpty(record.access_token);
-  const refreshToken = nonEmpty(record.refresh_token);
-  const expiresIn = record.expires_in;
-  if (
-    !accessToken ||
-    (requireRefreshToken && !refreshToken) ||
-    typeof expiresIn !== "number" ||
-    !Number.isFinite(expiresIn) ||
-    expiresIn <= 0
-  ) {
-    throw new Error(
-      `Anthropic OAuth token response is missing required fields (nonempty access_token${
-        requireRefreshToken ? ", nonempty refresh_token" : ""
-      }, finite positive expires_in)`,
-    );
-  }
-  return data as TokenResponse;
+  if (response.ok) return (await response.json()) as TokenResponse;
+  const parsed = (await response.json().catch(() => undefined)) as
+    | { error?: string | { type?: string }; error_description?: string }
+    | undefined;
+  const oauthError = typeof parsed?.error === "string" ? parsed.error : parsed?.error?.type;
+  const description = parsed?.error_description?.slice(0, 300);
+  throw new Error(
+    `Anthropic OAuth token request failed (HTTP ${response.status}${oauthError ? `, ${oauthError}` : ""})` +
+      (description ? `: ${description}` : "") +
+      (oauthError === "invalid_grant" ? " — reconnect Anthropic with Claude Pro/Max." : ""),
+  );
 }
 
 /**
@@ -317,25 +197,17 @@ async function fetchCoworkBootstrapIdentity(
 }
 
 /**
- * Resolve account (and optionally organization) identity for a token
- * response, merging the token response over profile recovery. `includeOrg`
- * is login-only: the org a token is scoped to is captured once when the
- * credential is created and deliberately never refreshed afterwards —
- * rewriting org identity during background refreshes could silently re-key
- * stored credentials. Every profile recovery failure (network, non-OK, timeout,
- * invalid JSON) is swallowed so identity recovery never invalidates an
- * otherwise successful token exchange or refresh.
+ * Resolve the login identity, merging the token response over profile
+ * recovery. Identity is captured once at login and kept across refreshes.
+ * Recovery failures are swallowed so they never invalidate an otherwise
+ * successful token exchange.
  */
-export async function resolveIdentity(
-  data: TokenResponse,
-  options?: { includeOrg?: boolean; profile?: SpoofingProfile },
-): Promise<OAuthIdentity> {
+export async function resolveIdentity(data: TokenResponse, profile?: SpoofingProfile): Promise<OAuthIdentity> {
   const identity = extractIdentity(data);
-  const orgSatisfied = !options?.includeOrg || identity.orgId !== undefined;
-  if (identity.accountId && identity.email && orgSatisfied) return identity;
+  if (identity.accountId && identity.email && identity.orgId) return identity;
   try {
-    const recovered = options?.profile?.id === "cowork"
-      ? await fetchCoworkBootstrapIdentity(data.access_token, options.profile)
+    const recovered = profile?.id === "cowork"
+      ? await fetchCoworkBootstrapIdentity(data.access_token, profile)
       : await fetchOAuthIdentity(data.access_token);
     return {
       accountId: identity.accountId ?? recovered.accountId,
@@ -348,559 +220,15 @@ export async function resolveIdentity(
   }
 }
 
-async function exchangeCode(
-  code: string,
-  state: string,
-  verifier: string,
-  redirectUri: string,
-  profile: SpoofingProfile,
-): Promise<{ access: string; refresh: string; expires: number; accountId?: string }> {
-  const data = await postToken({
-    grant_type: "authorization_code",
-    client_id: CLIENT_ID,
-    code,
-    state,
-    redirect_uri: redirectUri,
-    code_verifier: verifier,
-  });
-
-  // Login captures the full identity once: profile recovery runs whenever account
-  // identity (uuid/email) or org identity is incomplete. Only accountId is
-  // returned/persisted through OpenCode; email/org stay transient.
-  const identity = await resolveIdentity(data, { includeOrg: true, profile });
-
-  return {
-    access: data.access_token,
-    refresh: data.refresh_token,
-    expires: Date.now() + data.expires_in * 1000 - 5 * 60 * 1000,
-    accountId: identity.accountId,
-  };
-}
-
-async function refreshTokens(refreshToken: string): Promise<TokenResponse> {
-  // Refresh responses may omit refresh_token (rotation optional); the caller
-  // keeps the previous value in that case.
-  return postToken(
-    {
-      grant_type: "refresh_token",
-      client_id: CLIENT_ID,
-      refresh_token: refreshToken,
-      scope: REFRESH_SCOPES,
-    },
-    undefined,
-    false,
-  );
-}
-
-// ---------------------------------------------------------------------------
-// Cross-instance refresh coordination
-// ---------------------------------------------------------------------------
-
-/** Thrown when Anthropic rejects the refresh grant terminally (invalid_grant). */
-export class AnthropicReauthRequiredError extends Error {
-  constructor(cause?: unknown, grantAgeDays?: number) {
-    super(
-      "Anthropic OAuth grant is no longer valid (invalid_grant) — re-login required: run `opencode auth login`, pick Anthropic, and choose a Claude Pro/Max method." +
-        (grantAgeDays === undefined
-          ? ""
-          : ` Observed grant age: ~${grantAgeDays} day(s) since authorization (~30 days is the typical observed lifetime, not a guaranteed contract).`),
-      { cause },
-    );
-    this.name = "AnthropicReauthRequiredError";
-  }
-}
-
-interface RefreshedCredential {
-  refresh: string;
-  access: string;
-  expires: number;
-  accountId?: string;
-}
-
-// A lease holder that crashed mid-refresh is stolen after this long. Must
-// safely exceed the worst-case in-lease work: one token refresh (30s timeout)
-// plus profile/roles recovery (10s timeout), with ample room so a slow-but-live
-// holder is never stolen mid-flight.
-const REFRESH_LEASE_TTL_MS = 120_000;
-const REFRESH_LEASE_POLL_MS = 100;
-
-// Injectable clock/timers for the lease paths (tests simulate long waits).
-const leaseClock = {
-  now: () => Date.now(),
-  sleep: (ms: number) => Bun.sleep(ms),
-};
-
-// In-process coordination: every plugin/loader instance in this process shares
-// one refresh promise per credential identity (hashed accountId + refresh
-// token), so concurrent expirations trigger a single network refresh.
-const inFlightRefreshes = new Map<string, Promise<RefreshedCredential | null>>();
-
-/**
- * Key for the in-process map: a SHA-256 of the credential identity. Never the
- * raw refresh token — the map must stay free of credential material.
- */
-function inFlightKey(accountId: string | undefined, refresh: string): string {
-  return createHash("sha256")
-    .update(`${accountId ?? ""}:${refresh}`)
-    .digest("hex");
-}
-
-// Cross-process coordination: an exclusive mkdir lease under OpenCode's data
-// directory, keyed like the in-process map, so parallel opencode processes
-// don't race the same refresh token (rotation invalidates the loser's token).
-function refreshLeaseDir(key: string): string {
-  const hash = createHash("sha256").update(key).digest("hex").slice(0, 32);
-  return path.join(opencodeDataDir(), "claude-oauth", "refresh-lease", hash);
-}
-
-interface LeaseOwner {
-  owner: string;
-  pid: number;
-  at: number;
-}
-
-function newLeaseOwner(): LeaseOwner {
-  return { owner: randomBytes(16).toString("hex"), pid: process.pid, at: leaseClock.now() };
-}
-
-/** Read and validate the recorded lease owner; undefined when missing/malformed. */
-function readLeaseOwner(dir: string): LeaseOwner | undefined {
-  try {
-    const parsed = JSON.parse(readFileSync(path.join(dir, "owner"), "utf8")) as Partial<LeaseOwner>;
-    if (typeof parsed.owner === "string" && parsed.owner.length > 0 && typeof parsed.at === "number") {
-      return {
-        owner: parsed.owner,
-        pid: typeof parsed.pid === "number" ? parsed.pid : -1,
-        at: parsed.at,
-      };
-    }
-  } catch {}
-  return undefined;
-}
-
-/**
- * Atomic exclusive acquire via mkdir. Returns this holder's cryptographically
- * random owner token, or null when a live holder owns the lease. Only a lease
- * older than the TTL (a stale owner timestamp, or an ownerless directory aged
- * past the TTL — the holder crashed mid-refresh or mid-installation) is taken
- * over, and the takeover re-runs the atomic mkdir so concurrent stealers race
- * instead of both winning.
- */
-function tryAcquireLease(dir: string): string | null {
-  mkdirSync(path.dirname(dir), { recursive: true, mode: 0o700 });
-  const claim = newLeaseOwner();
-  try {
-    mkdirSync(dir);
-  } catch {
-    const current = readLeaseOwner(dir);
-    if (current && leaseClock.now() - current.at < REFRESH_LEASE_TTL_MS) return null;
-    if (!current) {
-      // No owner record yet (the holder is still installing it, microseconds
-      // after its mkdir won) or a malformed one: judge by the directory's own
-      // age. Stealing a mid-installation lease would let the dispossessed
-      // holder overwrite our owner record afterwards and leave TWO live
-      // holders refreshing the same grant. Only an aged ownerless directory
-      // (crash between mkdir and write) is taken over.
-      let aged = false;
-      try {
-        aged = leaseClock.now() - statSync(dir).mtimeMs >= REFRESH_LEASE_TTL_MS;
-      } catch {
-        return null; // vanished: the next poll retries the plain mkdir
-      }
-      if (!aged) return null;
-    }
-    // Stale owner record (or aged ownerless directory): the holder crashed —
-    // take over. The mkdir below decides the race if several waiters steal
-    // simultaneously.
-    rmSync(dir, { recursive: true, force: true });
-    try {
-      mkdirSync(dir);
-    } catch {
-      return null;
-    }
-  }
-  writeFileSync(path.join(dir, "owner"), JSON.stringify(claim), { mode: 0o600 });
-  // Verify ownership: a concurrent stealer may have replaced our record.
-  const verified = readLeaseOwner(dir);
-  return verified?.owner === claim.owner ? claim.owner : null;
-}
-
-/** Release only the lease we still own — never another holder's replacement. */
-function releaseLease(dir: string, ownerId: string): void {
-  const current = readLeaseOwner(dir);
-  if (!current || current.owner !== ownerId) return;
-  rmSync(dir, { recursive: true, force: true });
-}
-
-/**
- * Acquire the refresh lease, polling while a live holder works. Returns the
- * owner token on confirmed acquisition, or null when the holder's refresh
- * landed while we waited (or auth was removed/changed underneath us) — the
- * caller should adopt the latest persisted credentials instead of refreshing
- * again. A live lease is never stolen no matter how long it is held: takeover
- * happens only through the TTL path in tryAcquireLease once the holder's
- * timestamp goes stale.
- */
-async function waitForLease(
-  dir: string,
-  startAuth: { access?: string },
-  getAuth: () => Promise<any>,
-): Promise<string | null> {
-  for (;;) {
-    const owner = tryAcquireLease(dir);
-    if (owner) return owner;
-    const latest = await getAuth();
-    if (latest?.type !== "oauth" || latest.access !== startAuth.access || latest.expires >= leaseClock.now()) {
-      return null;
-    }
-    await leaseClock.sleep(REFRESH_LEASE_POLL_MS);
-  }
-}
-
-/**
- * Refresh the Anthropic OAuth credential so exactly one refresh happens per
- * identity: process-wide via the shared promise map, machine-wide via the fs
- * lease. Returns the persisted rotated credential, or null when a peer's
- * refresh already landed and the caller should re-read getAuth instead.
- */
-async function performSharedRefresh(
-  startAuth: { access?: string; refresh: string; accountId?: string },
-  getAuth: () => Promise<any>,
-  persist: (tokens: RefreshedCredential) => Promise<void>,
-  profile: SpoofingProfile,
-): Promise<RefreshedCredential | null> {
-  const credentialIdentity = `${startAuth.accountId ?? ""}:${startAuth.refresh}`;
-  const key = inFlightKey(startAuth.accountId, startAuth.refresh);
-  const inFlight = inFlightRefreshes.get(key);
-  if (inFlight) return inFlight;
-  const promise = (async (): Promise<RefreshedCredential | null> => {
-    // The on-disk lease stays keyed by the composite identity (hashed once
-    // inside refreshLeaseDir); only the in-process map key is the extra hash.
-    const dir = refreshLeaseDir(credentialIdentity);
-    const ownerId = await waitForLease(dir, startAuth, getAuth);
-    if (ownerId === null) return null;
-    try {
-      // Under the lease: a peer process may have persisted rotated credentials
-      // after we observed the expiry.
-      const latest = await getAuth();
-      if (latest?.type !== "oauth") return null;
-      if (latest.access !== startAuth.access || latest.expires >= leaseClock.now()) return null;
-
-      let tokens: TokenResponse;
-      try {
-        tokens = await refreshTokens(latest.refresh);
-      } catch (error) {
-        const e = error as Error & { status?: number; oauthError?: string };
-        // Terminal grant rejection: Anthropic answers 400, some gateway/error
-        // shapes answer 401 with the same OAuth error code.
-        if ((e.status === 400 || e.status === 401) && e.oauthError === "invalid_grant") {
-          // Mention the observed grant age when we tracked it; never delete auth.
-          const ageMs = observedGrantAgeMs(latest.refresh, latest.accountId);
-          throw new AnthropicReauthRequiredError(error, ageMs === undefined ? undefined : Math.floor(ageMs / DAY_MS));
-        }
-        throw error;
-      }
-      // No includeOrg: never re-key organization on refresh. The stored
-      // accountId survives whenever the response identity is missing/empty.
-      const identity = await resolveIdentity(tokens, { profile });
-      const refreshed: RefreshedCredential = {
-        refresh: tokens.refresh_token || latest.refresh,
-        access: tokens.access_token,
-        expires: Date.now() + tokens.expires_in * 1000 - 5 * 60 * 1000,
-        accountId: identity.accountId ?? latest.accountId,
-      };
-      // Immediately before persisting: re-read the stored credential and
-      // persist only if it is still the same OAuth grant we refreshed. A
-      // logout, API-key switch, new login, or peer rotation that happened
-      // during the network work must never be overwritten by our stale result.
-      const prePersist = await getAuth();
-      if (
-        prePersist?.type !== "oauth" ||
-        prePersist.refresh !== latest.refresh ||
-        prePersist.access !== latest.access ||
-        (prePersist.accountId ?? undefined) !== (latest.accountId ?? undefined)
-      ) {
-        return null;
-      }
-      // Persist before returning: only durable credentials are handed to
-      // callers, so every reader in every process observes the same token.
-      await persist(refreshed);
-      return refreshed;
-    } finally {
-      releaseLease(dir, ownerId);
-    }
-  })();
-  const tracked = promise.finally(() => inFlightRefreshes.delete(key));
-  inFlightRefreshes.set(key, tracked);
-  return tracked;
-}
-
-export const refreshTestSeam = {
-  leaseDirFor: refreshLeaseDir,
-  tryAcquireLease,
-  releaseLease,
-  readLeaseOwner,
-  leaseClock,
-  inFlightKey,
-  /** Hashed keys of currently tracked in-flight refreshes (safe to inspect). */
-  inFlightKeys: (): string[] => [...inFlightRefreshes.keys()],
-  /** Safe reset replacing direct access to the internal map. */
-  resetInFlightRefreshes: (): void => inFlightRefreshes.clear(),
-};
-
-// ---------------------------------------------------------------------------
-// Grant-age tracking (plugin-side sidecar; OpenCode's OAuth auth schema has no
-// authorizedAt field)
-// ---------------------------------------------------------------------------
-
-const DAY_MS = 24 * 60 * 60 * 1000;
-// Warn once a grant nears its observed ~30-day absolute lifetime.
-const GRANT_WARN_AGE_MS = 28 * DAY_MS;
-
-export const grantTestSeam = {
-  clock: { now: () => Date.now() },
-  warnedGrantKeys: new Set<string>(),
-  grantsLockDir,
-  acquireGrantsLock,
-  releaseGrantsLock,
-  readGrantsLockOwner,
-};
-
-function grantsFile(): string {
-  return path.join(opencodeDataDir(), "claude-oauth", "grants.json");
-}
-
-/**
- * Minimal sidecar key: accountId when known, otherwise a short SHA-256 of the
- * refresh token (non-secret, stable until rotation). Only authorization
- * timestamps live here — never a second credential store.
- */
-function grantKey(refreshToken: string, accountId?: string): string {
-  return accountId ?? createHash("sha256").update(refreshToken).digest("hex").slice(0, 16);
-}
-
-/** Best-effort read: malformed/missing/unreadable sidecar reads as empty. */
-function readGrants(): Record<string, number> {
-  try {
-    const parsed = JSON.parse(readFileSync(grantsFile(), "utf8")) as unknown;
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
-    const grants: Record<string, number> = {};
-    for (const [key, value] of Object.entries(parsed)) {
-      if (typeof value === "number" && Number.isFinite(value)) grants[key] = value;
-    }
-    return grants;
-  } catch {
-    return {};
-  }
-}
-
-/** Corruption-resistant write: temp file (0600) in the same directory, then atomic rename. */
-function writeGrants(grants: Record<string, number>): void {
-  const file = grantsFile();
-  mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
-  const tmp = `${file}.${process.pid}.${randomUUID()}.tmp`;
-  writeFileSync(tmp, JSON.stringify(grants), { mode: 0o600 });
-  try {
-    renameSync(tmp, file);
-  } catch (error) {
-    rmSync(tmp, { force: true });
-    throw error;
-  }
-}
-
-// Cross-process mutual exclusion for grants.json read-modify-write cycles, so
-// concurrent logins in parallel opencode processes cannot lose each other's
-// updates. The critical section is synchronous and normally lasts only
-// milliseconds; a live holder is never stolen, while a dead holder's exact
-// lock directory is atomically quarantined before a replacement is installed.
-const GRANT_LOCK_WAIT_MS = 10_000;
-
-function grantsLockDir(): string {
-  return path.join(opencodeDataDir(), "claude-oauth", "grants.lock");
-}
-
-interface GrantsLockOwner {
-  owner: string;
-  pid: number;
-  at: number;
-}
-
-/** Read and validate the recorded lock owner; undefined when missing/malformed. */
-function readGrantsLockOwner(dir: string): GrantsLockOwner | undefined {
-  try {
-    const parsed = JSON.parse(readFileSync(path.join(dir, "owner"), "utf8")) as Partial<GrantsLockOwner>;
-    if (typeof parsed.owner === "string" && parsed.owner.length > 0 && typeof parsed.at === "number") {
-      return {
-        owner: parsed.owner,
-        pid: typeof parsed.pid === "number" ? parsed.pid : -1,
-        at: parsed.at,
-      };
-    }
-  } catch {}
-  return undefined;
-}
-
-function processIsAlive(pid: number): boolean {
-  if (pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code === "EPERM";
-  }
-}
-
-/** Atomically install a prepared owner directory; returns its owner token. */
-function acquireGrantsLock(): string {
-  const dir = grantsLockDir();
-  mkdirSync(path.dirname(dir), { recursive: true, mode: 0o700 });
-  const ownerId = randomBytes(16).toString("hex");
-  const claim = `${dir}.claim-${ownerId}`;
-  const deadline = Date.now() + GRANT_LOCK_WAIT_MS;
-  mkdirSync(claim);
-  try {
-    writeFileSync(
-      path.join(claim, "owner"),
-      JSON.stringify({ owner: ownerId, pid: process.pid, at: Date.now() } satisfies GrantsLockOwner),
-      { mode: 0o600 },
-    );
-    for (;;) {
-      try {
-        renameSync(claim, dir);
-        return ownerId;
-      } catch {
-        const current = readGrantsLockOwner(dir);
-        if (current && !processIsAlive(current.pid)) {
-          // The destination includes the observed owner's random token and is
-          // intentionally retained. Only one waiter can quarantine this exact
-          // dead lock; lagging waiters cannot rename a replacement over it.
-          try {
-            renameSync(dir, `${dir}.stale-${current.owner}`);
-          } catch {}
-          continue;
-        }
-        if (Date.now() >= deadline) throw new Error("Timed out waiting for the grants lock");
-        Bun.sleepSync(2);
-      }
-    }
-  } catch (error) {
-    rmSync(claim, { recursive: true, force: true });
-    throw error;
-  }
-}
-
-/**
- * Release only the lock we still own — never a replacement installed by a
- * stale-takeover stealer or another process. Without a readable owner record
- * ownership cannot be proven, so the directory is left alone.
- */
-function releaseGrantsLock(ownerId: string): void {
-  const dir = grantsLockDir();
-  if (readGrantsLockOwner(dir)?.owner !== ownerId) return;
-  rmSync(dir, { recursive: true, force: true });
-}
-
-/**
- * Record when a fresh grant was created. Called on login success only —
- * refresh rotation must never reset authorizedAt. Failures are swallowed so a
- * timestamp write can never fail the login itself.
- */
-export function recordAuthorizedAt(refreshToken: string, accountId?: string): void {
-  try {
-    const ownerId = acquireGrantsLock();
-    try {
-      const grants = readGrants();
-      grants[grantKey(refreshToken, accountId)] = grantTestSeam.clock.now();
-      writeGrants(grants);
-    } finally {
-      releaseGrantsLock(ownerId);
-    }
-  } catch {}
-}
-
-/**
- * A grant first recorded before the accountId was known lives under the
- * refresh-hash key. Once the accountId becomes known, move that history onto
- * the stable account key so later refresh rotation — which changes the hash —
- * cannot lose the authorization age. Best-effort; runs under the sidecar lock.
- */
-function migrateGrantAuthorizedAt(refreshToken: string, accountId?: string): void {
-  if (!accountId) return;
-  const accountKey = grantKey(refreshToken, accountId);
-  const legacyKey = grantKey(refreshToken);
-  if (accountKey === legacyKey) return;
-  try {
-    const ownerId = acquireGrantsLock();
-    try {
-      const grants = readGrants();
-      if (grants[accountKey] !== undefined || grants[legacyKey] === undefined) return;
-      grants[accountKey] = grants[legacyKey]!;
-      delete grants[legacyKey];
-      writeGrants(grants);
-    } finally {
-      releaseGrantsLock(ownerId);
-    }
-  } catch {}
-}
-
-/** Age of the grant, falling back to its pre-accountId refresh-hash entry. */
-function observedGrantAgeMs(refreshToken: string, accountId?: string): number | undefined {
-  migrateGrantAuthorizedAt(refreshToken, accountId);
-  const grants = readGrants();
-  const authorizedAt = grants[grantKey(refreshToken, accountId)] ?? grants[grantKey(refreshToken)];
-  if (authorizedAt === undefined) return undefined;
-  return Math.max(0, grantTestSeam.clock.now() - authorizedAt);
-}
-
-/**
- * One warning per process/account once the grant nears its observed ~30-day
- * absolute lifetime. Notification failures are swallowed so they never block auth.
- */
-async function warnOnStaleGrant(
-  client: PluginInput["client"],
-  refreshToken: string,
-  accountId?: string,
-): Promise<void> {
-  const key = grantKey(refreshToken, accountId);
-  const ageMs = observedGrantAgeMs(refreshToken, accountId);
-  if (ageMs === undefined || ageMs < GRANT_WARN_AGE_MS || grantTestSeam.warnedGrantKeys.has(key)) return;
-  grantTestSeam.warnedGrantKeys.add(key);
-  const ageDays = Math.floor(ageMs / DAY_MS);
-  try {
-    await client.app.log({
-      body: {
-        service: "claude-oauth",
-        level: "warn",
-        message:
-          `Anthropic OAuth grant for ${accountId ? `account ${accountId}` : "this credential"} is ~${ageDays} days old. ` +
-          "~30 days is an observed heuristic for the absolute grant lifetime — interactive re-login (`opencode auth login` → Anthropic → Claude Pro/Max) may soon be required.",
-        extra: { ageDays },
-      },
-    });
-  } catch {}
-  try {
-    await client.tui.showToast({
-      body: {
-        title: "Anthropic OAuth grant expiring soon",
-        message: `Grant is ~${ageDays} days old. Run opencode auth login and select Anthropic → Claude Pro/Max soon.`,
-        variant: "warning",
-        duration: 10_000,
-      },
-    });
-  } catch {}
-}
-
-const FLOW_TIMEOUT_MS = 5 * 60 * 1000;
-
-function buildAuthorizeUrl(redirectUri: string, pkce: PkceCodes, state: string): string {
+function buildAuthorizeUrl(challenge: string, state: string): string {
   const params = new URLSearchParams({
     // Non-standard: required by Claude's authorization page to return the raw code.
     code: "true",
     client_id: CLIENT_ID,
     response_type: "code",
-    redirect_uri: redirectUri,
+    redirect_uri: REDIRECT_URI,
     scope: SCOPES,
-    code_challenge: pkce.challenge,
+    code_challenge: challenge,
     code_challenge_method: "S256",
     state,
   });
@@ -910,453 +238,211 @@ function buildAuthorizeUrl(redirectUri: string, pkce: PkceCodes, state: string):
 export interface ClaudeOAuthOptions {
   attributionHeader?: boolean;
   /**
-    * Client identity spoofed on the Anthropic wire: "sdk-cli" (default),
-    * "cowork", or the source-derived "ex-machina" profile.
+   * Client identity spoofed on the Anthropic wire: "sdk-cli" (default),
+   * "cowork", or the source-derived "ex-machina" profile.
    */
   spoofingProfile?: SpoofingProfile["id"];
 }
 
-export const ClaudeOAuthPlugin: Plugin = async (input: PluginInput, options?: PluginOptions | ClaudeOAuthOptions) => {
-  const pluginOptions = options as ClaudeOAuthOptions | undefined;
-  // Validated once at the option boundary; unsupported values throw here.
-  const profile = resolveSpoofingProfile(pluginOptions?.spoofingProfile);
-  const attributionHeader = pluginOptions?.attributionHeader !== false;
-  // Non-Cowork profiles map raw OpenCode session ids to process-local UUIDv4s.
-  // Cowork derives a restart-stable UUID-shaped id from the install and session.
-  const wireSessionIds = new Map<string, string>();
-
-  // Shared login-success tail for both authorize methods: exchange the code
-  // and record the grant timestamp.
-  const finishLogin = async (code: string, state: string, verifier: string, redirectUri: string) => {
-    const tokens = await exchangeCode(code, state, verifier, redirectUri, profile);
-    recordAuthorizedAt(tokens.refresh, tokens.accountId);
-    return { type: "success" as const, ...tokens };
-  };
-
-  // Persist rotated tokens during background refreshes. Login results are
-  // persisted by core directly.
-  const persist = async (tokens: RefreshedCredential) => {
-    // The generated client takes ONE options object; `throwOnError` lives in
-    // it because the SDK otherwise resolves to a { data, error } result tuple
-    // and does NOT throw on HTTP errors. The returned error is still
-    // validated explicitly below, in case the option stops being honored.
-    // `accountId` is a documented extension of the generated OAuth body type.
-    const result = await input.client.auth.set({
-      path: { id: "anthropic" },
-      body: {
-        type: "oauth",
-        refresh: tokens.refresh,
-        access: tokens.access,
-        expires: tokens.expires,
-        ...(tokens.accountId ? { accountId: tokens.accountId } : {}),
-      } as RefreshedCredential & { type: "oauth" },
-      throwOnError: true,
-    });
-    if (result && typeof result === "object" && "error" in result && result.error !== undefined) {
-      throw new Error(`Failed to persist refreshed Anthropic credentials: ${JSON.stringify(result.error)}`);
-    }
-  };
-
-  const hooks: Hooks = {
-    provider: {
-      id: "anthropic",
-      async models(provider, ctx) {
-        if (ctx.auth?.type !== "oauth") return provider.models;
-        // Subscription-billed: zero out costs so usage tracking doesn't
-        // report API spend for Pro/Max requests.
-        return Object.fromEntries(
-          Object.entries(provider.models).map(([modelID, model]) => [
-            modelID,
-            {
-              ...model,
-              cost: { input: 0, output: 0, cache: { read: 0, write: 0 } },
-            },
-          ]),
-        );
-      },
-    },
-
-    auth: {
-      provider: "anthropic",
-      async loader(getAuth) {
-        const stored = await getAuth();
-        // Auth may be absent (logged out) by the time the loader runs.
-        if (stored?.type !== "oauth") return {};
-        // Best-effort staleness advisory; never blocks auth.
-        await warnOnStaleGrant(input.client, stored.refresh, stored.accountId);
-
-        // Classification of whatever getAuth currently returns. The cached
-        // fetch closure re-runs this on every request and again after any
-        // shared refresh, so logout / API-key / re-login transitions that
-        // happen mid-flight are routed correctly instead of dispatching a
-        // stale bearer.
-        type AuthSnapshot =
-          | { kind: "missing" }
-          | { kind: "api"; key: string }
-          | { kind: "unsupported"; authType: string }
-          | { kind: "oauth"; access: string; expires: number; refresh: string; accountId?: string };
-
-        async function readAuth(): Promise<AuthSnapshot> {
-          const raw = (await getAuth()) as
-            | undefined
-            | null
-            | { type?: string; access?: string; expires?: number; refresh?: string; key?: string; accountId?: string };
-          if (raw === undefined || raw === null) return { kind: "missing" };
-          if (raw.type === "api") return { kind: "api", key: raw.key ?? "" };
-          if (raw.type !== "oauth") return { kind: "unsupported", authType: String(raw.type) };
-          return {
-            kind: "oauth",
-            access: raw.access ?? "",
-            expires: raw.expires ?? 0,
-            refresh: raw.refresh ?? "",
-            accountId: raw.accountId,
-          };
-        }
-
-        return {
-          apiKey: OAUTH_DUMMY_KEY,
-          // Non-secret marker for chat.headers: identifies this as an OAuth
-          // session without depending on the dummy apiKey, which provider
-          // config merging can overwrite.
-          claudeOAuth: true,
-          async fetch(requestInput: string | URL | Request, init?: RequestInit) {
-            // Auth can disappear (logout) or change type (API key login, new
-            // OAuth login) while this closure stays cached inside the Anthropic
-            // SDK client. The CURRENT stored auth is classified exactly once,
-            // here at the boundary.
-            let auth = await readAuth();
-            let url: URL | undefined;
-
-            if (auth.kind === "oauth") {
-              url = requestInput instanceof URL ? requestInput : new URL(typeof requestInput === "string" ? requestInput : requestInput.url);
-
-              // Origin allowlist: the OAuth bearer token is attached only to
-              // official Anthropic API traffic. HTTP, localhost, alternate
-              // hosts, credentials-in-URL, and custom baseURL destinations are
-              // rejected before refresh, mutation, or dispatch — never send
-              // subscription credentials to a non-official endpoint.
-              if (url.origin !== OAUTH_ALLOWED_ORIGIN || url.username || url.password) {
-                throw new Error(
-                  `Refusing to send Claude Pro/Max OAuth credentials to "${url.origin}" - this transport only supports the official ${OAUTH_ALLOWED_ORIGIN} endpoint. Configure an Anthropic API key instead of a custom baseURL/gateway/proxy to use it there.`,
-                );
-              }
-
-              // Requests carrying their own body cannot be re-targeted/re-signed
-              // (the body would be dispatched without the plugin's rewrite), so
-              // they are rejected here — still before any network activity.
-              if (typeof requestInput !== "string" && !(requestInput instanceof URL)) {
-                if (requestInput.body !== null && init?.body === undefined) {
-                  throw new Error(
-                    "Unsupported Anthropic request: a pre-constructed Request with a body was handed to the claude-oauth transport; expected (string | URL, RequestInit).",
-                  );
-                }
-              }
-
-              if (!auth.access || auth.expires < Date.now()) {
-                // Shared across loader instances (in-process promise map) and
-                // processes (fs lease): at most one refresh per credential.
-                const refreshed = await performSharedRefresh(auth, getAuth, persist, profile);
-                if (refreshed) {
-                  // Adopt the full rotated credential we just persisted — all
-                  // fields, not only the access token.
-                  auth = { kind: "oauth", ...refreshed };
-                } else {
-                  // A peer refreshed while we waited on the promise or the
-                  // lease, or auth was logged out / transitioned / re-keyed
-                  // underneath us: re-route on the latest persisted state,
-                  // never the pre-refresh snapshot.
-                  auth = await readAuth();
-                }
-              }
-            }
-
-            // Single dispatch boundary: route on the latest classified state.
-            if (auth.kind !== "oauth") {
-              if (auth.kind === "api") {
-                // Ordinary Anthropic API-key request: replace the dummy
-                // x-api-key with the real one and drop OAuth-only mutations.
-                // No fingerprinting, body rewrite, cch, tool cloaking, or
-                // response uncloaking on this path — and no x-client-request-id:
-                // that id is an OAuth-fingerprint field. This is not OAuth wire
-                // traffic, so plugin-only transport markers (session id header,
-                // private request id, stale bearer) are stripped too —
-                // chat.headers can still emit the markers while the cached
-                // claudeOAuth flag lingers.
-                const headers = new Headers(init?.headers);
-                headers.delete("Authorization");
-                headers.delete(SESSION_ID_HEADER);
-                headers.delete(REQUEST_ID_HEADER);
-                headers.delete(PROMPT_ID_HEADER);
-                headers.set("x-api-key", auth.key);
-                return fetch(requestInput, { ...init, headers });
-              }
-              throw new Error(
-                auth.kind === "missing"
-                  ? "Anthropic credentials are missing (logged out?) - run `opencode auth login`, pick Anthropic, then choose a Claude Pro/Max method."
-                  : `Unsupported Anthropic auth type "${auth.authType}" - run \`opencode auth login\`, pick Anthropic, then choose a Claude Pro/Max method.`,
-              );
-            }
-
-            if (!url) throw new Error("OAuth request URL was not initialized");
-            const access = auth.access
-
-            if (profile.wireFormat === "ex-machina") {
-              const rewrittenUrl = rewriteExMachinaUrl(url)
-              const requestTarget = rewrittenUrl.href === url.href
-                ? requestInput
-                : requestInput instanceof Request
-                  ? new Request(rewrittenUrl, requestInput)
-                  : rewrittenUrl
-              const body = typeof init?.body === "string"
-                ? rewriteExMachinaBody(init.body, attributionHeader)
-                : init?.body
-              const headers = buildExMachinaHeaders(requestInput, init?.headers, access)
-              const response = await fetch(requestTarget, { ...init, headers, body })
-              const contentType = response.headers.get("content-type") ?? ""
-              if (contentType.includes("text/event-stream")) {
-                if (!response.body) return response
-                return new Response(
-                  response.body.pipeThrough(createSseToolNameTransform("mcp_", unprefixExMachinaName)),
-                  {
-                    status: response.status,
-                    statusText: response.statusText,
-                    headers: uncloakedResponseHeaders(response),
-                  },
-                )
-              }
-              if (contentType.includes("application/json")) {
-                const text = await readBoundedJsonText(response)
-                const transformed = transformJsonToolUseNames(text, "mcp_", unprefixExMachinaName)
-                return new Response(transformed, {
-                  status: response.status,
-                  statusText: response.statusText,
-                  headers: uncloakedResponseHeaders(response),
-                })
-              }
-              return response
-            }
-
-            const accountId = auth.accountId
-            const headers = new Headers(init?.headers)
-            headers.delete("x-session-affinity")
-            headers.delete("x-session-id")
-            headers.delete("x-parent-session-id")
-
-            // Per-invocation request id from chat.headers. Read once, then
-            // removed: it is a plugin-only transport marker and must never
-            // reach the wire. SDK retries re-run this fetch with the same
-            // prepared headers, so they reuse the id; a new logical invocation
-            // carries a freshly generated one. Absent (direct request), a
-            // fresh UUID is minted at dispatch below.
-            const hookRequestId = headers.get(REQUEST_ID_HEADER) ?? undefined
-            headers.delete(REQUEST_ID_HEADER)
-            const logicalRequestId = hookRequestId ?? randomUUID()
-            headers.delete(PROMPT_ID_HEADER)
-
-            // The session header must always match the body's metadata
-            // user_id session. rewriteBody returns the effective session
-            // (hook-provided, preserved from a valid incoming user_id, or
-            // synthesized), so the header is set from it below — never the
-            // other way around.
-            headers.delete(OPENCODE_SESSION_ID_HEADER)
-            const hookSessionId = headers.get(SESSION_ID_HEADER) ?? undefined
-            // Reinsert at dispatch so Bun serializes Claude Code's title casing
-            // instead of retaining the SDK-normalized lowercase field name.
-            headers.delete(SESSION_ID_HEADER)
-            let sessionId = hookSessionId
-            let body: RequestInit["body"] = init?.body
-            const isMessages = url.pathname === "/v1/messages"
-            const isCountTokens = url.pathname === "/v1/messages/count_tokens"
-            const isMessagesApi = isMessages || isCountTokens
-            let requestTarget: typeof requestInput = requestInput
-            // Claude Code hits the official API with ?beta=true on /messages;
-            // existing query params are preserved.
-            if (isMessagesApi && url.hostname === "api.anthropic.com") {
-              url.searchParams.set("beta", "true")
-              requestTarget = url
-            }
-            if (isMessages && typeof body === "string" && body.startsWith("{")) {
-              const { json, thinking, hasTools, sessionId: rewrittenSessionId } = rewriteBody(body, {
-                sessionId: hookSessionId,
-                accountId,
-                attributionHeader,
-                profile,
-              })
-              sessionId = rewrittenSessionId
-              body = json
-              // Headers.get is case-insensitive, so SDK betas arrive regardless
-              // of the caller's key casing.
-              headers.set("anthropic-beta", buildBetas(thinking, hasTools, headers.get("anthropic-beta"), profile))
-            } else if (isCountTokens && typeof body === "string" && body.startsWith("{")) {
-              const params = JSON.parse(body) as Record<string, any>
-              prefixRequestToolNames(params, profile)
-              body = JSON.stringify(params)
-              headers.set("anthropic-beta", countTokensBetas(profile))
-            }
-
-            headers.delete("x-api-key")
-            let response: Response
-            if (isMessagesApi) {
-              // Claude Code profiles use the ordered HTTP/1.1 transport.
-              // It only engages for a plain header record, which this builder
-              // supplies in the profile's captured order.
-              const stainless = stainlessHeaders(profile)
-              if (isCountTokens) delete stainless["X-Stainless-Timeout"]
-              const wireHeaders = buildEnforcedHeaders(headers, {
-                profile: profile.id,
-                userAgent: profile.userAgent,
-                sessionId,
-                betas: headers.get("anthropic-beta") ?? undefined,
-                authorization: `Bearer ${access}`,
-                clientRequestId: logicalRequestId,
-                stainless,
-              })
-              response = await coworkTransport.impl(requestTarget, {
-                ...init,
-                method: init?.method ?? "POST",
-                headers: wireHeaders,
-                body,
-                signal: init?.signal,
-              })
-            } else {
-              headers.set("Authorization", `Bearer ${access}`)
-              if (sessionId) headers.set("X-Claude-Code-Session-Id", sessionId)
-              response = await fetch(requestTarget, { ...init, headers, body })
-            }
-            if (!isMessages) return response
-            // Uncloak custom tool names on the way back. Streaming responses are
-            // rewritten incrementally (no full buffering); non-streaming JSON
-            // bodies are transformed whole within a bounded read. Rewritten
-            // responses get cloned headers with stale entity headers stripped.
-            const contentType = response.headers.get("content-type") ?? ""
-            if (contentType.includes("text/event-stream")) {
-              if (!response.body) return response
-              return new Response(response.body.pipeThrough(createSseToolNameTransform(profile.toolPrefix)), {
-                status: response.status,
-                statusText: response.statusText,
-                headers: uncloakedResponseHeaders(response),
-              })
-            }
-            if (contentType.includes("application/json")) {
-              const text = await readBoundedJsonText(response)
-              const transformed = transformJsonToolUseNames(text, profile.toolPrefix)
-              return new Response(transformed, {
-                status: response.status,
-                statusText: response.statusText,
-                headers: uncloakedResponseHeaders(response),
-              })
-            }
-            return response
-          },
-        }
-      },
-
-      methods: [
-        {
-          type: "oauth",
-          label: "Claude Pro/Max",
-          authorize: async () => {
-            const pkce = await generatePKCE()
-            const state = base64UrlEncode(crypto.getRandomValues(new Uint8Array(32)).buffer)
-            const startedAt = Date.now()
-            return {
-              url: buildAuthorizeUrl(REDIRECT_URI, pkce, state),
-              instructions:
-                "Complete login in your browser, then paste the authorization code shown by Claude within 5 minutes. It may look like `<code>#<state>`. Note: the OAuth grant typically stays valid for around 30 days (an observed lifetime, not a guaranteed protocol limit) — after that you may need to re-login.",
-              method: "code" as const,
-              callback: async (pasted: string) => {
-                const failed = (reason: string): { type: "failed" } => {
-                  // Actionable detail goes to logs only; it must never echo
-                  // the pasted code or state. Logging is best-effort.
-                  try {
-                    input.client.app
-                      .log({
-                        body: {
-                          service: "claude-oauth",
-                          level: "warn",
-                          message: `Claude Pro/Max paste-code login failed (${reason}). Restart login with \`opencode auth login\`.`,
-                        },
-                      })
-                      .catch(() => {})
-                  } catch {}
-                  return { type: "failed" }
-                }
-                if (Date.now() - startedAt > FLOW_TIMEOUT_MS) {
-                  return failed("the 5-minute authorization window expired")
-                }
-                try {
-                  // Accept a bare code (`code#state`) or the full redirect URL,
-                  // and validate any accompanying state locally BEFORE the
-                  // token exchange.
-                  let code = pasted.trim()
-                  let pastedState = ""
-                  try {
-                    const parsed = new URL(code)
-                    const urlCode = parsed.searchParams.get("code")
-                    if (urlCode) {
-                      code = urlCode
-                      pastedState = parsed.searchParams.get("state") ?? ""
-                    }
-                  } catch {}
-                  const fragment = code.indexOf("#")
-                  if (fragment >= 0) {
-                    pastedState = code.slice(fragment + 1)
-                    code = code.slice(0, fragment)
-                  }
-                  if (pastedState.length > 0 && pastedState !== state) {
-                    return failed("the pasted state does not match this login session")
-                  }
-                  const tokens = await finishLogin(code, state, pkce.verifier, REDIRECT_URI)
-                  return tokens
-                } catch {
-                  // Never surface the pasted code/state or raw endpoint errors.
-                  return failed("the authorization code was rejected")
-                }
-              },
-            }
-          },
-        },
-        {
-          type: "api",
-          label: "Anthropic API key",
-        },
-      ],
-    },
-
-    "chat.headers": async (input, output) => {
-      if (input.model.providerID !== "anthropic") return
-      // Only fingerprint OAuth sessions; API-key traffic never carries the
-      // markers. Marker-based so provider config apiKey merging (which replaces
-      // the dummy key) cannot disable stable session propagation.
-      if ((input.provider.options as Record<string, unknown>).claudeOAuth !== true) return
-      let wireSessionId = profile.id === "cowork" ? deriveCoworkSessionId(input.sessionID) : wireSessionIds.get(input.sessionID)
-      if (!wireSessionId) {
-        wireSessionId = randomUUID().toLowerCase()
-        wireSessionIds.set(input.sessionID, wireSessionId)
-      }
-      output.headers["X-Claude-Code-Session-Id"] = wireSessionId
-      output.headers[OPENCODE_SESSION_ID_HEADER] = input.sessionID
-      // Fresh UUID per logical OpenCode LLM invocation, transported in the
-      // private plugin header and emitted as x-client-request-id by the auth
-      // fetch. SDK retries reuse the prepared headers — and therefore this id;
-      // a separate identical invocation runs this hook again and gets a new one.
-      output.headers[REQUEST_ID_HEADER] = randomUUID()
-    },
-
-    event: async ({ event }) => {
-      if (event.type === "session.deleted") {
-        wireSessionIds.delete(event.properties.info.id)
-      }
-    },
-
-    dispose: async () => {
-      wireSessionIds.clear()
-    },
-  }
-  return hooks
-}
-
-export default {
+export default Plugin.define({
   id: "claude_oauth",
-  server: ClaudeOAuthPlugin,
-}
+  setup: async (ctx) => {
+    const options = ctx.options as ClaudeOAuthOptions;
+    // Validated once at the option boundary; unsupported values throw here.
+    const profile = resolveSpoofingProfile(options.spoofingProfile);
+    const attributionHeader = options.attributionHeader !== false;
+    // Non-Cowork profiles map raw OpenCode session ids to process-local UUIDv4s.
+    // Cowork derives a restart-stable UUID-shaped id from the install and session.
+    const wireSessionIds = new Map<string, string>();
+    // The active Anthropic credential when it is this plugin's OAuth grant;
+    // every wire rewrite below is gated on it.
+    let oauth: Credential.OAuth | undefined;
+
+    const load = async () => {
+      const connection = await ctx.integration.connection.active("anthropic");
+      const credential = connection
+        ? await ctx.integration.connection.resolve(connection).catch(() => undefined)
+        : undefined;
+      oauth = credential?.type === "oauth" && credential.methodID === METHOD_ID ? credential : undefined;
+    };
+
+    await ctx.integration.transform((editor) => {
+      editor.method.update({
+        integrationID: "anthropic",
+        method: { id: METHOD_ID, type: "oauth", label: "Claude Pro/Max" },
+        label: (credential) => credential.metadata?.email as string | undefined,
+        authorize: async () => {
+          const pkce = await generatePKCE();
+          const state = base64UrlEncode(crypto.getRandomValues(new Uint8Array(32)).buffer);
+          return {
+            url: buildAuthorizeUrl(pkce.challenge, state),
+            instructions:
+              "Complete login in your browser, then paste the authorization code shown by Claude within 5 minutes. It may look like `<code>#<state>`.",
+            expiresAt: Date.now() + FLOW_TIMEOUT_MS,
+            mode: "code",
+            callback: async (pasted) => {
+              // Accept a bare code (`code#state`) or the full redirect URL,
+              // and validate any accompanying state locally BEFORE the
+              // token exchange.
+              let code = pasted.trim();
+              let pastedState = "";
+              if (URL.canParse(code)) {
+                const parsed = new URL(code);
+                const urlCode = parsed.searchParams.get("code");
+                if (urlCode) {
+                  code = urlCode;
+                  pastedState = parsed.searchParams.get("state") ?? "";
+                }
+              }
+              const fragment = code.indexOf("#");
+              if (fragment >= 0) {
+                pastedState = code.slice(fragment + 1);
+                code = code.slice(0, fragment);
+              }
+              if (pastedState.length > 0 && pastedState !== state) {
+                throw new Error("The pasted state does not match this login session. Restart the Claude Pro/Max login.");
+              }
+              const tokens = await postToken({
+                grant_type: "authorization_code",
+                client_id: CLIENT_ID,
+                code,
+                state,
+                redirect_uri: REDIRECT_URI,
+                code_verifier: pkce.verifier,
+              });
+              return {
+                type: "oauth",
+                methodID: METHOD_ID,
+                access: tokens.access_token,
+                refresh: tokens.refresh_token!,
+                expires: Date.now() + tokens.expires_in * 1000,
+                metadata: { ...(await resolveIdentity(tokens, profile)) },
+              };
+            },
+          };
+        },
+        refresh: async (credential) => {
+          const tokens = await postToken({
+            grant_type: "refresh_token",
+            client_id: CLIENT_ID,
+            refresh_token: credential.refresh,
+            scope: REFRESH_SCOPES,
+          });
+          // Rotation is optional; identity stays as captured at login.
+          return {
+            ...credential,
+            access: tokens.access_token,
+            refresh: tokens.refresh_token ?? credential.refresh,
+            expires: Date.now() + tokens.expires_in * 1000,
+          };
+        },
+      });
+    });
+
+    await load();
+
+    // Subscription-billed: zero out costs so usage tracking doesn't report
+    // API spend for Pro/Max requests.
+    await ctx.model.transform((editor) => {
+      if (!oauth) return;
+      for (const model of editor.list("anthropic")) {
+        editor.update(model.providerID, model.id, (draft) => {
+          draft.cost = [];
+        });
+      }
+    });
+
+    await ctx.session.hook(
+      "model.request",
+      (event) => {
+        if (!oauth || profile.wireFormat === "ex-machina") return;
+        let wireSessionId =
+          profile.id === "cowork" ? deriveCoworkSessionId(event.sessionID) : wireSessionIds.get(event.sessionID);
+        if (!wireSessionId) {
+          wireSessionId = randomUUID().toLowerCase();
+          wireSessionIds.set(event.sessionID, wireSessionId);
+        }
+        event.headers[SESSION_ID_HEADER] = wireSessionId;
+        // Fresh UUID per logical invocation; HTTP retries of the prepared
+        // request reuse it.
+        event.headers[REQUEST_ID_HEADER] = randomUUID();
+      },
+      { providerID: "anthropic" },
+    );
+
+    await ctx.session.hook(
+      "http.request",
+      async (event) => {
+        const request = event.request;
+        const url = new URL(request.url);
+        if (!oauth || url.pathname !== "/v1/messages") return;
+        const body = await request.text();
+        if (profile.wireFormat === "ex-machina") {
+          event.request = new Request(url, {
+            method: request.method,
+            headers: buildExMachinaHeaders(request.headers),
+            body: rewriteExMachinaBody(body, attributionHeader),
+          });
+          return;
+        }
+        const rewritten = rewriteBody(body, {
+          sessionId: request.headers.get(SESSION_ID_HEADER) ?? undefined,
+          accountId: oauth.metadata?.accountId as string | undefined,
+          attributionHeader,
+          profile,
+        });
+        event.request = new Request(url, {
+          method: request.method,
+          // The session header always matches the body's metadata user_id
+          // session, which rewriteBody may have preserved from the body.
+          headers: buildEnforcedHeaders(profile, {
+            sessionId: rewritten.sessionId,
+            betas: buildBetas(rewritten.thinking, rewritten.hasTools, request.headers.get("anthropic-beta"), profile),
+            authorization: request.headers.get("authorization")!,
+            clientRequestId: request.headers.get(REQUEST_ID_HEADER) ?? randomUUID(),
+          }),
+          body: rewritten.json,
+        });
+      },
+      { providerID: "anthropic" },
+    );
+
+    // Uncloak custom tool names on the way back, incrementally (no full
+    // buffering). Rewritten responses get cloned headers with stale entity
+    // headers stripped.
+    await ctx.session.hook(
+      "http.response",
+      (event) => {
+        const response = event.response;
+        if (!oauth || new URL(event.request.url).pathname !== "/v1/messages" || !response.body) return;
+        if (!(response.headers.get("content-type") ?? "").includes("text/event-stream")) return;
+        const transform =
+          profile.wireFormat === "ex-machina"
+            ? createSseToolNameTransform("mcp_", unprefixExMachinaName)
+            : createSseToolNameTransform(profile.toolPrefix);
+        event.response = new Response(response.body.pipeThrough(transform), {
+          status: response.status,
+          statusText: response.statusText,
+          headers: uncloakedResponseHeaders(response),
+        });
+      },
+      { providerID: "anthropic" },
+    );
+
+    // Subscriptions close with the plugin scope.
+    void (async () => {
+      for await (const event of ctx.event.subscribe()) {
+        if (event.type === "session.deleted") wireSessionIds.delete(event.data.sessionID);
+        if (
+          event.type === "credential.updated" ||
+          (event.type === "credential.switched" && event.data.integrationID === "anthropic")
+        ) {
+          await load();
+          await ctx.model.reload();
+        }
+      }
+    })();
+
+    return () => wireSessionIds.clear();
+  },
+});

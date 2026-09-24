@@ -22,14 +22,17 @@
     "workflows"
   ],
   "engines": {
-    "opencode": ">=1.18.21"
+    "opencode": ">=2.0.15"
   },
   "publishConfig": {
     "access": "restricted"
   },
   "dependencies": {
-    "@opencode-ai/plugin": "^1.18.21",
-    "@opentui/solid": "0.4.3",
+    "@opencode/plugin": "2.0.15",
+    "@opencode/theme": "2.0.15",
+    "@opentui/core": "0.5.10",
+    "@opentui/solid": "0.5.10",
+    "effect": "4.0.0-rc.112",
     "solid-js": "1.9.12"
   }
 }

@@ -944,12 +944,12 @@ describe("CCA tool schema normalization", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Config-facing registration
+// Provider model registration
 // ---------------------------------------------------------------------------
 
-describe("provider model registration map", () => {
+describe("provider model registration", () => {
   test("registers all usable families with zero cost", () => {
-    const models = providerModels();
+    const models = Object.fromEntries(providerModels().map((model) => [model.id, model]));
     for (const expected of [
       "gemini-3.5-flash",
       "gemini-3-flash",
@@ -967,45 +967,44 @@ describe("provider model registration map", () => {
     ]) {
       expect(models[expected]).toBeDefined();
     }
+    expect(models["gemini-2.5-pro"]).toBeUndefined();
     for (const model of Object.values(models)) {
-      expect(model.cost).toEqual({ input: 0, output: 0, cache_read: 0, cache_write: 0 });
-      expect(model.reasoning).toBe(true);
-      if (model.reasoning) expect(Object.keys(model.variants as object).length).toBeGreaterThan(0);
+      expect(model.providerID).toBe("google-antigravity");
+      expect(model.cost).toEqual([]);
+      expect(model.variants.length).toBeGreaterThan(0);
     }
-    expect((models["gpt-oss-120b"]!.modalities as any).input).toEqual(["text"]);
-    expect((models["claude-opus-4-6"]!.limit as any)).toEqual({ context: 250_000, output: 64_000 });
+    expect(models["gpt-oss-120b"]!.capabilities.input).toEqual(["text"]);
+    expect(models["claude-opus-4-6"]!.limit).toEqual({ context: 250_000, output: 64_000 });
+    // Effort variants map onto the captured budget tiers.
+    const variant = (id: string, effort: string) =>
+      models[id]!.variants.find((candidate) => candidate.id === effort)!.settings!.thinkingConfig;
+    expect(variant("gemini-3.1-pro", "high").thinkingBudget).toBe(10001);
+    expect(variant("gemini-3.7-flash", "low").thinkingLevel).toBe("low");
   });
 
-  test("never registers invented thinking budgets; disables the derived max variant", () => {
-    const models = providerModels();
-    for (const [id, model] of Object.entries(models)) {
-      const variants = model.variants as Record<string, any>;
-      // Only OMP's minimal/low/medium/high efforts carry real controls.
-      for (const [name, variant] of Object.entries(variants)) {
-        if (name === "max") continue;
-        expect(variant.thinkingConfig).toBeDefined();
-      }
-      const max = variants["max"];
-      if (id.includes("2.5")) {
-        // OpenCode derives `max` for Gemini 2.5 ids; it is explicitly
-        // disabled rather than given an invented budget.
-        expect(max).toEqual({ disabled: true });
-        expect(max.thinkingConfig).toBeUndefined();
-      } else {
-        expect(max).toBeUndefined();
+  test("never registers invented thinking budgets", () => {
+    for (const model of providerModels()) {
+      for (const variant of model.variants) {
+        expect(["minimal", "low", "medium", "high"]).toContain(variant.id);
+        expect(variant.settings?.thinkingConfig).toBeDefined();
       }
     }
-    // Realistic OpenCode config processing: merge derived + configured
-    // variants, then drop disabled entries. Only Gemini 2.5 ids derive a
-    // `max` variant.
-    for (const id of ["gemini-2.5-flash-lite", "gemini-3.1-pro"]) {
-      const derived = id.includes("2.5")
-        ? { high: {}, max: { thinkingConfig: { includeThoughts: true, thinkingBudget: 32_768 } } }
-        : {};
-      const merged = { ...derived, ...(models[id]!.variants as Record<string, any>) };
-      const kept = Object.fromEntries(Object.entries(merged).filter(([, v]) => !v.disabled));
-      expect(kept["max"]).toBeUndefined();
-    }
+  });
+
+  test("live discovery keeps supported routes and drops unavailable variants", () => {
+    const models = Object.fromEntries(
+      providerModels({
+        "gemini-3.1-pro-low": { maxTokens: 800_000, maxOutputTokens: 65_535, supportsImages: true },
+        "claude-opus-4-6-thinking": { maxTokens: 250_000 },
+        "claude-sonnet-4-6": {},
+        "gemini-3.7-flash-low": { isInternal: true },
+        "gemini-2.5-pro": {},
+        "unmapped-model": {},
+      }).map((model) => [model.id, model]),
+    );
+    expect(Object.keys(models).sort()).toEqual(["claude-opus-4-6", "claude-sonnet-4-6", "gemini-3.1-pro"]);
+    expect(models["gemini-3.1-pro"]!.limit.context).toBe(800_000);
+    expect(models["gemini-3.1-pro"]!.variants.map((variant) => variant.id)).toEqual(["minimal", "low", "medium"]);
   });
 });
 

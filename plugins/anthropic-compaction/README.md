@@ -2,43 +2,42 @@
 
 Enables [Anthropic server-side compaction](https://platform.claude.com/docs/en/build-with-claude/compaction) for supported Claude models in OpenCode.
 
-The plugin adds Anthropic's `compact_20260112` context-management strategy to normal requests. When the trigger is reached, Anthropic summarizes the older context, returns a `compaction` block, and continues the response using the smaller context. OpenCode's Anthropic AI SDK preserves that block and passes it back on later turns.
+The plugin adds Anthropic's `compact_20260112` context-management strategy to normal requests. When the trigger is reached, Anthropic summarizes the older context, returns a `compaction` block, and continues the response using the smaller context. OpenCode does not keep inline compaction blocks in the transcript, so the plugin records the latest block per session and passes it back on later requests.
 
 ## Install
 
 ```sh
-opencode plugin @jiafuei/opencode-anthropic-compaction
+opencode plugin add @jiafuei/opencode-anthropic-compaction
 ```
 
 ## Configuration
 
 ```json
 {
-  "plugin": [
-    ["@jiafuei/opencode-anthropic-compaction", {
-      "enabled": true,
-      "threshold": "70%",
-      "additionalProviders": ["my-anthropic-proxy"],
-      "additionalModels": ["anthropic.claude-sonnet-4-6-v1:0"]
-    }]
-  ],
-  "provider": {
-    "my-anthropic-proxy": {
+  "plugins": [
+    {
+      "package": "@jiafuei/opencode-anthropic-compaction",
       "options": {
-        "anthropicCompactionBedrock": true
+        "enabled": true,
+        "threshold": "70%",
+        "additionalProviders": ["my-anthropic-proxy"],
+        "additionalModels": ["anthropic.claude-sonnet-4-6-v1:0"]
       }
     }
-  }
+  ]
 }
 ```
 
 - `threshold` controls the input-token trigger. Use an absolute token count of at least `50000`, a percentage such as `"70%"`, or the fractional form `0.7` for 70% of the model context window. Relative values are clamped to Anthropic's 50,000-token minimum. The default is `"70%"`.
-- `additionalProviders` enables provider IDs in addition to `anthropic`. Their models must still use the `@ai-sdk/anthropic` adapter.
+- `additionalProviders` enables provider IDs in addition to `anthropic`. Their models must still use the native Anthropic Messages package (`@ai-sdk/anthropic`, `@opencode/ai/providers/anthropic`, or `@opencode/ai/providers/anthropic-compatible`).
 - `additionalModels` enables upstream or OpenCode model IDs in addition to Anthropic's documented model allowlist. This is useful for proxy and cloud-platform aliases.
 - `instructions` replaces Anthropic's model-specific compaction prompt. When omitted, Anthropic uses its server-side default.
-- `provider.<id>.options.anthropicCompactionBedrock` marks a proxy that forwards Bedrock-native request fields. The plugin adds `anthropic_version: "bedrock-2023-05-31"` and `anthropic_beta: ["compact-2026-01-12"]` to request bodies containing `context_management`. This marker does not enable the provider; include its ID in `additionalProviders` as well.
 
 Restart OpenCode after installing the plugin or changing its configuration.
+
+### Let Anthropic compact before OpenCode
+
+OpenCode still runs its own automatic compaction. It compacts once the estimated prompt reaches `context - max(output limit, compaction.buffer)` (and `limit.input - compaction.buffer` when the model declares an input limit). Keep the plugin `threshold` well below that point so Anthropic compacts first. A larger `compaction.buffer` makes OpenCode compact earlier, so do not raise it above the gap between the plugin threshold and the context window. To leave compaction entirely to Anthropic, set `"compaction": { "auto": false }`; manual compaction and overflow recovery still use OpenCode's summarizer.
 
 ## Supported models
 
@@ -58,24 +57,32 @@ Use `additionalModels` when a compatible provider exposes one of these models un
 
 ## How it works
 
-- `chat.params` enables `contextManagement.edits` only for configured providers, supported models, and the `@ai-sdk/anthropic` adapter.
-- The installed Anthropic AI SDK adds the required `compact-2026-01-12` beta automatically.
-- Existing non-compaction context-management edits are preserved. An existing `compact_20260112` edit is replaced by this plugin's configuration.
-- Anthropic streams a compaction block as a metadata-tagged text part. OpenCode stores that part and the Anthropic SDK reconstructs it as a `compaction` block on subsequent requests.
-- When that compaction block starts streaming, the plugin shows a five-second toast and inserts a persistent ignored `Compacting context...` message immediately before the triggering user message. The indicator does not become model input or start another turn.
-- The generated summary is visible in the transcript. This is intentional: retaining the metadata-tagged part provides the reliable plugin-only replay path.
-- The internal `title`, `summary`, and `compaction` agents are skipped.
-
-No global fetch patch or separate per-session state is used.
+- A session `context` hook sets the Anthropic `contextManagement` provider option only for configured providers, supported models, and the Anthropic Messages package. The native protocol adds the required `compact-2026-01-12` beta header.
+- Only primary agent requests are affected; OpenCode's title, compaction, and generate requests are left alone.
+- An `http.response` hook copies the response stream and records the compaction block, if any, together with the last message of that request.
+- On later requests, the recorded block is prepended to the first assistant message after that anchor. Anthropic drops everything before it, so the compacted context is reused instead of compacting again.
+- Recorded blocks live in memory. After a restart, or once OpenCode's own compaction or a revert removes the anchor message, Anthropic simply compacts again when the trigger is reached.
 
 ## Anthropic proxies backed by Bedrock
 
-A Bedrock-backed proxy can work when OpenCode talks to it through `@ai-sdk/anthropic`. Add its OpenCode provider ID to `additionalProviders`, set its `anthropicCompactionBedrock` provider option, and add any renamed model ID to `additionalModels`.
+A Bedrock-backed proxy can work when OpenCode talks to it through the Anthropic Messages package. Add its OpenCode provider ID to `additionalProviders` and any renamed model ID to `additionalModels`. If the proxy forwards the request body to Bedrock unchanged, add the Bedrock-native fields with the provider `body` overlay:
+
+```json
+{
+  "providers": {
+    "my-anthropic-proxy": {
+      "body": {
+        "anthropic_version": "bedrock-2023-05-31",
+        "anthropic_beta": ["compact-2026-01-12"]
+      }
+    }
+  }
+}
+```
 
 The proxy must faithfully implement the Anthropic Messages contract for compaction:
 
 - accept `context_management.edits`
-- accept `anthropic_version` and `anthropic_beta` in the proxy request body and forward them to Bedrock
 - stream `compaction` and `compaction_delta` events
 - accept returned compaction blocks in later assistant messages
 - preserve compaction usage iterations
@@ -84,10 +91,9 @@ Merely using Bedrock internally is not enough. A proxy that strips these fields,
 
 ## Limitations
 
-- OpenCode's standard `@ai-sdk/amazon-bedrock` models use Bedrock Converse and do not expose Anthropic compaction blocks through the required request and response conversion. They are not enabled by this plugin.
-- OpenCode's experimental native LLM runtime currently drops Anthropic compaction blocks. Do not enable `OPENCODE_EXPERIMENTAL_NATIVE_LLM` when using this plugin with the built-in `anthropic` provider.
-- On OpenCode versions with the automatic compaction decision hook, eligible sessions continue to Anthropic instead of starting the built-in compaction agent. Manual compaction and provider context-overflow recovery still use OpenCode's built-in summarizer. Older OpenCode versions ignore this hook, so set the server-side trigger early enough that Anthropic compacts before OpenCode reaches its own overflow boundary.
-- Server-side compaction adds a billed sampling iteration. The current Anthropic AI SDK aggregates compaction and message iterations into reported executor usage.
+- OpenCode's `amazon-bedrock` provider uses Bedrock Converse and does not expose Anthropic compaction blocks. It is not enabled by this plugin.
+- The compaction summary is not shown in the transcript.
+- Server-side compaction adds a billed sampling iteration.
 
 ## Tests
 

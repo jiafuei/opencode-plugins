@@ -31,7 +31,7 @@ For "comb through these codebases and inventory X". The repo list is not known w
       "checkpoint": true,
       "steps": [{ "type": "worker", "worker": {
         "id": "scope", "label": "Scope",
-        "prompt": "List every git repository under ~/src that builds a deployable service. For each, record its path, its name, and which of {auth, rate limiting, telemetry} it plausibly configures, with the evidence that made you say so. Return the structured result only; write no files.",
+        "prompt": "List every git repository under ~/src that builds a deployable service. For each, record its path, its name, and which of {auth, rate limiting, telemetry} it plausibly configures, with the evidence that made you say so. Submit the structured result only; write no files.",
         "schema": { "type": "object", "additionalProperties": false, "required": ["repos"], "properties": { "repos": { "type": "array", "items": { "type": "object", "additionalProperties": false, "required": ["path", "name", "features"], "properties": { "path": { "type": "string" }, "name": { "type": "string" }, "features": { "type": "array", "items": { "type": "string" } } } } } } }
       }}]
     },

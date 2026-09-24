@@ -9,26 +9,34 @@ Standalone plugins for [OpenCode](https://opencode.ai), maintained as independen
 - [Memory](plugins/memory/README.md): project-scoped automatic memory with a `/memory` browser.
 - [Model glob](plugins/model-glob/README.md): search connected model IDs and their available variants.
 - [Web search](plugins/websearch/README.md): provider-native web search, currently backed by OpenAI hosted search with a ChatGPT subscription.
-- [OpenAI compaction](plugins/openai-compaction/README.md): compact OpenAI sessions with the provider's server-side compact endpoint instead of a summary.
 - [Redact keys](plugins/redact-keys/README.md): redact secrets from protected files before they reach the model.
 - [Workflows](plugins/workflows/README.md): declarative child-agent workflows with steering and a native TUI inspector.
 
 ## Installation
 
-Install a plugin for the current project:
+Install a plugin into the global OpenCode configuration:
 
 ```sh
-opencode plugin @jiafuei/opencode-anthropic-compaction
-opencode plugin @jiafuei/opencode-antigravity-oauth
-opencode plugin @jiafuei/opencode-memory
-opencode plugin @jiafuei/opencode-model-glob
-opencode plugin @jiafuei/opencode-websearch
-opencode plugin @jiafuei/opencode-openai-compaction
-opencode plugin @jiafuei/opencode-redact-keys
-opencode plugin @jiafuei/opencode-workflows
+opencode plugin add @jiafuei/opencode-anthropic-compaction
+opencode plugin add @jiafuei/opencode-antigravity-oauth
+opencode plugin add @jiafuei/opencode-memory
+opencode plugin add @jiafuei/opencode-model-glob
+opencode plugin add @jiafuei/opencode-websearch
+opencode plugin add @jiafuei/opencode-redact-keys
+opencode plugin add @jiafuei/opencode-workflows
 ```
 
-Pass `--global` to install into the global OpenCode configuration. Memory and Workflows expose both server and TUI entrypoints, so the installer updates both configurations automatically.
+Plugins are listed in the `plugins` array of `opencode.json`, either as a package name or as `{ "package": "...", "options": { ... } }`. Memory and Workflows expose both server and TUI entrypoints; OpenCode loads each from the same entry.
+
+## Retired plugins
+
+These plugins were removed in the OpenCode v2 migration because v2 core covers them natively.
+
+- **OpenAI compaction** (`@jiafuei/opencode-openai-compaction`): v2 core implements OpenAI's `/responses/compact` endpoint and in-band compaction trigger. Enable it per provider or model instead:
+
+  ```json
+  { "providers": { "openai": { "settings": { "compaction": { "type": "native" } } } } }
+  ```
 
 ## Development
 

@@ -1,16 +1,13 @@
 import { describe, expect, test } from "bun:test";
-import type { TuiPluginApi } from "@opencode-ai/plugin/tui";
 import {
   DEFAULT_LIMITS,
   effectiveLimits,
   drainPendingCoordination,
   failureDecisionStatus,
   isLeaseStale,
-  isWorkflowControlAction,
   planDiff,
   reconcileRevisionWorkers,
   sealActivePhase,
-  selectCoordinatorOperationChild,
   assertCoordinatorSource,
   coordinatorRetryable,
   hydrateRun,
@@ -24,7 +21,6 @@ import {
   beginAttempt,
   RETRY_DELAYS_MS,
   type WorkerAttempt,
-  selectWorkflowChild,
   validateWorkflowSpec,
   validatePlanRevision,
   canContinueCoordinatorFailure,
@@ -37,6 +33,7 @@ import {
   type WorkflowSpec,
   type WorkflowStatus,
   workflowMessageID,
+  workflowSessionID,
   workersInOrder,
   workerIDsInPhases,
   acceptWorkerSteering,
@@ -45,28 +42,19 @@ import {
   steeringFollowUp,
   tokenUsage,
   workerTurnPrompt,
-  promptResponseError,
   requeueDeliveredSteering,
-  replacementControlDecision,
   abortForParentDeletion,
   canDiscardRun,
   normalizeWorkflowOptions,
-  ownedChildSessionIDs,
   retentionCandidates,
   startupActions,
-  tuiPresenceFresh,
   workflowCeilings,
-  pendingChildCleanup,
-  sessionAlreadyDeleted,
-  parentDeletionRoute,
   acceptCoordinatorResult,
   finalizeSoftPause,
-  isPendingControlFilename,
   pendingWorkers,
-  workflowProjectDirectory,
 } from "./workflow_shared.ts";
 import { WorkflowCoordination } from "./workflow_coordination.ts";
-import workflowTui, { failureControlOptions, promptRightRun } from "./workflow_tui.tsx";
+import { failureControlOptions, promptRightRun } from "./workflow_tui.tsx";
 
 const agents = new Set(["build", "explore"]);
 const models = new Set(["openai/gpt-5"]);
@@ -213,11 +201,8 @@ describe("Stage 4 steering and inspector", () => {
     expect(workerTurnPrompt(true, 1, "retry", undefined, "boom")).toBe("Your prior attempt failed with this error:\n\nboom\n\nCorrect the issue and return the requested final result.");
   });
 
-  test("throws authoritative response errors before output handling", () => {
-    const error = { name: "PermissionDenied", status: 403 };
-    expect(() => promptResponseError({ error })).toThrow();
-    expect(retryClassification(error)).toBe("none");
-    expect(() => promptResponseError({})).not.toThrow();
+  test("classifies authoritative permission errors as terminal", () => {
+    expect(retryClassification({ name: "PermissionDenied", status: 403 })).toBe("none");
   });
 
   test("requeues delivered steering after failed or interrupted follow-up", () => {
@@ -238,12 +223,6 @@ describe("Stage 4 steering and inspector", () => {
     expect(retryDelay(worker.automaticRetries + 1)).toBe(5_000);
   });
 
-  test("starts replacement when observed owner vanished and rejects a different owner", () => {
-    expect(replacementControlDecision({ token: "old", generation: 1 })).toBe("start");
-    expect(replacementControlDecision({ token: "old", generation: 1 }, { token: "new", generation: 2, heartbeatAt: 100 }, 101)).toBe("reject");
-    expect(replacementControlDecision({ token: "same", generation: 2 }, { token: "same", generation: 2, heartbeatAt: 100 }, 101)).toBe("stop_owner");
-  });
-
   test("derives current-plan progress without retired history", () => {
     const current = run();
     current.workers.old = { id: "old", label: "Old", agent: "build", prompt: "old", status: "completed", steering: [] };
@@ -252,11 +231,10 @@ describe("Stage 4 steering and inspector", () => {
     expect(currentPlanProgress(current)).toEqual({ completed: 1, total: 3, running: 1 });
   });
 
-  test("selects lease owner before other active and pending prompt statuses", () => {
+  test("selects active runs before pending prompt statuses", () => {
     const pending = run(); pending.id = "pending"; pending.status = "pending";
     const active = run(); active.id = "active";
     const leased = run(); leased.id = "leased"; leased.status = "soft_paused";
-    expect(promptRightRun([pending, active, leased], { runID: "leased", heartbeatAt: Date.now() })?.id).toBe("leased");
     expect(promptRightRun([pending, active])?.id).toBe("active");
     active.status = "completed"; pending.status = "failed"; leased.status = "stopped";
     expect(promptRightRun([pending, active, leased])).toBeUndefined();
@@ -331,9 +309,7 @@ describe("Stage 3 adaptive planning", () => {
     expect(workerIDsInPhases(current.spec.phases)).not.toContain("audit");
   });
 
-  test("uses exact coordinator operation metadata and monotonic sources", () => {
-    const children = [{ id: "old", metadata: { workflowRunID: "run", workflowCoordinatorOperationID: "old" } }, { id: "exact", metadata: { workflowRunID: "run", workflowCoordinatorOperationID: "op" } }];
-    expect(selectCoordinatorOperationChild(children, "run", "op")?.id).toBe("exact");
+  test("rejects coordinator results from a stale source plan or frontier", () => {
     const current = run();
     const operation: CoordinatorOperation = { id: "op", sourcePlanVersion: 1, sourceFrontierGeneration: 1, reason: "plan_change", guidanceIDs: ["g1"], attempts: [], input: "", status: "running" };
     expect(() => assertCoordinatorSource(current, operation)).not.toThrow();
@@ -417,27 +393,6 @@ describe("templates and state helpers", () => {
 describe("Stage 5 lifecycle and release", () => {
   const run = (id: string, status: WorkflowRun["status"], updatedAt: number): WorkflowRun => hydrateRun({ version: 1, id, parentSessionID: "parent", parentMessageID: "message", createdAt: updatedAt, updatedAt, status, spec: validateWorkflowSpec(base, agents, models), limits: DEFAULT_LIMITS, workers: {} });
 
-  test("returns before project lookup starts and disposes without opening SQLite", async () => {
-    const calls: string[] = [];
-    let dispose: (() => void | Promise<void>) | undefined;
-    const projectID = `tui-dispose-${crypto.randomUUID()}`;
-    const api = {
-      client: { project: { current: async () => { calls.push("project"); return { data: { id: projectID } }; } } },
-      state: { path: { directory: "/tmp" } },
-      keymap: { registerLayer: () => { calls.push("keymap"); return () => {}; } },
-      route: { register: () => { calls.push("route"); return () => {}; } },
-      slots: { register: () => { calls.push("slots"); return "workflows"; } },
-      lifecycle: { onDispose: (callback: () => void | Promise<void>) => { calls.push("dispose"); dispose = callback; return () => {}; } },
-    } as unknown as TuiPluginApi;
-
-    await workflowTui.tui(api, undefined, {} as never);
-    expect(calls).toEqual(["keymap", "route", "slots", "dispose"]);
-
-    await dispose!();
-    await Bun.sleep(0);
-    expect(await Bun.file(`${workflowProjectDirectory(projectID, "/tmp")}/coordination.sqlite`).exists()).toBe(false);
-  });
-
   test("selects retention by age or count and protects every nonterminal status", () => {
     const now = 40 * 86_400_000;
     const values = [run("new", "completed", now), run("second", "aborted", now - 1), run("overflow", "rejected", now - 2), run("old", "failed", 1), run("active", "running", 1), run("stopped", "stopped", 1), run("interrupted", "interrupted", 1)];
@@ -447,24 +402,13 @@ describe("Stage 5 lifecycle and release", () => {
     expect(retentionCandidates([rewritten], 30, 30, now).map((item) => item.id)).toEqual(["rewritten"]);
   });
 
-  test("collects persisted and metadata-reconciled children but never the parent", () => {
-    const current = run("run", "completed", 1);
-    current.workers = { one: { id: "one", label: "One", agent: "build", prompt: "x", status: "completed", steering: [], childSessionID: "worker" } };
-    current.handoffSessionID = "handoff";
-    current.coordinatorOperations = [{ id: "op", sourcePlanVersion: 1, sourceFrontierGeneration: 1, reason: "checkpoint", guidanceIDs: [], attempts: [], input: "", status: "accepted", sessionID: "coordinator" }];
-    expect(ownedChildSessionIDs(current, [{ id: "retry", metadata: { workflowRunID: "run" } }, { id: "parent", metadata: { workflowRunID: "run" } }, { id: "other", metadata: { workflowRunID: "other" } }])).toEqual(["coordinator", "handoff", "retry", "worker"]);
-  });
-
   test("enforces configured plugin ceilings", () => {
     const options = normalizeWorkflowOptions({ max_workers: 2, max_revisions: 3, max_run_ms: 1000 });
     const tooLarge = structuredClone(base); tooLarge.limits = { maxWorkers: 3 };
     expect(() => validateWorkflowSpec(tooLarge, agents, models, workflowCeilings(options))).toThrow("1 to 2");
   });
 
-  test("checks TUI freshness and derives startup/manual actions", () => {
-    expect(tuiPresenceFresh({ heartbeatAt: 1000 }, 5999)).toBe(true);
-    expect(tuiPresenceFresh({ heartbeatAt: 1000 }, 6001)).toBe(false);
-    expect(tuiPresenceFresh({ heartbeatAt: 7001 }, 5999)).toBe(false);
+  test("derives startup/manual actions", () => {
     const interrupted = run("run", "interrupted", 1);
     expect(startupActions(interrupted)).toEqual(["resume", "open", "later", "discard"]);
     expect(canDiscardRun(interrupted)).toBe(true);
@@ -476,17 +420,6 @@ describe("Stage 5 lifecycle and release", () => {
     expect(abortForParentDeletion(current)).toBe(true);
     expect(current).toMatchObject({ status: "aborted", error: "Originating parent session was deleted" });
     expect(abortForParentDeletion(current)).toBe(false);
-  });
-
-  test("routes parent deletion to the exact healthy cross-process owner", () => {
-    const path = `/tmp/opencode/workflow-parent-delete-${crypto.randomUUID()}.sqlite`;
-    const owner = new WorkflowCoordination(path), observer = new WorkflowCoordination(path);
-    const lease = owner.acquire("run", "owner", 100)!;
-    const observed = observer.current()!;
-    expect(parentDeletionRoute(undefined, observed, 101)).toEqual({ targetOwner: "owner", leaseToken: lease.token, leaseGeneration: lease.generation });
-    expect(parentDeletionRoute(lease, observed, 101)).toBe("handle");
-    expect(parentDeletionRoute(undefined, observed, 20_000)).toBe("acquire");
-    owner.close(); observer.close();
   });
 
   test("maintenance claims serialize and can be retried after cleanup failure", () => {
@@ -505,9 +438,7 @@ describe("Stage 5 lifecycle and release", () => {
     const cleaner = new WorkflowCoordination(path), runner = new WorkflowCoordination(path);
     const claim = cleaner.claimMaintenance("run", "cleaner", 100)!;
     expect(runner.acquire("run", "runner", 101)).toBeUndefined();
-    expect(cleaner.renewMaintenance({ ...claim, token: "wrong" }, 200)).toBe(false);
-    expect(cleaner.renewMaintenance(claim, 20_000)).toBe(true);
-    expect(runner.acquire("run", "runner", 20_001)).toBeUndefined();
+    expect(cleaner.releaseMaintenance({ ...claim, token: "wrong" })).toBe(false);
     expect(cleaner.releaseMaintenance(claim)).toBe(true);
     const lease = runner.acquire("run", "runner", 20_002)!;
     expect(cleaner.claimMaintenance("run", "cleaner", 20_003)).toBeUndefined();
@@ -515,14 +446,6 @@ describe("Stage 5 lifecycle and release", () => {
     cleaner.close(); runner.close();
   });
 
-  test("partial child cleanup progress and not-found deletion are retry-idempotent", () => {
-    const ids = ["first", "second", "third"];
-    expect(pendingChildCleanup(ids, ["first"])).toEqual(["second", "third"]);
-    expect(pendingChildCleanup(ids, ["first", "second"])).toEqual(["third"]);
-    expect(sessionAlreadyDeleted({ status: 404, name: "SessionNotFound" })).toBe(true);
-    expect(sessionAlreadyDeleted(new Error("session not found"))).toBe(true);
-    expect(sessionAlreadyDeleted({ status: 500 })).toBe(false);
-  });
 });
 
 describe("Stage 2 reliability helpers", () => {
@@ -535,9 +458,6 @@ describe("Stage 2 reliability helpers", () => {
     expect(retryDelay(6)).toBeUndefined();
   });
 
-  test("keeps pause boundaries and selects queued runs deterministically", () => {
-  });
-
   test("preserves quiescing coordinator state and finalizes soft pauses", () => {
     const run = { status: "hard_pausing", failure: { workerID: "x", reason: "x" }, error: "Hard pause requested" } as WorkflowRun;
     acceptCoordinatorResult(run);
@@ -547,13 +467,6 @@ describe("Stage 2 reliability helpers", () => {
     run.status = "soft_pausing";
     expect(finalizeSoftPause(run)).toBe(true);
     expect(run.status as WorkflowStatus).toBe("soft_paused");
-  });
-
-  test("ignores claimed controls while preserving owner suffixes", () => {
-    expect(isPendingControlFilename("1.json.owner")).toBe(true);
-    expect(isPendingControlFilename("1.json.owner.claimed")).toBe(false);
-    expect(isPendingControlFilename("1.json.owner.tmp")).toBe(false);
-    expect(isPendingControlFilename("1.json.uuid.tmp")).toBe(false);
   });
 
   test("schedules only pending and interrupted workers, in spec order", () => {
@@ -597,11 +510,6 @@ describe("Stage 2 reliability helpers", () => {
     expect(isLeaseStale(lease, 25_001)).toBe(true);
   });
 
-  test("recognizes controls so unknown claimed files can be discarded", () => {
-    expect(isWorkflowControlAction("stop")).toBe(true);
-    expect(isWorkflowControlAction("unknown")).toBe(false);
-  });
-
   test("requires quiescence before hard pause and stop become resumable", () => {
     expect(quiescenceStatus("hard_pause", false)).toBe("hard_pausing");
     expect(quiescenceStatus("hard_pause", true)).toBe("hard_paused");
@@ -621,16 +529,7 @@ describe("Stage 2 reliability helpers", () => {
     expect(workflowMessageID(now) < workflowMessageID(now)).toBe(true);
     expect(workflowMessageID(now) < workflowMessageID(now + 1)).toBe(true);
     expect(workflowMessageID(now) > workflowMessageID(now - 1000)).toBe(true);
-  });
-
-  test("reconciles worker and handoff children by metadata", () => {
-    const children = [
-      { id: "other", metadata: { workflowRunID: "other", workflowWorkerID: "scan" } },
-      { id: "worker", metadata: { workflowRunID: "run", workflowWorkerID: "scan" } },
-      { id: "handoff", metadata: { workflowRunID: "run", workflowHandoff: true } },
-    ];
-    expect(selectWorkflowChild(children, "run", "scan")?.id).toBe("worker");
-    expect(selectWorkflowChild(children, "run")?.id).toBe("handoff");
+    expect(workflowSessionID(now) > workflowSessionID(now + 1)).toBe(true);
   });
 
   test("fences lease contention, takeover, ownership loss, and token release", () => {
@@ -669,5 +568,6 @@ describe("Stage 2 reliability helpers", () => {
     expect(retryClassification({ name: "MessageAbortedError", data: { message: "aborted" } })).toBe("none");
     expect(retryClassification({ name: "ProviderAuthError", data: { providerID: "anthropic", message: "missing key" } })).toBe("none");
     expect(retryClassification(new TypeError("fetch failed"))).toBe("transient");
+    expect(retryClassification({ type: "provider.rate_limit", message: "slow down", status: 429 })).toBe("transient");
   });
 });

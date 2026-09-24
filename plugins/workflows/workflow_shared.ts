@@ -1,18 +1,7 @@
-import { tool } from "@opencode-ai/plugin";
-import { mkdir, rename, rm } from "node:fs/promises";
+import { Rpc } from "@opencode/plugin";
+import { Effect, Schema } from "effect";
 import { homedir } from "node:os";
-import { dirname, join, resolve } from "node:path";
-
-export async function atomicWrite(path: string, content: string): Promise<void> {
-  await mkdir(dirname(path), { recursive: true });
-  const temporary = `${path}.${crypto.randomUUID()}.tmp`;
-  try {
-    await Bun.write(temporary, content);
-    await rename(temporary, path);
-  } finally {
-    await rm(temporary, { force: true }).catch(() => {});
-  }
-}
+import { join, resolve } from "node:path";
 
 /** Resolves early when the signal aborts, so retry backoff never outlives a cancelled run. */
 export async function abortableSleep(delayMs: number, signal: AbortSignal): Promise<void> {
@@ -20,7 +9,7 @@ export async function abortableSleep(delayMs: number, signal: AbortSignal): Prom
   await Promise.race([Bun.sleep(delayMs), new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }))]);
 }
 
-export type ModelRef = { providerID: string; modelID: string };
+export type ModelRef = { providerID: string; id: string };
 
 export type WorkerSpec = {
   id: string;
@@ -50,7 +39,7 @@ export type PlanDiffEntry = { kind: "added" | "removed" | "reordered" | "changed
 export type WorkflowGuidance = { id: string; generation: number; text: string; createdAt: number };
 export type ExecutionFrontier = { generation: number; phaseID?: string; completedSteps: number; sealed: boolean };
 export type PlanRevision = { version: number; operationID: string; reason: "checkpoint" | "plan_change" | "repair"; checkpointOccurrenceID?: string; guidance: WorkflowGuidance[]; rationale: string; before: PhaseSpec[]; after: PhaseSpec[]; diff: PlanDiffEntry[]; acceptedAt: number };
-export type CoordinatorOperation = { id: string; sourcePlanVersion: number; sourceFrontierGeneration: number; reason: PlanRevision["reason"]; checkpointOccurrenceID?: string; guidanceIDs: string[]; sessionID?: string; attempts: WorkerAttempt[]; input: string; output?: unknown; rationale?: string; status: "creating" | "running" | "accepted" | "failed"; error?: string; terminalKind?: "creation" | "turn" | "policy" };
+export type CoordinatorOperation = { id: string; sourcePlanVersion: number; sourceFrontierGeneration: number; reason: PlanRevision["reason"]; checkpointOccurrenceID?: string; guidanceIDs: string[]; attempts: WorkerAttempt[]; input: string; output?: unknown; rationale?: string; status: "running" | "accepted" | "failed"; error?: string; terminalKind?: "turn" | "policy" };
 export type CoordinatorState = { operationID?: string; status: "idle" | "running" | "failed"; reason?: PlanRevision["reason"]; error?: string };
 export type WorkerAttempt = {
   number: number;
@@ -90,16 +79,14 @@ export type WorkerState = {
   creationRetries?: number;
 };
 export type WorkflowStatus = "pending" | "queued" | "running" | "soft_pausing" | "soft_paused" | "hard_pausing" | "hard_paused" | "stopping" | "blocked" | "repair_required" | "stopped" | "completed" | "rejected" | "failed" | "aborted" | "interrupted";
-export type WorkflowControlAction = "approve" | "queue" | "replace" | "reject" | "soft_pause" | "hard_pause" | "resume" | "stop" | "discard" | "parent_deleted" | "failure_retry" | "failure_skip" | "failure_stop" | "plan_change" | "coordinator_retry" | "coordinator_continue" | "steer";
+const CONTROL_ACTIONS = ["approve", "replace", "reject", "soft_pause", "hard_pause", "resume", "stop", "discard", "failure_retry", "failure_skip", "failure_stop", "plan_change", "coordinator_retry", "coordinator_continue", "steer"] as const;
+export type WorkflowControlAction = typeof CONTROL_ACTIONS[number];
 export type WorkflowRun = {
   version: 1;
   id: string;
   parentSessionID: string;
   parentMessageID: string;
   parentModel?: ModelRef;
-  parentAgent?: string;
-  parentVariant?: string;
-  parentDeletedAt?: number;
   createdAt: number;
   updatedAt: number;
   terminalAt?: number;
@@ -108,7 +95,6 @@ export type WorkflowRun = {
   spec: WorkflowSpec;
   limits: WorkflowLimits;
   workers: Record<string, WorkerState>;
-  handoffSessionID?: string;
   handoff?: WorkflowHandoff;
   error?: string;
   failure?: { workerID: string; reason: string; kind?: "worker" | "handoff" | "repair" | "coordinator" };
@@ -131,7 +117,6 @@ export type WorkflowRun = {
   coordinatorOperations: CoordinatorOperation[];
   reservedWorkerIDs: string[];
   reservedPhaseIDs: string[];
-  controlErrors?: Array<{ id: string; action: WorkflowControlAction; createdAt: number; rejectedAt: number; error: string; workerID?: string }>;
 };
 
 type HydratedField =
@@ -175,45 +160,47 @@ export type WorkflowHandoff = {
 
 const ID = /^[A-Za-z][A-Za-z0-9_-]*$/;
 const TEMPLATE_REFERENCE = /^\s*workers\.([A-Za-z][A-Za-z0-9_-]*)\.output((?:\.[A-Za-z_$][A-Za-z0-9_$]*)*)\s*$/;
-const NONEMPTY_TEXT = tool.schema.string({ message: "must be a non-empty string" }).refine((value) => !!value.trim(), { message: "must be a non-empty string" });
-const TEXT = tool.schema.string({ message: "must be a string" });
-const IDENTIFIER = tool.schema.string({ message: "must use letters, numbers, _ or - and begin with a letter" }).refine((value) => ID.test(value), { message: "must use letters, numbers, _ or - and begin with a letter" });
-const MODEL_ID = tool.schema.string({ message: 'must be a "providerID/modelID" string such as "openai/gpt-1.0" or "anthropic/claude-sonnet-1.0"' }).refine((value) => /^[^\s/]+\/\S+$/.test(value), { message: 'must be a "providerID/modelID" string such as "openai/gpt-1.0" or "anthropic/claude-sonnet-1.0"' });
-export const WORKER_SCHEMA = tool.schema.object({
-  id: IDENTIFIER.describe("Globally unique across the workflow; letters, digits, _ or -, starting with a letter"),
+const NONEMPTY_TEXT = Schema.String.check(Schema.isPattern(/\S/, { message: "must be a non-empty string" }));
+const IDENTIFIER = Schema.String.check(Schema.isPattern(ID, { message: "must use letters, numbers, _ or - and begin with a letter" }));
+const MODEL_ID = Schema.String.check(Schema.isPattern(/^[^\s/]+\/\S+$/, { message: 'must be a "providerID/modelID" string such as "openai/gpt-1.0" or "anthropic/claude-sonnet-1.0"' }));
+const POSITIVE_INT = Schema.Int.check(Schema.isGreaterThanOrEqualTo(1));
+const NOT_EMPTY = Schema.isNonEmpty({ message: "must not be empty" });
+export const RUN_ID = Schema.String.check(Schema.isPattern(/^[A-Za-z0-9_-]+$/, { message: "Invalid workflow run ID" }));
+export const WORKER_SCHEMA = Schema.Struct({
+  id: IDENTIFIER.annotate({ description: "Globally unique across the workflow; letters, digits, _ or -, starting with a letter" }),
   label: NONEMPTY_TEXT,
-  agent: IDENTIFIER.optional().default("general").describe("Defaults to 'general'; must be listed in allowedAgents"),
-  modelID: MODEL_ID.optional().describe('"providerID/modelID"; must be an available model. Omit to inherit the originating session model. Set it explicitly on workers that check other workers, so verification does not repeat the same model\'s mistakes.'),
-  variant: TEXT.optional(),
-  prompt: NONEMPTY_TEXT.describe("Self-contained instructions; the worker sees no conversation history. May embed earlier workers' outputs as {{workers.<id>.output}} (append .field for schema outputs; \\{{ for a literal). Forward and same-step sibling references are rejected. When the worker produces bulk data, name the exact file path it must write to."),
-  schema: tool.schema.record(tool.schema.string(), tool.schema.unknown()).optional().describe("JSON Schema for the worker's structured output. Results are passed intact to coordinators and the final handoff. For bulk results, write an artifact and return {path, count, notes}."),
+  agent: IDENTIFIER.annotate({ description: "Defaults to 'general'; must be listed in allowedAgents" }).pipe(Schema.withDecodingDefaultKey(Effect.succeed("general"))),
+  modelID: Schema.optional(MODEL_ID.annotate({ description: '"providerID/modelID"; must be an available model. Omit to inherit the originating session model. Set it explicitly on workers that check other workers, so verification does not repeat the same model\'s mistakes.' })),
+  variant: Schema.optional(Schema.String),
+  prompt: NONEMPTY_TEXT.annotate({ description: "Self-contained instructions; the worker sees no conversation history. May embed earlier workers' outputs as {{workers.<id>.output}} (append .field for schema outputs; \\{{ for a literal). Forward and same-step sibling references are rejected. When the worker produces bulk data, name the exact file path it must write to." }),
+  schema: Schema.optional(Schema.Record(Schema.String, Schema.Unknown).annotate({ description: "JSON Schema for the worker's structured result, which the worker submits through a dedicated tool. Results are passed intact to coordinators and the final handoff. For bulk results, write an artifact and return {path, count, notes}." })),
 });
-export const WORKFLOW_SPEC_SCHEMA = tool.schema.object({
-  version: tool.schema.literal(1),
+export const PHASE_SCHEMA = Schema.Struct({
+  id: IDENTIFIER,
+  title: NONEMPTY_TEXT,
+  checkpoint: Schema.optional(Schema.Boolean.annotate({ description: "After this phase, a coordinator sees its outputs and rewrites ALL remaining phases. This is the only way to express work whose shape is unknown up front — fan-out over a list this phase discovers, or repeat-until-exhausted. There is no loop construct; end the discovering phase with a checkpoint and let the coordinator write the phases that consume it." })),
+  steps: Schema.Array(Schema.Union([
+    Schema.Struct({ type: Schema.Literal("worker"), worker: WORKER_SCHEMA }),
+    Schema.Struct({ type: Schema.Literal("parallel"), id: IDENTIFIER, title: Schema.optional(NONEMPTY_TEXT), workers: Schema.Array(WORKER_SCHEMA).check(NOT_EMPTY) }),
+  ])).check(NOT_EMPTY),
+});
+export const WORKFLOW_SPEC_SCHEMA = Schema.Struct({
+  version: Schema.Literal(1),
   name: NONEMPTY_TEXT,
-  description: NONEMPTY_TEXT.describe("One line shown in the approval dialog and run tree"),
-  goal: NONEMPTY_TEXT.describe("The complete objective AND the condition that ends the run, in a few full sentences — this is the only context a checkpoint coordinator gets besides worker outputs: it has no tools and no conversation history, so everything it must know between phases belongs here. A workflow that repeats until exhausted must state its stopping rule here or it will not converge."),
-  allowedAgents: tool.schema.array(IDENTIFIER).min(1, { message: "must contain at least one agent" }).describe("Unique registered agents workers may use; also bounds anything a checkpoint coordinator adds later"),
-  phases: tool.schema.array(tool.schema.object({
-    id: IDENTIFIER,
-    title: NONEMPTY_TEXT,
-    checkpoint: tool.schema.boolean().optional().describe("After this phase, a coordinator sees its outputs and rewrites ALL remaining phases. This is the only way to express work whose shape is unknown up front — fan-out over a list this phase discovers, or repeat-until-exhausted. There is no loop construct; end the discovering phase with a checkpoint and let the coordinator write the phases that consume it."),
-    steps: tool.schema.array(tool.schema.discriminatedUnion("type", [
-      tool.schema.object({ type: tool.schema.literal("worker"), worker: WORKER_SCHEMA }),
-      tool.schema.object({ type: tool.schema.literal("parallel"), id: IDENTIFIER, title: NONEMPTY_TEXT.optional(), workers: tool.schema.array(WORKER_SCHEMA).min(1, { message: "must not be empty" }) }),
-    ])).min(1, { message: "must not be empty" }),
-  })).min(1, { message: "must not be empty" }),
-  limits: tool.schema.object({
-    maxWorkers: tool.schema.number().int().min(1).optional().describe("Total worker budget. A checkpoint coordinator may only add (maxWorkers - workers already listed) workers, so a spec with checkpoints must set this well above its own worker count or the expansion silently has no room."),
-    maxRevisions: tool.schema.number().int().min(1).optional().describe("Coordinator revisions allowed; each checkpoint consumes one"),
-    maxRunMs: tool.schema.number().int().min(1).optional(),
-  }).optional(),
+  description: NONEMPTY_TEXT.annotate({ description: "One line shown in the approval dialog and run tree" }),
+  goal: NONEMPTY_TEXT.annotate({ description: "The complete objective AND the condition that ends the run, in a few full sentences — this is the only context a checkpoint coordinator gets besides worker outputs: it has no tools and no conversation history, so everything it must know between phases belongs here. A workflow that repeats until exhausted must state its stopping rule here or it will not converge." }),
+  allowedAgents: Schema.Array(IDENTIFIER).check(Schema.isNonEmpty({ message: "must contain at least one agent" })).annotate({ description: "Unique registered agents workers may use; also bounds anything a checkpoint coordinator adds later" }),
+  phases: Schema.Array(PHASE_SCHEMA).check(NOT_EMPTY),
+  limits: Schema.optional(Schema.Struct({
+    maxWorkers: Schema.optional(POSITIVE_INT.annotate({ description: "Total worker budget. A checkpoint coordinator may only add (maxWorkers - workers already listed) workers, so a spec with checkpoints must set this well above its own worker count or the expansion silently has no room." })),
+    maxRevisions: Schema.optional(POSITIVE_INT.annotate({ description: "Coordinator revisions allowed; each checkpoint consumes one" })),
+    maxRunMs: Schema.optional(POSITIVE_INT),
+  })),
 });
 export const DEFAULT_LIMITS: WorkflowLimits = { maxWorkers: 100, maxRevisions: 10, maxRunMs: 6 * 60 * 60 * 1000, maxConcurrency: 2 };
 export const RETRY_DELAYS_MS = [5_000, 10_000, 20_000, 30_000, 40_000] as const;
 export const LEASE_HEARTBEAT_MS = 5_000;
 export const LEASE_STALE_MS = 15_000;
-export const TUI_PRESENCE_STALE_MS = 5_000;
 export type WorkflowOptions = { retentionRuns: number; retentionDays: number; maxWorkers: number; maxRevisions: number; maxRunMs: number; maxConcurrency: number };
 
 export function normalizeWorkflowOptions(value: Record<string, unknown> | undefined = {}): WorkflowOptions {
@@ -231,7 +218,7 @@ export function workflowCeilings(options: WorkflowOptions): WorkflowLimits { ret
 
 export function parseModelID(value: string): ModelRef {
   const separator = value.indexOf("/");
-  return { providerID: value.slice(0, separator), modelID: value.slice(separator + 1) };
+  return { providerID: value.slice(0, separator), id: value.slice(separator + 1) };
 }
 
 function templateReferences(prompt: string): Array<{ start: number; end: number; id: string; suffix: string }> {
@@ -266,7 +253,7 @@ export function templateDependencies(prompt: string): string[] {
 }
 
 export function validateWorkflowSpec(value: unknown, registeredAgents?: ReadonlySet<string>, registeredModels?: ReadonlySet<string>, ceilings: WorkflowLimits = DEFAULT_LIMITS): WorkflowSpec {
-  return checkWorkflowPlan(WORKFLOW_SPEC_SCHEMA.parse(value), registeredAgents, registeredModels, ceilings);
+  return checkWorkflowPlan(Schema.decodeUnknownSync(WORKFLOW_SPEC_SCHEMA)(value) as WorkflowSpec, registeredAgents, registeredModels, ceilings);
 }
 
 function checkWorkflowPlan(spec: WorkflowSpec, registeredAgents?: ReadonlySet<string>, registeredModels?: ReadonlySet<string>, ceilings: WorkflowLimits = DEFAULT_LIMITS): WorkflowSpec {
@@ -446,16 +433,9 @@ export function finalizeSoftPause(run: Pick<WorkflowRun, "status">): boolean {
   return true;
 }
 
-export function isPendingControlFilename(name: string): boolean {
-  if (name.endsWith(".claimed") || name.endsWith(".tmp")) return false;
-  return name.endsWith(".json") || /\.json\.[^.]+$/.test(name);
-}
-
 export function pendingWorkers(workers: WorkerSpec[], states: Record<string, WorkerState>): WorkerSpec[] {
   return workers.filter((worker) => states[worker.id]?.status === "pending" || states[worker.id]?.status === "interrupted");
 }
-
-export function promptResponseError(info: { error?: unknown }): void { if (info.error !== undefined) throw info.error; }
 
 export function tokenUsage(value: unknown): TokenUsage | undefined {
   if (!value || typeof value !== "object") return;
@@ -464,11 +444,6 @@ export function tokenUsage(value: unknown): TokenUsage | undefined {
   const result = { input: Number(input.input ?? 0), output: Number(input.output ?? 0), reasoning: Number(input.reasoning ?? 0), cacheRead: Number(input.cacheRead ?? cache.read ?? 0), cacheWrite: Number(input.cacheWrite ?? cache.write ?? 0), total: 0 };
   result.total = result.input + result.output + result.reasoning;
   return result;
-}
-
-export function addTokenUsage(current: TokenUsage | undefined, next: TokenUsage | undefined): TokenUsage | undefined {
-  if (!next) return current;
-  return { input: (current?.input ?? 0) + next.input, output: (current?.output ?? 0) + next.output, reasoning: (current?.reasoning ?? 0) + next.reasoning, cacheRead: (current?.cacheRead ?? 0) + next.cacheRead, cacheWrite: (current?.cacheWrite ?? 0) + next.cacheWrite, total: (current?.total ?? 0) + next.total };
 }
 
 export function planDiff(before: PhaseSpec[], after: PhaseSpec[]): PlanDiffEntry[] {
@@ -496,7 +471,7 @@ export function validatePlanRevision(run: WorkflowRun, pending: unknown): PhaseS
   const frozen = (phase: PhaseSpec) => run.completedPhases.includes(phase.id) || run.sealedPhases.includes(phase.id);
   const immutable = run.spec.phases.filter(frozen);
   const priorPending = run.spec.phases.filter((phase) => !frozen(phase));
-  const candidate = checkWorkflowPlan({ ...run.spec, phases: [...immutable, ...tool.schema.array(WORKFLOW_SPEC_SCHEMA.shape.phases.element).parse(pending)], limits: { maxWorkers: run.limits.maxWorkers, maxRevisions: run.limits.maxRevisions, maxRunMs: run.limits.maxRunMs } }, undefined, undefined, run.limits);
+  const candidate = checkWorkflowPlan({ ...run.spec, phases: [...immutable, ...Schema.decodeUnknownSync(Schema.Array(PHASE_SCHEMA))(pending) as PhaseSpec[]], limits: { maxWorkers: run.limits.maxWorkers, maxRevisions: run.limits.maxRevisions, maxRunMs: run.limits.maxRunMs } }, undefined, undefined, run.limits);
   const immutableIDs = new Set(workerIDsInPhases(immutable));
   const historical = new Set(run.reservedWorkerIDs);
   const reusable = new Set(workerIDsInPhases(priorPending));
@@ -587,21 +562,22 @@ export function renderTemplate(prompt: string, outputs: Record<string, unknown>)
   return result + literal(prompt.slice(cursor));
 }
 
-// OpenCode reports turn failures as NamedError objects shaped { name, data: { message, statusCode, isRetryable } },
-// so the retryable fields live under data, not at the top level.
+// OpenCode reports turn failures as { type, message, status } session errors; SDK and provider errors may instead
+// be shaped { name, data: { message, statusCode, isRetryable } }, with the retryable fields under data.
 export function retryClassification(error: unknown): "transient" | "structured" | "none" {
   let text = String(error);
   if (error && typeof error === "object") {
-    const input = error as { name?: unknown; message?: unknown; isRetryable?: unknown; status?: unknown; statusCode?: unknown; data?: unknown; error?: unknown };
+    const input = error as { name?: unknown; type?: unknown; message?: unknown; isRetryable?: unknown; status?: unknown; statusCode?: unknown; data?: unknown; error?: unknown };
+    const name = input.name ?? input.type;
     const data = (input.data && typeof input.data === "object" ? input.data : {}) as { message?: unknown; isRetryable?: unknown; status?: unknown; statusCode?: unknown };
     if (input.isRetryable === true || data.isRetryable === true) return "transient";
     const status = Number(input.status ?? input.statusCode ?? data.status ?? data.statusCode);
     if (status === 408 || status === 429 || status >= 500 && status <= 599) return "transient";
     if (status === 401 || status === 403) return "none";
-    if (typeof input.name === "string") {
-      if (/abort|cancel|permission|reject|denied|auth/i.test(input.name)) return "none";
-      if (/structured|schema|json|malformed/i.test(input.name)) return "structured";
-      if (/timeout|network|provider|runtime/i.test(input.name)) return "transient";
+    if (typeof name === "string") {
+      if (/abort|cancel|permission|reject|denied|auth/i.test(name)) return "none";
+      if (/structured|schema|json|malformed/i.test(name)) return "structured";
+      if (/timeout|network|provider|runtime/i.test(name)) return "transient";
     }
     if (input.error && input.error !== error) return retryClassification(input.error);
     const described = data.message ?? input.message;
@@ -652,11 +628,6 @@ export function isLeaseStale(lease: Pick<WorkflowLease, "heartbeatAt">, now = Da
   return now - lease.heartbeatAt > LEASE_STALE_MS;
 }
 
-export function replacementControlDecision(observed: { token?: string; generation?: number }, current?: { token: string; generation: number; heartbeatAt: number }, now = Date.now()): "stop_owner" | "start" | "reject" {
-  if (!current || isLeaseStale(current, now)) return "start";
-  return current.token === observed.token && current.generation === observed.generation ? "stop_owner" : "reject";
-}
-
 const RESUMABLE = new Set<WorkflowStatus>(["interrupted", "soft_paused", "hard_paused", "stopped"]);
 const CONTROLLABLE = new Set<WorkflowStatus>(["running", "soft_pausing", "soft_paused", "hard_pausing", "hard_paused", "stopping", "blocked", "repair_required"]);
 const ACCEPTS_PLAN_CHANGE = new Set<WorkflowStatus>(["running", "soft_pausing", "soft_paused", "hard_paused", "blocked", "repair_required"]);
@@ -668,10 +639,6 @@ export function isControllable(status: WorkflowStatus): boolean { return CONTROL
 /** Has pending work a coordinator revision could still change. */
 export function acceptsPlanChange(status: WorkflowStatus): boolean { return ACCEPTS_PLAN_CHANGE.has(status); }
 
-export function isWorkflowControlAction(value: unknown): value is WorkflowControlAction {
-  return typeof value === "string" && ["approve", "queue", "replace", "reject", "soft_pause", "hard_pause", "resume", "stop", "discard", "parent_deleted", "failure_retry", "failure_skip", "failure_stop", "plan_change", "coordinator_retry", "coordinator_continue", "steer"].includes(value);
-}
-
 export function quiescenceStatus(action: "hard_pause" | "stop", quiesced: boolean): WorkflowStatus {
   return action === "hard_pause" ? quiesced ? "hard_paused" : "hard_pausing" : quiesced ? "stopped" : "stopping";
 }
@@ -680,34 +647,28 @@ export function failureDecisionStatus(action: "retry" | "skip", hasDependent: bo
   return action === "skip" && hasDependent ? "repair_required" : "soft_paused";
 }
 
-// OpenCode derives the current user/assistant message by max ID and exits its prompt loop only when
-// lastUser.id < lastAssistant.id, so message IDs must keep its ascending encoding: 6 bytes of
-// (milliseconds << 12 | counter) as hex, then 14 random base62 characters.
+// OpenCode encodes IDs as 6 bytes of (milliseconds << 12 | counter) as hex — inverted for descending session IDs —
+// then 14 random base62 characters. Message IDs must keep the ascending encoding so turns order correctly.
 const BASE62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
-let messageTimestamp = 0;
-let messageCounter = 0;
+let idTimestamp = 0;
+let idCounter = 0;
 
-export function workflowMessageID(now = Date.now()): string {
-  if (now !== messageTimestamp) {
-    messageTimestamp = now;
-    messageCounter = 0;
+function workflowIdentifier(prefix: string, descending: boolean, now: number): string {
+  if (now !== idTimestamp) {
+    idTimestamp = now;
+    idCounter = 0;
   }
-  messageCounter++;
-  const value = BigInt(now) * 0x1000n + BigInt(messageCounter);
+  idCounter++;
+  const current = BigInt(now) * 0x1000n + BigInt(idCounter);
+  const value = descending ? ~current : current;
   const time = Array.from({ length: 6 }, (_, index) => Number((value >> BigInt(40 - 8 * index)) & 0xffn).toString(16).padStart(2, "0")).join("");
   const random = Array.from(crypto.getRandomValues(new Uint8Array(14)), (byte) => BASE62[byte % 62]).join("");
-  return `msg_${time}${random}`;
+  return `${prefix}_${time}${random}`;
 }
 
-export type WorkflowChild = { id: string; metadata?: Record<string, unknown> };
-
-export function selectWorkflowChild(children: WorkflowChild[], runID: string, workerID?: string): WorkflowChild | undefined {
-  return children.find((child) => child.metadata?.workflowRunID === runID && (workerID ? child.metadata.workflowWorkerID === workerID : child.metadata.workflowHandoff === true));
-}
-
-export function selectCoordinatorOperationChild(children: WorkflowChild[], runID: string, operationID: string): WorkflowChild | undefined {
-  return children.find((child) => child.metadata?.workflowRunID === runID && child.metadata.workflowCoordinatorOperationID === operationID);
-}
+export function workflowMessageID(now = Date.now()): string { return workflowIdentifier("msg", false, now); }
+/** Pre-generated and persisted before creation, so a repeated session.create after a crash returns the same session. */
+export function workflowSessionID(now = Date.now()): string { return workflowIdentifier("ses", true, now); }
 
 export function assertLeaseOwnership(owns: boolean): void {
   if (!owns) throw new Error("Workflow lease ownership lost before external side effect");
@@ -722,7 +683,6 @@ export function workflowProjectDirectory(projectID: string, directory: string): 
 export function runDirectory(root: string, runID: string): string { return join(root, "runs", runID); }
 export function statePath(root: string, runID: string): string { return join(runDirectory(root, runID), "state.json"); }
 export function eventPath(root: string, runID: string): string { return join(runDirectory(root, runID), "events.ndjson"); }
-export function controlDirectory(root: string): string { return join(root, "controls"); }
 
 export function isTerminal(status: WorkflowRun["status"]): boolean {
   return status === "completed" || status === "rejected" || status === "failed" || status === "aborted";
@@ -735,22 +695,6 @@ export function retentionCandidates(runs: WorkflowRun[], retentionRuns: number, 
   return terminal.filter((run, index) => index >= retentionRuns || (run.terminalAt ?? run.updatedAt) <= cutoff);
 }
 
-export function ownedChildSessionIDs(run: WorkflowRun, children: WorkflowChild[]): string[] {
-  const ids = new Set<string>();
-  for (const worker of Object.values(run.workers)) if (worker.childSessionID) ids.add(worker.childSessionID);
-  if (run.handoffSessionID) ids.add(run.handoffSessionID);
-  for (const operation of run.coordinatorOperations) if (operation.sessionID) ids.add(operation.sessionID);
-  for (const child of children) if (child.metadata?.workflowRunID === run.id) ids.add(child.id);
-  ids.delete(run.parentSessionID);
-  return [...ids].sort();
-}
-
-export function tuiPresenceFresh(value: unknown, now = Date.now()): boolean {
-  if (!value || typeof value !== "object" || typeof (value as { heartbeatAt?: unknown }).heartbeatAt !== "number") return false;
-  const age = now - Number((value as { heartbeatAt: number }).heartbeatAt);
-  return age >= -1_000 && age <= TUI_PRESENCE_STALE_MS;
-}
-export function tuiPresencePath(root: string): string { return join(root, "tui-presence.json"); }
 export function startupActions(run: WorkflowRun): Array<"resume" | "open" | "later" | "discard"> { return run.status === "interrupted" ? ["resume", "open", "later", "discard"] : []; }
 export function canDiscardRun(run: WorkflowRun): boolean { return run.status === "interrupted" || run.status === "stopped" || isTerminal(run.status); }
 export function abortForParentDeletion(run: WorkflowRun): boolean {
@@ -761,23 +705,21 @@ export function abortForParentDeletion(run: WorkflowRun): boolean {
   return true;
 }
 
-export function sessionAlreadyDeleted(error: unknown): boolean {
-  if (!error) return false;
-  if (typeof error === "object") {
-    const item = error as { status?: unknown; statusCode?: unknown; name?: unknown; error?: unknown };
-    if (Number(item.status ?? item.statusCode) === 404 || typeof item.name === "string" && /not.?found/i.test(item.name)) return true;
-    if (item.error && item.error !== error) return sessionAlreadyDeleted(item.error);
-  }
-  return /session.*not.?found|not.?found.*session/i.test(error instanceof Error ? error.message : String(error));
-}
+const RUN_VALUE = Schema.declare((value): value is WorkflowRun => typeof value === "object" && value !== null);
+const OUTCOME = Schema.Struct({ status: Schema.Literals(["accepted", "ignored", "rejected"]), error: Schema.optional(Schema.String) });
 
-export function pendingChildCleanup(ids: string[], deleted: string[]): string[] {
-  const completed = new Set(deleted);
-  return ids.filter((id) => !completed.has(id));
-}
-
-export function parentDeletionRoute(local: { token: string; generation: number } | undefined, current: WorkflowLease & { token: string; generation: number } | undefined, now = Date.now()): "handle" | "acquire" | { targetOwner: string; leaseToken: string; leaseGeneration: number } {
-  if (local && current && local.token === current.token && local.generation === current.generation && !isLeaseStale(current, now)) return "handle";
-  if (current && !isLeaseStale(current, now)) return { targetOwner: current.ownerIdentity, leaseToken: current.token, leaseGeneration: current.generation };
-  return "acquire";
-}
+/** Server<->TUI contract: the TUI reads and controls runs; the server emits every persisted run snapshot. */
+export const WorkflowRpc = Rpc.define({
+  id: "workflows",
+  methods: {
+    list: { input: Schema.toStandardSchemaV1(Schema.Struct({})), output: Schema.toStandardSchemaV1(Schema.Struct({ runs: Schema.Array(RUN_VALUE) })) },
+    control: {
+      input: Schema.toStandardSchemaV1(Schema.Struct({ runID: RUN_ID, action: Schema.Literals(CONTROL_ACTIONS), guidance: Schema.optional(Schema.String), workerID: Schema.optional(Schema.String) })),
+      output: Schema.toStandardSchemaV1(OUTCOME),
+    },
+  },
+  events: {
+    updated: { schema: Schema.toStandardSchemaV1(Schema.Struct({ run: RUN_VALUE })) },
+    removed: { schema: Schema.toStandardSchemaV1(Schema.Struct({ runID: Schema.String })) },
+  },
+});

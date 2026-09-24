@@ -20,14 +20,12 @@ It returns a JSON array sorted by model ID:
 ]
 ```
 
-Models from providers that are not authenticated or configured are excluded.
+Only models OpenCode reports as available are included; models from providers that are not connected or configured are excluded.
 
 ## Installation
 
-Install the package for the current project:
+Install the package and add it to the global configuration:
 
 ```sh
-opencode plugin @jiafuei/opencode-model-glob
+opencode plugin add @jiafuei/opencode-model-glob
 ```
-
-Pass `--global` to install it globally.

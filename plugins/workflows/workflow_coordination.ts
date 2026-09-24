@@ -70,8 +70,6 @@ export class WorkflowCoordination {
     });
   }
 
-  renewMaintenance(claim: MaintenanceToken, now = Date.now()): boolean { return this.db.query("UPDATE maintenance SET claimed_at=? WHERE run_id=? AND owner=? AND token=?").run(now, claim.runID, claim.ownerIdentity, claim.token).changes === 1; }
-
   releaseMaintenance(claim: MaintenanceToken): boolean { return this.db.query("DELETE FROM maintenance WHERE run_id=? AND owner=? AND token=?").run(claim.runID, claim.ownerIdentity, claim.token).changes === 1; }
 
   fenced<T>(lease: LeaseToken, work: () => T): T {

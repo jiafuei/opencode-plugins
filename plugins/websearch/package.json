@@ -1,15 +1,12 @@
 {
   "name": "@jiafuei/opencode-websearch",
   "version": "0.0.1",
-  "description": "Provider-native web search for OpenCode",
+  "description": "OpenAI-native web search provider for OpenCode",
   "type": "module",
   "exports": {
     "./server": "./websearch.ts"
   },
   "files": [
-    "antigravity_backend.ts",
-    "backend.ts",
-    "openai_backend.ts",
     "websearch.ts",
     "websocket_fetch.ts",
     "README.md"
@@ -17,21 +14,20 @@
   "keywords": [
     "opencode",
     "opencode-plugin",
-    "antigravity",
-    "google",
     "openai",
     "websearch"
   ],
   "engines": {
-    "opencode": ">=1.18.21"
+    "opencode": ">=2.0.15"
   },
   "publishConfig": {
     "access": "public"
   },
   "dependencies": {
     "@ai-sdk/openai": "3.0.104",
-    "@opencode-ai/plugin": "^1.18.21",
+    "@opencode/plugin": "2.0.15",
     "ai": "6.0.168",
+    "effect": "4.0.0-rc.112",
     "ws": "^8.18.3"
   },
   "devDependencies": {

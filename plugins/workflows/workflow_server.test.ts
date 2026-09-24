@@ -1,21 +1,15 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtempSync } from "node:fs";
-import { mkdir, rename } from "node:fs/promises";
+import { mkdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import workflows from "./workflow_server.ts";
-import { controlDirectory, runDirectory, statePath, tuiPresencePath, workflowProjectDirectory, type WorkflowRun } from "./workflow_shared.ts";
+import { runDirectory, statePath, workflowProjectDirectory, type WorkflowRun } from "./workflow_shared.ts";
 
 process.env.XDG_DATA_HOME = mkdtempSync(join(tmpdir(), "workflow-server-test-"));
 
-type ToolResult = { output: string };
-type ServerHooks = {
-  tool: {
-    workflow: { execute: (args: { spec: unknown }, context: unknown) => Promise<ToolResult> };
-    workflow_status: { execute: (args: { runID: string }) => Promise<ToolResult> };
-  };
-  dispose: () => Promise<void>;
-};
+type Tool = { execute: (input: any, context: any) => Promise<{ content: string }> };
+type Message = { id: string; type: string; content?: Array<{ type: string; text?: string }> };
 
 const disposers: Array<() => Promise<void>> = [];
 afterEach(async () => { for (const dispose of disposers.splice(0)) await dispose(); });
@@ -30,88 +24,93 @@ async function until<T>(check: () => T | undefined | Promise<T | undefined>, tim
   throw new Error("Timed out waiting for workflow condition");
 }
 
-const model = { providerID: "anthropic", modelID: "claude" };
 const handoffResult = { summary: "done", completedWork: ["work"], evidence: [], changedFiles: [], verification: [], unresolvedIssues: [], recommendedNextAction: "none" };
+const registration = { dispose: async () => {} };
+const never = () => new Promise<never>(() => {});
 
 async function createHarness(options: Record<string, unknown> = {}) {
   const projectID = `test-${crypto.randomUUID()}`;
   const directory = "/tmp/workflow-server-test-project";
   const root = workflowProjectDirectory(projectID, directory);
   const state = {
-    sessions: 0,
     inFlight: 0,
     maxInFlight: 0,
-    failChildren: false,
+    failCreate: false,
+    failGenerate: false,
     agents: ["build", "general"],
     models: ["claude"],
-    connected: ["anthropic"],
     agentRefreshes: 0,
     modelRefreshes: 0,
-    synthetic: [] as string[],
-    syntheticBody: undefined as { agent?: string; model?: { providerID: string; modelID: string } } | undefined,
-    created: [] as Array<{ agent?: string; model?: { providerID: string; id: string } }>,
-    onPrompt: undefined as ((agent: string) => void) | undefined,
+    synthetic: [] as Array<{ sessionID: string; id: string; text: string }>,
+    created: [] as Array<{ id: string; agent?: string; model?: { providerID: string; id: string } }>,
+    generated: [] as string[],
+    onPrompt: undefined as ((sessionID: string) => Promise<void> | void) | undefined,
     promptDelay: undefined as ((text: string) => number) | undefined,
     workerOutput: undefined as ((text: string) => string) | undefined,
-    prompts: [] as Array<{ agent: string; text: string }>,
   };
-  const client = {
-    app: { log: async () => ({}), agents: async () => { state.agentRefreshes++; return { data: state.agents.map((name) => ({ name })) }; } },
-    provider: { list: async () => { state.modelRefreshes++; return { data: { all: [{ id: "anthropic", models: Object.fromEntries(state.models.map((id) => [id, {}])) }, { id: "offline", models: { ghost: {} } }], default: {}, connected: state.connected } }; } },
+  const tools = new Map<string, Tool>();
+  const messages = new Map<string, Message[]>();
+  let control: (input: Record<string, unknown>) => Promise<{ status: string; error?: string }> = never;
+  let contextHook: (event: { sessionID: string; tools: Record<string, { input: unknown }> }) => void = () => {};
+  const ctx = {
+    options,
+    location: { directory, project: { id: projectID } },
+    rpc: { register: async (_definition: unknown, handlers: { control: typeof control }) => { control = handlers.control; return { ...registration, events: { emit: async () => {} } }; } },
+    agent: { list: async () => { state.agentRefreshes++; return { data: state.agents.map((id) => ({ id })) }; } },
+    model: { list: async () => { state.modelRefreshes++; return { data: state.models.map((id) => ({ providerID: "anthropic", id })) }; } },
+    generate: {
+      text: async ({ prompt }: { prompt: string }) => {
+        state.generated.push(prompt);
+        await Bun.sleep(20);
+        if (state.failGenerate) throw new Error("permission denied for generation");
+        return { text: JSON.stringify(prompt.startsWith("You are an internal workflow coordinator") ? { rationale: "keep the plan", phases: [] } : handoffResult) };
+      },
+    },
+    event: { subscribe: () => ({ [Symbol.asyncIterator]: () => ({ next: never }) }) },
+    command: { transform: async () => registration },
+    tool: { transform: async (callback: (editor: { add: (tool: Tool & { name: string }) => void }) => void) => { callback({ add: (tool) => tools.set(tool.name, tool) }); return registration; } },
     session: {
-      create: async (input: { body: { agent?: string; model?: { providerID: string; id: string } } }) => { state.created.push(input.body); return { data: { id: `session-${++state.sessions}` } }; },
-      prompt: async (input: { body: { agent: string; format?: unknown; parts: Array<{ text: string }> } }) => {
-        state.prompts.push({ agent: input.body.agent, text: input.body.parts[0]!.text });
+      hook: async (_name: string, callback: typeof contextHook) => { contextHook = callback; return registration; },
+      create: async (input: { id: string; agent?: string; model?: { providerID: string; id: string } }) => {
+        if (state.failCreate) throw new Error("permission denied creating session");
+        state.created.push(input);
+        return { id: input.id };
+      },
+      get: async ({ sessionID }: { sessionID: string }) => sessionID === "parent-session"
+        ? { id: sessionID, permissions: [], model: { providerID: "anthropic", id: "claude" } }
+        : { id: sessionID, tokens: { input: 2, output: 3, reasoning: 1, cache: { read: 0, write: 0 } } },
+      prompt: async (input: { sessionID: string; id: string; text: string }) => {
         state.inFlight++;
         state.maxInFlight = Math.max(state.maxInFlight, state.inFlight);
-        await Bun.sleep(input.body.format ? 50 : state.promptDelay?.(input.body.parts[0]!.text) ?? 50);
+        await Bun.sleep(state.promptDelay?.(input.text) ?? 50);
         state.inFlight--;
-        state.onPrompt?.(input.body.agent);
-        if (input.body.format) {
-          const structured = input.body.agent === "workflow-coordinator-internal" ? { rationale: "keep the plan", phases: [] } : handoffResult;
-          return { data: { info: { structured }, parts: [] } };
-        }
-        return { data: { info: {}, parts: [{ type: "text", text: state.workerOutput?.(input.body.parts[0]!.text) ?? `output:${input.body.agent}` }] } };
+        await state.onPrompt?.(input.sessionID);
+        const agent = state.created.find((item) => item.id === input.sessionID)?.agent;
+        messages.set(input.sessionID, [{ id: input.id, type: "user" }, { id: `${input.id}-reply`, type: "assistant", content: [{ type: "text", text: state.workerOutput?.(input.text) ?? `output:${agent}` }] }]);
+        return {};
       },
-      promptAsync: async (input: { body: { agent?: string; model?: { providerID: string; modelID: string }; parts: Array<{ text: string }> } }) => { state.synthetic.push(input.body.parts[0]!.text); state.syntheticBody = input.body; return { data: {} }; },
-      abort: async () => ({ data: true }),
-      children: async () => state.failChildren ? { error: { status: 500, message: "children unavailable" } } : { data: [] },
-      delete: async () => ({ data: true }),
-      get: async () => ({ data: { permission: [] } }),
-      message: async (input: { path: { messageID: string } }) => input.path.messageID === "parent-message" ? { data: { info: { role: "assistant", providerID: model.providerID, modelID: model.modelID, agent: "parent-agent" } } } : { error: { status: 404 } },
+      wait: async () => {},
+      context: async ({ sessionID }: { sessionID: string }) => messages.get(sessionID) ?? [],
+      synthetic: async (input: { sessionID: string; id: string; text: string }) => { state.synthetic.push(input); return {}; },
+      interrupt: async () => ({ interrupted: true }),
     },
   };
-  const server = workflows.server as unknown as (input: unknown, options?: Record<string, unknown>) => Promise<ServerHooks>;
-  const hooks = await server({ client, project: { id: projectID }, directory }, options);
-  disposers.push(() => hooks.dispose());
+  const cleanup = await workflows.setup(ctx as never);
+  disposers.push(async () => { await cleanup?.(); });
 
+  const context = (signal = new AbortController().signal, onRunID: (id: string) => void = () => {}) => ({ sessionID: "parent-session", messageID: "parent-message", signal, progress: async (value: { workflowRunID?: string }) => { if (value.workflowRunID) onRunID(value.workflowRunID); } });
   const submit = async (spec: unknown) => {
-    await Bun.write(tuiPresencePath(root), JSON.stringify({ heartbeatAt: Date.now() }));
     let runID = "";
-    const context = {
-      sessionID: "parent-session",
-      messageID: "parent-message",
-      abort: new AbortController().signal,
-      metadata: (value: { metadata?: { workflowRunID?: string } }) => { runID = value.metadata?.workflowRunID ?? runID; },
-    };
-    const result = hooks.tool.workflow.execute({ spec }, context).then((value) => JSON.parse(value.output) as { runID: string; status: string });
+    const result = tools.get("workflow")!.execute({ spec }, context(undefined, (id) => { runID = id; })).then((value) => JSON.parse(value.content) as { runID: string; status: string });
     const id = await Promise.race([until(() => runID || undefined), result.then((value) => value.runID)]);
     return { id, result };
   };
-  const control = async (value: Record<string, unknown>) => {
-    await mkdir(controlDirectory(root), { recursive: true });
-    const path = join(controlDirectory(root), `${Date.now()}-${crypto.randomUUID()}.json`);
-    await Bun.write(`${path}.tmp`, JSON.stringify({ createdAt: Date.now(), ...value }));
-    await rename(`${path}.tmp`, path);
-  };
-  const controlResult = (controlID: string) =>
-    until(async () => await Bun.file(join(root, "control-results", `${controlID}.json`)).json().catch(() => undefined) as { status: string; error?: string } | undefined);
   const waitForRun = (id: string, ready: (run: WorkflowRun) => boolean) =>
     until(async () => {
       const run = await Bun.file(statePath(root, id)).json().catch(() => undefined) as WorkflowRun | undefined;
       return run && ready(run) ? run : undefined;
     });
-  return { root, state, hooks, submit, control, controlResult, waitForRun };
+  return { root, state, tools, context, submit, control: (input: Record<string, unknown>) => control(input), contextHook: (event: Parameters<typeof contextHook>[0]) => contextHook(event), waitForRun };
 }
 
 const spec = (phases: unknown[]) => ({
@@ -137,105 +136,106 @@ describe("workflow server", () => {
     const run = await harness.waitForRun(submission.id, (run) => run.status === "completed" || run.status === "blocked");
     expect(run.failure).toBeUndefined();
     expect(run.status).toBe("completed");
-    for (const agent of ["workflow-coordinator-internal", "workflow-handoff-internal"]) {
-      const prompt = harness.state.prompts.find((item) => item.agent === agent)!.text;
+    expect(harness.state.generated).toHaveLength(2);
+    for (const prompt of harness.state.generated) {
       expect(prompt).toContain(large);
       expect(prompt).toContain("LATE_VERIFICATION_RESULT");
     }
   }, 15_000);
 
-  test("initializes while OpenCode client endpoints remain unresolved", async () => {
+  test("initializes while OpenCode endpoints remain unresolved", async () => {
     const projectID = `test-${crypto.randomUUID()}`;
     const directory = "/tmp/workflow-server-test-project";
     const root = workflowProjectDirectory(projectID, directory);
     await mkdir(runDirectory(root, "broken"), { recursive: true });
     await Bun.write(statePath(root, "broken"), "{");
-    const calls = { agents: 0, models: 0, sessions: 0, logs: 0 };
-    const unresolved = () => new Promise<never>(() => {});
-    const session = () => { calls.sessions++; return unresolved(); };
-    const client = {
-      app: {
-        agents: () => { calls.agents++; return unresolved(); },
-        log: () => { calls.logs++; return unresolved(); },
-      },
-      provider: { list: () => { calls.models++; return unresolved(); } },
-      session: { create: session, prompt: session, promptAsync: session, abort: session, children: session, delete: session, get: session, message: session },
+    const calls = { agents: 0, models: 0, sessions: 0, generate: 0 };
+    const registered = { dispose: async () => {} };
+    const session = () => { calls.sessions++; return never(); };
+    const ctx = {
+      options: {},
+      location: { directory, project: { id: projectID } },
+      rpc: { register: async () => ({ ...registered, events: { emit: async () => {} } }) },
+      agent: { list: () => { calls.agents++; return never(); } },
+      model: { list: () => { calls.models++; return never(); } },
+      generate: { text: () => { calls.generate++; return never(); } },
+      event: { subscribe: () => ({ [Symbol.asyncIterator]: () => ({ next: never }) }) },
+      command: { transform: async () => registered },
+      tool: { transform: async () => registered },
+      session: { hook: async () => registered, create: session, get: session, prompt: session, wait: session, context: session, synthetic: session, interrupt: session },
     };
-    const server = workflows.server as unknown as (input: unknown) => Promise<ServerHooks>;
-    const hooks = await Promise.race([server({ client, project: { id: projectID }, directory }), Bun.sleep(500).then(() => undefined)]);
-    expect(hooks).toBeDefined();
-    if (!hooks) return;
-    disposers.push(() => hooks.dispose());
-    expect(calls).toEqual({ agents: 0, models: 0, sessions: 0, logs: 0 });
+    const cleanup = await Promise.race([workflows.setup(ctx as never), Bun.sleep(500).then(() => "timeout" as const)]);
+    expect(cleanup).not.toBe("timeout");
+    if (typeof cleanup === "function") disposers.push(async () => { await cleanup(); });
+    expect(calls).toEqual({ agents: 0, models: 0, sessions: 0, generate: 0 });
   });
 
   test("refreshes agents and models before each workflow validation", async () => {
     const h = await createHarness();
-    const context = { sessionID: "parent-session", messageID: "parent-message", abort: new AbortController().signal, metadata: () => {} };
-    await Bun.write(tuiPresencePath(h.root), JSON.stringify({ heartbeatAt: Date.now() }));
-
+    const workflow = h.tools.get("workflow")!;
     h.state.agents = ["general"];
-    await expect(h.hooks.tool.workflow.execute({ spec: spec([{ id: "p1", title: "Phase", steps: [workerStep("a")] }]) }, context)).rejects.toThrow("unregistered agent");
+    await expect(workflow.execute({ spec: spec([{ id: "p1", title: "Phase", steps: [workerStep("a")] }]) }, h.context())).rejects.toThrow("unregistered agent");
     expect([h.state.agentRefreshes, h.state.modelRefreshes]).toEqual([1, 1]);
 
     h.state.agents = ["build", "general"];
     h.state.models = ["sonnet"];
-    await expect(h.hooks.tool.workflow.execute({ spec: spec([{ id: "p1", title: "Phase", steps: [{ type: "worker", worker: { ...worker("a"), modelID: "anthropic/claude" } }] }]) }, context)).rejects.toThrow("unavailable model");
+    await expect(workflow.execute({ spec: spec([{ id: "p1", title: "Phase", steps: [{ type: "worker", worker: { ...worker("a"), modelID: "anthropic/claude" } }] }]) }, h.context())).rejects.toThrow("unavailable model");
     expect([h.state.agentRefreshes, h.state.modelRefreshes]).toEqual([2, 2]);
   });
-
-  test("registers only models from connected providers, falling back to all when connected is empty", async () => {
-    const h = await createHarness();
-    const context = { sessionID: "parent-session", messageID: "parent-message", abort: new AbortController().signal, metadata: () => {} };
-    await Bun.write(tuiPresencePath(h.root), JSON.stringify({ heartbeatAt: Date.now() }));
-    const offlineStep = { type: "worker", worker: { ...worker("a"), modelID: "offline/ghost" } };
-
-    await expect(h.hooks.tool.workflow.execute({ spec: spec([{ id: "p1", title: "Phase", steps: [offlineStep] }]) }, context)).rejects.toThrow("unavailable model");
-
-    const { id } = await h.submit(spec([{ id: "p1", title: "Phase", steps: [{ type: "worker", worker: { ...worker("a"), modelID: "anthropic/claude" } }] }]));
-    expect((await h.waitForRun(id, (run) => run.status === "pending")).status).toBe("pending");
-
-    h.state.connected = [];
-    const fallback = await h.submit(spec([{ id: "p1", title: "Phase", steps: [offlineStep] }]));
-    expect((await h.waitForRun(fallback.id, (run) => run.status === "pending")).status).toBe("pending");
-  }, 15_000);
 
   test("approves, renders templates across sequential workers, and completes with a synthetic handoff", async () => {
     const h = await createHarness();
     h.state.models = ["claude", "haiku"];
     const { id, result } = await h.submit(spec([{ id: "p1", title: "Phase", steps: [workerStep("a"), { type: "worker", worker: { ...worker("b", "use {{workers.a.output}}"), modelID: "anthropic/haiku" } }] }]));
     expect((await h.waitForRun(id, (run) => run.status === "pending")).limits.maxConcurrency).toBe(2);
-    await h.control({ runID: id, action: "approve", controlID: "ctl-approve" });
+    expect((await h.control({ runID: id, action: "approve" })).status).toBe("accepted");
     expect((await result).status).toBe("running");
     const run = await h.waitForRun(id, (item) => item.status === "completed");
     expect(run.workers.a!.status).toBe("completed");
     expect(run.workers.b!.prompt).toBe("use output:build");
-    expect(h.state.created.filter((item) => item.agent === "build").map((item) => item.model)).toEqual([{ id: model.modelID, providerID: model.providerID }, { id: "haiku", providerID: "anthropic" }]);
-    expect(h.state.syntheticBody).toMatchObject({ agent: "parent-agent", model });
+    expect(run.workers.a!.tokens?.total).toBe(6);
+    expect(h.state.created.map((item) => item.model)).toEqual([{ providerID: "anthropic", id: "claude" }, { providerID: "anthropic", id: "haiku" }]);
+    expect(h.state.created.map((item) => item.id)).toEqual([run.workers.a!.childSessionID!, run.workers.b!.childSessionID!]);
     expect(run.handoff?.summary).toBe("done");
-    expect(h.state.synthetic[0]).toContain(`<workflow_result run_id="${id}">`);
-    expect(h.state.synthetic[0]).toContain(`run stats: {"workers":{"completed":2},"durationMs":`);
-    expect(h.state.synthetic[0]).toContain(`<handoff>`);
-    expect((await h.controlResult("ctl-approve")).status).toBe("accepted");
+    expect(h.state.synthetic).toHaveLength(1);
+    expect(h.state.synthetic[0]).toMatchObject({ sessionID: "parent-session", id: run.synthesisMessageID });
+    expect(h.state.synthetic[0]!.text).toContain(`<workflow_result run_id="${id}">`);
+    expect(h.state.synthetic[0]!.text).toContain(`run stats: {"workers":{"completed":2},"durationMs":`);
+    expect(h.state.synthetic[0]!.text).toContain(`<handoff>`);
+  }, 15_000);
+
+  test("collects a schema worker's result through the submit tool visible only to that worker", async () => {
+    const h = await createHarness();
+    const schema = { type: "object", properties: { count: { type: "number" } } };
+    h.state.onPrompt = async (sessionID) => {
+      const tools = { workflow_submit: { input: {} } };
+      h.contextHook({ sessionID, tools });
+      expect(tools.workflow_submit.input).toMatchObject({ properties: { result: schema } });
+      await h.tools.get("workflow_submit")!.execute({ result: { count: 3 } }, { sessionID });
+    };
+    const { id } = await h.submit(spec([{ id: "p1", title: "Phase", steps: [{ type: "worker", worker: { ...worker("a"), schema } }] }]));
+    await h.control({ runID: id, action: "approve" });
+    const run = await h.waitForRun(id, (item) => item.status === "completed");
+    expect(run.workers.a!.output).toEqual({ count: 3 });
+    const parentTools: Record<string, { input: unknown }> = { workflow_submit: { input: {} } };
+    h.contextHook({ sessionID: "parent-session", tools: parentTools });
+    expect(parentTools.workflow_submit).toBeUndefined();
   }, 15_000);
 
   test("resolves the waiting tool call when a pending plan is rejected", async () => {
     const h = await createHarness();
     const { id, result } = await h.submit(spec([{ id: "p1", title: "Phase", steps: [workerStep("a")] }]));
-    await h.control({ runID: id, action: "reject", controlID: "ctl-reject" });
+    expect((await h.control({ runID: id, action: "reject" })).status).toBe("accepted");
     expect((await result).status).toBe("rejected");
     const run = await h.waitForRun(id, (item) => item.status === "rejected");
     expect(run.terminalAt).toBeGreaterThan(0);
-    expect((await h.controlResult("ctl-reject")).status).toBe("accepted");
   }, 15_000);
 
   test("aborting a hung tool call leaves a run that has advanced past pre-start untouched", async () => {
     const h = await createHarness();
-    await Bun.write(tuiPresencePath(h.root), JSON.stringify({ heartbeatAt: Date.now() }));
     const controller = new AbortController();
     let runID = "";
-    const context = { sessionID: "parent-session", messageID: "parent-message", abort: controller.signal, metadata: (value: { metadata?: { workflowRunID?: string } }) => { runID = value.metadata?.workflowRunID ?? runID; } };
-    const result = h.hooks.tool.workflow.execute({ spec: spec([{ id: "p1", title: "Phase", steps: [workerStep("a")] }]) }, context);
+    const result = h.tools.get("workflow")!.execute({ spec: spec([{ id: "p1", title: "Phase", steps: [workerStep("a")] }]) }, h.context(controller.signal, (id) => { runID = id; }));
     const id = await until(() => runID || undefined);
     const started = await Bun.file(statePath(h.root, id)).json() as WorkflowRun;
     started.status = "completed";
@@ -248,38 +248,36 @@ describe("workflow server", () => {
     expect(after.workers.a!.status).toBe("completed");
   }, 15_000);
 
-  test("blocks recoverably when handoff session recovery fails, then retries to completion", async () => {
+  test("blocks recoverably when the final handoff fails, then retries to completion", async () => {
     const h = await createHarness();
-    h.state.onPrompt = (agent) => { if (agent === "build") h.state.failChildren = true; };
+    h.state.failGenerate = true;
     const { id, result } = await h.submit(spec([{ id: "p1", title: "Phase", steps: [workerStep("a")] }]));
     await h.control({ runID: id, action: "approve" });
     await result;
     const blocked = await h.waitForRun(id, (item) => item.status === "blocked");
     expect(blocked.failure?.kind).toBe("handoff");
-    expect(blocked.error).toContain("Handoff session recovery failed");
-    h.state.onPrompt = undefined;
-    h.state.failChildren = false;
-    await h.control({ runID: id, action: "failure_retry", controlID: "ctl-retry" });
+    expect(blocked.error).toContain("Final handoff failed");
+    h.state.failGenerate = false;
+    expect((await h.control({ runID: id, action: "failure_retry" })).status).toBe("accepted");
     const run = await h.waitForRun(id, (item) => item.status === "completed");
     expect(run.handoff?.summary).toBe("done");
-    expect((await h.controlResult("ctl-retry")).status).toBe("accepted");
   }, 15_000);
 
-  test("blocks recoverably when coordinator session recovery fails at a checkpoint", async () => {
+  test("blocks recoverably when the coordinator fails at a checkpoint", async () => {
     const h = await createHarness();
-    h.state.onPrompt = (agent) => { if (agent === "build") h.state.failChildren = true; };
+    h.state.failGenerate = true;
     const { id, result } = await h.submit(spec([{ id: "p1", title: "Phase", checkpoint: true, steps: [workerStep("a")] }]));
     await h.control({ runID: id, action: "approve" });
     await result;
     const blocked = await h.waitForRun(id, (item) => item.status === "blocked");
     expect(blocked.failure?.kind).toBe("coordinator");
-    expect(blocked.error).toContain("Coordinator session recovery failed");
+    expect(blocked.error).toContain("Coordinator failed");
     expect(blocked.coordinator?.status).toBe("failed");
   }, 15_000);
 
   test("blocks recoverably on a worker failure while the tool call stays decoupled from the run", async () => {
     const h = await createHarness();
-    h.state.failChildren = true;
+    h.state.failCreate = true;
     const { id, result } = await h.submit(spec([{ id: "p1", title: "Phase", steps: [workerStep("a")] }]));
     await h.control({ runID: id, action: "approve" });
     expect((await result).status).toBe("running");
@@ -287,10 +285,9 @@ describe("workflow server", () => {
     expect(blocked.failure?.workerID).toBe("a");
     expect(blocked.error).toContain("Worker a failed");
     expect(blocked.terminalAt).toBeUndefined();
-    h.state.failChildren = false;
-    await h.control({ runID: id, action: "failure_retry", controlID: "ctl-retry" });
+    h.state.failCreate = false;
+    expect((await h.control({ runID: id, action: "failure_retry" })).status).toBe("accepted");
     expect((await h.waitForRun(id, (item) => item.status === "completed")).handoff?.summary).toBe("done");
-    expect((await h.controlResult("ctl-retry")).status).toBe("accepted");
   }, 15_000);
 
   test("ignores stop for a lease-less resumable run instead of crashing", async () => {
@@ -305,8 +302,7 @@ describe("workflow server", () => {
     } as unknown as WorkflowRun;
     await mkdir(runDirectory(h.root, id), { recursive: true });
     await Bun.write(statePath(h.root, id), JSON.stringify(run));
-    await h.control({ runID: id, action: "stop", controlID: "ctl-stop" });
-    const outcome = await h.controlResult("ctl-stop");
+    const outcome = await h.control({ runID: id, action: "stop" });
     expect(outcome.status).toBe("ignored");
     expect(outcome.error).toContain("interrupted");
     expect((await Bun.file(statePath(h.root, id)).json() as WorkflowRun).status).toBe("interrupted");
@@ -314,18 +310,18 @@ describe("workflow server", () => {
 
   test("answers workflow_status from memory and disk without owning the lease", async () => {
     const h = await createHarness();
+    const status = h.tools.get("workflow_status")!;
     const { id } = await h.submit(spec([{ id: "p1", title: "Phase", steps: [workerStep("a")] }]));
     await h.waitForRun(id, (run) => run.status === "pending");
-    const live = JSON.parse((await h.hooks.tool.workflow_status.execute({ runID: id })).output);
+    const live = JSON.parse((await status.execute({ runID: id }, {})).content);
     expect(live).toMatchObject({ runID: id, name: "server-test", status: "pending", revisions: 0 });
     expect(live.phases).toEqual([{ id: "p1", title: "Phase", status: "pending" }]);
     // Written after startup, so it only exists on disk — the cross-process path.
     const foreign = { version: 1, id: "foreign-run", parentSessionID: "parent-session", parentMessageID: "parent-message", createdAt: 1, updatedAt: 1, status: "running", spec: spec([{ id: "p1", title: "Phase", steps: [workerStep("a")] }]), limits: { maxWorkers: 100, maxRevisions: 10, maxRunMs: 21_600_000, maxConcurrency: 2 }, workers: {} };
     await mkdir(runDirectory(h.root, "foreign-run"), { recursive: true });
     await Bun.write(statePath(h.root, "foreign-run"), JSON.stringify(foreign));
-    expect(JSON.parse((await h.hooks.tool.workflow_status.execute({ runID: "foreign-run" })).output)).toMatchObject({ runID: "foreign-run", status: "running" });
-    await expect(h.hooks.tool.workflow_status.execute({ runID: "../escape" })).rejects.toThrow("Invalid workflow run ID");
-    await expect(h.hooks.tool.workflow_status.execute({ runID: "missing-run" })).rejects.toThrow("No workflow run found for missing-run");
+    expect(JSON.parse((await status.execute({ runID: "foreign-run" }, {})).content)).toMatchObject({ runID: "foreign-run", status: "running" });
+    await expect(status.execute({ runID: "missing-run" }, {})).rejects.toThrow("No workflow run found for missing-run");
   }, 15_000);
 
   test("runs a parallel group at the configured max_concurrency", async () => {

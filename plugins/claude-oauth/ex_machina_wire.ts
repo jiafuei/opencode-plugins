@@ -27,14 +27,6 @@ export function mergeExMachinaBetas(incoming?: string | null): string {
   return betas.join(",");
 }
 
-export function rewriteExMachinaUrl(url: URL): URL {
-  const rewritten = new URL(url);
-  if (rewritten.pathname === "/v1/messages" && !rewritten.searchParams.has("beta")) {
-    rewritten.searchParams.set("beta", "true");
-  }
-  return rewritten;
-}
-
 export function sanitizeExMachinaSystemText(text: string): string {
   const paragraphs = text
     .split(/\n\n+/)
@@ -145,17 +137,12 @@ export function unprefixExMachinaName(name: string): string {
   return `${uncloaked.charAt(0).toLowerCase()}${uncloaked.slice(1)}`;
 }
 
-export function buildExMachinaHeaders(
-  input: string | URL | Request,
-  initHeaders: HeadersInit | undefined,
-  accessToken: string,
-): Headers {
-  const inherited = new Headers(input instanceof Request ? input.headers : undefined);
-  new Headers(initHeaders).forEach((value, key) => inherited.set(key, value));
+export function buildExMachinaHeaders(incoming: Headers): Headers {
   const headers = new Headers();
-  inherited.forEach((value, key) => {
+  incoming.forEach((value, key) => {
     const lower = key.toLowerCase();
     if (
+      lower === "authorization" ||
       lower === "accept" ||
       lower === "content-type" ||
       lower === "anthropic-version" ||
@@ -167,7 +154,6 @@ export function buildExMachinaHeaders(
       headers.set(key, value);
     }
   });
-  headers.set("Authorization", `Bearer ${accessToken}`);
   headers.set("anthropic-beta", mergeExMachinaBetas(headers.get("anthropic-beta")));
   headers.set("User-Agent", EX_MACHINA_PROFILE.userAgent);
   return headers;

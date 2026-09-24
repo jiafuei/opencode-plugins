@@ -1,57 +1,36 @@
 # Web search
 
-Provider-native `websearch` for OpenCode. Each backend performs searching, content retrieval, and answer generation in one model request. Included backends use OpenAI's hosted Responses API web search or Antigravity's native Cloud Code Assist `web_search` operation.
+OpenAI-native web search provider for OpenCode's built-in `websearch` tool. Each search is one OpenAI Responses API request with the hosted `web_search` tool, so searching, content retrieval, and answer generation happen in a single model call.
 
 ## Installation
 
 ```sh
-opencode plugin @jiafuei/opencode-websearch
+opencode plugin add @jiafuei/opencode-websearch
 ```
 
-Connect an OpenAI API key, a ChatGPT subscription, or the [`@jiafuei/opencode-antigravity-oauth`](../antigravity-oauth) plugin in OpenCode before using the tool. The Antigravity backend requires both plugins to be installed and a Google Antigravity OAuth login.
+Connect the OpenAI integration in OpenCode with an OpenAI API key (or `OPENAI_API_KEY`) or a ChatGPT Pro/Plus subscription. The `OpenAI` web search provider is offered only while an OpenAI connection exists; select it like any other web search provider.
 
-OpenAI API-key and ChatGPT subscription requests use HTTPS. To opt into the persistent WebSocket transport for ChatGPT subscriptions:
+- API keys call `https://api.openai.com/v1/responses`.
+- ChatGPT subscriptions call the Codex backend (`https://chatgpt.com/backend-api/codex`) with the account id from the connection.
+
+The synthesized answer is returned on the first result, followed by the remaining cited sources.
+
+For Google Antigravity search, install [`@jiafuei/opencode-antigravity-oauth`](../antigravity-oauth); it registers its own `antigravity` web search provider.
+
+## Options
 
 ```jsonc
 {
-  "plugin": [
-    ["@jiafuei/opencode-websearch", { "openaiSubscriptionTransport": "websocket" }]
+  "plugins": [
+    {
+      "package": "@jiafuei/opencode-websearch",
+      "options": { "model": "gpt-5.6-luna", "openaiSubscriptionTransport": "websocket" }
+    }
   ]
 }
 ```
 
-The transport option only affects ChatGPT subscriptions; OpenAI API-key requests always use HTTPS.
+- `model`: OpenAI model used for searches. Defaults to `gpt-5.6-luna`. ChatGPT subscriptions only accept Codex-eligible models.
+- `openaiSubscriptionTransport`: `"https"` (default) or `"websocket"` for a persistent WebSocket to the Codex backend. Only affects ChatGPT subscriptions; API-key requests always use HTTPS.
 
-## Model selection
-
-The plugin chooses a model in this order:
-
-1. A model on any supported backend marked `"websearch": "always"`.
-2. The active model when its provider has a search backend.
-3. A model on any supported backend marked `"websearch": "auto"`.
-
-Pin a search backend through one of its provider models:
-
-```json
-{
-  "provider": {
-    "openai": {
-      "models": {
-        "gpt-5.6-luna": {
-          "options": {
-            "websearch": "always"
-          }
-        }
-      }
-    }
-  }
-}
-```
-
-Use the model only when the active provider is unsupported by changing `"always"` to `"auto"`. For Antigravity, use the `google-antigravity` provider and any of its models; the backend dispatches the dedicated `gemini-3.1-flash-lite` search operation captured from the native client.
-
-## Tool
-
-- `web-search`: search the live web and return grounded content with sources.
-
-The plugin does not fetch or parse web pages locally. Search backends are provider-native adapters for OpenAI and Google Antigravity.
+The plugin does not fetch or parse web pages locally.

@@ -167,9 +167,8 @@ export async function exchangeToken(
 /** Refresh an access token; preserves the (possibly rotated) refresh token. */
 export async function refreshToken(
   storedRefreshToken: string,
-  projectId: string,
   fetcher: typeof fetch = fetch,
-): Promise<OAuthCredentials> {
+): Promise<Pick<OAuthCredentials, "refresh" | "access" | "expires">> {
   const data = await postToken(
     {
       client_id: CLIENT_ID,
@@ -183,7 +182,6 @@ export async function refreshToken(
     refresh: data.refresh_token || storedRefreshToken,
     access: data.access_token,
     expires: Date.now() + data.expires_in * 1000 - EXPIRY_SKEW_MS,
-    projectId,
   };
 }
 

@@ -1,29 +1,32 @@
 # Redact keys
 
-Redacts configured secret patterns from protected file reads before their contents reach the model. When the model subsequently writes, edits, or applies a patch containing a generated redaction placeholder, the plugin restores the original secret for the matching file.
+Redacts configured secret patterns from protected file reads before their contents reach the model. When the model subsequently writes, edits, or patches a file containing a generated redaction placeholder, the plugin restores the original secret for the matching file.
 
 ## Installation
 
-Install the package for the current project:
+Install the package and add it to the global configuration:
 
 ```sh
-opencode plugin @jiafuei/opencode-redact-keys
+opencode plugin add @jiafuei/opencode-redact-keys
 ```
 
-Pass `--global` to install it globally. To customize the plugin, edit its entry in `opencode.json`:
+To customize the plugin, replace its entry in the `plugins` array of `opencode.json`:
 
 ```json
 {
-  "plugin": [
-    ["@jiafuei/opencode-redact-keys", {
-      "files": ["**/.env", "**/.config.json", "**/.config.yaml"],
-      "exclude": ["**/.env.example", "**/.env.sample"],
-      "patterns": [
-        "sk-(?:proj-)?[A-Za-z0-9_-]{20,}",
-        "sk-ant-[A-Za-z0-9_-]{20,}",
-        "ghp_[A-Za-z0-9]{36}"
-      ]
-    }]
+  "plugins": [
+    {
+      "package": "@jiafuei/opencode-redact-keys",
+      "options": {
+        "files": ["**/.env", "**/.config.json", "**/.config.yaml"],
+        "exclude": ["**/.env.example", "**/.env.sample"],
+        "patterns": [
+          "sk-(?:proj-)?[A-Za-z0-9_-]{20,}",
+          "sk-ant-[A-Za-z0-9_-]{20,}",
+          "ghp_[A-Za-z0-9]{36}"
+        ]
+      }
+    }
   ]
 }
 ```

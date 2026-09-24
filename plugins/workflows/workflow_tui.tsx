@@ -1,64 +1,17 @@
 /** @jsxImportSource @opentui/solid */
-import type { TuiPlugin, TuiPluginApi, TuiPluginModule } from "@opencode-ai/plugin/tui";
-import { mkdir, readdir, rename, rm, stat } from "node:fs/promises";
-import { join } from "node:path";
-import { createSignal, For, onCleanup, Show } from "solid-js";
-import { acceptsPlanChange, atomicWrite, canContinueCoordinatorFailure, canDiscardRun, controlDirectory, currentPlanProgress, hydrateRun, type PersistedRun, isControllable, isLeaseStale, isResumable, stableJson, startupActions, statePath, TUI_PRESENCE_STALE_MS, tuiPresencePath, type WorkerState, type WorkflowControlAction, type WorkflowRun, workflowProjectDirectory } from "./workflow_shared.ts";
-import { WorkflowCoordination } from "./workflow_coordination.ts";
+import { Plugin } from "@opencode/plugin/tui";
+import type { Destination, Route } from "@opencode/plugin/tui/context";
+import { useTerminalDimensions } from "@opentui/solid";
+import { createSignal, For, Show } from "solid-js";
+import { acceptsPlanChange, canContinueCoordinatorFailure, canDiscardRun, currentPlanProgress, isControllable, isResumable, stableJson, startupActions, type WorkerState, type WorkflowControlAction, WorkflowRpc, type WorkflowRun } from "./workflow_shared.ts";
 
-type Control = { runID: string; action: WorkflowControlAction; createdAt: number; guidance?: string; workerID?: string; controlID?: string; leaseToken?: string; leaseGeneration?: number; targetOwner?: string };
+type Control = { runID: string; action: WorkflowControlAction; guidance?: string; workerID?: string };
 export type InspectorSelection = { runID: string; kind: "run" | "phase" | "group" | "worker"; id: string };
-
-async function projectRoot(api: TuiPluginApi): Promise<string> {
-  const current = await api.client.project.current();
-  if (!current.data) throw new Error("Could not resolve the current project");
-  return workflowProjectDirectory(current.data.id, api.state.path.directory);
-}
-
-type RunCacheEntry = { ino: number; mtimeMs: number; size: number; run: WorkflowRun };
-
-async function readRuns(root: string, cache?: Map<string, RunCacheEntry>): Promise<WorkflowRun[]> {
-  let ids: string[];
-  try { ids = await readdir(join(root, "runs")); } catch { return []; }
-  const runs = await Promise.all(ids.sort().map(async (id) => {
-    const path = statePath(root, id);
-    try {
-      const info = await stat(path);
-      const cached = cache?.get(id);
-      if (cached?.ino === info.ino && cached.mtimeMs === info.mtimeMs && cached.size === info.size) return cached.run;
-      const run = hydrateRun(await Bun.file(path).json() as PersistedRun);
-      cache?.set(id, { ino: info.ino, mtimeMs: info.mtimeMs, size: info.size, run });
-      return run;
-    } catch { return undefined; }
-  }));
-  if (cache) for (const id of cache.keys()) if (!ids.includes(id)) cache.delete(id);
-  return runs.filter((run): run is WorkflowRun => !!run).sort((left, right) => right.createdAt - left.createdAt || left.id.localeCompare(right.id));
-}
-
-async function sendControl(root: string, control: Control): Promise<string> {
-  await mkdir(controlDirectory(root), { recursive: true });
-  const submitted = { ...control, controlID: control.controlID ?? crypto.randomUUID() };
-  const target = submitted.targetOwner ? `.${encodeURIComponent(submitted.targetOwner)}` : "";
-  await atomicWrite(join(controlDirectory(root), `${submitted.createdAt}-${crypto.randomUUID()}.json${target}`), `${JSON.stringify(submitted)}\n`);
-  return submitted.controlID;
-}
-
-/** Controls must name the lease generation they observed, so a stale owner cannot act on them. */
-function leaseRef(coordination: WorkflowCoordination, runID: string): Partial<Control> {
-  const owner = coordination.current();
-  return owner?.runID === runID && !isLeaseStale(owner) ? { targetOwner: owner.ownerIdentity, leaseToken: owner.token, leaseGeneration: owner.generation } : {};
-}
-
-/** The public API exposes no auto-approve value, so it is read off the toggle command's title. */
-function autoApproveFromTitle(title: unknown): boolean | undefined {
-  if (typeof title !== "string") return undefined;
-  return title.startsWith("Disable") ? true : title.startsWith("Enable") ? false : undefined;
-}
 
 function detail(run: WorkflowRun): string {
   const worker = (item: { id: string; label: string; agent: string; modelID?: string; variant?: string; prompt: string; schema?: Record<string, unknown> }) =>
     `${item.id}: ${item.label} [${item.agent}${item.modelID ? `, ${item.modelID}` : ""}${item.variant ? `, variant ${item.variant}` : ""}]\n${item.prompt}${item.schema ? `\nSchema: ${JSON.stringify(item.schema)}` : ""}`;
-  return `Internal coordinator/handoff model: ${run.parentModel ? `${run.parentModel.providerID}/${run.parentModel.modelID}` : "originating parent model"}\n` + run.spec.phases.map((phase) => `${phase.title}\n${phase.steps.map((step) => step.type === "worker" ? worker(step.worker) : `${step.title ?? step.id}\n${step.workers.map(worker).join("\n")}`).join("\n")}`).join("\n");
+  return `Internal coordinator/handoff model: ${run.parentModel ? `${run.parentModel.providerID}/${run.parentModel.id}` : "default model"}\n` + run.spec.phases.map((phase) => `${phase.title}\n${phase.steps.map((step) => step.type === "worker" ? worker(step.worker) : `${step.title ?? step.id}\n${step.workers.map(worker).join("\n")}`).join("\n")}`).join("\n");
 }
 
 export type FailureOption = { action: WorkflowControlAction; title: string; description: string };
@@ -86,10 +39,8 @@ export function transcriptSelection(runs: WorkflowRun[], params?: Record<string,
   return run && worker?.childSessionID ? { run, worker } : undefined;
 }
 
-export function promptRightRun(runs: WorkflowRun[], lease?: { runID: string; heartbeatAt: number }): WorkflowRun | undefined {
-  const visible = (run: WorkflowRun) => isControllable(run.status) || ["pending", "queued"].includes(run.status);
-  const leased = lease && !isLeaseStale(lease) ? runs.find((run) => run.id === lease.runID && visible(run)) : undefined;
-  return leased ?? runs.find((run) => isControllable(run.status)) ?? runs.find((run) => ["pending", "queued"].includes(run.status));
+export function promptRightRun(runs: WorkflowRun[]): WorkflowRun | undefined {
+  return runs.find((run) => isControllable(run.status)) ?? runs.find((run) => ["pending", "queued"].includes(run.status));
 }
 
 function elapsed(worker: WorkerState): string {
@@ -98,8 +49,10 @@ function elapsed(worker: WorkerState): string {
   return seconds < 60 ? `${seconds}s` : `${Math.floor(seconds / 60)}m${seconds % 60}s`;
 }
 
-function Dashboard(props: { runs: () => WorkflowRun[]; api: TuiPluginApi; back: () => string | undefined; initial?: InspectorSelection; controls: (run: WorkflowRun, worker?: WorkerState) => void; steer: (run: WorkflowRun, worker: WorkerState) => void }) {
-  const theme = () => props.api.theme.current;
+function Dashboard(props: { ctx: Plugin.Context; runs: () => WorkflowRun[]; back: (run?: WorkflowRun) => void; transcript: (run: WorkflowRun, worker: WorkerState) => void; initial?: InspectorSelection; controls: (run: WorkflowRun, worker?: WorkerState) => void; steer: (run: WorkflowRun, worker: WorkerState) => void }) {
+  const theme = () => props.ctx.theme;
+  const selectedFg = () => theme().text.action.primary.focused;
+  const selectedBg = () => theme().background.action.primary.focused;
   const first = () => props.runs()[0];
   const [selection, setSelection] = createSignal<InspectorSelection | undefined>(props.initial ?? (first() ? { runID: first()!.id, kind: "run", id: first()!.id } : undefined));
   const [tab, setTab] = createSignal<"Activity" | "Prompt" | "Result" | "Attempts">("Activity");
@@ -120,288 +73,270 @@ function Dashboard(props: { runs: () => WorkflowRun[]; api: TuiPluginApi; back: 
         ...run.coordinatorOperations.map((operation) => `Coordinator ${operation.id} ${operation.status}\n${operation.attempts.map((attempt) => `#${attempt.number} ${attempt.kind ?? "turn"} ${attempt.result ?? "running"}${attempt.error ? `: ${attempt.error}` : ""}`).join("\n")}`),
         ...(run.handoffAttempts?.length ? [`Handoff\n${run.handoffAttempts.map((attempt) => `#${attempt.number} ${attempt.kind ?? "turn"} ${attempt.result ?? "running"}${attempt.error ? `: ${attempt.error}` : ""}`).join("\n")}`] : []),
       ].join("\n\n") || "No coordinator or handoff attempts";
-      const errors = [run.error ? `Error: ${run.error}` : "", ...(run.controlErrors ?? []).map((item) => `Control ${item.action} rejected: ${item.error}`)].filter(Boolean).join("\n");
-      return `${summary}\nStatus: ${run.status}\nProgress: ${ids.filter((id) => run.workers[id]?.status === "completed").length}/${ids.length}, ${ids.filter((id) => run.workers[id]?.status === "running").length} running${errors ? `\n${errors}` : ""}\n${run.revisions.map((revision) => `Revision ${revision.version} (${revision.reason})\n${revision.rationale}\nBefore:\n${stableJson(revision.before)}\nAfter:\n${stableJson(revision.after)}`).join("\n\n")}`;
+      return `${summary}\nStatus: ${run.status}\nProgress: ${ids.filter((id) => run.workers[id]?.status === "completed").length}/${ids.length}, ${ids.filter((id) => run.workers[id]?.status === "running").length} running${run.error ? `\nError: ${run.error}` : ""}\n${run.revisions.map((revision) => `Revision ${revision.version} (${revision.reason})\n${revision.rationale}\nBefore:\n${stableJson(revision.before)}\nAfter:\n${stableJson(revision.after)}`).join("\n\n")}`;
     }
     if (tab() === "Prompt") return worker.prompt;
     if (tab() === "Result") return worker.output === undefined ? "No accepted result" : stableJson(worker.output);
     if (tab() === "Attempts") return (worker.attempts ?? []).map((attempt) => `#${attempt.number} ${attempt.kind ?? "turn"} ${attempt.result ?? "running"}${attempt.steeringIDs?.length ? ` steering=${attempt.steeringIDs.join(",")}` : ""}${attempt.error ? `\n${attempt.error}` : ""}`).join("\n") + (worker.steering?.length ? `\n\nSteering\n${worker.steering.map((item) => `${item.status} ${item.id}: ${item.text}`).join("\n")}` : "");
     return `${worker.activity ?? worker.status}\nAgent: ${worker.agent}\nModel: ${worker.modelID ?? "parent model"}\nVariant: ${worker.variant ?? "model default"}\nElapsed: ${elapsed(worker)}  Attempts: ${worker.attempts?.filter((item) => item.kind === "turn").length ?? 0}  Tokens: ${worker.tokens?.total ?? 0} (cache read ${worker.tokens?.cacheRead ?? 0}, write ${worker.tokens?.cacheWrite ?? 0})\n${worker.steering?.map((item) => `${item.status}: ${item.text}`).join("\n") ?? ""}`;
   };
-  const [width, setWidth] = createSignal(props.api.renderer.width);
-  const [autoApprove, setAutoApprove] = createSignal<boolean | undefined>(undefined);
-  const resizeTimer = setInterval(() => {
-    if (props.api.renderer.width !== width()) setWidth(props.api.renderer.width);
-    setAutoApprove(autoApproveFromTitle(props.api.keymap.getCommands({ visibility: "registered", filter: { name: "permission.mode" } })[0]?.title));
-  }, 250);
-  onCleanup(() => clearInterval(resizeTimer));
-  const narrow = () => width() < 100;
+  const dimensions = useTerminalDimensions();
+  const narrow = () => dimensions().width < 100;
   const isSelected = (kind: InspectorSelection["kind"], runID: string, id: string) => { const s = selection(); return s?.runID === runID && s?.kind === kind && s?.id === id; };
   const workerRow = (runID: string, worker: WorkerState, prefix: string) => {
     const sel = () => isSelected("worker", runID, worker.id);
-    const statusFg = worker.status === "failed" ? theme().error : worker.status === "running" ? theme().warning : worker.status === "completed" ? theme().success : theme().textMuted;
-    const meta = ` — ${worker.agent}/${worker.modelID ?? "parent"} · ${elapsed(worker)} · attempts ${worker.attempts?.filter((item) => item.kind === "turn").length ?? 0} · tokens ${worker.tokens?.total ?? 0}`;
-    return <text wrapMode="none" bg={sel() ? theme().primary : undefined} onMouseDown={() => setSelection({ runID, kind: "worker", id: worker.id })}><span style={{ fg: sel() ? theme().selectedListItemText : theme().textMuted }}>{prefix}</span><span style={{ fg: sel() ? theme().selectedListItemText : statusFg }}>{worker.status}</span><span style={{ fg: sel() ? theme().selectedListItemText : theme().text }}> {worker.label}</span><span style={{ fg: sel() ? theme().selectedListItemText : theme().textMuted }}>{meta}</span></text>;
+    const statusFg = () => worker.status === "failed" ? theme().text.feedback.error.base : worker.status === "running" ? theme().text.feedback.warning.base : worker.status === "completed" ? theme().text.feedback.success.base : theme().text.muted;
+    const meta = () => ` — ${worker.agent}/${worker.modelID ?? "parent"} · ${elapsed(worker)} · attempts ${worker.attempts?.filter((item) => item.kind === "turn").length ?? 0} · tokens ${worker.tokens?.total ?? 0}`;
+    return <text wrapMode="none" bg={sel() ? selectedBg() : undefined} onMouseDown={() => setSelection({ runID, kind: "worker", id: worker.id })}><span style={{ fg: sel() ? selectedFg() : theme().text.muted }}>{prefix}</span><span style={{ fg: sel() ? selectedFg() : statusFg() }}>{worker.status}</span><span style={{ fg: sel() ? selectedFg() : theme().text.base }}> {worker.label}</span><span style={{ fg: sel() ? selectedFg() : theme().text.muted }}>{meta()}</span></text>;
   };
   const [narrowInspector, setNarrowInspector] = createSignal(false);
   const rows = () => props.runs().flatMap((run) => [{ runID: run.id, kind: "run" as const, id: run.id }, ...run.spec.phases.flatMap((phase) => [{ runID: run.id, kind: "phase" as const, id: phase.id }, ...phase.steps.flatMap((step) => step.type === "worker" ? [{ runID: run.id, kind: "worker" as const, id: step.worker.id }] : [{ runID: run.id, kind: "group" as const, id: step.id }, ...step.workers.map((worker) => ({ runID: run.id, kind: "worker" as const, id: worker.id }))])])]);
   let treeScroll: { scrollTop: number; viewport: { height: number }; scrollTo: (top: number) => void } | undefined;
-  const selectRow = (index: number) => {
-    const next = Math.max(0, Math.min(rows().length - 1, index));
+  const move = (offset: number) => {
+    if (narrow() && narrowInspector()) return;
+    const index = Math.max(0, rows().findIndex((item) => item.runID === selection()?.runID && item.kind === selection()?.kind && item.id === selection()?.id));
+    const next = Math.max(0, Math.min(rows().length - 1, index + offset));
     setSelection(rows()[next]);
     if (!treeScroll) return;
     if (next < treeScroll.scrollTop) treeScroll.scrollTo(next);
     else if (next >= treeScroll.scrollTop + treeScroll.viewport.height) treeScroll.scrollTo(next - treeScroll.viewport.height + 1);
   };
-  const key = (event: { name: string }) => {
-    const names = ["Activity", "Prompt", "Result", "Attempts"] as const;
-    if (/^[1-4]$/.test(event.name)) setTab(names[Number(event.name) - 1]!);
-    if (event.name === "tab" && narrow()) setNarrowInspector(!narrowInspector());
-    if ((event.name === "up" || event.name === "down") && (!narrow() || !narrowInspector())) { const index = Math.max(0, rows().findIndex((item) => item.runID === selection()?.runID && item.kind === selection()?.kind && item.id === selection()?.id)); selectRow(index + (event.name === "down" ? 1 : -1)); }
-    if (event.name === "c") selectedRun() && props.controls(selectedRun()!, selectedWorker());
-    if (event.name === "s" && selectedRun() && selectedWorker()?.status === "running") props.steer(selectedRun()!, selectedWorker()!);
-    if (event.name === "a") props.api.keymap.dispatchCommand("permission.mode");
-    if (event.name === "return") { if (narrow() && !narrowInspector()) setNarrowInspector(true); else if (selectedWorker()?.childSessionID) props.api.route.navigate("workflows-transcript", { runID: selectedRun()!.id, workerID: selectedWorker()!.id }); }
-    if (event.name === "t" && selectedWorker()?.childSessionID) props.api.route.navigate("workflows-transcript", { runID: selectedRun()!.id, workerID: selectedWorker()!.id });
-    if (event.name === "q" || event.name === "escape") { const sessionID = props.back() ?? selectedRun()?.parentSessionID ?? props.runs()[0]?.parentSessionID; props.api.route.navigate(sessionID ? "session" : "home", sessionID ? { sessionID } : undefined); }
-  };
+  const openTranscript = () => { const worker = selectedWorker(); if (worker?.childSessionID) props.transcript(selectedRun()!, worker); };
+  props.ctx.keymap.layer(() => ({
+    commands: [
+      { bind: "up", title: "select", group: "Workflows", run: () => move(-1) },
+      { bind: "down", title: "select", group: "Workflows", run: () => move(1) },
+      ...(["Activity", "Prompt", "Result", "Attempts"] as const).map((name, index) => ({ bind: String(index + 1), title: name, group: "Workflows", run: () => { setTab(name); } })),
+      { bind: "tab", title: "switch pane", group: "Workflows", run: () => { if (narrow()) setNarrowInspector(!narrowInspector()); } },
+      { bind: "return", title: "inspect/open", group: "Workflows", run: () => { if (narrow() && !narrowInspector()) setNarrowInspector(true); else openTranscript(); } },
+      { bind: "c", title: "controls", group: "Workflows", run: () => { if (selectedRun()) props.controls(selectedRun()!, selectedWorker()); } },
+      { bind: "s", title: "steer", group: "Workflows", run: () => { if (selectedRun() && selectedWorker()?.status === "running") props.steer(selectedRun()!, selectedWorker()!); } },
+      { bind: "t", title: "transcript", group: "Workflows", run: openTranscript },
+      { bind: "q,escape", title: "back", group: "Workflows", run: () => props.back(selectedRun()) },
+    ],
+  }));
   return (
-    <box flexDirection="column" padding={1} gap={1} flexGrow={1} minHeight={0} focusable focused onKeyDown={key}>
-      <text wrapMode="none" flexShrink={0} fg={theme().text}><b>Workflows</b>  {narrow() ? (narrowInspector() ? "Inspector" : "Tree") : "Tree + Inspector"} · auto-approve <span style={{ fg: autoApprove() === true ? theme().warning : theme().textMuted }}>{autoApprove() === true ? "ON" : autoApprove() === false ? "off" : "unknown"}</span></text>
-      <Show when={props.runs().length > 0} fallback={<text fg={theme().textMuted}>No workflow runs for this project.</text>}>
+    <box flexDirection="column" padding={1} gap={1} flexGrow={1} minHeight={0}>
+      <text wrapMode="none" flexShrink={0} fg={theme().text.base}><b>Workflows</b>  {narrow() ? (narrowInspector() ? "Inspector" : "Tree") : "Tree + Inspector"}</text>
+      <Show when={props.runs().length > 0} fallback={<text fg={theme().text.muted}>No workflow runs for this project.</text>}>
         <box flexDirection="row" gap={1} flexGrow={1} minHeight={0}>
-          <Show when={!narrow() || !narrowInspector()}><box width={narrow() ? "100%" : "48%"} flexDirection="column" borderStyle="single" borderColor={theme().border} padding={1} minHeight={0}>
+          <Show when={!narrow() || !narrowInspector()}><box width={narrow() ? "100%" : "48%"} flexDirection="column" borderStyle="single" borderColor={theme().border.base} padding={1} minHeight={0}>
           <scrollbox ref={(element) => (treeScroll = element)} flexGrow={1} flexBasis={0} minHeight={0} verticalScrollbarOptions={{ visible: true }} horizontalScrollbarOptions={{ visible: false }}>
           <For each={props.runs()}>{(run) => (
             <box flexDirection="column">
-              {(() => { const sel = () => isSelected("run", run.id, run.id); const statusFg = run.status === "completed" ? theme().success : ["failed", "rejected", "aborted", "blocked", "repair_required"].includes(run.status) ? theme().error : ["pending", "queued"].includes(run.status) ? theme().warning : theme().textMuted; return <text wrapMode="none" bg={sel() ? theme().primary : undefined} onMouseDown={() => setSelection({ runID: run.id, kind: "run", id: run.id })}><b><span style={{ fg: sel() ? theme().selectedListItemText : statusFg }}>{run.status.toUpperCase()}</span></b><span style={{ fg: sel() ? theme().selectedListItemText : theme().text }}> {run.spec.name}</span></text>; })()}
+              {(() => { const sel = () => isSelected("run", run.id, run.id); const statusFg = () => run.status === "completed" ? theme().text.feedback.success.base : ["failed", "rejected", "aborted", "blocked", "repair_required"].includes(run.status) ? theme().text.feedback.error.base : ["pending", "queued"].includes(run.status) ? theme().text.feedback.warning.base : theme().text.muted; return <text wrapMode="none" bg={sel() ? selectedBg() : undefined} onMouseDown={() => setSelection({ runID: run.id, kind: "run", id: run.id })}><b><span style={{ fg: sel() ? selectedFg() : statusFg() }}>{run.status.toUpperCase()}</span></b><span style={{ fg: sel() ? selectedFg() : theme().text.base }}> {run.spec.name}</span></text>; })()}
               <For each={run.spec.phases}>{(phase) => { const phaseSel = () => isSelected("phase", run.id, phase.id); return <box flexDirection="column">
-                <text wrapMode="none" bg={phaseSel() ? theme().primary : undefined} fg={phaseSel() ? theme().selectedListItemText : theme().textMuted} onMouseDown={() => setSelection({ runID: run.id, kind: "phase", id: phase.id })}>  +- {phase.title}</text>
-                <For each={phase.steps}>{(step) => step.type === "parallel" ? (() => { const groupSel = () => isSelected("group", run.id, step.id); return <box flexDirection="column"><text wrapMode="none" bg={groupSel() ? theme().primary : undefined} fg={groupSel() ? theme().selectedListItemText : theme().textMuted} onMouseDown={() => setSelection({ runID: run.id, kind: "group", id: step.id })}>  |  +- {step.title ?? step.id} [parallel]</text><For each={step.workers}>{(spec) => workerRow(run.id, run.workers[spec.id]!, "  |  |  ")}</For></box>; })() : workerRow(run.id, run.workers[step.worker.id]!, "  |  +- ")}</For>
+                <text wrapMode="none" bg={phaseSel() ? selectedBg() : undefined} fg={phaseSel() ? selectedFg() : theme().text.muted} onMouseDown={() => setSelection({ runID: run.id, kind: "phase", id: phase.id })}>  +- {phase.title}</text>
+                <For each={phase.steps}>{(step) => step.type === "parallel" ? (() => { const groupSel = () => isSelected("group", run.id, step.id); return <box flexDirection="column"><text wrapMode="none" bg={groupSel() ? selectedBg() : undefined} fg={groupSel() ? selectedFg() : theme().text.muted} onMouseDown={() => setSelection({ runID: run.id, kind: "group", id: step.id })}>  |  +- {step.title ?? step.id} [parallel]</text><For each={step.workers}>{(spec) => workerRow(run.id, run.workers[spec.id]!, "  |  |  ")}</For></box>; })() : workerRow(run.id, run.workers[step.worker.id]!, "  |  +- ")}</For>
               </box>; }}</For>
             </box>
           )}</For>
           </scrollbox>
           </box>
           </Show>
-          <Show when={!narrow() || narrowInspector()}><box width={narrow() ? "100%" : "52%"} flexDirection="column" borderStyle="single" borderColor={theme().border} padding={1} minHeight={0}>
-            <box flexDirection="row" gap={2} flexShrink={0}><For each={["Activity", "Prompt", "Result", "Attempts"] as const}>{(name) => <text fg={tab() === name ? theme().primary : theme().textMuted} onMouseDown={() => setTab(name)}>{tab() === name ? `[${name}]` : name}</text>}</For></box>
-            <scrollbox flexGrow={1} flexBasis={0} minHeight={0} verticalScrollbarOptions={{ visible: true }} horizontalScrollbarOptions={{ visible: false }}><text fg={theme().textMuted}>{inspector()}</text></scrollbox>
+          <Show when={!narrow() || narrowInspector()}><box width={narrow() ? "100%" : "52%"} flexDirection="column" borderStyle="single" borderColor={theme().border.base} padding={1} minHeight={0}>
+            <box flexDirection="row" gap={2} flexShrink={0}><For each={["Activity", "Prompt", "Result", "Attempts"] as const}>{(name) => <text fg={tab() === name ? theme().text.action.primary.base : theme().text.muted} onMouseDown={() => setTab(name)}>{tab() === name ? `[${name}]` : name}</text>}</For></box>
+            <scrollbox flexGrow={1} flexBasis={0} minHeight={0} verticalScrollbarOptions={{ visible: true }} horizontalScrollbarOptions={{ visible: false }}><text fg={theme().text.muted}>{inspector()}</text></scrollbox>
           </box></Show>
         </box>
       </Show>
-      <box flexDirection="column" borderStyle="single" borderColor={theme().borderActive} paddingX={1}>
-        <text fg={theme().text}><b>Keyboard shortcuts</b></text>
-        <text wrapMode="none" fg={theme().text}><span style={{ fg: theme().primary }}>[Up/Down]</span> select  <span style={{ fg: theme().primary }}>[Enter]</span> inspect/open  <span style={{ fg: theme().primary }}>[Tab]</span> switch pane  <span style={{ fg: theme().primary }}>[1-4]</span> inspector tabs</text>
-        <text wrapMode="none" fg={theme().text}><span style={{ fg: theme().primary }}>[c]</span> controls  <span style={{ fg: theme().primary }}>[s]</span> steer  <span style={{ fg: theme().primary }}>[t]</span> transcript  <span style={{ fg: theme().primary }}>[a]</span> auto-approve ({autoApprove() === true ? "on" : autoApprove() === false ? "off" : "?"})  <span style={{ fg: theme().primary }}>[q/Esc]</span> back</text>
+      <box flexDirection="column" borderStyle="single" borderColor={theme().text.action.primary.base} paddingX={1}>
+        <text fg={theme().text.base}><b>Keyboard shortcuts</b></text>
+        <text wrapMode="none" fg={theme().text.base}><span style={{ fg: theme().text.action.primary.base }}>[Up/Down]</span> select  <span style={{ fg: theme().text.action.primary.base }}>[Enter]</span> inspect/open  <span style={{ fg: theme().text.action.primary.base }}>[Tab]</span> switch pane  <span style={{ fg: theme().text.action.primary.base }}>[1-4]</span> inspector tabs</text>
+        <text wrapMode="none" fg={theme().text.base}><span style={{ fg: theme().text.action.primary.base }}>[c]</span> controls  <span style={{ fg: theme().text.action.primary.base }}>[s]</span> steer  <span style={{ fg: theme().text.action.primary.base }}>[t]</span> transcript  <span style={{ fg: theme().text.action.primary.base }}>[q/Esc]</span> back</text>
       </box>
-      <text fg={theme().primary} onMouseDown={() => selectedRun() && props.controls(selectedRun()!, selectedWorker())}>[Open controls for selection]</text>
-      <Show when={selectedWorker()?.childSessionID}><text fg={theme().primary} onMouseDown={() => props.api.route.navigate("workflows-transcript", { runID: selectedRun()!.id, workerID: selectedWorker()!.id })}>[Open read-only transcript]</text></Show>
+      <text fg={theme().text.action.primary.base} onMouseDown={() => selectedRun() && props.controls(selectedRun()!, selectedWorker())}>[Open controls for selection]</text>
+      <Show when={selectedWorker()?.childSessionID}><text fg={theme().text.action.primary.base} onMouseDown={openTranscript}>[Open read-only transcript]</text></Show>
     </box>
   );
 }
 
-function Transcript(props: { api: TuiPluginApi; run: WorkflowRun; worker: WorkerState }) {
-  const messages = () => props.worker.childSessionID ? props.api.state.session.messages(props.worker.childSessionID) : [];
-  return <box flexDirection="column" padding={1} flexGrow={1} minHeight={0} focusable focused onKeyDown={(event: { name: string }) => { if (event.name === "q" || event.name === "escape") props.api.route.navigate("workflows", { runID: props.run.id, kind: "worker", id: props.worker.id }); }}><text flexShrink={0} fg={props.api.theme.current.text}><b>Workflows transcript: {props.worker.label}</b> (read-only)</text><scrollbox flexGrow={1} flexBasis={0} minHeight={0} verticalScrollbarOptions={{ visible: true }} horizontalScrollbarOptions={{ visible: false }}><For each={messages()}>{(message) => <box flexDirection="column" marginTop={1}><text fg={props.api.theme.current.textMuted}>{message.role}</text><For each={props.api.state.part(message.id)}>{(part) => <text fg={props.api.theme.current.text}>{"text" in part ? String(part.text) : `[${part.type}] ${stableJson(part)}`}</text>}</For></box>}</For></scrollbox><text flexShrink={0} fg={props.api.theme.current.textMuted} marginTop={1}>q/back returns to the selected worker inspector. No prompt input is available.</text></box>;
-}
-
-function TranscriptNotFound(props: { api: TuiPluginApi; params?: Record<string, unknown> }) {
-  return <box flexDirection="column" padding={1} focusable focused onKeyDown={(event: { name: string }) => { if (event.name === "q" || event.name === "escape" || event.name === "return") props.api.route.navigate("workflows", props.params?.runID ? { runID: props.params.runID, kind: "run", id: props.params.runID } : undefined); }}><text fg={props.api.theme.current.warning}><b>Workflow transcript not found</b></text><text fg={props.api.theme.current.textMuted}>The run, worker, or child session is no longer available. Press Enter, q, or Escape to go back.</text></box>;
-}
-
-function openSteering(api: TuiPluginApi, root: string, run: WorkflowRun, worker: WorkerState, coordination: WorkflowCoordination): void {
-  const ref = leaseRef(coordination, run.id);
-  api.ui.dialog.replace(() => <api.ui.DialogPrompt title={`Steer: ${worker.label}`} placeholder="Guidance delivered at the next safe turn" onConfirm={(guidance) => {
-    if (!guidance.trim()) return;
-    void sendControl(root, { runID: run.id, action: "steer", workerID: worker.id, controlID: crypto.randomUUID(), guidance: guidance.trim(), createdAt: Date.now(), ...ref }).then(() => api.ui.dialog.clear());
-  }} />);
-}
-
-async function openDashboard(api: TuiPluginApi, root: string, coordination: WorkflowCoordination, selectedRun?: WorkflowRun, selectedWorker?: WorkerState): Promise<void> {
-  const lease = coordination.current();
-  const current = await readRuns(root);
-  const healthyLease = lease && !isLeaseStale(lease) ? lease : undefined;
-  const ownsProject = !!healthyLease;
-  const choices = current.filter((run) => !selectedRun || run.id === selectedRun.id).flatMap((run) => {
-    const actions: Array<{ title: string; description: string; value: Control | "permission_mode" }> = [];
-    const targetOwner = healthyLease?.runID === run.id ? healthyLease.ownerIdentity : undefined;
-    const ref = targetOwner ? { targetOwner, leaseToken: healthyLease!.token, leaseGeneration: healthyLease!.generation } : {};
-    if (run.status === "pending") {
-      if (ownsProject) {
-        actions.push({ title: `Queue approved plan: ${run.spec.name}`, description: `${run.spec.goal}\n${detail(run)}`, value: { runID: run.id, action: "queue", createdAt: Date.now() } });
-        actions.push({ title: `Replace current run: ${run.spec.name}`, description: "Stop the observed current run resumably, then start this approved plan.\n" + detail(run), value: { runID: run.id, action: "replace", createdAt: Date.now(), leaseToken: healthyLease?.token, leaseGeneration: healthyLease?.generation } });
-      } else {
-        actions.push({ title: `Approve: ${run.spec.name}`, description: `${run.spec.goal}\n${detail(run)}`, value: { runID: run.id, action: "approve", createdAt: Date.now() } });
-      }
-      actions.push({ title: `Reject: ${run.spec.name}`, description: detail(run), value: { runID: run.id, action: "reject", createdAt: Date.now() } });
-    }
-    if (isResumable(run.status)) actions.push({ title: `Resume: ${run.spec.name}`, description: detail(run), value: { runID: run.id, action: "resume", createdAt: Date.now(), ...ref } });
-    if (run.status === "running") {
-      actions.push({ title: `Soft pause: ${run.spec.name}`, description: "Stop scheduling after active work finishes.", value: { runID: run.id, action: "soft_pause", createdAt: Date.now(), ...ref } });
-      actions.push({ title: `Hard pause: ${run.spec.name}`, description: "Interrupt active child sessions and preserve them for continuation.", value: { runID: run.id, action: "hard_pause", createdAt: Date.now(), ...ref } });
-    }
-    const worker = selectedWorker && selectedWorker.id in run.workers ? run.workers[selectedWorker.id] : undefined;
-    if (worker?.status === "running") actions.push({ title: `Steer: ${worker.label}`, description: "Append guidance for the next safe turn boundary. The current turn is never aborted.", value: { runID: run.id, action: "steer", workerID: worker.id, controlID: crypto.randomUUID(), createdAt: Date.now(), ...ref } });
-    if (acceptsPlanChange(run.status)) actions.push({ title: `Request plan change: ${run.spec.name}`, description: "Enter guidance after selecting this action. Active work reaches its safe worker/group boundary first.", value: { runID: run.id, action: "plan_change", createdAt: Date.now(), ...ref } });
-    if (isControllable(run.status)) actions.push({ title: `Stop: ${run.spec.name}`, description: "Release the project lease and leave the run resumable.", value: { runID: run.id, action: "stop", createdAt: Date.now(), ...ref } });
-    if (canDiscardRun(run)) actions.push({ title: `Discard: ${run.spec.name}`, description: "Permanently delete this run and all child sessions after confirmation.", value: { runID: run.id, action: "discard", createdAt: Date.now(), ...ref } });
-    if (run.status === "blocked") {
-      for (const option of failureControlOptions(run)) {
-        actions.push({ title: option.title, description: option.description, value: { runID: run.id, action: option.action, createdAt: Date.now(), ...ref } });
-      }
-    }
-    return actions;
-  });
-  const autoApproveState = autoApproveFromTitle(api.keymap.getCommands({ visibility: "registered", filter: { name: "permission.mode" } })[0]?.title);
-  choices.unshift({ title: "Toggle OpenCode auto-approve", description: autoApproveState === true ? "Currently ON. Dispatches permission.mode." : autoApproveState === false ? "Currently off. Dispatches permission.mode." : "Dispatches permission.mode. The public API does not expose a reliable current mode.", value: "permission_mode" });
-  api.ui.dialog.replace(() => api.ui.DialogSelect<Control | "permission_mode">({
-    title: "Workflow plans",
-    placeholder: "Select an explicit workflow control",
-    options: choices,
-    onSelect: (option) => {
-      if (option.value === "permission_mode") {
-        api.keymap.dispatchCommand("permission.mode");
-        api.ui.dialog.clear();
-        return;
-      }
-      const control = option.value;
-      if (control.action === "plan_change" || control.action === "steer") {
-        api.ui.dialog.replace(() => <api.ui.DialogPrompt title={control.action === "steer" ? "Steer active worker" : "Request workflow plan change"} placeholder={control.action === "steer" ? "Guidance delivered at the next safe turn" : "Guidance for the coordinator"} onConfirm={(guidance) => {
-          if (!guidance.trim()) return;
-           void sendControl(root, { ...control, guidance: guidance.trim() }).then(() => { api.ui.dialog.clear(); api.ui.toast({ variant: "info", title: "Workflows", message: `${control.action} submitted; awaiting server confirmation` }); api.route.navigate("workflows", { runID: control.runID, kind: control.action === "steer" ? "worker" : "run", id: control.workerID ?? control.runID }); });
-        }} />);
-        return;
-      }
-      if (control.action === "discard") {
-        api.ui.dialog.replace(() => api.ui.DialogSelect<Control | undefined>({ title: `Discard ${current.find((run) => run.id === control.runID)?.spec.name}?`, placeholder: "This permanently deletes persisted workflow data and owned child sessions", options: [{ title: "Discard permanently", value: control }, { title: "Cancel", value: undefined }], onSelect: (confirmation) => { if (confirmation.value) void sendControl(root, confirmation.value).then(() => api.ui.dialog.clear()); else api.ui.dialog.clear(); } }));
-        return;
-      }
-      void sendControl(root, control).then(() => {
-        api.ui.dialog.clear();
-        api.ui.toast({ variant: "info", title: "Workflows", message: `${control.action} submitted; awaiting server confirmation` });
-        api.route.navigate("workflows");
-      }).catch((error) => api.ui.toast({ variant: "error", title: "Workflows", message: error instanceof Error ? error.message : String(error) }));
-    },
-  }));
-}
-
-const WorkflowTuiPlugin: TuiPlugin = async (api) => {
-  const runCache = new Map<string, RunCacheEntry>();
-  const [runs, setRuns] = createSignal<WorkflowRun[]>([]);
-  const [blink, setBlink] = createSignal(false);
-  const [lease, setLease] = createSignal<ReturnType<WorkflowCoordination["current"]>>();
-  const presenceID = crypto.randomUUID();
-  let lastSessionID: string | undefined;
-  let root: string | undefined;
-  let coordination: WorkflowCoordination | undefined;
-  let initialized = false;
-  let refreshing = false;
-  let disposed = false;
-  const blinkTimer = setInterval(() => setBlink((value) => !value), 600);
-  let refreshTimer: ReturnType<typeof setInterval> | undefined;
-  let presenceTimer: ReturnType<typeof setInterval> | undefined;
-  let initializationTimer: ReturnType<typeof setTimeout> | undefined;
-  let resolveInitialization: (() => void) | undefined;
-  let presenceWrite: Promise<void> | undefined;
-  let initialization = Promise.resolve();
-  const refresh = async () => {
-    const route = api.route.current;
-    if (route.name === "session" && typeof (route as any).params?.sessionID === "string") lastSessionID = (route as any).params.sessionID;
-    const currentRoot = root;
-    const currentCoordination = coordination;
-    if (!currentRoot || !currentCoordination || refreshing || disposed) return;
-    refreshing = true;
-    try {
-    const next = await readRuns(currentRoot, runCache);
-    if (disposed) return;
-    let controlResults: string[] = [];
-    try { controlResults = await readdir(join(currentRoot, "control-results")); } catch {}
-    for (const file of controlResults.filter((name) => name.endsWith(".claimed"))) {
-      const claim = file.match(/^(.*\.json)\.[0-9a-f-]+\.claimed$/i);
-      if (!claim) continue;
-      const source = join(currentRoot, "control-results", file);
-      try {
-        if (Date.now() - (await stat(source)).ctimeMs <= TUI_PRESENCE_STALE_MS) continue;
-        await rename(source, join(currentRoot, "control-results", claim[1]!));
-        controlResults.push(claim[1]!);
-      } catch {}
-    }
-    for (const file of controlResults.filter((name) => name.endsWith(".json"))) {
-      const source = join(currentRoot, "control-results", file);
-      const path = `${source}.${presenceID}.claimed`;
-      try {
-        await rename(source, path);
-        const result = await Bun.file(path).json() as { action: string; status: "accepted" | "ignored" | "rejected"; error?: string };
-        api.ui.toast({ variant: result.status === "accepted" ? "success" : result.status === "ignored" ? "warning" : "error", title: `${result.action} ${result.status}`, message: result.error ?? "Workflow control processed" });
-      } catch {} finally { await rm(path, { force: true }); }
-    }
-    if (disposed) return;
-    setLease(currentCoordination.current());
-    if (!initialized) {
-      const pending = next.filter((run) => run.status === "pending");
-      if (pending.length) {
-        api.ui.toast({ variant: "warning", title: "Workflow approval required", message: pending.length === 1 ? pending[0]!.spec.name : `${pending.length} workflows are waiting`, duration: 10_000 });
-        void api.attention.notify({ title: "Workflow approval required", message: pending.length === 1 ? pending[0]!.spec.name : `${pending.length} workflows are waiting`, notification: true, sound: { name: "question" } }).catch(() => {});
-      }
-    }
-    if (initialized) {
-      for (const run of next) {
-        const previous = runs().find((item) => item.id === run.id);
-        if (run.status === "pending" && !previous) {
-          api.ui.toast({ variant: "warning", title: "Workflow approval required", message: run.spec.name, duration: 10_000 });
-          void api.attention.notify({ title: "Workflow approval required", message: run.spec.name, notification: true, sound: { name: "question" } }).catch(() => {});
-        }
-        if (run.status === "completed" && previous?.status !== "completed") {
-          api.ui.toast({ variant: "success", title: "Workflow completed", message: run.spec.name });
-        }
-        if (run.status === "soft_paused" && previous?.status !== "soft_paused") {
-          const timeout = run.error?.startsWith("Run window reached");
-          api.ui.toast({ variant: "warning", title: timeout ? "Workflow time limit reached" : "Workflow paused", message: run.error ?? run.spec.name });
-          if (timeout) void api.attention.notify({ title: "Workflow time limit reached", message: run.spec.name, notification: true, sound: { name: "question" } }).catch(() => {});
-        }
-        if (run.status === "blocked" && previous?.status !== "blocked") {
-          if (run.failure && api.route.current.name === "workflows") {
-            const ref = leaseRef(currentCoordination, run.id);
-            api.ui.dialog.replace(() => api.ui.DialogSelect<Control>({
-              title: `Workflow failure: ${run.failure!.workerID}`,
-              placeholder: "Choose a failure decision",
-              options: failureControlOptions(run).map((option) => ({ title: option.title, description: option.description, value: { runID: run.id, action: option.action, createdAt: Date.now(), ...ref } })),
-              onSelect: (option) => { void sendControl(currentRoot, option.value).then(() => api.ui.dialog.clear()).catch((error) => api.ui.toast({ variant: "error", title: "Workflows", message: error instanceof Error ? error.message : String(error) })); },
-            }));
-          } else {
-            api.ui.toast({ variant: "warning", title: "Workflow paused for failure", message: run.error ?? run.spec.name });
-          }
-        }
-        for (const worker of Object.values(run.workers)) for (const steering of worker.steering ?? []) {
-          const prior = previous?.workers[worker.id]?.steering?.find((item) => item.id === steering.id);
-          if (steering.status === "rejected" && prior?.status !== "rejected") api.ui.toast({ variant: "error", title: "Worker steering rejected", message: steering.error ?? "Worker is no longer steerable" });
-        }
-      }
-    }
-    setRuns(next);
-    initialized = true;
-    } finally { refreshing = false; }
+function Transcript(props: { ctx: Plugin.Context; worker: WorkerState; back: () => void }) {
+  const sessionID = props.worker.childSessionID!;
+  const theme = () => props.ctx.theme;
+  void props.ctx.data.session.message.sync(sessionID);
+  props.ctx.keymap.layer(() => ({ commands: [{ bind: "q,escape", title: "back", group: "Workflows", run: props.back }] }));
+  const body = (message: ReturnType<Plugin.Context["data"]["session"]["message"]["list"]>[number]): string => {
+    if (message.type === "assistant") return message.content.map((part) => part.type === "tool" ? `[tool ${part.name}] ${part.state.status}` : part.type === "reasoning" ? `[reasoning] ${part.text}` : part.text).join("\n") + (message.error ? `\n[error] ${message.error.message}` : "");
+    return "text" in message ? String(message.text) : `[${message.type}]`;
   };
-  api.keymap.registerLayer({
-    commands: [{ name: "workflows.open", title: "Workflows", category: "Project", namespace: "palette", slashName: "workflows", run() { api.route.navigate("workflows"); } }],
-    bindings: [],
-  });
-  api.route.register([
-    { name: "workflows", render: ({ params }) => <Dashboard runs={runs} api={api} back={() => lastSessionID} initial={params?.runID ? params as InspectorSelection : undefined} controls={(run, worker) => {
-      if (!root || !coordination) { api.ui.toast({ variant: "warning", title: "Workflows", message: "Workflow data is still initializing" }); return; }
-      void openDashboard(api, root, coordination, run, worker).catch((error) => api.ui.toast({ variant: "error", title: "Workflows", message: error instanceof Error ? error.message : String(error) }));
-    }} steer={(run, worker) => {
-      if (!root || !coordination) { api.ui.toast({ variant: "warning", title: "Workflows", message: "Workflow data is still initializing" }); return; }
-      openSteering(api, root, run, worker, coordination);
-    }} /> },
-    { name: "workflows-transcript", render: ({ params }) => { const selection = transcriptSelection(runs(), params); return selection ? <Transcript api={api} run={selection.run} worker={selection.worker} /> : <TranscriptNotFound api={api} params={params} />; } },
-  ]);
-  api.slots.register({
-    order: 500,
-    slots: {
-      session_prompt_right(_ctx, props) {
-        const visible = () => promptRightRun(runs().filter((run) => run.parentSessionID === props.session_id), lease());
+  return <box flexDirection="column" padding={1} flexGrow={1} minHeight={0}><text flexShrink={0} fg={theme().text.base}><b>Workflows transcript: {props.worker.label}</b> (read-only)</text><scrollbox flexGrow={1} flexBasis={0} minHeight={0} verticalScrollbarOptions={{ visible: true }} horizontalScrollbarOptions={{ visible: false }}><For each={props.ctx.data.session.message.list(sessionID)}>{(message) => <box flexDirection="column" marginTop={1}><text fg={theme().text.muted}>{message.type}</text><text fg={theme().text.base}>{body(message)}</text></box>}</For></scrollbox><text flexShrink={0} fg={theme().text.muted} marginTop={1}>q/back returns to the selected worker inspector. No prompt input is available.</text></box>;
+}
+
+function TranscriptNotFound(props: { ctx: Plugin.Context; back: () => void }) {
+  props.ctx.keymap.layer(() => ({ commands: [{ bind: "q,escape,return", title: "back", group: "Workflows", run: props.back }] }));
+  return <box flexDirection="column" padding={1}><text fg={props.ctx.theme.text.feedback.warning.base}><b>Workflow transcript not found</b></text><text fg={props.ctx.theme.text.muted}>The run, worker, or child session is no longer available. Press Enter, q, or Escape to go back.</text></box>;
+}
+
+export default Plugin.define({
+  id: "workflows",
+  setup(ctx) {
+    const rpc = ctx.client.rpc(WorkflowRpc);
+    const location = () => ({ directory: (ctx.location ?? ctx.data.location.default()).directory });
+    const [runs, setRuns] = createSignal<WorkflowRun[]>([]);
+    const [blink, setBlink] = createSignal(false);
+    const [previous, setPrevious] = createSignal<Route>();
+    const blinkTimer = setInterval(() => setBlink((value) => !value), 600);
+    const failure = (error: unknown) => ctx.ui.toast.show({ variant: "error", title: "Workflows", message: error instanceof Error ? error.message : typeof error === "object" && error && "message" in error ? String(error.message) : String(error) });
+    const approvalNeeded = (message: string) => {
+      ctx.ui.toast.show({ variant: "warning", title: "Workflow approval required", message, duration: 10_000 });
+      void ctx.attention.notify({ title: "Workflow approval required", message, notification: true, sound: { name: "question" } });
+    };
+
+    const navigate = (destination: Destination) => {
+      const current = ctx.ui.router.current();
+      // The router exposes a mutable store; retain the route we came from before entering the dashboard.
+      if (current.type !== "plugin" || !current.name.startsWith("workflows")) setPrevious({ ...current });
+      ctx.ui.dialog.clear();
+      ctx.ui.router.navigate(destination);
+    };
+    const openDashboard = (data?: InspectorSelection) => navigate({ type: "plugin", name: "workflows", data });
+
+    const send = async (control: Control) => {
+      const result = await rpc.control(control, { location: location() });
+      ctx.ui.toast.show({ variant: result.status === "accepted" ? "success" : result.status === "ignored" ? "warning" : "error", title: `${control.action} ${result.status}`, message: result.error ?? "Workflow control processed" });
+    };
+
+    const steer = async (run: WorkflowRun, worker: WorkerState) => {
+      const guidance = await ctx.ui.dialog.prompt({ title: `Steer: ${worker.label}`, placeholder: "Guidance delivered at the next safe turn" });
+      if (guidance?.trim()) await send({ runID: run.id, action: "steer", workerID: worker.id, guidance: guidance.trim() });
+    };
+
+    const discard = async (run: WorkflowRun) => {
+      if (await ctx.ui.dialog.confirm({ title: `Discard ${run.spec.name}?`, message: "This permanently deletes the persisted workflow data. Its worker sessions are kept.", label: { confirm: "Discard permanently" } })) await send({ runID: run.id, action: "discard" });
+    };
+
+    const controls = async (selected: WorkflowRun, selectedWorker?: WorkerState) => {
+      const run = runs().find((item) => item.id === selected.id) ?? selected;
+      const actions: Array<{ title: string; description: string; value: Control }> = [];
+      const action = (value: WorkflowControlAction, title: string, description: string) => actions.push({ title, description, value: { runID: run.id, action: value } });
+      if (run.status === "pending") {
+        action("approve", `Approve: ${run.spec.name}`, `Starts now, or queues behind the active workflow.\n${run.spec.goal}\n${detail(run)}`);
+        action("replace", `Replace current run: ${run.spec.name}`, "Stop the current run resumably, then start this approved plan.\n" + detail(run));
+        action("reject", `Reject: ${run.spec.name}`, detail(run));
+      }
+      if (isResumable(run.status)) action("resume", `Resume: ${run.spec.name}`, detail(run));
+      if (run.status === "running") {
+        action("soft_pause", `Soft pause: ${run.spec.name}`, "Stop scheduling after active work finishes.");
+        action("hard_pause", `Hard pause: ${run.spec.name}`, "Interrupt active worker sessions and preserve them for continuation.");
+      }
+      const worker = selectedWorker && run.workers[selectedWorker.id];
+      if (worker?.status === "running") actions.push({ title: `Steer: ${worker.label}`, description: "Append guidance for the next safe turn boundary. The current turn is never aborted.", value: { runID: run.id, action: "steer", workerID: worker.id } });
+      if (acceptsPlanChange(run.status)) action("plan_change", `Request plan change: ${run.spec.name}`, "Enter guidance after selecting this action. Active work reaches its safe worker/group boundary first.");
+      if (isControllable(run.status)) action("stop", `Stop: ${run.spec.name}`, "Release the project lease and leave the run resumable.");
+      if (canDiscardRun(run)) action("discard", `Discard: ${run.spec.name}`, "Permanently delete this run's workflow data after confirmation.");
+      if (run.status === "blocked") for (const option of failureControlOptions(run)) action(option.action, option.title, option.description);
+      const control = await ctx.ui.dialog.select({ title: "Workflow plans", placeholder: "Select an explicit workflow control", options: actions });
+      if (!control) return;
+      if (control.action === "steer") return steer(run, worker!);
+      if (control.action === "discard") return discard(run);
+      if (control.action === "plan_change") {
+        const guidance = await ctx.ui.dialog.prompt({ title: "Request workflow plan change", placeholder: "Guidance for the coordinator" });
+        if (guidance?.trim()) await send({ ...control, guidance: guidance.trim() });
+        return;
+      }
+      await send(control);
+    };
+
+    const upsert = (run: WorkflowRun) => {
+      const prior = runs().find((item) => item.id === run.id);
+      setRuns([run, ...runs().filter((item) => item.id !== run.id)].sort((left, right) => right.createdAt - left.createdAt || left.id.localeCompare(right.id)));
+      if (run.status === "pending" && !prior) approvalNeeded(run.spec.name);
+      if (run.status === "completed" && prior?.status !== "completed") ctx.ui.toast.show({ variant: "success", title: "Workflow completed", message: run.spec.name });
+      if (run.status === "soft_paused" && prior?.status !== "soft_paused") {
+        const timeout = run.error?.startsWith("Run window reached");
+        ctx.ui.toast.show({ variant: "warning", title: timeout ? "Workflow time limit reached" : "Workflow paused", message: run.error ?? run.spec.name });
+        if (timeout) void ctx.attention.notify({ title: "Workflow time limit reached", message: run.spec.name, notification: true, sound: { name: "question" } });
+      }
+      if (run.status === "blocked" && prior?.status !== "blocked") {
+        const route = ctx.ui.router.current();
+        if (run.failure && route.type === "plugin" && route.name === "workflows") {
+          void ctx.ui.dialog.select({
+            title: `Workflow failure: ${run.failure.workerID}`,
+            placeholder: "Choose a failure decision",
+            options: failureControlOptions(run).map((option) => ({ title: option.title, description: option.description, value: { runID: run.id, action: option.action } })),
+          }).then((control) => control && send(control)).catch(failure);
+        } else {
+          ctx.ui.toast.show({ variant: "warning", title: "Workflow paused for failure", message: run.error ?? run.spec.name });
+        }
+      }
+      for (const worker of Object.values(run.workers)) for (const steering of worker.steering) {
+        const before = prior?.workers[worker.id]?.steering.find((item) => item.id === steering.id);
+        if (steering.status === "rejected" && before && before.status !== "rejected") ctx.ui.toast.show({ variant: "error", title: "Worker steering rejected", message: steering.error ?? "Worker is no longer steerable" });
+      }
+    };
+
+    const ours = (event: { location?: { directory: string } }) => event.location?.directory === location().directory;
+    const unsubscribe = [
+      rpc.events.on("updated", (event) => { if (ours(event)) upsert(event.data.run); }),
+      rpc.events.on("removed", (event) => { if (ours(event)) setRuns(runs().filter((run) => run.id !== event.data.runID)); }),
+    ];
+
+    const initialize = async () => {
+      setRuns([...(await rpc.list({}, { location: location() })).runs]);
+      const pending = runs().filter((run) => run.status === "pending");
+      if (pending.length) approvalNeeded(pending.length === 1 ? pending[0]!.spec.name : `${pending.length} workflows are waiting`);
+      const interrupted = runs().filter((run) => startupActions(run).length > 0);
+      if (!interrupted.length) return;
+      type Recovery = { action: "resume" | "open" | "later" | "discard"; run?: WorkflowRun };
+      const choice = await ctx.ui.dialog.select<Recovery>({
+        title: "Interrupted workflows",
+        placeholder: `${interrupted.length} interrupted workflow(s); choose one recovery action`,
+        options: [
+          ...interrupted.flatMap((run) => [{ title: `Resume: ${run.spec.name}`, description: detail(run), value: { action: "resume" as const, run } }, { title: `Discard: ${run.spec.name}`, description: "Requires a second permanent-delete confirmation", value: { action: "discard" as const, run } }]),
+          { title: "Open dashboard", description: "Review all interrupted workflows without changing them", value: { action: "open" as const } },
+          { title: "Decide later", description: "Keep runs interrupted until /workflows is opened", value: { action: "later" as const } },
+        ],
+      });
+      if (choice?.action === "resume") await send({ runID: choice.run!.id, action: "resume" });
+      if (choice?.action === "open") openDashboard();
+      if (choice?.action === "discard") await discard(choice.run!);
+    };
+    void initialize().catch(failure);
+
+    const back = (run?: WorkflowRun) => {
+      ctx.ui.router.navigate(previous() ?? (run ? { type: "session", sessionID: run.parentSessionID } : { type: "home" }));
+    };
+    ctx.ui.router.register({
+      name: "workflows",
+      render: ({ data }) => <Dashboard ctx={ctx} runs={runs} back={back} initial={data?.runID ? data as InspectorSelection : undefined}
+        transcript={(run, worker) => navigate({ type: "plugin", name: "workflows-transcript", data: { runID: run.id, workerID: worker.id } })}
+        controls={(run, worker) => void controls(run, worker).catch(failure)}
+        steer={(run, worker) => void steer(run, worker).catch(failure)} />,
+    });
+    ctx.ui.router.register({
+      name: "workflows-transcript",
+      render: ({ data }) => {
+        const selection = transcriptSelection(runs(), data);
+        const backToInspector = () => ctx.ui.router.navigate({ type: "plugin", name: "workflows", data: selection ? { runID: selection.run.id, kind: "worker", id: selection.worker.id } : undefined });
+        return selection ? <Transcript ctx={ctx} worker={selection.worker} back={backToInspector} /> : <TranscriptNotFound ctx={ctx} back={backToInspector} />;
+      },
+    });
+    ctx.ui.slot({
+      append: "app",
+      render() {
+        ctx.keymap.layer(() => ({
+          mode: "global",
+          commands: [{
+            id: "workflows.open",
+            title: "Workflows",
+            group: "Project",
+            slash: { name: "workflows" },
+            palette: true,
+            run() {
+              // Re-list so runs written by other processes of this project appear.
+              void rpc.list({}, { location: location() }).then((result) => setRuns([...result.runs])).catch(failure);
+              openDashboard();
+            },
+          }],
+        }));
+        return null;
+      },
+    });
+    ctx.ui.slot({
+      append: "prompt.footer.status",
+      render(input) {
+        const visible = () => promptRightRun(runs().filter((run) => run.parentSessionID === input.sessionID));
         // Paused, blocked and stopping runs need naming: a bare progress count reads as healthy progress.
         const label = (run: WorkflowRun) => {
           if (run.status === "completed" || ["pending", "queued"].includes(run.status)) return run.status;
@@ -409,87 +344,13 @@ const WorkflowTuiPlugin: TuiPlugin = async (api) => {
           const stalled = run.status !== "running" ? ` ${run.status}` : "";
           return `${progress.completed}/${progress.total}${stalled} | ${progress.running} running`;
         };
-        return <Show when={visible()}>{(run: () => WorkflowRun) => <text fg={run().status === "pending" ? (blink() ? api.theme.current.warning : api.theme.current.textMuted) : ["blocked", "repair_required"].includes(run().status) ? api.theme.current.error : api.theme.current.warning} onMouseDown={() => api.route.navigate("workflows", { runID: run().id, kind: "run", id: run().id })}>WF {label(run())}</text>}</Show>;
+        return <Show when={visible()}>{(run: () => WorkflowRun) => <text fg={run().status === "pending" ? (blink() ? ctx.theme.text.feedback.warning.base : ctx.theme.text.muted) : ["blocked", "repair_required"].includes(run().status) ? ctx.theme.text.feedback.error.base : ctx.theme.text.feedback.warning.base} onMouseDown={() => openDashboard({ runID: run().id, kind: "run", id: run().id })}>WF {label(run())}</text>}</Show>;
       },
-    },
-  });
-  api.lifecycle.onDispose(async () => {
-    disposed = true;
-    clearInterval(blinkTimer);
-    if (refreshTimer) clearInterval(refreshTimer);
-    if (presenceTimer) clearInterval(presenceTimer);
-    if (initializationTimer) {
-      clearTimeout(initializationTimer);
-      initializationTimer = undefined;
-      resolveInitialization?.();
-      resolveInitialization = undefined;
-    }
-    if (!coordination) return;
-    await initialization;
-    while (refreshing) await Bun.sleep(10);
-    await presenceWrite;
-    coordination?.close();
-    coordination = undefined;
-    if (!root) return;
-    const presence = tuiPresencePath(root);
-    const claimed = `${presence}.${presenceID}.dispose`;
-    try {
-      await rename(presence, claimed);
-      const value = await Bun.file(claimed).json() as { processID?: string };
-      if (value.processID !== presenceID) await rename(claimed, presence);
-    } catch {}
-    await rm(claimed, { force: true });
-  });
-  initialization = new Promise<void>((resolve) => {
-    resolveInitialization = resolve;
-    initializationTimer = setTimeout(() => {
-      initializationTimer = undefined;
-      void (async () => {
-        const currentRoot = await projectRoot(api);
-        if (disposed) return;
-        const currentCoordination = new WorkflowCoordination(join(currentRoot, "coordination.sqlite"));
-        if (disposed) { currentCoordination.close(); return; }
-        root = currentRoot;
-        coordination = currentCoordination;
-        const writePresence = () => {
-          if (disposed || presenceWrite) return presenceWrite ?? Promise.resolve();
-          const write = atomicWrite(tuiPresencePath(currentRoot), `${JSON.stringify({ heartbeatAt: Date.now(), processID: presenceID })}\n`).catch(() => {});
-          presenceWrite = write.finally(() => { presenceWrite = undefined; });
-          return presenceWrite;
-        };
-        await writePresence();
-        if (disposed) return;
-        await refresh().catch(() => {});
-        if (disposed) return;
-        refreshTimer = setInterval(() => { void refresh().catch(() => {}); }, 500);
-        presenceTimer = setInterval(() => { void writePresence(); }, 2_000);
-        const interrupted = runs().filter((run) => startupActions(run).length > 0);
-        if (!interrupted.length) return;
-        type Recovery = { action: "resume" | "open" | "later" | "discard"; run?: WorkflowRun };
-        api.ui.dialog.replace(() => api.ui.DialogSelect<Recovery>({
-          title: "Interrupted workflows",
-          placeholder: `${interrupted.length} interrupted workflow(s); choose one recovery action`,
-          options: [
-            ...interrupted.flatMap((run) => [{ title: `Resume: ${run.spec.name}`, description: detail(run), value: { action: "resume" as const, run } }, { title: `Discard: ${run.spec.name}`, description: "Requires a second permanent-delete confirmation", value: { action: "discard" as const, run } }]),
-            { title: "Open dashboard", description: "Review all interrupted workflows without changing them", value: { action: "open" as const } },
-            { title: "Decide later", description: "Keep runs interrupted until /workflows is opened", value: { action: "later" as const } },
-          ],
-          onSelect: (option) => {
-            if (option.value.action === "resume") void sendControl(currentRoot, { runID: option.value.run!.id, action: "resume", createdAt: Date.now() }).then(() => api.ui.dialog.clear()).catch((error) => api.ui.toast({ variant: "error", title: "Workflows", message: error instanceof Error ? error.message : String(error) }));
-            if (option.value.action === "open") { api.ui.dialog.clear(); api.route.navigate("workflows"); }
-            if (option.value.action === "later") api.ui.dialog.clear();
-            if (option.value.action === "discard") api.ui.dialog.replace(() => api.ui.DialogSelect<Control | undefined>({ title: `Discard ${option.value.run!.spec.name}?`, placeholder: "This permanently deletes persisted workflow data and owned child sessions", options: [{ title: "Discard permanently", value: { runID: option.value.run!.id, action: "discard", createdAt: Date.now() } }, { title: "Cancel", value: undefined }], onSelect: (confirmation) => { if (confirmation.value) void sendControl(currentRoot, confirmation.value).then(() => api.ui.dialog.clear()).catch((error) => api.ui.toast({ variant: "error", title: "Workflows", message: error instanceof Error ? error.message : String(error) })); else api.ui.dialog.clear(); } }));
-          },
-        }));
-      })().catch((error) => {
-        if (!disposed) api.ui.toast({ variant: "error", title: "Workflows failed to initialize", message: error instanceof Error ? error.message : String(error) });
-      }).finally(() => {
-        resolveInitialization = undefined;
-        resolve();
-      });
-    }, 0);
-  });
-};
+    });
 
-const plugin: TuiPluginModule & { id: string } = { id: "workflows", tui: WorkflowTuiPlugin };
-export default plugin;
+    return () => {
+      clearInterval(blinkTimer);
+      for (const stop of unsubscribe) stop();
+    };
+  },
+});

@@ -1,13 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import {
-  ClaudeOAuthPlugin,
-  extractIdentity,
-  resolveIdentity,
-} from "./claude_oauth.ts";
-import { coworkTransport } from "./cowork_fetch.ts";
+import { extractIdentity, resolveIdentity } from "./claude_oauth.ts";
 import { COWORK_PROFILE } from "./wire_format.ts";
-
-coworkTransport.impl = (input, init) => globalThis.fetch(input, init);
 
 const TOKEN_BODY = {
   access_token: "access-1",
@@ -27,9 +20,8 @@ interface Call {
   init?: RequestInit;
 }
 
-// Bun runs async tests concurrently by default; suites below mock
-// globalThis.fetch and drive stateful plugin loaders, so their tests are
-// serialized by hand through a shared promise chain.
+// Suites below mock globalThis.fetch, so their tests are serialized by hand
+// through a shared promise chain.
 let serialQueue: Promise<unknown> = Promise.resolve();
 function serialTest(name: string, fn: () => Promise<void> | void) {
   test(name, async () => {
@@ -73,8 +65,6 @@ describe("extractIdentity normalization", () => {
   });
 });
 
-// Serialized: these suites mock globalThis.fetch and drive stateful plugin
-// loaders, so interleaved async tests would see each other's mocks.
 describe("resolveIdentity (login semantics)", () => {
   serialTest("Cowork recovers identity from the Claude CLI bootstrap request", async () => {
     const { calls, restore } = mockFetch(() => jsonResponse({
@@ -86,7 +76,7 @@ describe("resolveIdentity (login semantics)", () => {
       },
     }));
     try {
-      expect(await resolveIdentity({ ...TOKEN_BODY }, { includeOrg: true, profile: COWORK_PROFILE })).toEqual({
+      expect(await resolveIdentity({ ...TOKEN_BODY }, COWORK_PROFILE)).toEqual({
         accountId: "bootstrap-account",
         email: "bootstrap@example.com",
         orgId: "bootstrap-org",
@@ -105,7 +95,7 @@ describe("resolveIdentity (login semantics)", () => {
   serialTest("missing account block: recovers full identity from profile and roles", async () => {
     const { calls, restore } = mockFetch(identityResponse);
     try {
-      const identity = await resolveIdentity({ ...TOKEN_BODY }, { includeOrg: true });
+      const identity = await resolveIdentity({ ...TOKEN_BODY });
       expect(identity).toEqual({
         accountId: "profile-account",
         email: "user@example.com",
@@ -127,7 +117,7 @@ describe("resolveIdentity (login semantics)", () => {
       url.includes("/roles") ? Promise.reject(new Error("roles unavailable")) : jsonResponse(PROFILE_IDENTITY),
     );
     try {
-      expect(await resolveIdentity({ ...TOKEN_BODY }, { includeOrg: true })).toEqual({
+      expect(await resolveIdentity({ ...TOKEN_BODY })).toEqual({
         accountId: "profile-account",
         email: "user@example.com",
         orgId: "profile-org",
@@ -147,7 +137,6 @@ describe("resolveIdentity (login semantics)", () => {
           account: { uuid: "token-account", email_address: "token@example.com" },
           organization: { name: "Token org name" },
         },
-        { includeOrg: true },
       );
       expect(identity).toEqual({
         accountId: "token-account",
@@ -171,7 +160,6 @@ describe("resolveIdentity (login semantics)", () => {
           account: { uuid: "acct", email_address: "a@b.c" },
           organization: { uuid: "org", name: "Org" },
         },
-        { includeOrg: true },
       );
       expect(identity).toEqual({ accountId: "acct", email: "a@b.c", orgId: "org", orgName: "Org" });
       expect(calls).toHaveLength(0);
@@ -185,113 +173,9 @@ describe("resolveIdentity (login semantics)", () => {
     try {
       expect(await resolveIdentity(
         { ...TOKEN_BODY, account: { uuid: "token-account" } },
-        { includeOrg: true },
       )).toMatchObject({ accountId: "token-account" });
     } finally {
       restore();
     }
-  });
-
-  serialTest("refresh path (includeOrg unset): missing org alone does not trigger profile recovery", async () => {
-    const { calls, restore } = mockFetch(() => {
-      throw new Error("profile must not be called");
-    });
-    try {
-      await resolveIdentity({
-        ...TOKEN_BODY,
-        account: { uuid: "acct", email_address: "a@b.c" },
-        // organization deliberately absent — irrelevant on refresh
-      });
-      expect(calls).toHaveLength(0);
-    } finally {
-      restore();
-    }
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Refresh through the plugin loader: stored accountId preservation + persistence
-// ---------------------------------------------------------------------------
-
-describe("refresh accountId preservation", () => {
-  const EXPIRED_AUTH = {
-    type: "oauth" as const,
-    access: "stale-access",
-    refresh: "stale-refresh",
-    expires: Date.now() - 1000,
-    accountId: "stored-account",
-  };
-
-  interface Persisted {
-    refresh?: string;
-    access?: string;
-    expires?: number;
-    accountId?: string;
-  }
-
-  async function runRefreshedFetch(auth: Record<string, unknown>, responder: (url: string) => Response | Promise<Response>) {
-    // Clone: the loader mutates the auth object it receives (access/accountId
-    // are cached on it after a refresh), so each test needs its own copy.
-    const authState = structuredClone(auth);
-    const persisted: Persisted[] = [];
-    const plugin = await ClaudeOAuthPlugin({
-      client: {
-        auth: {
-          set: async ({ body }: { body: Persisted }) => {
-            persisted.push(body);
-          },
-        },
-      },
-    } as never);
-    const options = await plugin.auth!.loader!(async () => authState as never, {} as never);
-    const mock = mockFetch(responder);
-    try {
-      await options.fetch!("https://api.anthropic.com/v1/messages", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ model: "claude-sonnet-4-6", messages: [], max_tokens: 1 }),
-      });
-    } finally {
-      mock.restore();
-    }
-    return { persisted, calls: mock.calls };
-  }
-
-  function tokenResponse(overrides: Record<string, unknown> = {}) {
-    return jsonResponse({
-      access_token: "new-access",
-      refresh_token: "new-refresh",
-      expires_in: 3600,
-      ...overrides,
-    });
-  }
-
-  serialTest("refresh response with no identity preserves the stored accountId when profile recovery fails", async () => {
-    const { persisted } = await runRefreshedFetch(EXPIRED_AUTH, (url) =>
-      url.includes("/v1/oauth/token") ? tokenResponse() : jsonResponse({ error: "down" }, 500),
-    );
-    expect(persisted[0]).toMatchObject({ access: "new-access", refresh: "new-refresh", accountId: "stored-account" });
-  });
-
-  serialTest("refresh with no stored accountId resolves one from profile", async () => {
-    const { persisted } = await runRefreshedFetch(
-      { type: "oauth", access: "stale-access", refresh: "stale-refresh", expires: Date.now() - 1000 },
-      (url) => (url.includes("/v1/oauth/token") ? tokenResponse() : identityResponse(url)),
-    );
-    expect(persisted[0]?.accountId).toBe("profile-account");
-  });
-
-  serialTest("refresh response identity wins over the stored accountId when present", async () => {
-    const { persisted } = await runRefreshedFetch(EXPIRED_AUTH, (url) => {
-      if (url.includes("/v1/oauth/token")) {
-        return tokenResponse({
-          account: { uuid: "rotated-account", email_address: "fresh@example.com" },
-          organization: { uuid: "rotated-org", name: "New org" },
-        });
-      }
-      if (url.includes("/api/oauth/")) return Promise.reject(new Error("profile must not be called"));
-      return jsonResponse({});
-    });
-    expect(persisted[0]?.accountId).toBe("rotated-account");
   });
 });

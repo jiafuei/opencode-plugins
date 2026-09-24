@@ -9,20 +9,16 @@ Requests are fingerprinted to look exactly like the native `antigravity/hub` des
 ## Installation
 
 ```sh
-opencode plugin @jiafuei/opencode-antigravity-oauth
+opencode plugin add @jiafuei/opencode-antigravity-oauth
 ```
 
-Pass `--global` to install into your global OpenCode configuration. Then restart OpenCode so the plugin registers the `google-antigravity` provider.
+The plugin registers the `google-antigravity` integration and provider. The provider becomes available once you connect an account.
 
 ## Login
 
-```sh
-opencode auth login
-```
-
-1. Pick **Google Antigravity**.
+1. Connect the **Google Antigravity** integration in OpenCode.
 2. Choose a sign-in method:
-   - **Antigravity (browser)** — opens `accounts.google.com` in your browser and completes login against a local callback server on `127.0.0.1:51121/oauth-callback` (the native Antigravity port). Keep the command running until the redirect completes.
+   - **Antigravity (browser)** — opens `accounts.google.com` in your browser and completes login against a local callback server on `127.0.0.1:51121/oauth-callback` (the native Antigravity port). Keep OpenCode open until the redirect completes.
    - **Antigravity (paste code)** — use this when the browser cannot reach the callback server (remote OpenCode, container, or restricted loopback forwarding). This method intentionally does not start a server: after Google redirects, the browser may show “cannot connect.” Copy the complete `http://127.0.0.1:51121/oauth-callback?...` URL from its address bar and paste that URL into OpenCode. Start a fresh paste-code login first; a redirect from an older browser-method attempt has a different `state` and is rejected.
 3. On first login the plugin checks your Cloud Code Assist account state, provisions the Antigravity free tier if needed (one long-running operation polled every second under a 30-second deadline), and stores the resolved project.
 
@@ -34,7 +30,7 @@ If Google requires account verification, login errors show the verification URL 
 
 All models report zero subscription cost. Reasoning variants (`minimal` / `low` / `medium` / `high`) map onto upstream effort tiers exactly like the native client:
 
-The table below is the static fallback. During startup, an existing OAuth login enables live `fetchAvailableModels` discovery (daily then sandbox, or the pinned endpoint; 5-second timeout per endpoint). Discovery filters the list to supported models whose default wire route is available, disables unavailable reasoning variants, and updates context/output limits and image support. Explicit model configuration still wins. Failed discovery retains the defaults; a successful empty list removes them. Unknown and internal models are not automatically added. Restart OpenCode to refresh availability.
+The table below is the static fallback. At startup and whenever the active Antigravity connection changes, live `fetchAvailableModels` discovery runs (daily then sandbox, or the pinned endpoint; 5-second timeout per endpoint). Discovery filters the list to supported models whose default wire route is available, drops unavailable reasoning variants, and updates context/output limits and image support. The discovered list is bound to the connection that produced it. Failed discovery retains the defaults; a successful empty list removes them. Unknown and internal models are not automatically added.
 
 | Model | Context | Output | Input | Notes |
 | --- | --- | --- | --- | --- |
@@ -55,8 +51,8 @@ Checkpoint-only ids (`gemini-3.1-flash-lite`, tab completion previews) are inten
 ```jsonc
 // opencode.json
 {
-  "plugin": [
-    ["@jiafuei/opencode-antigravity-oauth", { "endpointMode": "auto" }]
+  "plugins": [
+    { "package": "@jiafuei/opencode-antigravity-oauth", "options": { "endpointMode": "auto" } }
   ]
 }
 ```
@@ -79,22 +75,26 @@ os/arch are deliberately pinned to the darwin/arm64 reference client the constan
 
 ## Wire behavior
 
-For OAuth traffic only, the auth loader's fetch boundary rewrites standard `@ai-sdk/google` requests into the Cloud Code Assist envelope used by the native client:
+The plugin installs a fetch on the `@ai-sdk/google` SDK of the `google-antigravity` provider (AI SDK `sdk` hook) that rewrites standard `@ai-sdk/google` requests into the Cloud Code Assist envelope used by the native client:
 
 - URL: `POST https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse` (or `:generateContent` for non-stream calls).
 - Envelope: `project`, `model` (effort-routed wire id), `userAgent: "antigravity"`, `requestType: "agent"`, and `request.requestId = agent/<agentId>/<timestamp>/<trajectoryId>/<step>` with labels `last_step_index`, `trajectory_id`, `used_claude`, `used_claude_conservative`, `model_enum`, and `last_execution_id`.
 - Per-session identity: stable `agentId`/`trajectoryId`, signed-decimal `sessionId`, monotonic step index, and the prior response's id carried forward. SDK retries of the same logical request reuse the envelope instead of advancing the step.
-- Headers: captured `antigravity/hub/<version> (...)` user agent, bearer token, `Content-Type: application/json`, `Accept: text/event-stream`, plus `anthropic-beta: interleaved-thinking-2025-05-14` for reasoning Claude models. The `@ai-sdk/google` fingerprint (`x-goog-api-key`, `x-goog-api-client`), OpenCode's session-routing headers (`x-session-affinity`, `x-session-id`, `x-parent-session-id`, `client-metadata`), and the plugin-private routing markers are all stripped before dispatch — only the native inference header set reaches Cloud Code Assist.
+- Headers: captured `antigravity/hub/<version> (...)` user agent, bearer token, `Content-Type: application/json`, `Accept: text/event-stream`, plus `anthropic-beta: interleaved-thinking-2025-05-14` for reasoning Claude models. The `@ai-sdk/google` fingerprint (`x-goog-api-key`, `x-goog-api-client`), OpenCode's session-routing headers (`x-session-affinity`, `x-session-id`, `x-parent-session-id`, `x-opencode-*`, `client-metadata`), and the plugin-private routing markers are all stripped before dispatch — only the native inference header set reaches Cloud Code Assist.
 - Bodies: system instructions tagged `role: "user"`, default function-calling mode `VALIDATED` (forced for Claude even with no tools), tool schemas converted from the SDK's `parametersJsonSchema` form to normalized legacy `parameters`, fixed per-model `maxOutputTokens`, thinking controls normalized to each family's native transport (budget or level), and explicit server-side thinking suppression where omitting the config would silently re-enable it.
 - Responses: SSE events wrapping Gemini chunks under `response` are unwrapped incrementally (no full buffering); the response id is captured for the next request's `last_execution_id`. In-band error events surface as stream errors with sanitized messages. Session state (last-good endpoint, response identity) commits only after a stream completes successfully.
 - Endpoint failover: in `"auto"` mode a pre-first-event watchdog buffers up to the first complete SSE event; transient failures before that point (HTTP status or in-band error) switch to the alternate endpoint without losing bytes, while non-transient errors surface immediately. Once an ordinary event has been exposed, the endpoint is never switched.
-- Origin safety: bearer credentials are sent **only** to the two official Cloud Code Assist endpoints. Any other configured `baseURL` (proxy/gateway) is rejected with a clear error rather than leaking subscription traffic. There is no plain API-key mode; logout/re-login transitions are detected per request because stored auth is re-read at every request.
+- Origin safety: bearer credentials are sent **only** to the two official Cloud Code Assist endpoints. Any other configured `baseURL` (proxy/gateway) is rejected with a clear error rather than leaking subscription traffic. There is no plain API-key mode. Switching the active connection resets every session's identity chain.
 
-Responses are parsed by OpenCode's bundled `@ai-sdk/google` — the plugin never interprets model output itself.
+Responses are parsed by `@ai-sdk/google` — the plugin never interprets model output itself. Overriding `google-antigravity` provider or model settings in OpenCode config can make OpenCode switch the provider to its native Google route, which bypasses this transport; leave the provider unconfigured.
+
+## Web search
+
+While an Antigravity connection exists, the plugin registers an `antigravity` web search provider for OpenCode's built-in `websearch` tool. It dispatches the dedicated `gemini-3.1-flash-lite` `web_search` operation captured from the native client and returns each grounding source with the answer segments it supports.
 
 ## Credential storage
 
-OpenCode's OAuth auth schema persists `refresh`, `access`, `expires`, and an opaque `accountId`. The plugin stores the Cloud Code Assist **project id** in `accountId`; the account email is shown during login only and is not persisted. No secondary credential store exists, and tokens are never written to logs or error messages. Token refresh happens transparently with a five-minute expiry skew and preserves rotated refresh tokens.
+OpenCode stores the OAuth credential (`refresh`, `access`, `expires`) and refreshes it through the plugin's refresh callback, preserving rotated refresh tokens. The Cloud Code Assist **project id** and the account email are kept in the credential metadata; the email labels the connection. No secondary credential store exists, and tokens are never written to logs or error messages.
 
 ## Limitations
 

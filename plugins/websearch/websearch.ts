@@ -1,126 +1,114 @@
-import { tool, type Plugin, type PluginOptions } from "@opencode-ai/plugin";
-import { createAntigravityBackend } from "./antigravity_backend.ts";
-import type { ProviderData, SearchBackend, SearchResult } from "./backend.ts";
-import { createOpenAIBackend, type OpenAISubscriptionTransport } from "./openai_backend.ts";
+import { createOpenAI, type OpenAIResponsesProviderOptions } from "@ai-sdk/openai";
+import { Plugin } from "@opencode/plugin";
+import { streamText } from "ai";
+import { createWebSocketFetch } from "./websocket_fetch.ts";
 
-type ActiveModel = { modelID: string; providerID: string };
-interface WebSearchOptions extends PluginOptions {
+export type OpenAISubscriptionTransport = "https" | "websocket";
+interface WebSearchOptions {
+  model?: string;
   openaiSubscriptionTransport?: OpenAISubscriptionTransport;
 }
-type Resolution = {
-  backend: SearchBackend;
-  fallbackModel?: string;
-  lockedModel?: string;
-  providerID: string;
-};
 
-function scanProviders(providers: ProviderData[], backends: SearchBackend[]): Resolution[] {
-  return providers.flatMap((provider) => {
-    const backend = backends.find((candidate) => candidate.matches(provider));
-    if (!backend) return [];
+const DEFAULT_MODEL = "gpt-5.6-luna";
+const CHATGPT_BASE_URL = "https://chatgpt.com/backend-api/codex";
 
-    let lockedModel: string | undefined;
-    let fallbackModel: string | undefined;
-    for (const model of Object.values(provider.models)) {
-      if (!lockedModel && model.options.websearch === "always") lockedModel = model.id;
-      if (!fallbackModel && model.options.websearch === "auto") fallbackModel = model.id;
-    }
-    return [{ backend, fallbackModel, lockedModel, providerID: provider.id }];
-  });
+function residency(accessToken: string) {
+  try {
+    const claims = JSON.parse(Buffer.from(accessToken.split(".")[1] ?? "", "base64url").toString()) as {
+      chatgpt_compute_residency?: string;
+      "https://api.openai.com/auth"?: { chatgpt_compute_residency?: string };
+    };
+    const value = claims["https://api.openai.com/auth"]?.chatgpt_compute_residency ?? claims.chatgpt_compute_residency;
+    return value && value !== "no_constraint" ? value : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
-export function pickResolution(resolutions: Resolution[], active: ActiveModel | undefined) {
-  const locked = resolutions.find((resolution) => resolution.lockedModel);
-  if (locked?.lockedModel) return { backend: locked.backend, model: locked.lockedModel };
-
-  const current = active && resolutions.find((resolution) => resolution.providerID === active.providerID);
-  if (current && active) return { backend: current.backend, model: active.modelID };
-
-  const fallback = resolutions.find((resolution) => resolution.fallbackModel);
-  return fallback?.fallbackModel ? { backend: fallback.backend, model: fallback.fallbackModel } : undefined;
-}
-
-function formatResult(result: SearchResult) {
-  const seen = new Set<string>();
-  const links = result.sources.flatMap((source) => {
-    if (seen.has(source.url)) return [];
-    seen.add(source.url);
-    return [`- [${source.title ?? source.url}](${source.url})`];
-  });
-  return links.length ? `${result.text.trim()}\n\nSources:\n${links.join("\n")}` : result.text.trim();
-}
-
-const WebSearchPlugin: Plugin = async ({ client, directory }, options?: PluginOptions | WebSearchOptions) => {
-  const pluginOptions = options as WebSearchOptions | undefined;
-  const backends: SearchBackend[] = [
-    createOpenAIBackend(client, directory, pluginOptions?.openaiSubscriptionTransport),
-    createAntigravityBackend(),
-  ];
-  const log = (level: "info" | "warn" | "error", message: string, extra?: Record<string, unknown>) =>
-    client.app.log({ body: { service: "websearch", level, message, extra }, query: { directory } }).catch(() => {});
-  const activeModels = new Map<string, ActiveModel>();
-  let resolutions: Resolution[] | undefined;
-
-  log("info", "Plugin initialized; web-search tool registered", {
-    backends: backends.map((backend) => backend.id),
-    openaiSubscriptionTransport: pluginOptions?.openaiSubscriptionTransport ?? "https",
-  });
-
-  return {
-    dispose: async () => {
-      for (const backend of backends) backend.dispose();
-    },
-    "chat.message": async (input) => {
-      if (input.model) activeModels.set(input.sessionID, input.model);
-    },
-    tool: {
-      "web-search": tool({
-        description: "Search the live web with a provider-native search model and return grounded content with sources. Use for current information and topics beyond the model's knowledge cutoff.",
-        args: {
-          query: tool.schema.string().describe("The web search query."),
-        },
-        execute: async ({ query }, context) => {
-          await context.ask({ permission: "websearch", patterns: [query], always: ["*"], metadata: { query } });
-          context.metadata({ title: `Web Search: ${query}` });
-
-          if (!resolutions) {
-            const response = await client.config.providers({ query: { directory } });
-            if (!response.data) throw new Error("Failed to retrieve search models");
-            resolutions = scanProviders(response.data.providers as ProviderData[], backends);
-            log("info", "Search backends resolved", {
-              resolutions: resolutions.map(({ backend, fallbackModel, lockedModel, providerID }) => ({
-                backend: backend.id,
-                fallbackModel,
-                lockedModel,
-                providerID,
-              })),
-            });
-          }
-          const selected = pickResolution(resolutions, activeModels.get(context.sessionID));
-          if (!selected) {
-            log("warn", "No search backend selected", { activeModel: activeModels.get(context.sessionID) });
-            throw new Error('Choose a supported model for web search with `"websearch": "always"` or `"websearch": "auto"`');
-          }
-
-          log("info", "Search started", { backend: selected.backend.id, model: selected.model });
-          try {
-            const result = await selected.backend.search({ context, model: selected.model, query });
-            log("info", "Search completed", { backend: selected.backend.id, sources: result.sources.length });
-            return formatResult(result);
-          } catch (error) {
-            log("error", "Search failed", {
-              backend: selected.backend.id,
-              error: error instanceof Error ? error.message : String(error),
-            });
-            throw error;
-          }
-        },
-      }),
-    },
-  };
-};
-
-export default {
+export default Plugin.define({
   id: "websearch",
-  server: WebSearchPlugin,
-};
+  setup: async (ctx) => {
+    const options = ctx.options as WebSearchOptions;
+    const model = options.model ?? DEFAULT_MODEL;
+    const websocketFetch = options.openaiSubscriptionTransport === "websocket" ? createWebSocketFetch() : undefined;
+    let connected = false;
+
+    const credential = async () => {
+      const connection = await ctx.integration.connection.active("openai");
+      return connection && ctx.integration.connection.resolve(connection);
+    };
+
+    await ctx.websearch.transform((editor) => {
+      if (!connected) return;
+      editor.add({
+        id: "openai",
+        name: "OpenAI",
+        execute: async ({ query }, { signal }) => {
+          const auth = await credential();
+          if (!auth) throw new Error("Connect a ChatGPT subscription or OpenAI API key before using web search");
+          // ChatGPT subscriptions (OAuth) go through the Codex backend; API keys use the public API.
+          const subscription = auth.type === "oauth";
+          const apiKey = subscription ? auth.access : auth.key;
+          const accountID = subscription ? auth.metadata?.accountID as string | undefined : undefined;
+          const location = subscription ? residency(apiKey) : undefined;
+          const openai = createOpenAI({
+            apiKey,
+            ...(subscription ? { baseURL: CHATGPT_BASE_URL } : {}),
+            ...(subscription && websocketFetch ? { fetch: websocketFetch } : {}),
+            ...(subscription
+              ? {
+                  headers: {
+                    ...(accountID ? { "ChatGPT-Account-Id": accountID } : {}),
+                    ...(location ? { "x-openai-internal-codex-residency": location } : {}),
+                  },
+                }
+              : {}),
+          });
+          const result = streamText({
+            abortSignal: signal,
+            maxRetries: 0,
+            model: openai.responses(model),
+            prompt: `Search the live web for this query and return a concise, factual answer grounded in the retrieved content. Include useful details and cite sources.\n\n${query}`,
+            providerOptions: {
+              openai: {
+                reasoningEffort: "low",
+                store: false,
+              } satisfies OpenAIResponsesProviderOptions,
+            },
+            toolChoice: { type: "tool", toolName: "web_search" },
+            tools: { web_search: openai.tools.webSearch() },
+          });
+          const [text, sources, toolResults] = await Promise.all([result.text, result.sources, result.toolResults]);
+          const found = new Map<string, string | undefined>();
+          for (const source of sources) if (source.sourceType === "url" && !found.has(source.url)) found.set(source.url, source.title);
+          for (const toolResult of toolResults) {
+            if (toolResult.toolName !== "web_search") continue;
+            for (const source of toolResult.output.sources ?? []) if (source.type === "url" && !found.has(source.url)) found.set(source.url, undefined);
+          }
+          // The Responses API cites sources without per-source excerpts, so the
+          // synthesized answer rides on the first result.
+          const answer = text.trim();
+          return [...found].map(([url, title], index) => ({
+            url,
+            ...(title ? { title } : {}),
+            ...(index === 0 && answer ? { content: answer } : {}),
+            time: {},
+          }));
+        },
+      });
+    });
+
+    const refresh = async () => {
+      connected = (await ctx.integration.connection.active("openai")) !== undefined;
+      await ctx.websearch.reload();
+    };
+    void (async () => {
+      for await (const event of ctx.event.subscribe()) {
+        if (event.type === "credential.switched" && event.data.integrationID === "openai") await refresh();
+      }
+    })();
+    await refresh();
+
+    return () => websocketFetch?.close();
+  },
+});

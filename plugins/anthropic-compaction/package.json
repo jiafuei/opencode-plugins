@@ -17,12 +17,13 @@
     "anthropic"
   ],
   "engines": {
-    "opencode": ">=1.18.21"
+    "opencode": ">=2.0.15"
   },
   "publishConfig": {
     "access": "public"
   },
   "dependencies": {
-    "@opencode-ai/plugin": "^1.18.21"
+    "@opencode/plugin": "2.0.15",
+    "effect": "4.0.0-rc.112"
   }
 }

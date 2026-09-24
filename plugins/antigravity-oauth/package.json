@@ -8,6 +8,7 @@
   },
   "files": [
     "antigravity_oauth.ts",
+    "discovery.ts",
     "oauth_flow.ts",
     "schema.ts",
     "wire.ts",
@@ -23,12 +24,13 @@
     "oauth"
   ],
   "engines": {
-    "opencode": ">=1.18.20"
+    "opencode": ">=2.0.15"
   },
   "publishConfig": {
     "access": "public"
   },
   "dependencies": {
-    "@opencode-ai/plugin": "^1.18.21"
+    "@opencode/plugin": "2.0.15",
+    "effect": "4.0.0-rc.112"
   }
 }
