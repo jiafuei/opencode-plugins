@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import plugin from "./anthropic_compaction.ts";
+import plugin from "./server.ts";
 
 type Hook = (event: any) => Promise<void> | void;
 

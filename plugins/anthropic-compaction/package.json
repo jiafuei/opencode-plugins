@@ -4,10 +4,10 @@
   "description": "Enable Anthropic server-side compaction for OpenCode sessions",
   "type": "module",
   "exports": {
-    "./server": "./anthropic_compaction.ts"
+    "./server": "./server.ts"
   },
   "files": [
-    "anthropic_compaction.ts",
+    "server.ts",
     "README.md"
   ],
   "keywords": [

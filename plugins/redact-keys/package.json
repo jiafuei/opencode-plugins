@@ -4,10 +4,10 @@
   "description": "Secret redaction for protected files in OpenCode",
   "type": "module",
   "exports": {
-    "./server": "./redact_keys.ts"
+    "./server": "./server.ts"
   },
   "files": [
-    "redact_keys.ts",
+    "server.ts",
     "README.md"
   ],
   "keywords": [
