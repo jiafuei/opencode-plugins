@@ -1,26 +1,20 @@
-import { Connection, Credential, Integration, Model, Plugin, Provider } from "@opencode/plugin";
+import { Connection, Credential, Integration, Model, Plugin } from "@opencode/plugin";
 import { discoverModels } from "./discovery.ts";
 import {
   ANTIGRAVITY_DAILY_ENDPOINT,
+  ANTIGRAVITY_ENDPOINTS,
   ANTIGRAVITY_SANDBOX_ENDPOINT,
   CLAUDE_THINKING_BETA_HEADER,
-  MODEL_SPECS,
   PROVIDER_ID,
-  TRANSIENT_STATUSES,
   createCcaSseUnwrap,
   createSessionState,
   describeInBandError,
   ensureAntigravityVersion,
-  errorStream,
-  firstEventTimeoutMs,
   getAntigravityUserAgent,
-  isInBandErrorTransient,
   isClaudeModel,
   providerModels,
-  readFirstSseEvent,
   readInBandError,
   rewriteBodyForAntigravity,
-  sanitizeOutgoingHeaders,
   unwrapCcaJson,
   unwrappedResponseHeaders,
   type AntigravitySessionState,
@@ -52,46 +46,13 @@ import {
 const INTEGRATION_ID = Integration.ID.make(PROVIDER_ID);
 const BROWSER_METHOD_ID = Integration.MethodID.make("browser");
 const PASTE_METHOD_ID = Integration.MethodID.make("paste");
-/** Non-secret marker set by the model.request hook; stripped before dispatch. */
-const SESSION_MARKER_HEADER = "x-antigravity-opencode-session";
-/** Per-invocation UUID; identical values mark SDK retries of the same logical request. */
+/** Per-invocation UUID; identical values mark retries of the same logical request. */
 const INVOCATION_HEADER = "x-antigravity-opencode-invocation";
 const WEB_SEARCH_USER_AGENT = "antigravity/ide/2.5.5 (aidev_client; os_type=windows; arch=amd64)";
 /** Login/browser-callback wait window. */
 export const FLOW_TIMEOUT_MS = 5 * 60 * 1000;
 
 type EndpointMode = "auto" | "production" | "sandbox";
-
-function officialEndpoint(origin: string): string | undefined {
-  if (origin === ANTIGRAVITY_DAILY_ENDPOINT || origin === ANTIGRAVITY_SANDBOX_ENDPOINT) return origin;
-  return undefined;
-}
-
-/**
- * Endpoint attempt order for a request. Auto consults the session's
- * last-good endpoint first, then daily, then sandbox; pinned modes return a
- * single endpoint.
- */
-export function resolveEndpointChain(mode: EndpointMode, lastGood?: string): string[] {
-  if (mode === "production") return [ANTIGRAVITY_DAILY_ENDPOINT];
-  if (mode === "sandbox") return [ANTIGRAVITY_SANDBOX_ENDPOINT];
-  const chain =
-    lastGood === ANTIGRAVITY_SANDBOX_ENDPOINT
-      ? [ANTIGRAVITY_SANDBOX_ENDPOINT, ANTIGRAVITY_DAILY_ENDPOINT]
-      : [ANTIGRAVITY_DAILY_ENDPOINT, ANTIGRAVITY_SANDBOX_ENDPOINT];
-  return chain;
-}
-
-interface StreamTarget {
-  kind: "stream" | "nonstream";
-  logicalModelId: string;
-}
-
-function parseGenerateContentPath(pathname: string): StreamTarget | undefined {
-  const match = /^\/models\/([^:]+):(streamGenerateContent|generateContent)$/.exec(pathname);
-  if (!match) return undefined;
-  return { kind: match[2] === "streamGenerateContent" ? "stream" : "nonstream", logicalModelId: match[1]! };
-}
 
 /** The Cloud Code Assist project and account email ride the credential metadata. */
 function toCredential(methodID: Integration.MethodID, credentials: OAuthCredentials): Credential.OAuth {
@@ -183,7 +144,7 @@ export function createCallbackWaiter(state: string, timeoutMs: number = FLOW_TIM
 export default Plugin.define({
   id: "antigravity_oauth",
   setup: async (ctx) => {
-    const options = ctx.options as { endpointMode?: EndpointMode; firstEventTimeoutMs?: number };
+    const options = ctx.options as { endpointMode?: EndpointMode };
     if (
       options.endpointMode !== undefined &&
       options.endpointMode !== "auto" &&
@@ -192,13 +153,14 @@ export default Plugin.define({
     ) {
       throw new Error(`Unsupported Antigravity endpointMode "${String(options.endpointMode)}"`);
     }
-    if (
-      options.firstEventTimeoutMs !== undefined &&
-      (!Number.isFinite(options.firstEventTimeoutMs) || options.firstEventTimeoutMs <= 0)
-    ) {
-      throw new Error("Antigravity firstEventTimeoutMs must be a finite positive number");
-    }
     const endpointMode: EndpointMode = options.endpointMode ?? "auto";
+    // Pinned modes use one endpoint; auto starts at daily and falls back to sandbox.
+    const endpoints: string[] =
+      endpointMode === "production"
+        ? [ANTIGRAVITY_DAILY_ENDPOINT]
+        : endpointMode === "sandbox"
+          ? [ANTIGRAVITY_SANDBOX_ENDPOINT]
+          : [...ANTIGRAVITY_ENDPOINTS];
 
     // Warm the manifest-discovered client version once per process; failures
     // silently keep the pinned fallback.
@@ -207,7 +169,7 @@ export default Plugin.define({
     /** Per-OpenCode-session envelope identity; cleared on session deletion and credential switches. */
     const sessionStates = new Map<string, AntigravitySessionState>();
     /** Account-specific state loaded from the active connection. */
-    let loaded: { connection?: Connection.Info; models?: Model.Info[] } = {};
+    let loaded: { connection?: Connection.Info; projectId?: string; models?: Model.Info[] } = {};
 
     const load = async () => {
       const connection = await ctx.integration.connection.active(INTEGRATION_ID);
@@ -216,8 +178,12 @@ export default Plugin.define({
         loaded = {};
         return;
       }
-      const available = await discoverModels(credential.access, resolveEndpointChain(endpointMode));
-      loaded = { connection, models: available && providerModels(available) };
+      const available = await discoverModels(credential.access, endpoints);
+      loaded = {
+        connection,
+        projectId: credential.metadata?.projectId as string,
+        models: available && providerModels(available),
+      };
     };
     let loading = Promise.resolve();
     const refresh = () =>
@@ -309,7 +275,9 @@ export default Plugin.define({
           integrationID: INTEGRATION_ID,
           name: "Google Antigravity",
           activation: "auto",
-          package: "aisdk:@ai-sdk/google",
+          // OpenCode's native Gemini client; the session HTTP hooks below
+          // rewrite its requests into Cloud Code Assist calls.
+          package: "@opencode/ai/providers/google",
           settings: { baseURL: ANTIGRAVITY_DAILY_ENDPOINT },
         },
         models: loaded.models ?? providerModels(),
@@ -317,233 +285,113 @@ export default Plugin.define({
       });
     });
 
-    // Core passes the resolved OAuth access token as `apiKey` and the
-    // credential metadata (`projectId`) into the SDK options. @ai-sdk/google
-    // reads `options.fetch` lazily per language model, so this also applies
-    // when another plugin constructed the SDK first.
-    await ctx.aisdk.hook(
-      "sdk",
+    await ctx.session.hook(
+      "model.request",
       (evt) => {
-        const access = evt.options.apiKey as string;
-        const projectId = evt.options.projectId as string;
-        const upstream = evt.options.fetch as typeof fetch;
-        evt.options.fetch = async (requestInput: string | URL | Request, init?: RequestInit) => {
-        const url =
-          requestInput instanceof URL
-            ? requestInput
-            : new URL(typeof requestInput === "string" ? requestInput : requestInput.url);
-        if (url.username || url.password) {
-          throw new Error(`Refusing to send Antigravity OAuth credentials to "${url.origin}"`);
-        }
-
-        const inputEndpoint = officialEndpoint(url.origin);
-        if (!inputEndpoint) {
-          throw new Error(
-            `Refusing to send Antigravity OAuth credentials to "${url.origin}" - this transport only supports the official ${ANTIGRAVITY_DAILY_ENDPOINT} and ${ANTIGRAVITY_SANDBOX_ENDPOINT} endpoints.`,
-          );
-        }
-
-        const headers = new Headers(init?.headers);
-        const opencodeSessionId = headers.get(SESSION_MARKER_HEADER) ?? undefined;
-        const invocationId = headers.get(INVOCATION_HEADER) ?? undefined;
-        // Strip the SDK fingerprint, OpenCode session-routing headers,
-        // and both plugin-private markers before anything is sent.
-        sanitizeOutgoingHeaders(headers);
-        headers.delete(SESSION_MARKER_HEADER);
-        headers.delete(INVOCATION_HEADER);
-
-        const target = parseGenerateContentPath(url.pathname);
-        if (!target) {
-          headers.set("Authorization", `Bearer ${access}`);
-          return upstream(requestInput, { ...init, headers });
-        }
-
-        const spec = MODEL_SPECS[target.logicalModelId];
-        if (!spec) {
-          throw new Error(`Unknown google-antigravity model "${target.logicalModelId}"`);
-        }
-        if (typeof init?.body !== "string" || !init.body.startsWith("{")) {
-          throw new Error("Unsupported Antigravity request: expected a JSON string body");
-        }
-        const args = JSON.parse(init.body) as Record<string, any>;
-
-        const stateKey = opencodeSessionId ?? "";
-        let state = opencodeSessionId ? sessionStates.get(stateKey) : undefined;
-        if (!state) {
-          state = createSessionState();
-          if (opencodeSessionId) sessionStates.set(stateKey, state);
-        }
-
-        const rewritten = rewriteBodyForAntigravity({
-          args,
-          logicalModelId: target.logicalModelId,
-          projectId,
-          state,
-          invocationId,
-        });
-
-        // Build the native inference fingerprint from scratch. OpenCode,
-        // the AI SDK, and user-supplied tracing headers must not leak.
-        for (const name of [...headers.keys()]) headers.delete(name);
-        headers.set("Authorization", `Bearer ${access}`);
-        headers.set("Content-Type", "application/json");
-        headers.set("User-Agent", getAntigravityUserAgent());
-        if (target.kind === "stream") headers.set("Accept", "text/event-stream");
-        if (target.kind === "stream" && isClaudeModel(rewritten.wireModelId) && spec.reasoning) {
-          headers.set("anthropic-beta", CLAUDE_THINKING_BETA_HEADER);
-        }
-
-        const verb = target.kind === "stream" ? "streamGenerateContent" : "generateContent";
-        const suffix = target.kind === "stream" ? "?alt=sse" : "";
-        const probeBudget = options.firstEventTimeoutMs ?? firstEventTimeoutMs(target.logicalModelId);
-
-        const commitCompletion = (endpoint: string, responseId: string | undefined) => {
-          state!.lastExecutionId = responseId;
-          if (endpointMode === "auto") state!.lastGoodEndpoint = endpoint;
-        };
-
-        const streamResponse = (endpoint: string, body: ReadableStream<Uint8Array>, response: Response) => {
-          // Session state commits only when the stream completes
-          // successfully; failed/cancelled streams poison nothing.
-          let lastResponseId: string | undefined;
-          return new Response(
-            body.pipeThrough(
-              createCcaSseUnwrap({
-                onResponseId: (responseId) => {
-                  lastResponseId = responseId;
-                },
-                onComplete: () => commitCompletion(endpoint, lastResponseId),
-              }),
-            ),
-            { status: response.status, statusText: response.statusText, headers: unwrappedResponseHeaders(response) },
-          );
-        };
-
-        // Endpoint chain: auto mode fails over between the official
-        // endpoints before anything streams, remembering the winner.
-        const chain = resolveEndpointChain(endpointMode, state.lastGoodEndpoint);
-        let lastError: unknown;
-        for (let index = 0; index < chain.length; index++) {
-          const endpoint = chain[index]!;
-          const isLast = index === chain.length - 1;
-          const canProbe = target.kind === "stream" && endpointMode === "auto" && !isLast;
-
-          let response: Response;
-          try {
-            response = await upstream(`${endpoint}/v1internal:${verb}${suffix}`, {
-              ...init,
-              method: "POST",
-              headers,
-              body: rewritten.body,
-            });
-          } catch (error) {
-            lastError = error;
-            if (!isLast && !(init?.signal?.aborted as boolean | undefined)) continue;
-            throw error;
-          }
-
-          if (!response.ok && !isLast && TRANSIENT_STATUSES.has(response.status)) {
-            lastError = new Error(`Cloud Code Assist API error (${response.status}) from ${endpoint}`);
-            continue;
-          }
-          if (!response.ok) {
-            const payload = await response.clone().json().catch(() => undefined);
-            const verification = accountVerificationMessage(payload, "retry your request");
-            if (!verification) return response;
-            return new Response(JSON.stringify({ error: { ...payload.error, message: verification } }), {
-              status: response.status,
-              statusText: response.statusText,
-              headers: unwrappedResponseHeaders(response),
-            });
-          }
-
-          if (target.kind === "nonstream") {
-            const text = await response.text();
-            let payload: Record<string, any>;
-            try {
-              payload = JSON.parse(text);
-            } catch {
-              // Unparseable body: forward it without committing state.
-              return new Response(text, {
-                status: response.status,
-                statusText: response.statusText,
-                headers: unwrappedResponseHeaders(response),
-              });
-            }
-            const inBand = readInBandError(payload);
-            if (inBand) {
-              if (isInBandErrorTransient(inBand)) {
-                lastError = new Error(describeInBandError(inBand));
-                continue;
-              }
-              const status =
-                typeof inBand.code === "number" && inBand.code >= 400 && inBand.code <= 599
-                  ? inBand.code
-                  : 500;
-              return new Response(JSON.stringify({ error: inBand }), {
-                status,
-                headers: { "content-type": "application/json" },
-              });
-            }
-            const unwrapped = unwrapCcaJson(payload);
-            commitCompletion(endpoint, typeof unwrapped.responseId === "string" ? unwrapped.responseId : undefined);
-            return new Response(JSON.stringify(unwrapped), {
-              status: response.status,
-              statusText: response.statusText,
-              headers: unwrappedResponseHeaders(response),
-            });
-          }
-
-          if (!response.body) return response;
-
-          if (canProbe) {
-            // Pre-first-event watchdog: buffer until the first complete
-            // SSE event; abandon this endpoint while nothing user-visible
-            // has streamed and the failure is failover-safe.
-            let probe;
-            try {
-              probe = await readFirstSseEvent(response.body, probeBudget, init?.signal ?? undefined);
-            } catch (error) {
-              if (init?.signal?.aborted) throw error;
-              lastError = error;
-              continue;
-            }
-            const inBand = probe.event ? readInBandError(probe.event) : undefined;
-            if (inBand) {
-              if (isInBandErrorTransient(inBand)) {
-                await probe.stream.cancel();
-                lastError = new Error(describeInBandError(inBand));
-                continue;
-              }
-              // Non-transient in-band error: surface it; never switch.
-              await probe.stream.cancel();
-              return new Response(errorStream(new Error(describeInBandError(inBand))), {
-                status: response.status,
-                statusText: response.statusText,
-                headers: unwrappedResponseHeaders(response),
-              });
-            }
-            // Ordinary first event (or clean EOF): expose it and never
-            // switch endpoints again.
-            return streamResponse(endpoint, probe.stream, response);
-          }
-
-          return streamResponse(endpoint, response.body, response);
-        }
-        throw lastError instanceof Error ? lastError : new Error("All Antigravity endpoints failed");
-        };
+        // Fresh UUID per logical OpenCode LLM invocation. Retries reuse the
+        // prepared headers — and therefore this id — so they do not advance
+        // the request-chain step.
+        evt.headers[INVOCATION_HEADER] = crypto.randomUUID();
       },
       { providerID: PROVIDER_ID },
     );
 
+    // The native Gemini client sends `{baseURL}/models/<id>:streamGenerateContent`
+    // with the OAuth access token as `x-goog-api-key`. Rewrite it into the
+    // Cloud Code Assist envelope with the native `antigravity/hub` fingerprint.
     await ctx.session.hook(
-      "model.request",
-      (evt) => {
-        evt.headers[SESSION_MARKER_HEADER] = evt.sessionID;
-        // Fresh UUID per logical OpenCode LLM invocation. SDK retries reuse
-        // the prepared headers — and therefore this id — so they do not
-        // advance the request-chain step.
-        evt.headers[INVOCATION_HEADER] = crypto.randomUUID();
+      "http.request",
+      async (evt) => {
+        const request = evt.request;
+        const match = /\/models\/([^/:]+):(streamGenerateContent|generateContent)$/.exec(new URL(request.url).pathname);
+        if (!match) return;
+        const verb = match[2]!;
+        const stream = verb === "streamGenerateContent";
+
+        let state = sessionStates.get(evt.sessionID);
+        if (!state) {
+          state = createSessionState();
+          sessionStates.set(evt.sessionID, state);
+        }
+        const rewritten = rewriteBodyForAntigravity({
+          args: await request.json(),
+          logicalModelId: match[1]!,
+          projectId: loaded.projectId!,
+          state,
+          invocationId: request.headers.get(INVOCATION_HEADER) ?? undefined,
+        });
+
+        // Build the native inference fingerprint from scratch. OpenCode,
+        // Gemini-client, and user-supplied tracing headers must not leak.
+        const headers = new Headers({
+          Authorization: `Bearer ${request.headers.get("x-goog-api-key")}`,
+          "Content-Type": "application/json",
+          "User-Agent": getAntigravityUserAgent(),
+        });
+        if (stream) headers.set("Accept", "text/event-stream");
+        if (stream && isClaudeModel(rewritten.wireModelId)) headers.set("anthropic-beta", CLAUDE_THINKING_BETA_HEADER);
+
+        const endpoint = (endpointMode === "auto" && state.endpoint) || endpoints[0];
+        evt.request = new Request(`${endpoint}/v1internal:${verb}${stream ? "?alt=sse" : ""}`, {
+          method: "POST",
+          headers,
+          body: rewritten.body,
+        });
+      },
+      { providerID: PROVIDER_ID },
+    );
+
+    // Unwrap Cloud Code Assist responses back into plain Gemini for the
+    // native parser. In auto mode a failure moves the session to the other
+    // endpoint, so core's retry of the request lands there.
+    await ctx.session.hook(
+      "http.response",
+      async (evt) => {
+        const url = new URL(evt.request.url);
+        const verb = /^\/v1internal:(streamGenerateContent|generateContent)$/.exec(url.pathname)?.[1];
+        if (!verb) return;
+        const state = sessionStates.get(evt.sessionID)!;
+        const response = evt.response;
+        const failover = () => {
+          if (endpointMode === "auto") state.endpoint = endpoints.find((endpoint) => endpoint !== url.origin);
+        };
+
+        if (!response.ok) {
+          failover();
+          const payload = await response.clone().json().catch(() => undefined);
+          const verification = accountVerificationMessage(payload, "retry your request");
+          if (!verification) return;
+          evt.response = new Response(JSON.stringify({ error: { ...payload.error, message: verification } }), {
+            status: response.status,
+            statusText: response.statusText,
+            headers: unwrappedResponseHeaders(response),
+          });
+          return;
+        }
+        if (endpointMode === "auto") state.endpoint = url.origin;
+
+        if (verb === "generateContent") {
+          const payload = unwrapCcaJson(await response.json());
+          if (typeof payload.responseId === "string") state.lastExecutionId = payload.responseId;
+          evt.response = new Response(JSON.stringify(payload), {
+            status: response.status,
+            statusText: response.statusText,
+            headers: unwrappedResponseHeaders(response),
+          });
+          return;
+        }
+
+        // The response id commits only when the stream completes; failed or
+        // cancelled streams poison nothing.
+        evt.response = new Response(
+          response.body!.pipeThrough(
+            createCcaSseUnwrap({
+              onError: failover,
+              onComplete: (responseId) => (state.lastExecutionId = responseId),
+            }),
+          ),
+          { status: response.status, statusText: response.statusText, headers: unwrappedResponseHeaders(response) },
+        );
       },
       { providerID: PROVIDER_ID },
     );
@@ -557,8 +405,7 @@ export default Plugin.define({
           const connection = await ctx.integration.connection.active(INTEGRATION_ID);
           const credential = connection && (await ctx.integration.connection.resolve(connection));
           if (credential?.type !== "oauth") throw new Error("Connect Google Antigravity before using web search");
-          const endpoint = resolveEndpointChain(endpointMode)[0]!;
-          const response = await fetch(`${endpoint}/v1internal:generateContent`, {
+          const response = await fetch(`${endpoints[0]}/v1internal:generateContent`, {
             method: "POST",
             headers: {
               Authorization: `Bearer ${credential.access}`,

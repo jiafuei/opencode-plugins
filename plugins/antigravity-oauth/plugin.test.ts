@@ -21,7 +21,7 @@ interface RecordedCall {
   init: RequestInit;
 }
 
-/** Fake plugin context capturing registrations; `loader()` runs the SDK hook like core does. */
+/** Fake plugin context capturing registrations; `send()` runs the session HTTP hooks like core does. */
 function makeHarness(credential: StoredCredential | undefined, options: Record<string, unknown> = {}) {
   let current = credential;
   const hooks: Record<string, (evt: any) => unknown> = {};
@@ -47,7 +47,6 @@ function makeHarness(credential: StoredCredential | undefined, options: Record<s
       transform: async (callback: any) => void (transforms.websearch = callback),
       reload: async () => {},
     },
-    aisdk: { hook: async (name: string, callback: any) => void (hooks[`aisdk.${name}`] = callback) },
     session: { hook: async (name: string, callback: any) => void (hooks[`session.${name}`] = callback) },
     event: {
       subscribe: async function* () {
@@ -89,19 +88,19 @@ function makeHarness(credential: StoredCredential | undefined, options: Record<s
       await ready();
       transforms[name]!(editor);
     },
-    async loader() {
+    /** Dispatch a native Gemini request through the http.request/http.response hooks. */
+    async send(sessionID: string, request: Request): Promise<Response> {
       await ready();
-      const evt = {
-        model: { providerID: "google-antigravity" },
-        package: "@ai-sdk/google",
-        options: {
-          apiKey: current?.access,
-          projectId: current?.metadata?.projectId,
-          fetch: (input: any, init: any) => globalThis.fetch(input, init),
-        },
+      const before = { sessionID, request };
+      await hooks["session.http.request"]!(before);
+      const sent = before.request;
+      const after = {
+        sessionID,
+        request: sent,
+        response: await fetch(sent.url, { method: sent.method, headers: sent.headers, body: await sent.clone().text() }),
       };
-      hooks["aisdk.sdk"]!(evt);
-      return { fetch: evt.options.fetch as (input: string, init?: RequestInit) => Promise<Response> };
+      await hooks["session.http.response"]!(after);
+      return after.response;
     },
   };
 }
@@ -124,15 +123,13 @@ function sseResponse(events: unknown[]): Response {
   return new Response(body, { headers: { "content-type": "text/event-stream" } });
 }
 
-function streamTarget(modelId: string, bodyArgs: Record<string, any>, headers: Record<string, string> = {}) {
-  return {
-    url: `${DAILY}/models/${modelId}:streamGenerateContent?alt=sse`,
-    init: {
-      method: "POST",
-      headers: { "content-type": "application/json", ...headers },
-      body: JSON.stringify(bodyArgs),
-    } as RequestInit,
-  };
+/** A request as OpenCode's native Gemini client issues it. */
+function nativeRequest(modelId: string, body: Record<string, any>, headers: Record<string, string> = {}) {
+  return new Request(`${DAILY}/models/${modelId}:streamGenerateContent?alt=sse`, {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-goog-api-key": "at-live", ...headers },
+    body: JSON.stringify(body),
+  });
 }
 
 const OAUTH_AUTH: StoredCredential = {
@@ -149,7 +146,7 @@ async function readStream(response: Response): Promise<string> {
 }
 
 describe("provider registration", () => {
-  test("registers the static catalog backed by @ai-sdk/google", async () => {
+  test("registers the static catalog backed by the native Gemini client", async () => {
     const harness = makeHarness(undefined);
     let added: any;
     await harness.edit("provider", { add: (definition: unknown) => (added = definition) });
@@ -158,7 +155,7 @@ describe("provider registration", () => {
       integrationID: "google-antigravity",
       name: "Google Antigravity",
       activation: "auto",
-      package: "aisdk:@ai-sdk/google",
+      package: "@opencode/ai/providers/google",
       settings: { baseURL: DAILY },
     });
     expect(added.sourceConnection).toBeUndefined();
@@ -378,55 +375,33 @@ describe("web search provider", () => {
   });
 });
 
-describe("SDK fetch boundary", () => {
-  test("rejects non-official origins without dispatching anything", async () => {
+describe("session HTTP hooks", () => {
+  test("rewrites native Gemini requests into the Cloud Code Assist envelope and unwraps SSE", async () => {
     const harness = makeHarness(OAUTH_AUTH);
-    const loader = await harness.loader();
-    const mock = mockFetch(() => {
-      throw new Error("must not be called");
-    });
-    try {
-      await expect(
-        loader.fetch("https://evil.example.com/models/gemini-3.1-pro:streamGenerateContent?alt=sse", {
-          method: "POST",
-          body: "{}",
-        }),
-      ).rejects.toThrow(/Refusing to send/);
-      expect(mock.calls).toHaveLength(0);
-    } finally {
-      mock.restore();
-    }
-  });
-
-  test("rewrites requests into the Cloud Code Assist envelope with native headers", async () => {
-    const harness = makeHarness(OAUTH_AUTH);
-    const loader = await harness.loader();
-
     const args = {
       contents: [{ role: "user", parts: [{ text: "hello" }] }],
       systemInstruction: { parts: [{ text: "sys" }] },
       generationConfig: { thinkingConfig: { includeThoughts: true, thinkingLevel: "high" } },
     };
     const chunk = { response: { candidates: [], usageMetadata: {}, responseId: "resp-9" } };
-
-    const mock = mockFetch((url) => {
-      expect(url).toBe(`${DAILY}/v1internal:streamGenerateContent?alt=sse`);
-      return sseResponse([chunk]);
-    });
+    const mock = mockFetch(() => sseResponse([chunk]));
     try {
-      const target = streamTarget("gemini-3.1-pro", args, {
-        "x-antigravity-opencode-session": "ses-1",
-        "x-antigravity-opencode-invocation": "inv-a",
-      });
-      const response = await loader.fetch(target.url, target.init);
+      const response = await harness.send(
+        "ses-1",
+        nativeRequest("gemini-3.1-pro", args, {
+          "x-antigravity-opencode-invocation": "inv-a",
+          "x-opencode-session": "ses-1",
+          "x-custom-trace": "trace-1",
+        }),
+      );
       const call = mock.calls[0]!;
+      expect(call.url).toBe(`${DAILY}/v1internal:streamGenerateContent?alt=sse`);
+      // Only the native inference header set reaches the wire.
       const headers = new Headers(call.init.headers);
+      expect([...headers.keys()].sort()).toEqual(["accept", "authorization", "content-type", "user-agent"]);
       expect(headers.get("authorization")).toBe("Bearer at-live");
       expect(headers.get("user-agent")).toMatch(/^antigravity\/hub\/2\.8\.0 \(aidev_client;/);
       expect(headers.get("accept")).toBe("text/event-stream");
-      // Private routing markers never reach the wire.
-      expect(headers.get("x-antigravity-opencode-session")).toBeNull();
-      expect(headers.get("x-antigravity-opencode-invocation")).toBeNull();
 
       const wireBody = JSON.parse(String(call.init.body));
       expect(wireBody.project).toBe("proj-42");
@@ -438,7 +413,7 @@ describe("SDK fetch boundary", () => {
       // Budget transport: the OpenCode level input is normalized natively.
       expect(wireBody.request.generationConfig.thinkingConfig).toEqual({ includeThoughts: true, thinkingBudget: 10001 });
 
-      // SSE unwrapped incrementally: raw Gemini chunks reach the SDK parser.
+      // Raw Gemini chunks reach the native parser.
       const output = await readStream(response);
       const dataLine = output.trim().split("\n").at(-1)!.replace(/^data:\s*/, "");
       expect(JSON.parse(dataLine)).toEqual(chunk.response);
@@ -447,78 +422,31 @@ describe("SDK fetch boundary", () => {
     }
   });
 
-  test("strips SDK, OpenCode session-routing, and plugin-private headers before dispatch", async () => {
+  test("session chain advances across invocations and survives retries", async () => {
     const harness = makeHarness(OAUTH_AUTH);
-    const loader = await harness.loader();
-    const mock = mockFetch(() => sseResponse([{ response: { candidates: [] } }]));
-    try {
-      const target = streamTarget("gemini-2.5-pro", { contents: [] }, {
-        "x-goog-api-key": "leaked-key",
-        "x-goog-api-client": "ai-sdk/google/3.0.73",
-        "client-metadata": "ideType=IDE_UNSPECIFIED",
-        "x-session-affinity": "ses-1",
-        "X-Session-Id": "ses-1",
-        "x-parent-session-id": "parent-1",
-        "x-opencode-session": "ses-1",
-        "x-antigravity-opencode-session": "ses-1",
-        "x-antigravity-opencode-invocation": "inv-1",
-        "x-custom-trace": "trace-1",
-      });
-      const response = await loader.fetch(target.url, target.init);
-      await readStream(response);
-      const headers = new Headers(mock.calls[0]!.init.headers);
-      for (const leaked of [
-        "x-goog-api-key",
-        "x-goog-api-client",
-        "client-metadata",
-        "x-session-affinity",
-        "x-session-id",
-        "x-parent-session-id",
-        "x-opencode-session",
-        "x-antigravity-opencode-session",
-        "x-antigravity-opencode-invocation",
-        "x-custom-trace",
-      ]) {
-        expect(headers.get(leaked)).toBeNull();
-      }
-      // The OMP inference header set is intact.
-      expect(headers.get("authorization")).toBe("Bearer at-live");
-      expect(headers.get("content-type")).toBe("application/json");
-      expect(headers.get("accept")).toBe("text/event-stream");
-      expect(headers.get("user-agent")).toMatch(/^antigravity\/hub\//);
-    } finally {
-      mock.restore();
-    }
-  });
-
-  test("session chain advances across invocations and survives SDK retries", async () => {
-    const harness = makeHarness(OAUTH_AUTH);
-    const loader = await harness.loader();
     const mock = mockFetch(() =>
       sseResponse([{ response: { candidates: [{ finishReason: "STOP" }], responseId: "r-1" } }]),
     );
     try {
-      const request = (invocation: string) => {
-        const target = streamTarget("claude-sonnet-4-6", { contents: [] }, {
-          "x-antigravity-opencode-session": "ses-x",
-          "x-antigravity-opencode-invocation": invocation,
-        });
-        return loader.fetch(target.url, target.init);
-      };
+      const send = (invocation: string) =>
+        harness.send(
+          "ses-x",
+          nativeRequest("claude-sonnet-4-6", { contents: [] }, { "x-antigravity-opencode-invocation": invocation }),
+        );
 
       // Consume each stream fully so response-id commits land before the next
       // invocation's assertions.
-      await readStream(await request("inv-1"));
+      await readStream(await send("inv-1"));
       const firstEnvelope = JSON.parse(String(mock.calls[0]!.init.body));
       // A retry of the same logical invocation reuses the exact envelope.
-      await readStream(await request("inv-1"));
+      await readStream(await send("inv-1"));
       const retryEnvelope = JSON.parse(String(mock.calls[1]!.init.body));
       expect(retryEnvelope.requestId).toBe(firstEnvelope.requestId);
       expect(retryEnvelope.request.sessionId).toBe(firstEnvelope.request.sessionId);
 
       // The next logical invocation advances the step and carries the prior
       // response id.
-      await readStream(await request("inv-2"));
+      await readStream(await send("inv-2"));
       const secondEnvelope = JSON.parse(String(mock.calls[2]!.init.body));
       const stepOf = (requestId: string) => Number(requestId.split("/").at(-1));
       expect(stepOf(secondEnvelope.requestId)).toBe(stepOf(firstEnvelope.requestId) + 1);
@@ -528,150 +456,18 @@ describe("SDK fetch boundary", () => {
     }
   });
 
-  test("auto mode fails over to sandbox before streaming and remembers the winner", async () => {
+  test("auto mode moves a session to the other endpoint after a failure and stays there", async () => {
     const harness = makeHarness(OAUTH_AUTH);
-    const loader = await harness.loader();
     const mock = mockFetch((url) => {
       if (url.startsWith(DAILY)) return new Response("overloaded", { status: 503 });
       return sseResponse([{ response: { candidates: [{ finishReason: "STOP" }] } }]);
     });
     try {
-      const send = (invocation: string) => {
-        const target = streamTarget("gemini-2.5-pro", { contents: [] }, {
-          "x-antigravity-opencode-session": "ses-fail",
-          "x-antigravity-opencode-invocation": invocation,
-        });
-        return loader.fetch(target.url, target.init);
-      };
-      await readStream(await send("i-1"));
-      expect(mock.calls[0]!.url.startsWith(DAILY)).toBe(true);
-      expect(mock.calls[1]!.url.startsWith(SANDBOX)).toBe(true);
-
-      // The last-good endpoint is consulted first on the following request.
-      await readStream(await send("i-2"));
-      expect(mock.calls[2]!.url.startsWith(SANDBOX)).toBe(true);
-    } finally {
-      mock.restore();
-    }
-  });
-
-  test("transient in-band errors before the first event fail over without losing bytes", async () => {
-    const harness = makeHarness(OAUTH_AUTH);
-    const loader = await harness.loader();
-    const dailyEvent = { error: { code: 500, message: "internal", status: "INTERNAL" } };
-    const sandboxEvents = [
-      { response: { candidates: [], usageMetadata: {}, responseId: "r-9" } },
-      { response: { candidates: [{ finishReason: "STOP" }], responseId: "r-9" } },
-    ];
-    const mock = mockFetch((url) => {
-      if (url.startsWith(DAILY)) return sseResponse([dailyEvent]);
-      return sseResponse(sandboxEvents);
-    });
-    try {
-      const send = (invocation: string) => {
-        const target = streamTarget("gemini-2.5-pro", { contents: [] }, {
-          "x-antigravity-opencode-session": "ses-probe",
-          "x-antigravity-opencode-invocation": invocation,
-        });
-        return loader.fetch(target.url, target.init);
-      };
-      const output = await readStream(await send("p-1"));
-
-      expect(mock.calls[0]!.url.startsWith(DAILY)).toBe(true);
-      expect(mock.calls[1]!.url.startsWith(SANDBOX)).toBe(true);
-      // The sandbox events arrive intact (and unwrapped) after failover.
-      const dataLines = output.trim().split("\n").filter((line) => line.startsWith("data:"));
-      expect(dataLines).toHaveLength(2);
-      expect(JSON.parse(dataLines[0]!.slice(6))).toEqual(sandboxEvents[0]!.response);
-      expect(JSON.parse(dataLines[1]!.slice(6))).toEqual(sandboxEvents[1]!.response);
-
-      // Successful completion commits the winner as the session's endpoint.
-      await readStream(await send("p-2"));
-      expect(mock.calls[2]!.url.startsWith(SANDBOX)).toBe(true);
-    } finally {
-      mock.restore();
-    }
-  });
-
-  test("truncated streams do not commit response identity or endpoint affinity", async () => {
-    const harness = makeHarness(OAUTH_AUTH);
-    const loader = await harness.loader();
-    let firstRequest = true;
-    const mock = mockFetch((url) => {
-      if (firstRequest && url.startsWith(DAILY)) return new Response("overloaded", { status: 503 });
-      if (firstRequest) {
-        firstRequest = false;
-        return sseResponse([{ response: { candidates: [], responseId: "truncated-id" } }]);
-      }
-      return sseResponse([{ response: { candidates: [{ finishReason: "STOP" }], responseId: "complete-id" } }]);
-    });
-    const send = (invocation: string) => {
-      const target = streamTarget("gemini-3.8-flash", { contents: [] }, {
-        "x-antigravity-opencode-session": "ses-truncated",
-        "x-antigravity-opencode-invocation": invocation,
-      });
-      return loader.fetch(target.url, target.init);
-    };
-    try {
-      await readStream(await send("i-1"));
-      expect(mock.calls[0]!.url.startsWith(DAILY)).toBe(true);
-      expect(mock.calls[1]!.url.startsWith(SANDBOX)).toBe(true);
-
-      await readStream(await send("i-2"));
-      expect(mock.calls[2]!.url.startsWith(DAILY)).toBe(true);
-      const nextEnvelope = JSON.parse(String(mock.calls[2]!.init.body));
-      expect(nextEnvelope.request.labels.last_execution_id).toBeUndefined();
-    } finally {
-      mock.restore();
-    }
-  });
-
-  test("non-transient in-band errors surface instead of failing over", async () => {
-    const harness = makeHarness(OAUTH_AUTH);
-    const loader = await harness.loader();
-    const mock = mockFetch(() =>
-      sseResponse([{ error: { code: 403, message: "permission denied", status: "PERMISSION_DENIED" } }]),
-    );
-    try {
-      const target = streamTarget("gemini-2.5-pro", { contents: [] }, {});
-      const response = await loader.fetch(target.url, target.init);
-      await expect(readStream(response)).rejects.toThrow(/Cloud Code Assist error \(PERMISSION_DENIED\): permission denied/);
-      expect(mock.calls).toHaveLength(1); // no sandbox attempt
-    } finally {
-      mock.restore();
-    }
-  });
-
-  test("failed streams never poison session state or the last-good endpoint", async () => {
-    const harness = makeHarness(OAUTH_AUTH);
-    const loader = await harness.loader();
-    let failing = true;
-    const mock = mockFetch((url) => {
-      if (!failing) return sseResponse([{ response: { candidates: [], responseId: "ok-1" } }]);
-      return sseResponse([{ error: { code: 500, message: "boom", status: "INTERNAL" } }]);
-    });
-    try {
-      const send = (invocation: string) => {
-        const target = streamTarget("gemini-2.5-pro", { contents: [] }, {
-          "x-antigravity-opencode-session": "ses-poison",
-          "x-antigravity-opencode-invocation": invocation,
-        });
-        return loader.fetch(target.url, target.init);
-      };
-      // Both endpoints fail in-band before the first event: the first send
-      // probes daily (transient → fail over) and surfaces the sandbox
-      // failure; nothing commits.
-      await expect(readStream(await send("f-1"))).rejects.toThrow(/boom/);
-      expect(mock.calls.map((call) => call.url.startsWith(DAILY))).toEqual([true, false]);
-
-      // Recovery: nothing was committed, so the chain starts at daily again,
-      // and a fresh envelope step is used for the retry of the same logical
-      // invocation id (the failed attempt never advanced it).
-      failing = false;
-      await readStream(await send("f-1"));
-      expect(mock.calls[2]!.url.startsWith(DAILY)).toBe(true);
-      const body = JSON.parse(String(mock.calls[2]!.init.body));
-      expect(body.requestId).toMatch(/\/2$/);
+      const send = () => harness.send("ses-fail", nativeRequest("gemini-2.5-pro", { contents: [] }));
+      expect((await send()).status).toBe(503);
+      await readStream(await send()); // core's retry
+      await readStream(await send());
+      expect(mock.calls.map((call) => new URL(call.url).origin)).toEqual([DAILY, SANDBOX, SANDBOX]);
     } finally {
       mock.restore();
     }
@@ -679,91 +475,11 @@ describe("SDK fetch boundary", () => {
 
   test("pinned production mode never touches the sandbox endpoint", async () => {
     const harness = makeHarness(OAUTH_AUTH, { endpointMode: "production" });
-    const loader = await harness.loader();
     const mock = mockFetch(() => new Response("boom", { status: 503 }));
     try {
-      await loader.fetch(`${DAILY}/models/gemini-2.5-pro:streamGenerateContent?alt=sse`, {
-        method: "POST",
-        body: "{}",
-      }).catch(() => {});
-      expect(mock.calls).toHaveLength(1);
-      expect(mock.calls[0]!.url.startsWith(DAILY)).toBe(true);
-    } finally {
-      mock.restore();
-    }
-  });
-
-  test("non-stream responses unwrap and commit response identity after successful parse", async () => {
-    const harness = makeHarness(OAUTH_AUTH);
-    const loader = await harness.loader();
-    const mock = mockFetch(() =>
-      new Response(JSON.stringify({ response: { candidates: [], responseId: "ns-77", usageMetadata: {} } }), {
-        status: 200,
-        headers: { "content-type": "application/json", "content-length": "999" },
-      }),
-    );
-    try {
-      const response = await loader.fetch(`${DAILY}/models/gemini-2.5-pro:generateContent`, {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          "x-goog-api-key": "leak",
-          "x-session-affinity": "ses-ns",
-          "x-antigravity-opencode-session": "ses-ns",
-        },
-        body: JSON.stringify({ contents: [] }),
-      });
-      const payload = JSON.parse(await response.text());
-      expect(payload).toEqual({ candidates: [], responseId: "ns-77", usageMetadata: {} });
-      expect(response.headers.get("content-length")).toBeNull();
-      const headers = new Headers(mock.calls[0]!.init.headers);
-      // No Accept: text/event-stream on non-stream calls.
-      expect(headers.get("accept")).toBeNull();
-
-      // Commit-after-parse: the next stream request carries the id.
-      const target = streamTarget("gemini-2.5-pro", { contents: [] }, {
-        "x-antigravity-opencode-session": "ses-ns",
-        "x-antigravity-opencode-invocation": "i-1",
-      });
-      await readStream(await loader.fetch(target.url, target.init));
-      const wireBody = JSON.parse(String(mock.calls[1]!.init.body));
-      expect(wireBody.request.labels.last_execution_id).toBe("ns-77");
-    } finally {
-      mock.restore();
-    }
-  });
-
-  test("non-stream in-band errors do not commit endpoint or response state", async () => {
-    const harness = makeHarness(OAUTH_AUTH);
-    const loader = await harness.loader();
-    let failing = true;
-    const mock = mockFetch((url) => {
-      if (failing) {
-        return new Response(JSON.stringify({ error: { code: 403, status: "PERMISSION_DENIED", message: "denied" } }), {
-          headers: { "content-type": "application/json" },
-        });
-      }
-      return new Response(JSON.stringify({ response: { candidates: [] } }), {
-        headers: { "content-type": "application/json" },
-      });
-    });
-    const send = () =>
-      loader.fetch(`${DAILY}/models/gemini-2.5-pro:generateContent`, {
-        method: "POST",
-        headers: { "x-antigravity-opencode-session": "ses-ns-error" },
-        body: JSON.stringify({ contents: [] }),
-      });
-    try {
-      const failure = await send();
-      expect(failure.status).toBe(403);
-      expect(await failure.json()).toEqual({
-        error: { code: 403, status: "PERMISSION_DENIED", message: "denied" },
-      });
-      expect(mock.calls).toHaveLength(1);
-
-      failing = false;
-      await expect(send()).resolves.toBeInstanceOf(Response);
-      expect(mock.calls[1]!.url.startsWith(DAILY)).toBe(true);
+      await harness.send("ses-pin", nativeRequest("gemini-2.5-pro", { contents: [] }));
+      await harness.send("ses-pin", nativeRequest("gemini-2.5-pro", { contents: [] }));
+      expect(mock.calls.map((call) => new URL(call.url).origin)).toEqual([DAILY, DAILY]);
     } finally {
       mock.restore();
     }
@@ -771,16 +487,13 @@ describe("SDK fetch boundary", () => {
 
   test("session deletion clears the identity chain", async () => {
     const harness = makeHarness(OAUTH_AUTH);
-    const loader = await harness.loader();
     const mock = mockFetch(() => sseResponse([{ response: { candidates: [] } }]));
     try {
-      const send = (invocation: string) => {
-        const target = streamTarget("gemini-2.5-pro", { contents: [] }, {
-          "x-antigravity-opencode-session": "ses-del",
-          "x-antigravity-opencode-invocation": invocation,
-        });
-        return loader.fetch(target.url, target.init);
-      };
+      const send = (invocation: string) =>
+        harness.send(
+          "ses-del",
+          nativeRequest("gemini-2.5-pro", { contents: [] }, { "x-antigravity-opencode-invocation": invocation }),
+        );
       await readStream(await send("a"));
       await readStream(await send("b"));
       const stepOf = (init: RequestInit) => Number(JSON.parse(String(init.body)).requestId.split("/").at(-1));
@@ -794,7 +507,7 @@ describe("SDK fetch boundary", () => {
     }
   });
 
-  test("credential switches reset the per-session identity chain", async () => {
+  test("credential switches reload the project and reset the per-session identity chain", async () => {
     const harness = makeHarness(OAUTH_AUTH);
     const mock = mockFetch((url) =>
       url.includes("fetchAvailableModels")
@@ -802,18 +515,19 @@ describe("SDK fetch boundary", () => {
         : sseResponse([{ response: { candidates: [], responseId: "r-old" } }]),
     );
     try {
-      const send = async (invocation: string) => {
-        const target = streamTarget("gemini-2.5-pro", { contents: [] }, {
-          "x-antigravity-opencode-session": "ses-proj",
+      const send = async (invocation: string, access: string) => {
+        const request = nativeRequest("gemini-2.5-pro", { contents: [] }, {
+          "x-goog-api-key": access,
           "x-antigravity-opencode-invocation": invocation,
         });
-        await readStream(await (await harness.loader()).fetch(target.url, target.init));
+        await readStream(await harness.send("ses-proj", request));
       };
-      await send("t-1");
-      await send("t-2");
+      await send("t-1", "at-live");
+      await send("t-2", "at-live");
       harness.setCredential({ ...OAUTH_AUTH, access: "at-other", metadata: { projectId: "proj-other" } });
       await harness.emit({ type: "credential.switched", data: { integrationID: "google-antigravity" } });
-      await send("t-3");
+      await Bun.sleep(10);
+      await send("t-3", "at-other");
 
       const dispatched = mock.calls.filter((call) => call.url.includes("streamGenerateContent"));
       const envelope = JSON.parse(String(dispatched[2]!.init.body));
@@ -828,14 +542,14 @@ describe("SDK fetch boundary", () => {
 });
 
 describe("model.request hook", () => {
-  test("marks each invocation with the session and a fresh invocation id", async () => {
+  test("marks each invocation with a fresh invocation id", async () => {
     const harness = makeHarness(undefined);
     await harness.ready();
     const first = { sessionID: "s-1", headers: {} as Record<string, string> };
     const second = { sessionID: "s-1", headers: {} as Record<string, string> };
     harness.hooks["session.model.request"]!(first);
     harness.hooks["session.model.request"]!(second);
-    expect(first.headers["x-antigravity-opencode-session"]).toBe("s-1");
+    expect(first.headers["x-antigravity-opencode-invocation"]).toBeDefined();
     expect(second.headers["x-antigravity-opencode-invocation"]).not.toBe(
       first.headers["x-antigravity-opencode-invocation"],
     );

@@ -10,7 +10,6 @@ import {
   getAntigravityVersion,
   normalizeSchemaForCCA,
   providerModels,
-  readFirstSseEvent,
   readRequestedEffort,
   resolveWireModelId,
   rewriteBodyForAntigravity,
@@ -951,12 +950,8 @@ describe("response unwrapping", () => {
   }
 
   test("unwraps response-wrapped SSE chunks incrementally, preserving framing", async () => {
-    const responseIds: string[] = [];
     let completed: string | undefined;
-    const transformer = createCcaSseUnwrap({
-      onResponseId: (id) => responseIds.push(id),
-      onComplete: (id) => (completed = id),
-    });
+    const transformer = createCcaSseUnwrap({ onComplete: (id) => (completed = id) });
     const chunkA = JSON.stringify({ response: { candidates: [], usageMetadata: {}, responseId: "r-1" } });
     const chunkB = JSON.stringify({ response: { candidates: [{ finishReason: "STOP" }], responseId: "r-1" } });
     // Split mid-line across writes to prove incremental processing.
@@ -970,54 +965,7 @@ describe("response unwrapping", () => {
     expect(dataLines).toHaveLength(2);
     expect(JSON.parse(dataLines[0]!.slice(6))).toEqual(JSON.parse(chunkA).response);
     expect(JSON.parse(dataLines[1]!.slice(6))).toEqual(JSON.parse(chunkB).response);
-    // Both chunks carried the same id; it is reported per chunk.
-    expect(responseIds).toEqual(["r-1", "r-1"]);
     expect(completed).toBe("r-1");
-  });
-
-  test("pre-first-event probe buffers without losing bytes", async () => {
-    const eventA = { response: { candidates: [], responseId: "r-1" } };
-    const eventB = { response: [{ finishReason: "STOP" }], responseId: "r-1" };
-    const raw = `data: ${JSON.stringify(eventA)}\ndata: ${JSON.stringify(eventB)}\n\n`;
-    // Split the raw bytes at an awkward boundary (mid first event).
-    const bytes = new TextEncoder().encode(raw);
-    const splitAt = 30;
-    const source = new ReadableStream<Uint8Array>({
-      start(controller) {
-        controller.enqueue(bytes.slice(0, splitAt));
-        controller.enqueue(bytes.slice(splitAt));
-        controller.close();
-      },
-    });
-    const probe = await readFirstSseEvent(source, 5_000);
-    expect(probe.event).toEqual(eventA);
-
-    // The returned stream replays consumed bytes and continues losslessly.
-    let text = "";
-    const reader = probe.stream.getReader();
-    const decoder = new TextDecoder();
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      text += decoder.decode(value);
-    }
-    expect(text).toBe(raw);
-  });
-
-  test("probe watchdog fires on silent endpoints", async () => {
-    const source = new ReadableStream<Uint8Array>({
-      start() {}, // never enqueues, never closes
-    });
-    await expect(readFirstSseEvent(source, 25)).rejects.toThrow(/timed out waiting for the first event/);
-  });
-
-  test("probe rejects clean EOF and [DONE] before the first event", async () => {
-    await expect(readFirstSseEvent(new Response("").body!, 5_000)).rejects.toThrow(
-      /ended before the first event/,
-    );
-    await expect(readFirstSseEvent(new Response("data: [DONE]\n\n").body!, 5_000)).rejects.toThrow(
-      /ended before the first event/,
-    );
   });
 
   test("[DONE] and non-data lines pass through", async () => {

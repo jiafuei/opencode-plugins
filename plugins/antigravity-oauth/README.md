@@ -59,8 +59,7 @@ Checkpoint-only ids (`gemini-3.1-flash-lite`, tab completion previews) are inten
 
 **Options**
 
-- `endpointMode`: `"auto"` (default) dispatches to `https://daily-cloudcode-pa.googleapis.com` first with sandbox failover before streaming begins, remembering the last-good endpoint per session. `"production"` / `"sandbox"` pin one endpoint.
-- `firstEventTimeoutMs`: override the pre-first-event watchdog ceiling (OMP uses 60s for Flash models and 300s otherwise). Only meaningful in `"auto"` mode where another endpoint can be tried.
+- `endpointMode`: `"auto"` (default) dispatches to `https://daily-cloudcode-pa.googleapis.com` first; a failed response moves that session to the other endpoint (sandbox, or back to daily), so OpenCode's retry lands there, and a successful one keeps it. `"production"` / `"sandbox"` pin one endpoint.
 
 **Environment overrides**
 
@@ -75,18 +74,16 @@ os/arch are deliberately pinned to the darwin/arm64 reference client the constan
 
 ## Wire behavior
 
-The plugin installs a fetch on the `@ai-sdk/google` SDK of the `google-antigravity` provider (AI SDK `sdk` hook) that rewrites standard `@ai-sdk/google` requests into the Cloud Code Assist envelope used by the native client:
+The provider uses OpenCode's native Gemini client (`@opencode/ai/providers/google`, `baseURL` set to the daily endpoint). Session `http.request` / `http.response` hooks for `google-antigravity` rewrite its `models/<id>:streamGenerateContent` requests into the Cloud Code Assist envelope used by the native client:
 
-- URL: `POST https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse` (or `:generateContent` for non-stream calls).
-- Envelope: `project`, `model` (effort-routed wire id), `userAgent: "antigravity"`, `requestType: "agent"`, and `request.requestId = agent/<agentId>/<timestamp>/<trajectoryId>/<step>` with labels `last_step_index`, `trajectory_id`, `used_claude`, `used_claude_conservative`, `model_enum`, and `last_execution_id`.
-- Per-session identity: stable `agentId`/`trajectoryId`, signed-decimal `sessionId`, monotonic step index, and the prior response's id carried forward. SDK retries of the same logical request reuse the envelope instead of advancing the step.
-- Headers: captured `antigravity/hub/<version> (...)` user agent, bearer token, `Content-Type: application/json`, `Accept: text/event-stream`, plus `anthropic-beta: interleaved-thinking-2025-05-14` for reasoning Claude models. The `@ai-sdk/google` fingerprint (`x-goog-api-key`, `x-goog-api-client`), OpenCode's session-routing headers (`x-session-affinity`, `x-session-id`, `x-parent-session-id`, `x-opencode-*`, `client-metadata`), and the plugin-private routing markers are all stripped before dispatch — only the native inference header set reaches Cloud Code Assist.
-- Bodies: system instructions tagged `role: "user"`, default function-calling mode `VALIDATED` (forced for Claude even with no tools), tool schemas converted from the SDK's `parametersJsonSchema` form to normalized legacy `parameters`, fixed per-model `maxOutputTokens`, thinking controls normalized to each family's native transport (budget or level), and explicit server-side thinking suppression where omitting the config would silently re-enable it.
-- Responses: SSE events wrapping Gemini chunks under `response` are unwrapped incrementally (no full buffering); the response id is captured for the next request's `last_execution_id`. In-band error events surface as stream errors with sanitized messages. Session state (last-good endpoint, response identity) commits only after a stream completes successfully.
-- Endpoint failover: in `"auto"` mode a pre-first-event watchdog buffers up to the first complete SSE event; transient failures before that point (HTTP status or in-band error) switch to the alternate endpoint without losing bytes, while non-transient errors surface immediately. Once an ordinary event has been exposed, the endpoint is never switched.
-- Origin safety: bearer credentials are sent **only** to the two official Cloud Code Assist endpoints. Any other configured `baseURL` (proxy/gateway) is rejected with a clear error rather than leaking subscription traffic. There is no plain API-key mode. Switching the active connection resets every session's identity chain.
+- URL: `POST <endpoint>/v1internal:streamGenerateContent?alt=sse` (or `:generateContent` for non-stream calls).
+- Envelope: `project` (from the active connection's credential metadata), `model` (effort-routed wire id), `userAgent: "antigravity"`, `requestType: "agent"`, and `request.requestId = agent/<agentId>/<timestamp>/<trajectoryId>/<step>` with labels `last_step_index`, `trajectory_id`, `used_claude`, `used_claude_conservative`, `model_enum`, and `last_execution_id`.
+- Per-session identity: stable `agentId`/`trajectoryId`, signed-decimal `sessionId`, monotonic step index, and the prior response's id carried forward. Retries of the same logical request reuse the envelope instead of advancing the step. Deleting a session or switching the active connection resets its identity chain.
+- Headers: rebuilt from scratch — bearer token (the OAuth access token OpenCode sends as `x-goog-api-key`), captured `antigravity/hub/<version> (...)` user agent, `Content-Type: application/json`, `Accept: text/event-stream`, plus `anthropic-beta: interleaved-thinking-2025-05-14` for Claude models. No OpenCode, Gemini-client, or plugin-private header reaches Cloud Code Assist.
+- Bodies: system instructions tagged `role: "user"`, default function-calling mode `VALIDATED` (forced for Claude even with no tools), tool schemas converted from `parametersJsonSchema` to normalized legacy `parameters`, fixed per-model `maxOutputTokens`, thinking controls normalized to each family's native transport (budget or level), and explicit server-side thinking suppression where omitting the config would silently re-enable it.
+- Responses: SSE events wrapping Gemini chunks under `response` are unwrapped incrementally (no full buffering) for the native parser; the response id is carried into the next request's `last_execution_id` only after a stream completes. In-band error events surface as stream errors with sanitized messages (and count as endpoint failures in `"auto"` mode).
 
-Responses are parsed by `@ai-sdk/google` — the plugin never interprets model output itself. Overriding `google-antigravity` provider or model settings in OpenCode config can make OpenCode switch the provider to its native Google route, which bypasses this transport; leave the provider unconfigured.
+Credentials only ever go to the two official Cloud Code Assist endpoints: the target URL is built from the endpoint mode, not from the configured `baseURL`. There is no plain API-key mode.
 
 ## Web search
 
@@ -100,9 +97,9 @@ OpenCode stores the OAuth credential (`refresh`, `access`, `expires`) and refres
 
 - The pinned fallback version (`2.8.0`) ages as Google ships new clients; the plugin refreshes it from the official update manifest at startup (5-second timeout, cached per process). If Google gates new models behind newer versions, update `OPENCODE_ANTIGRAVITY_VERSION`.
 - Free-tier quota windows (daily/weekly buckets per backend) are enforced server-side; the plugin does not track or display usage.
-- OMP's flash "planning leak" filtering and forced-tool directive text are not reproduced; requests rely on the SDK's own serialization otherwise.
+- OMP's flash "planning leak" filtering and forced-tool directive text are not reproduced; requests rely on OpenCode's own Gemini serialization otherwise.
 - Schema normalization covers the constructs OpenCode emits in practice (`anyOf`/`oneOf` folding, null unions, unsupported keyword stripping) but not OMP's full combiner-merge matrix.
-- The pre-first-event watchdog only engages in `"auto"` mode where a second endpoint exists. Pinned `"production"` / `"sandbox"` modes have no first-event failover (matching OMP's single-endpoint attempts).
+- There is no in-request endpoint failover or first-event watchdog: `"auto"` mode only switches endpoints between attempts, relying on OpenCode's retry policy to re-issue a failed request.
 - Unmatched custom thinking controls (budgets or levels outside the captured tiers) are forwarded untouched rather than remapped.
 
 ## Attribution

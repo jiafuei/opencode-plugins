@@ -21,9 +21,6 @@ export const ANTIGRAVITY_DAILY_ENDPOINT = "https://daily-cloudcode-pa.googleapis
 export const ANTIGRAVITY_SANDBOX_ENDPOINT = "https://daily-cloudcode-pa.sandbox.googleapis.com";
 export const ANTIGRAVITY_ENDPOINTS = [ANTIGRAVITY_DAILY_ENDPOINT, ANTIGRAVITY_SANDBOX_ENDPOINT] as const;
 
-/** Statuses eligible for pre-stream endpoint failover (OMP's transient set). */
-export const TRANSIENT_STATUSES = new Set([408, 429, 500, 502, 503, 504]);
-
 const DEFAULT_ANTIGRAVITY_VERSION = "2.8.0";
 
 const ANTIGRAVITY_VERSION_MANIFEST_URL =
@@ -97,31 +94,6 @@ export const CLAUDE_THINKING_BETA_HEADER = "interleaved-thinking-2025-05-14";
 
 /** CCA bypass accepted only when a Gemini 3 turn's first function call is unsigned. */
 const SKIP_THOUGHT_SIGNATURE = "skip_thought_signature_validator";
-
-/**
- * Headers stripped before every dispatch: the @ai-sdk/google fingerprint
- * (`x-goog-api-key`, `ai-sdk/google` client telemetry) and OpenCode's
- * session-routing headers must never reach Cloud Code Assist alongside the
- * Antigravity fingerprint.
- */
-const STRIPPED_REQUEST_HEADERS: Readonly<Record<string, true>> = {
-  "x-goog-api-key": true,
-  "x-goog-api-client": true,
-  "client-metadata": true,
-  "x-session-affinity": true,
-  "x-session-id": true,
-  "x-parent-session-id": true,
-  "x-opencode-project": true,
-  "x-opencode-session": true,
-  "x-opencode-client": true,
-};
-
-/** Delete SDK/OpenCode/private routing headers from an outgoing header set. */
-export function sanitizeOutgoingHeaders(headers: Headers): void {
-  for (const name of [...headers.keys()]) {
-    if (STRIPPED_REQUEST_HEADERS[name.toLowerCase()]) headers.delete(name);
-  }
-}
 
 /**
  * Per-wire-id Cloud Code Assist request constants captured from the real
@@ -345,9 +317,9 @@ export interface ResolvedThinking {
 }
 
 /**
- * Extract the requested thinking tier from the SDK's generationConfig.
+ * Extract the requested thinking tier from the request's generationConfig.
  *
- * OpenCode's default @ai-sdk/google variants supply `thinkingLevel` for
+ * OpenCode's default Google variants supply `thinkingLevel` for
  * Gemini 3 ids regardless of the family's native transport, and merged
  * variant options can carry level and budget together; this normalizes to
  * exactly the model spec's transport at the wire boundary:
@@ -494,8 +466,9 @@ export interface AntigravitySessionState {
   sessionId: string;
   stepIndex: number;
   lastExecutionId?: string;
-  lastGoodEndpoint?: string;
-  /** Last model.request invocation id seen; identical ids reuse the envelope so SDK retries do not advance steps. */
+  /** Auto endpoint mode: where this session's next request goes (daily when unset). */
+  endpoint?: string;
+  /** Last model.request invocation id seen; identical ids reuse the envelope so retries do not advance steps. */
   lastInvocationId?: string;
   lastEnvelope?: { requestId: string; step: number; labels: Record<string, string> };
 }
@@ -513,7 +486,7 @@ export function createSessionState(): AntigravitySessionState {
  * Advance (or reuse) the per-conversation envelope. Mirrors the native
  * client: `requestId` is `agent/<agentId>/<ts>/<trajectoryId>/<step>` and
  * `labels.last_step_index` trails the requestId step by one. When the same
- * invocation id is presented again (an SDK retry of the prepared request),
+ * invocation id is presented again (a retry of the prepared request),
  * the previous envelope is returned unchanged.
  */
 export function advanceEnvelope(
@@ -554,7 +527,7 @@ export { normalizeSchemaForCCA };
 // ---------------------------------------------------------------------------
 
 export interface BodyRewriteOptions {
-  /** SDK args object (@ai-sdk/google generateContent payload). */
+  /** Native Gemini generateContent body sent by OpenCode's Google client. */
   args: Record<string, any>;
   /** Logical OpenCode model id (registry key). */
   logicalModelId: string;
@@ -570,7 +543,7 @@ export interface BodyRewriteResult {
 }
 
 /**
- * Wrap a standard @ai-sdk/google generateContent payload in the Antigravity
+ * Wrap a standard Gemini generateContent payload in the Antigravity
  * Cloud Code Assist envelope: effort-routed wire model, VALIDATED function
  * calling (forced for Claude), role-tagged systemInstruction, wire-profile
  * maxOutputTokens/model_enum, session labels, and the signed-decimal session
@@ -628,7 +601,7 @@ export function rewriteBodyForAntigravity(options: BodyRewriteOptions): BodyRewr
   if (tools) request["tools"] = tools;
 
   // Antigravity's default tool mode is VALIDATED; Claude forces it even with
-  // no tools declared. An explicit non-AUTO SDK tool choice wins otherwise.
+  // no tools declared. An explicit non-AUTO tool choice wins otherwise.
   if (isClaude) {
     request["toolConfig"] = { functionCallingConfig: { mode: "VALIDATED" } };
   } else if (tools) {
@@ -687,7 +660,7 @@ function stripEmptyRole(systemInstruction: Record<string, any>): Record<string, 
 /**
  * Normalize tool declarations for Cloud Code Assist exactly like OMP's
  * `normalizeAntigravityTools`: normalize both legacy `parameters` and the
- * `parametersJsonSchema` field emitted by @ai-sdk/google 3.x, then emit only
+ * `parametersJsonSchema` field emitted by OpenCode's Gemini client, then emit only
  * the CCA `parameters` form.
  */
 function normalizeTools(tools: Array<Record<string, any>>): Array<Record<string, any>> {
@@ -723,10 +696,8 @@ export function unwrappedResponseHeaders(response: Response): Headers {
 }
 
 export interface SseUnwrapHooks {
-  /** Called with each unwrapped chunk's responseId (when present). */
-  onResponseId?: (responseId: string) => void;
   /** Called once when the stream carries an in-band error event. */
-  onError?: (error: { code?: number; message?: string; status?: string }) => void;
+  onError?: (error: InBandError) => void;
   /** Called after the stream reaches a candidate finish reason, with the last responseId. */
   onComplete?: (lastResponseId: string | undefined) => void;
 }
@@ -753,11 +724,6 @@ export function readInBandError(payload: unknown): InBandError | undefined {
 export function describeInBandError(error: InBandError): string {
   const detail = error.message || error.status || (typeof error.code === "number" ? String(error.code) : "unknown error");
   return `Cloud Code Assist error (${error.status ?? error.code ?? "unknown"}): ${detail}`;
-}
-
-/** An in-band error eligible for endpoint failover (OMP transient statuses). */
-export function isInBandErrorTransient(error: InBandError): boolean {
-  return typeof error.code === "number" && TRANSIENT_STATUSES.has(error.code);
 }
 
 /**
@@ -794,10 +760,7 @@ export function createCcaSseUnwrap(hooks: SseUnwrapHooks = {}): TransformStream<
     }
     if (parsed.response !== undefined && typeof parsed.response === "object") {
       const responseId = parsed.response.responseId;
-      if (typeof responseId === "string" && responseId.length > 0) {
-        lastResponseId = responseId;
-        hooks.onResponseId?.(responseId);
-      }
+      if (typeof responseId === "string" && responseId.length > 0) lastResponseId = responseId;
       if (
         Array.isArray(parsed.response.candidates) &&
         parsed.response.candidates.some((candidate: Record<string, any>) => candidate.finishReason)
@@ -836,133 +799,6 @@ export function createCcaSseUnwrap(hooks: SseUnwrapHooks = {}): TransformStream<
         }
       }
       if (sawFinishReason) hooks.onComplete?.(lastResponseId);
-    },
-  });
-}
-
-// ---------------------------------------------------------------------------
-// Pre-first-event probe (endpoint failover watchdog)
-// ---------------------------------------------------------------------------
-
-/** OMP's first-event ceilings: Flash gets 60s, everything else 300s. */
-export const FIRST_EVENT_TIMEOUT_FLASH_MS = 60_000;
-export const FIRST_EVENT_TIMEOUT_DEFAULT_MS = 300_000;
-
-export function firstEventTimeoutMs(modelId: string): number {
-  return modelId.includes("flash") ? FIRST_EVENT_TIMEOUT_FLASH_MS : FIRST_EVENT_TIMEOUT_DEFAULT_MS;
-}
-
-export interface FirstEventProbe {
-  /**
-   * Stream replaying every byte consumed during probing, then continuing
-   * transparently with the remainder of the response body.
-   */
-  stream: ReadableStream<Uint8Array>;
-  /** Parsed JSON of the first `data:` event. */
-  event: Record<string, unknown>;
-}
-
-/** Replay consumed bytes, then keep pulling from the original reader. */
-function continueAfterPrefix(
-  reader: {
-    read(): Promise<{ done: boolean; value?: Uint8Array }>;
-    cancel(reason?: unknown): Promise<void>;
-  },
-  prefix: Uint8Array[],
-): ReadableStream<Uint8Array> {
-  let index = 0;
-  return new ReadableStream<Uint8Array>({
-    async pull(controller) {
-      if (index < prefix.length) {
-        controller.enqueue(prefix[index++]);
-        return;
-      }
-      const { done, value } = await reader.read();
-      if (done || value === undefined) controller.close();
-      else controller.enqueue(value);
-    },
-    cancel(reason) {
-      return reader.cancel(reason);
-    },
-  });
-}
-
-/**
- * Buffer the response body until the first complete SSE data event, mirroring
- * OMP's pre-response watchdog: an endpoint that fails silently, ends without
- * an event, or delivers only an in-band transient error can be abandoned in
- * favor of the alternate endpoint while nothing user-visible has streamed.
- * Respects the caller abort signal; on timeout the body is cancelled and a
- * sanitized timeout error is thrown. The returned `stream` is the full
- * response body — consumed bytes included — so nothing is lost.
- */
-export async function readFirstSseEvent(
-  body: ReadableStream<Uint8Array>,
-  timeoutMs: number,
-  callerSignal?: AbortSignal,
-): Promise<FirstEventProbe> {
-  const reader = body.getReader();
-  const consumed: Uint8Array[] = [];
-  let buffer = new Uint8Array(0);
-  let lineStart = 0;
-  const decoder = new TextDecoder();
-
-  // Watchdog + caller-abort gate: rejects the pending read when either fires.
-  let gateReject: ((error: Error) => void) | undefined;
-  const gate = new Promise<never>((_, reject) => {
-    gateReject = reject;
-  });
-  const timer = setTimeout(
-    () => gateReject?.(new Error("Cloud Code Assist stream timed out waiting for the first event")),
-    timeoutMs,
-  );
-  timer.unref?.();
-  const onAbort = () =>
-    gateReject?.(callerSignal?.reason instanceof Error ? callerSignal.reason : new Error("Request was aborted"));
-  callerSignal?.addEventListener("abort", onAbort, { once: true });
-
-  try {
-    while (true) {
-      const newline = buffer.indexOf(10, lineStart);
-      if (newline >= 0) {
-        const start = lineStart;
-        lineStart = newline + 1;
-        const lineEnd = newline > 0 && buffer[newline - 1] === 13 ? newline - 1 : newline;
-        const line = decoder.decode(buffer.subarray(start, lineEnd));
-        if (!line.startsWith("data:")) continue;
-        const payload = line.slice(5).trim();
-        if (payload === "[DONE]") {
-          await reader.cancel();
-          throw new Error("Cloud Code Assist stream ended before the first event");
-        }
-        try {
-          return { stream: continueAfterPrefix(reader, consumed), event: JSON.parse(payload) as Record<string, unknown> };
-        } catch {
-          continue; // malformed line; keep scanning
-        }
-      }
-      const result = await Promise.race([reader.read(), gate]);
-      if (result.done) throw new Error("Cloud Code Assist stream ended before the first event");
-      consumed.push(result.value);
-      const merged = new Uint8Array(buffer.length + result.value.length);
-      merged.set(buffer);
-      merged.set(result.value, buffer.length);
-      buffer = merged;
-    }
-  } catch (error) {
-    reader.cancel().catch(() => {});
-    throw error;
-  } finally {
-    clearTimeout(timer);
-    callerSignal?.removeEventListener("abort", onAbort);
-  }
-}
-
-/** A stream that fails immediately with a sanitized error. */
-export function errorStream(error: Error): ReadableStream<Uint8Array> {
-  return new ReadableStream<Uint8Array>({
-    start(controller) {
-      controller.error(error);
     },
   });
 }
