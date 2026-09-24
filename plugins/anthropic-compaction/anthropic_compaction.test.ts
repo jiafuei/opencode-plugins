@@ -147,6 +147,20 @@ describe("request gating", () => {
   });
 });
 
+describe("compaction decide", () => {
+  test("defers OpenCode compaction to Anthropic once the trigger is reached", async () => {
+    const hooks = await load();
+    const decide = async (tokens: number, model = { providerID: "anthropic", id: "claude-sonnet-4-6" }) => {
+      const event = { sessionID: "ses_1", agent: "build", model, tokens, action: "compact" };
+      await hooks.get("experimental.compaction.decide:anthropic")!(event);
+      return event.action;
+    };
+    expect(await decide(140_000)).toBe("continue");
+    expect(await decide(139_999)).toBe("compact");
+    expect(await decide(180_000, { providerID: "proxy", id: "claude-sonnet-4-6" })).toBe("compact");
+  });
+});
+
 describe("compaction replay", () => {
   test("records a streamed compaction block and replays it on the following response", async () => {
     const hooks = await load();

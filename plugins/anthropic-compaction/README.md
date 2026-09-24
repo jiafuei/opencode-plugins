@@ -35,9 +35,9 @@ opencode plugin add @jiafuei/opencode-anthropic-compaction
 
 Restart OpenCode after installing the plugin or changing its configuration.
 
-### Let Anthropic compact before OpenCode
+### Interaction with OpenCode's automatic compaction
 
-OpenCode still runs its own automatic compaction. It compacts once the estimated prompt reaches `context - max(output limit, compaction.buffer)` (and `limit.input - compaction.buffer` when the model declares an input limit). Keep the plugin `threshold` well below that point so Anthropic compacts first. A larger `compaction.buffer` makes OpenCode compact earlier, so do not raise it above the gap between the plugin threshold and the context window. To leave compaction entirely to Anthropic, set `"compaction": { "auto": false }`; manual compaction and overflow recovery still use OpenCode's summarizer.
+OpenCode runs its own automatic compaction once the estimated prompt nears the context limit. The plugin registers an `experimental.compaction.decide` hook: when the plugin applies to the session's model and OpenCode's estimated token count has reached the plugin trigger, it tells OpenCode to continue so Anthropic compacts server-side instead of OpenCode's summarizer. Below the trigger, OpenCode's decision is left alone. Manual compaction and overflow recovery still use OpenCode's summarizer. The hook needs an OpenCode build that includes `experimental.compaction.decide`.
 
 ## Supported models
 
@@ -58,6 +58,7 @@ Use `additionalModels` when a compatible provider exposes one of these models un
 ## How it works
 
 - A session `context` hook sets the Anthropic `contextManagement` provider option only for configured providers, supported models, and the Anthropic Messages package. The native protocol adds the required `compact-2026-01-12` beta header.
+- An `experimental.compaction.decide` hook skips OpenCode's automatic compaction once the plugin trigger is reached.
 - Only primary agent requests are affected; OpenCode's title, compaction, and generate requests are left alone.
 - An `http.response` hook copies the response stream and records the compaction block, if any, together with the last message of that request.
 - On later requests, the recorded block is prepended to the first assistant message after that anchor. Anthropic drops everything before it, so the compacted context is reused instead of compacting again.

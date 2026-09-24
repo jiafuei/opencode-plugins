@@ -48,14 +48,6 @@
         "solid-js": "1.9.12",
       },
     },
-    "plugins/model-glob": {
-      "name": "@jiafuei/opencode-model-glob",
-      "version": "0.0.1",
-      "dependencies": {
-        "@opencode/plugin": "2.0.15",
-        "effect": "4.0.0-rc.112",
-      },
-    },
     "plugins/redact-keys": {
       "name": "@jiafuei/opencode-redact-keys",
       "version": "0.0.1",
@@ -229,8 +221,6 @@
     "@jiafuei/opencode-claude-oauth": ["@jiafuei/opencode-claude-oauth@workspace:plugins/claude-oauth"],
 
     "@jiafuei/opencode-memory": ["@jiafuei/opencode-memory@workspace:plugins/memory"],
-
-    "@jiafuei/opencode-model-glob": ["@jiafuei/opencode-model-glob@workspace:plugins/model-glob"],
 
     "@jiafuei/opencode-redact-keys": ["@jiafuei/opencode-redact-keys@workspace:plugins/redact-keys"],
 

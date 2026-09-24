@@ -97,19 +97,26 @@ export default Plugin.define({
     const pending = new Map<string, Anchor>();
     const compactions = new Map<string, Anchor & { text: string }>();
 
-    await ctx.session.hook("context", async (event) => {
-      pending.delete(event.sessionID);
-      if (!providers.has(event.model.providerID)) return;
+    // Resolves the model and its compaction trigger, or undefined when the plugin does not apply.
+    const resolve = async (ref: { providerID: string; id: string }) => {
+      if (!providers.has(ref.providerID)) return;
       const { data } = await ctx.model.list();
-      const model = data.find((item) => item.providerID === event.model.providerID && item.id === event.model.id)!;
+      const model = data.find((item) => item.providerID === ref.providerID && item.id === ref.id)!;
       if (!PACKAGES.has(model.package ?? "")) return;
       if (!models.has(model.id) && !models.has(model.modelID)) return;
       if ("ratio" in threshold && model.limit.context <= 0) return;
-
       const trigger =
         "ratio" in threshold
           ? Math.max(MINIMUM_TRIGGER, Math.floor(model.limit.context * threshold.ratio))
           : threshold.tokens;
+      return { model, trigger };
+    };
+
+    await ctx.session.hook("context", async (event) => {
+      pending.delete(event.sessionID);
+      const resolved = await resolve(event.model);
+      if (!resolved) return;
+      const { model, trigger } = resolved;
       event.options.contextManagement = {
         edits: [
           {
@@ -141,6 +148,15 @@ export default Plugin.define({
     });
 
     for (const providerID of providers) {
+      // Anthropic compacts server-side once the trigger is reached, so skip OpenCode's summary compaction.
+      await (ctx.session.hook as any)(
+        "experimental.compaction.decide",
+        async (event: { model: { providerID: string; id: string }; tokens: number; action: "compact" | "continue" }) => {
+          const resolved = await resolve(event.model);
+          if (resolved && event.tokens >= resolved.trigger) event.action = "continue";
+        },
+        { providerID },
+      );
       await ctx.session.hook(
         "http.response",
         (event) => {

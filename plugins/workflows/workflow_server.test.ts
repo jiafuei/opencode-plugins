@@ -9,7 +9,7 @@ import { runDirectory, statePath, workflowProjectDirectory, type WorkflowRun } f
 process.env.XDG_DATA_HOME = mkdtempSync(join(tmpdir(), "workflow-server-test-"));
 
 type Tool = { execute: (input: any, context: any) => Promise<{ content: string }> };
-type Message = { id: string; type: string; content?: Array<{ type: string; text?: string }> };
+type Message = { id: string; type: string; content?: Array<Record<string, unknown>> };
 
 const disposers: Array<() => Promise<void>> = [];
 afterEach(async () => { for (const dispose of disposers.splice(0)) await dispose(); });
@@ -47,11 +47,11 @@ async function createHarness(options: Record<string, unknown> = {}) {
     onPrompt: undefined as ((sessionID: string) => Promise<void> | void) | undefined,
     promptDelay: undefined as ((text: string) => number) | undefined,
     workerOutput: undefined as ((text: string) => string) | undefined,
+    formats: [] as unknown[],
   };
   const tools = new Map<string, Tool>();
   const messages = new Map<string, Message[]>();
   let control: (input: Record<string, unknown>) => Promise<{ status: string; error?: string }> = never;
-  let contextHook: (event: { sessionID: string; tools: Record<string, { input: unknown }> }) => void = () => {};
   const ctx = {
     options,
     location: { directory, project: { id: projectID } },
@@ -70,7 +70,6 @@ async function createHarness(options: Record<string, unknown> = {}) {
     command: { transform: async () => registration },
     tool: { transform: async (callback: (editor: { add: (tool: Tool & { name: string }) => void }) => void) => { callback({ add: (tool) => tools.set(tool.name, tool) }); return registration; } },
     session: {
-      hook: async (_name: string, callback: typeof contextHook) => { contextHook = callback; return registration; },
       create: async (input: { id: string; agent?: string; model?: { providerID: string; id: string } }) => {
         if (state.failCreate) throw new Error("permission denied creating session");
         state.created.push(input);
@@ -79,14 +78,16 @@ async function createHarness(options: Record<string, unknown> = {}) {
       get: async ({ sessionID }: { sessionID: string }) => sessionID === "parent-session"
         ? { id: sessionID, permissions: [], model: { providerID: "anthropic", id: "claude" } }
         : { id: sessionID, tokens: { input: 2, output: 3, reasoning: 1, cache: { read: 0, write: 0 } } },
-      prompt: async (input: { sessionID: string; id: string; text: string }) => {
+      prompt: async (input: { sessionID: string; id: string; text: string; format?: unknown }) => {
         state.inFlight++;
         state.maxInFlight = Math.max(state.maxInFlight, state.inFlight);
         await Bun.sleep(state.promptDelay?.(input.text) ?? 50);
         state.inFlight--;
         await state.onPrompt?.(input.sessionID);
         const agent = state.created.find((item) => item.id === input.sessionID)?.agent;
-        messages.set(input.sessionID, [{ id: input.id, type: "user" }, { id: `${input.id}-reply`, type: "assistant", content: [{ type: "text", text: state.workerOutput?.(input.text) ?? `output:${agent}` }] }]);
+        if (input.format) state.formats.push(input.format);
+        const content = input.format ? [{ type: "tool", name: "StructuredOutput", state: { status: "completed", input: { count: 3 } } }] : [{ type: "text", text: state.workerOutput?.(input.text) ?? `output:${agent}` }];
+        messages.set(input.sessionID, [{ id: input.id, type: "user" }, { id: `${input.id}-reply`, type: "assistant", content }]);
         return {};
       },
       wait: async () => {},
@@ -110,7 +111,7 @@ async function createHarness(options: Record<string, unknown> = {}) {
       const run = await Bun.file(statePath(root, id)).json().catch(() => undefined) as WorkflowRun | undefined;
       return run && ready(run) ? run : undefined;
     });
-  return { root, state, tools, context, submit, control: (input: Record<string, unknown>) => control(input), contextHook: (event: Parameters<typeof contextHook>[0]) => contextHook(event), waitForRun };
+  return { root, state, tools, context, submit, control: (input: Record<string, unknown>) => control(input), waitForRun };
 }
 
 const spec = (phases: unknown[]) => ({
@@ -204,22 +205,14 @@ describe("workflow server", () => {
     expect(h.state.synthetic[0]!.text).toContain(`<handoff>`);
   }, 15_000);
 
-  test("collects a schema worker's result through the submit tool visible only to that worker", async () => {
+  test("collects a schema worker's result through structured output", async () => {
     const h = await createHarness();
     const schema = { type: "object", properties: { count: { type: "number" } } };
-    h.state.onPrompt = async (sessionID) => {
-      const tools = { workflow_submit: { input: {} } };
-      h.contextHook({ sessionID, tools });
-      expect(tools.workflow_submit.input).toMatchObject({ properties: { result: schema } });
-      await h.tools.get("workflow_submit")!.execute({ result: { count: 3 } }, { sessionID });
-    };
     const { id } = await h.submit(spec([{ id: "p1", title: "Phase", steps: [{ type: "worker", worker: { ...worker("a"), schema } }] }]));
     await h.control({ runID: id, action: "approve" });
     const run = await h.waitForRun(id, (item) => item.status === "completed");
     expect(run.workers.a!.output).toEqual({ count: 3 });
-    const parentTools: Record<string, { input: unknown }> = { workflow_submit: { input: {} } };
-    h.contextHook({ sessionID: "parent-session", tools: parentTools });
-    expect(parentTools.workflow_submit).toBeUndefined();
+    expect(h.state.formats).toEqual([{ type: "json_schema", schema }]);
   }, 15_000);
 
   test("resolves the waiting tool call when a pending plan is rejected", async () => {

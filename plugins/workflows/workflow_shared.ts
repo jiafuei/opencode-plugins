@@ -173,7 +173,7 @@ export const WORKER_SCHEMA = Schema.Struct({
   modelID: Schema.optional(MODEL_ID.annotate({ description: '"providerID/modelID"; must be an available model. Omit to inherit the originating session model. Set it explicitly on workers that check other workers, so verification does not repeat the same model\'s mistakes.' })),
   variant: Schema.optional(Schema.String),
   prompt: NONEMPTY_TEXT.annotate({ description: "Self-contained instructions; the worker sees no conversation history. May embed earlier workers' outputs as {{workers.<id>.output}} (append .field for schema outputs; \\{{ for a literal). Forward and same-step sibling references are rejected. When the worker produces bulk data, name the exact file path it must write to." }),
-  schema: Schema.optional(Schema.Record(Schema.String, Schema.Unknown).annotate({ description: "JSON Schema for the worker's structured result, which the worker submits through a dedicated tool. Results are passed intact to coordinators and the final handoff. For bulk results, write an artifact and return {path, count, notes}." })),
+  schema: Schema.optional(Schema.Record(Schema.String, Schema.Unknown).annotate({ description: "JSON Schema for the worker's structured result, which the worker returns through structured output. Results are passed intact to coordinators and the final handoff. For bulk results, write an artifact and return {path, count, notes}." })),
 });
 export const PHASE_SCHEMA = Schema.Struct({
   id: IDENTIFIER,
