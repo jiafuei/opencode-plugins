@@ -50,15 +50,14 @@ Worker prompts may reference earlier outputs with `{{workers.workerId.output.pat
 
 Worker outputs and failure details reach coordinators and the final handoff intact, without byte truncation or an input-size cap. Keep results concise and use artifact files for bulk data. Identifiers retain their syntax restrictions but have no plugin-defined length cap.
 
-A worker defaults to the built-in `general` agent when `agent` is omitted; `general` must still appear in the workflow's `allowedAgents`. Specify another allowed registered agent to override it. Workers inherit the originating session's model when `modelID` is omitted, or may select an available model as `"providerID/modelID"` and a model variant directly in the spec:
+A worker defaults to the built-in `general` agent when `agent` is omitted; `general` must still appear in the workflow's `allowedAgents`. Specify another allowed registered agent to override it. Workers inherit the originating session's model when `modelID` is omitted, or may select an available model as `"providerID/modelID"`, or `"providerID/modelID#variant"` to include a variant, matching OpenCode's subagent model format:
 
 ```json
 {
   "id": "audit",
   "label": "Audit",
   "prompt": "Review the implementation",
-  "modelID": "openai/gpt-5",
-  "variant": "high"
+  "modelID": "openai/gpt-5#high"
 }
 ```
 

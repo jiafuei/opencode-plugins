@@ -9,8 +9,8 @@ type Control = { runID: string; action: WorkflowControlAction; guidance?: string
 export type InspectorSelection = { runID: string; kind: "run" | "phase" | "group" | "worker"; id: string };
 
 function detail(run: WorkflowRun): string {
-  const worker = (item: { id: string; label: string; agent: string; modelID?: string; variant?: string; prompt: string; schema?: Record<string, unknown> }) =>
-    `${item.id}: ${item.label} [${item.agent}${item.modelID ? `, ${item.modelID}` : ""}${item.variant ? `, variant ${item.variant}` : ""}]\n${item.prompt}${item.schema ? `\nSchema: ${JSON.stringify(item.schema)}` : ""}`;
+  const worker = (item: { id: string; label: string; agent: string; modelID?: string; prompt: string; schema?: Record<string, unknown> }) =>
+    `${item.id}: ${item.label} [${item.agent}${item.modelID ? `, ${item.modelID}` : ""}]\n${item.prompt}${item.schema ? `\nSchema: ${JSON.stringify(item.schema)}` : ""}`;
   return `Internal coordinator/handoff model: ${run.parentModel ? `${run.parentModel.providerID}/${run.parentModel.id}` : "default model"}\n` + run.spec.phases.map((phase) => `${phase.title}\n${phase.steps.map((step) => step.type === "worker" ? worker(step.worker) : `${step.title ?? step.id}\n${step.workers.map(worker).join("\n")}`).join("\n")}`).join("\n");
 }
 
@@ -78,7 +78,7 @@ function Dashboard(props: { ctx: Plugin.Context; runs: () => WorkflowRun[]; back
     if (tab() === "Prompt") return worker.prompt;
     if (tab() === "Result") return worker.output === undefined ? "No accepted result" : stableJson(worker.output);
     if (tab() === "Attempts") return (worker.attempts ?? []).map((attempt) => `#${attempt.number} ${attempt.kind ?? "turn"} ${attempt.result ?? "running"}${attempt.steeringIDs?.length ? ` steering=${attempt.steeringIDs.join(",")}` : ""}${attempt.error ? `\n${attempt.error}` : ""}`).join("\n") + (worker.steering?.length ? `\n\nSteering\n${worker.steering.map((item) => `${item.status} ${item.id}: ${item.text}`).join("\n")}` : "");
-    return `${worker.activity ?? worker.status}\nAgent: ${worker.agent}\nModel: ${worker.modelID ?? "parent model"}\nVariant: ${worker.variant ?? "model default"}\nElapsed: ${elapsed(worker)}  Attempts: ${worker.attempts?.filter((item) => item.kind === "turn").length ?? 0}  Tokens: ${worker.tokens?.total ?? 0} (cache read ${worker.tokens?.cacheRead ?? 0}, write ${worker.tokens?.cacheWrite ?? 0})\n${worker.steering?.map((item) => `${item.status}: ${item.text}`).join("\n") ?? ""}`;
+    return `${worker.activity ?? worker.status}\nAgent: ${worker.agent}\nModel: ${worker.modelID ?? "parent model"}\nElapsed: ${elapsed(worker)}  Attempts: ${worker.attempts?.filter((item) => item.kind === "turn").length ?? 0}  Tokens: ${worker.tokens?.total ?? 0} (cache read ${worker.tokens?.cacheRead ?? 0}, write ${worker.tokens?.cacheWrite ?? 0})\n${worker.steering?.map((item) => `${item.status}: ${item.text}`).join("\n") ?? ""}`;
   };
   const dimensions = useTerminalDimensions();
   const narrow = () => dimensions().width < 100;

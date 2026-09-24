@@ -343,8 +343,7 @@ export default Plugin.define({
         await save(run, { type: "worker.failed", workerID: worker.id, error: state.error });
         throw error;
       }
-      const base = worker.modelID ? parseModelID(worker.modelID) : run.parentModel;
-      const model = base && { ...base, ...(worker.variant ? { variant: worker.variant } : {}) };
+      const model = worker.modelID ? parseModelID(worker.modelID) : run.parentModel;
       state.prompt = prompt;
       state.status = "running";
       state.startedAt ??= Date.now();

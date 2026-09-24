@@ -9,14 +9,13 @@ export async function abortableSleep(delayMs: number, signal: AbortSignal): Prom
   await Promise.race([Bun.sleep(delayMs), new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }))]);
 }
 
-export type ModelRef = { providerID: string; id: string };
+export type ModelRef = { providerID: string; id: string; variant?: string };
 
 export type WorkerSpec = {
   id: string;
   label: string;
   agent: string;
   modelID?: string;
-  variant?: string;
   prompt: string;
   schema?: Record<string, unknown>;
 };
@@ -61,7 +60,6 @@ export type WorkerState = {
   label: string;
   agent: string;
   modelID?: string;
-  variant?: string;
   prompt: string;
   schema?: Record<string, unknown>;
   status: "pending" | "running" | "completed" | "failed" | "aborted" | "interrupted" | "skipped" | "retired";
@@ -162,7 +160,7 @@ const ID = /^[A-Za-z][A-Za-z0-9_-]*$/;
 const TEMPLATE_REFERENCE = /^\s*workers\.([A-Za-z][A-Za-z0-9_-]*)\.output((?:\.[A-Za-z_$][A-Za-z0-9_$]*)*)\s*$/;
 const NONEMPTY_TEXT = Schema.String.check(Schema.isPattern(/\S/, { message: "must be a non-empty string" }));
 const IDENTIFIER = Schema.String.check(Schema.isPattern(ID, { message: "must use letters, numbers, _ or - and begin with a letter" }));
-const MODEL_ID = Schema.String.check(Schema.isPattern(/^[^\s/]+\/\S+$/, { message: 'must be a "providerID/modelID" string such as "openai/gpt-1.0" or "anthropic/claude-sonnet-1.0"' }));
+const MODEL_ID = Schema.String.check(Schema.isPattern(/^[^\s/#]+\/[^\s#]+(#[^\s#]+)?$/, { message: 'must be a "providerID/modelID" or "providerID/modelID#variant" string such as "openai/gpt-1.0" or "anthropic/claude-sonnet-1.0#high"' }));
 const POSITIVE_INT = Schema.Int.check(Schema.isGreaterThanOrEqualTo(1));
 const NOT_EMPTY = Schema.isNonEmpty({ message: "must not be empty" });
 export const RUN_ID = Schema.String.check(Schema.isPattern(/^[A-Za-z0-9_-]+$/, { message: "Invalid workflow run ID" }));
@@ -170,8 +168,7 @@ export const WORKER_SCHEMA = Schema.Struct({
   id: IDENTIFIER.annotate({ description: "Globally unique across the workflow; letters, digits, _ or -, starting with a letter" }),
   label: NONEMPTY_TEXT,
   agent: IDENTIFIER.annotate({ description: "Defaults to 'general'; must be listed in allowedAgents" }).pipe(Schema.withDecodingDefaultKey(Effect.succeed("general"))),
-  modelID: Schema.optional(MODEL_ID.annotate({ description: '"providerID/modelID"; must be an available model. Omit to inherit the originating session model. Set it explicitly on workers that check other workers, so verification does not repeat the same model\'s mistakes.' })),
-  variant: Schema.optional(Schema.String),
+  modelID: Schema.optional(MODEL_ID.annotate({ description: '"providerID/modelID", or "providerID/modelID#variant" to select a variant; must be an available model. Omit to inherit the originating session model. Set it explicitly on workers that check other workers, so verification does not repeat the same model\'s mistakes.' })),
   prompt: NONEMPTY_TEXT.annotate({ description: "Self-contained instructions; the worker sees no conversation history. May embed earlier workers' outputs as {{workers.<id>.output}} (append .field for schema outputs; \\{{ for a literal). Forward and same-step sibling references are rejected. When the worker produces bulk data, name the exact file path it must write to." }),
   schema: Schema.optional(Schema.Record(Schema.String, Schema.Unknown).annotate({ description: "JSON Schema for the worker's structured result, which the worker returns through structured output. Results are passed intact to coordinators and the final handoff. For bulk results, write an artifact and return {path, count, notes}." })),
 });
@@ -217,8 +214,9 @@ export function normalizeWorkflowOptions(value: Record<string, unknown> | undefi
 export function workflowCeilings(options: WorkflowOptions): WorkflowLimits { return { maxWorkers: options.maxWorkers, maxRevisions: options.maxRevisions, maxRunMs: options.maxRunMs, maxConcurrency: options.maxConcurrency }; }
 
 export function parseModelID(value: string): ModelRef {
-  const separator = value.indexOf("/");
-  return { providerID: value.slice(0, separator), id: value.slice(separator + 1) };
+  const [model, variant] = value.split("#", 2);
+  const separator = model!.indexOf("/");
+  return { providerID: model!.slice(0, separator), id: model!.slice(separator + 1), ...(variant ? { variant } : {}) };
 }
 
 function templateReferences(prompt: string): Array<{ start: number; end: number; id: string; suffix: string }> {
@@ -281,7 +279,7 @@ function checkWorkflowPlan(spec: WorkflowSpec, registeredAgents?: ReadonlySet<st
     if (workerIDs.has(worker.id)) problems.push(`Worker id ${worker.id} is not globally unique`);
     else workerIDs.add(worker.id);
     if (!allowedAgents.has(worker.agent)) problems.push(`Worker ${worker.id} uses agent ${worker.agent} outside allowedAgents`);
-    if (worker.modelID && registeredModels && !registeredModels.has(worker.modelID)) problems.push(`Worker ${worker.id} uses unavailable model "${worker.modelID}"`);
+    if (worker.modelID && registeredModels && !registeredModels.has(worker.modelID.split("#")[0]!)) problems.push(`Worker ${worker.id} uses unavailable model "${worker.modelID}"`);
     try {
       for (const reference of templateReferences(worker.prompt)) {
         if (!known.has(reference.id)) {

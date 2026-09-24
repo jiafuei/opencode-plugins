@@ -83,10 +83,9 @@ describe("workflow spec", () => {
     const input = structuredClone(base);
     input.allowedAgents.push("general");
     delete (input.phases[0]!.steps[0]!.worker as { agent?: string }).agent;
-    input.phases[0]!.steps[0]!.worker.modelID = "openai/gpt-5";
-    input.phases[0]!.steps[0]!.worker.variant = "high";
+    input.phases[0]!.steps[0]!.worker.modelID = "openai/gpt-5#high";
     const spec = validateWorkflowSpec(input, new Set([...agents, "general"]), models);
-    expect((spec.phases[0]!.steps[0] as WorkerStep).worker).toMatchObject({ agent: "general", modelID: "openai/gpt-5", variant: "high" });
+    expect((spec.phases[0]!.steps[0] as WorkerStep).worker).toMatchObject({ agent: "general", modelID: "openai/gpt-5#high" });
 
     input.allowedAgents = ["build", "explore"];
     expect(() => validateWorkflowSpec(input, new Set([...agents, "general"]), models)).toThrow("general outside allowedAgents");
