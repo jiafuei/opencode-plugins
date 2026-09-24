@@ -1149,7 +1149,7 @@ export default Plugin.define({
         name: "workflow_authoring",
         options: { codemode: false },
         description: "Return the full AUTHORING.md reference for designing a `workflow` spec: the four facts that decide a spec's shape, worked examples of the common workflow shapes (discover/fan-out/verify, adversarial verification, staged migration), and the pre-submission checklist. Read this before writing your first workflow spec or when a spec design question arises. Cheap to call; returns only this document.",
-        input: Schema.Struct({}),
+        input: Schema.Record(Schema.String, Schema.Unknown),
         execute: async () => ({ content: authoringDoc }),
       });
     });
