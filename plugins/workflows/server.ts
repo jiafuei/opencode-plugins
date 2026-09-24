@@ -1091,7 +1091,7 @@ export default Plugin.define({
           // IDs are seeded here, because they must be stable from the moment the plan is submitted.
           const run = hydrateRun({
             version: 1, id, parentSessionID: context.sessionID, parentMessageID: context.messageID, createdAt: Date.now(), updatedAt: Date.now(), status: "pending", originalSpec: args.spec, spec,
-            ...(parent.model ? { parentModel: { providerID: parent.model.providerID, id: parent.model.id } } : {}),
+            ...(parent.model ? { parentModel: { providerID: parent.model.providerID, id: parent.model.id, ...(parent.model.variant ? { variant: parent.model.variant } : {}) } } : {}),
             limits: effectiveLimits(spec, ceilings.maxConcurrency),
             workers: Object.fromEntries(workersInOrder(spec).map((worker) => [worker.id, { ...worker, status: "pending", steering: [] }])),
             checkpointOccurrences: Object.fromEntries(spec.phases.filter((phase) => phase.checkpoint).map((phase) => [phase.id, crypto.randomUUID()])),
