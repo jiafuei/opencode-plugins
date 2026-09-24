@@ -3,7 +3,7 @@ import { mkdtempSync } from "node:fs";
 import { mkdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import workflows from "./workflow_server.ts";
+import workflows from "./server.ts";
 import { runDirectory, statePath, workflowProjectDirectory, type WorkflowRun } from "./workflow_shared.ts";
 
 process.env.XDG_DATA_HOME = mkdtempSync(join(tmpdir(), "workflow-server-test-"));

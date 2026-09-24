@@ -4,10 +4,10 @@
   "description": "OpenAI-native web search provider for OpenCode",
   "type": "module",
   "exports": {
-    "./server": "./websearch.ts"
+    "./server": "./server.ts"
   },
   "files": [
-    "websearch.ts",
+    "server.ts",
     "websocket_fetch.ts",
     "README.md"
   ],

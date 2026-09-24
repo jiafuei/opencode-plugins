@@ -54,7 +54,7 @@ import {
   pendingWorkers,
 } from "./workflow_shared.ts";
 import { WorkflowCoordination } from "./workflow_coordination.ts";
-import { failureControlOptions, promptRightRun } from "./workflow_tui.tsx";
+import { failureControlOptions, promptRightRun } from "./tui.tsx";
 
 const agents = new Set(["build", "explore"]);
 const models = new Set(["openai/gpt-5"]);

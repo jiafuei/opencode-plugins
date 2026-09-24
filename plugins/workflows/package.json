@@ -4,13 +4,13 @@
   "description": "Declarative child-agent workflows for OpenCode",
   "type": "module",
   "exports": {
-    "./server": "./workflow_server.ts",
-    "./tui": "./workflow_tui.tsx"
+    "./server": "./server.ts",
+    "./tui": "./tui.tsx"
   },
   "files": [
     "AUTHORING.md",
-    "workflow_server.ts",
-    "workflow_tui.tsx",
+    "server.ts",
+    "tui.tsx",
     "workflow_shared.ts",
     "workflow_coordination.ts",
     "README.md"

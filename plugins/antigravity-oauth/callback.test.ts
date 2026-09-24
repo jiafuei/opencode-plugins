@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { CALLBACK_PATH } from "./oauth_flow.ts";
-import { createCallbackWaiter } from "./antigravity_oauth.ts";
+import { createCallbackWaiter } from "./server.ts";
 
 describe("browser callback waiter", () => {
   test("a callback racing ahead of the hook is not lost", async () => {

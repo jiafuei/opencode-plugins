@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import plugin from "./websearch.ts";
+import plugin from "./server.ts";
 
 async function searchProvider(credential: Record<string, unknown> | undefined) {
   const added: any[] = [];

@@ -6,8 +6,8 @@ import MemoryModule, {
   indexLine,
   memoryProjectKey as serverProjectKey,
   parseIndexLine,
-} from "./memory_server.tsx";
-import MemoryTui, { memoryProjectKey as tuiProjectKey } from "./memory_tui.tsx";
+} from "./server.tsx";
+import MemoryTui, { memoryProjectKey as tuiProjectKey } from "./tui.tsx";
 
 const originalDataHome = process.env.XDG_DATA_HOME;
 afterEach(() => {

@@ -4,14 +4,14 @@
   "description": "Project-scoped automatic memory for OpenCode",
   "type": "module",
   "exports": {
-    "./server": "./memory_server.tsx",
-    "./tui": "./memory_tui.tsx",
-    "./rpc": "./memory_rpc.ts"
+    "./server": "./server.tsx",
+    "./tui": "./tui.tsx",
+    "./rpc": "./rpc.ts"
   },
   "files": [
-    "memory_server.tsx",
-    "memory_tui.tsx",
-    "memory_rpc.ts",
+    "server.tsx",
+    "tui.tsx",
+    "rpc.ts",
     "README.md"
   ],
   "keywords": [

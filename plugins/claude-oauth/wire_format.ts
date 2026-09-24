@@ -27,7 +27,7 @@ const FALLBACK_CREDIT_BETA = "fallback-credit-2026-06-01";
 // Claude client wire-format behavior: beta profiles, Stainless
 // headers, tool-name cloaking, bounded response uncloaking, and /v1/messages
 // body rewriting (billing fingerprint, cch attestation, metadata.user_id
-// attribution). Nothing here touches OpenCode's plugin API; claude_oauth.ts
+// attribution). Nothing here touches OpenCode's plugin API; server.ts
 // wires these pieces into the session HTTP hooks.
 
 /**

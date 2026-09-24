@@ -4,10 +4,10 @@
   "description": "Claude Pro/Max subscription auth for OpenCode with selectable wire profiles",
   "type": "module",
   "exports": {
-    "./server": "./claude_oauth.ts"
+    "./server": "./server.ts"
   },
   "files": [
-    "claude_oauth.ts",
+    "server.ts",
     "wire_format.ts",
     "cowork_wire.ts",
     "ex_machina_wire.ts",

@@ -1,4 +1,4 @@
-import plugin from "./claude_oauth.ts";
+import plugin from "./server.ts";
 
 // Minimal stand-in for the v2 plugin host: records the OAuth method, the model
 // transform, and the session hooks, and drives an Anthropic /v1/messages

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { extractIdentity, resolveIdentity } from "./claude_oauth.ts";
+import { extractIdentity, resolveIdentity } from "./server.ts";
 import { COWORK_PROFILE } from "./wire_format.ts";
 
 const TOKEN_BODY = {

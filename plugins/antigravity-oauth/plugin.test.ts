@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import plugin from "./antigravity_oauth.ts";
+import plugin from "./server.ts";
 
 // Prevent live manifest discovery during plugin instantiation.
 process.env.OPENCODE_ANTIGRAVITY_VERSION ??= "2.8.0";

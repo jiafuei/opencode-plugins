@@ -4,7 +4,7 @@ import { mkdir, readdir, rename, rm, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { createSignal, Show } from "solid-js";
-import { MemoryRpc, type DreamStatus } from "./memory_rpc.ts";
+import { MemoryRpc, type DreamStatus } from "./rpc.ts";
 
 type Choice =
   | { type: "toggle" }

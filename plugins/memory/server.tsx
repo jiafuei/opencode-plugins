@@ -3,7 +3,7 @@ import { Schema } from "effect";
 import { mkdir, readdir, rename, rm, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
-import { MemoryRpc, type DreamStatus } from "./memory_rpc.ts";
+import { MemoryRpc, type DreamStatus } from "./rpc.ts";
 
 // Configure the package in `opencode.json` like:
 //
