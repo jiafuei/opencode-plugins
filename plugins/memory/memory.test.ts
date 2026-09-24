@@ -25,11 +25,8 @@ async function fixture(
   respond: (call: WorkerCall) => unknown,
   options: {
     classifier_model?: string;
-    classifier_variant?: string;
     extractor_model?: string;
-    extractor_variant?: string;
     dream_model?: string;
-    dream_variant?: string;
     interval?: number;
     idle_delay_ms?: number;
     dream_interval_hours?: number;
@@ -182,9 +179,8 @@ describe("memory persistence", () => {
       isClassifier(call)
         ? saveDecisions(createDecision("the completed parser migration"))
         : memoryExtraction(), {
-      classifier_model: "test/small",
-      classifier_variant: "fast",
-      extractor_variant: "thorough",
+      classifier_model: "test/small#fast",
+      extractor_model: "test/small#thorough",
     });
 
     await app.message("ses_variants", "The parser migration is complete.");
@@ -694,7 +690,7 @@ describe("memory manual dreaming", () => {
     const app = await fixture(
       directory,
       (call) => isDreamSelector(call) ? { action: "none" } : saveDecisions(),
-      { dream_model: "test/deep-model", dream_variant: "deep" },
+      { dream_model: "test/deep-model#deep" },
     );
 
     await app.dream("req-rpc", "ses_rpc");

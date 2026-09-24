@@ -88,12 +88,9 @@ The package exposes server, TUI, and RPC entrypoints, so the one `plugins` entry
     {
       "package": "@jiafuei/opencode-memory",
       "options": {
-        "classifier_model": "anthropic/claude-haiku-4-5",
-        "classifier_variant": "low",
-        "extractor_model": "openai/gpt-5.6-luna",
-        "extractor_variant": "xhigh",
-        "dream_model": "anthropic/claude-sonnet-4-6",
-        "dream_variant": "high",
+        "classifier_model": "anthropic/claude-haiku-4-5#low",
+        "extractor_model": "openai/gpt-5.6-luna#xhigh",
+        "dream_model": "anthropic/claude-sonnet-4-6#high",
         "interval": 6,
         "idle_delay_ms": 300000,
         "dream_interval_hours": 36,
@@ -109,19 +106,14 @@ Options:
 | Option | Default | Purpose |
 | --- | --- | --- |
 | `classifier_model` | OpenCode's default model | Background save classification model |
-| `classifier_variant` | model default | Variant for classifier workers; requires a classifier model |
 | `extractor_model` | classifier model | Background extraction model |
-| `extractor_variant` | classifier variant when the model falls back | Variant for extractor workers |
 | `dream_model` | extractor, then classifier model | Memory dreaming selection and curation model |
-| `dream_variant` | extractor or classifier variant when the model falls back | Variant for dream workers |
 | `interval` | `6` | User turns between periodic checkpoints; minimum `2` |
 | `idle_delay_ms` | `300000` | Delay before pending short-session turns are classified |
 | `dream_interval_hours` | `36` | Minimum elapsed hours before automatic dreaming; must be greater than `0` |
 | `dream_min_additions` | `7` | Minimum ordinary creates or replacements before automatic dreaming; positive integer |
 
-Models use `provider/model` format. Without any configured model, workers use OpenCode's default model. Reading memory uses the normal local `read` tool and does not require a model worker.
-
-Variant fallback follows model fallback. For example, an extractor without `extractor_model` or `extractor_variant` inherits both classifier settings. If `extractor_model` is set explicitly, it uses that model's default variant unless `extractor_variant` is also set.
+Models use `provider/model` or `provider/model#variant` format. A worker without its own model inherits the fallback model including its variant. Without any configured model, workers use OpenCode's default model. Reading memory uses the normal local `read` tool and does not require a model worker.
 
 `/memory` toggles auto-memory and automatic dreaming, starts a dream, and opens the index, topic files, or storage folder using `$VISUAL` and then `$EDITOR`. `/dream` starts the same manual dreaming pass without adding a conversation message. Automatic dreaming is disabled until enabled from `/memory`.
 

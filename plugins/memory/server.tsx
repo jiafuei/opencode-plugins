@@ -11,12 +11,9 @@ import { MemoryRpc, type DreamStatus } from "./rpc.ts";
 //   "plugins": [{
 //     "package": "@jiafuei/opencode-memory",
 //     "options": {
-//       "classifier_model": "provider/light-model",
-//       "classifier_variant": "low",
-//       "extractor_model": "provider/memory-model",
-//       "extractor_variant": "high",
-//       "dream_model": "provider/memory-model",
-//       "dream_variant": "high",
+//       "classifier_model": "provider/light-model#low",
+//       "extractor_model": "provider/memory-model#high",
+//       "dream_model": "provider/memory-model#high",
 //       "interval": 6,
 //       "idle_delay_ms": 300000,
 //       "dream_interval_hours": 36,
@@ -27,24 +24,18 @@ import { MemoryRpc, type DreamStatus } from "./rpc.ts";
 
 type MemoryOptions = {
   classifier_model?: string;
-  classifier_variant?: string;
   extractor_model?: string;
-  extractor_variant?: string;
   dream_model?: string;
-  dream_variant?: string;
   interval?: number;
   idle_delay_ms?: number;
   dream_interval_hours?: number;
   dream_min_additions?: number;
 };
 
-type ModelRef = {
+// An undefined worker model means OpenCode's default model.
+type WorkerModel = {
   providerID: string;
   modelID: string;
-};
-
-// An undefined worker model means OpenCode's default model.
-type WorkerModel = ModelRef & {
   variant?: string;
 };
 
@@ -204,24 +195,15 @@ export function dreamDue(now: number, state: DreamRuntimeState, options: { inter
   return now - state.since >= options.intervalHours * 3_600_000 && state.additions >= options.minAdditions;
 }
 
-function parseModel(value: string | undefined): ModelRef | undefined {
+// Models use OpenCode's `provider/model#variant` selection format.
+function parseModel(value: string | undefined): WorkerModel | undefined {
   if (!value) return;
-  const separator = value.indexOf("/");
-  if (separator < 1 || separator === value.length - 1) {
-    throw new Error(`Memory model must use provider/model format: ${value}`);
+  const [model, variant] = value.split("#", 2);
+  const separator = model!.indexOf("/");
+  if (separator < 1 || separator === model!.length - 1) {
+    throw new Error(`Memory model must use provider/model[#variant] format: ${value}`);
   }
-  return { providerID: value.slice(0, separator), modelID: value.slice(separator + 1) };
-}
-
-function parseVariant(value: string | undefined, option: string): string | undefined {
-  if (value === undefined) return;
-  if (typeof value !== "string" || !value.trim()) throw new Error(`Memory ${option} must be a nonempty string`);
-  return value.trim();
-}
-
-function resolveWorkerModel(model: ModelRef | undefined, variant: string | undefined, fallback?: WorkerModel): WorkerModel | undefined {
-  if (model) return { ...model, variant };
-  if (fallback) return { ...fallback, variant: variant ?? fallback.variant };
+  return { providerID: model!.slice(0, separator), modelID: model!.slice(separator + 1), variant: variant || undefined };
 }
 
 export function parseIndexLine(line: string): IndexEntry | undefined {
@@ -498,12 +480,9 @@ export function memoryProjectKey(directory: string): string {
 const setup = async (ctx: Plugin.Context) => {
   const directory = ctx.location.directory;
   const source = ctx.options as MemoryOptions;
-  const configuredClassifier = parseModel(source.classifier_model);
-  const classifierVariant = parseVariant(source.classifier_variant, "classifier_variant");
-  const configuredExtractor = parseModel(source.extractor_model);
-  const extractorVariant = parseVariant(source.extractor_variant, "extractor_variant");
-  const configuredDream = parseModel(source.dream_model);
-  const dreamVariant = parseVariant(source.dream_variant, "dream_variant");
+  const classifierModel = parseModel(source.classifier_model);
+  const extractorModel = parseModel(source.extractor_model) ?? classifierModel;
+  const dreamModel = parseModel(source.dream_model) ?? extractorModel;
   const interval = source.interval ?? 6;
   const idleDelay = source.idle_delay_ms ?? 300_000;
   const dreamOptions = validateDreamOptions(source);
@@ -523,9 +502,6 @@ const setup = async (ctx: Plugin.Context) => {
   const states = new Map<string, SessionState>();
   const systemContexts = new Map<string, Promise<string>>();
   const background = new Set<Promise<unknown>>();
-  const classifierModel = resolveWorkerModel(configuredClassifier, classifierVariant);
-  const extractorModel = resolveWorkerModel(configuredExtractor, extractorVariant, classifierModel);
-  const dreamModel = resolveWorkerModel(configuredDream, dreamVariant, extractorModel);
   let writeQueue = Promise.resolve();
   let maintenanceJob: Promise<void> | undefined;
   let initialMaintenanceScheduled = false;
