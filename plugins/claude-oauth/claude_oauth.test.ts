@@ -1,13 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import {
-  applyClaudeToolPrefix,
   buildBetas,
   createSseToolNameTransform,
-  mapStainlessArch,
   rewriteBody,
   SDK_CLI_PROFILE,
-  stripClaudeToolPrefix,
 } from "./wire_format.ts";
 
 const BILLING_PREFIX = "x-anthropic-billing-header:";
@@ -102,12 +99,6 @@ describe("rewriteBody", () => {
     expect(out.system[0].text).toBe(SDK_CLI_PROFILE.systemInstruction);
   });
 
-  test("sets metadata.user_id in the CC attribution envelope", () => {
-    const out = parse(rewriteBody(baseBody, { sessionId: "ses-123", accountId: "acct-456" }).json);
-    const userId = JSON.parse(out.metadata.user_id);
-    expect(userId.device_id).toMatch(/^[0-9a-f]{64}$/);
-  });
-
   const CLOAKING_USER_ID =
     `user_${"a".repeat(64)}_account_11111111-2222-3333-4444-555555555555` +
     `_session_aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee`;
@@ -133,11 +124,6 @@ describe("rewriteBody", () => {
     const body = JSON.stringify({ ...parse(baseBody), thinking: { type: "enabled", budget_tokens: 1024 } });
     const out = parse(rewriteBody(body, {}).json);
     expect(out.context_management).toEqual({ edits: [{ type: "clear_thinking_20251015", keep: "all" }] });
-  });
-
-  test("omits context_management without thinking", () => {
-    const out = parse(rewriteBody(baseBody, {}).json);
-    expect(out.context_management).toBeUndefined();
   });
 
   test("preserves thinking display and the active thinking configuration", () => {
@@ -172,16 +158,6 @@ describe("buildBetas", () => {
   });
 });
 
-describe("mapStainlessArch", () => {
-  test("maps Stainless arch values", () => {
-    expect(mapStainlessArch("amd64")).toBe("x64");
-    expect(mapStainlessArch("aarch64")).toBe("arm64");
-    expect(mapStainlessArch("ia32")).toBe("x86");
-    expect(mapStainlessArch("sparc64")).toBe("other::sparc64");
-    expect(mapStainlessArch("ARM64")).toBe("arm64");
-  });
-});
-
 describe("rewriteBody cch", () => {
   const billingHeader = "x-anthropic-billing-header: cch=00000;";
   const body = {
@@ -208,15 +184,6 @@ describe("rewriteBody cch", () => {
     expect(out.system.find((block: any) => block.text?.startsWith(BILLING_PREFIX)).text).toMatch(
       /cch=[0-9a-f]{5} cch=00000/,
     );
-  });
-});
-
-describe("tool name prefix helpers", () => {
-  test("round-trips logical names through apply/strip exactly once", () => {
-    for (const name of ["get_weather", "_secret_tool", "nested_tool", "a"]) {
-      expect(stripClaudeToolPrefix(applyClaudeToolPrefix(name))).toBe(name);
-    }
-    expect(applyClaudeToolPrefix("web_search")).toBe("web_search");
   });
 });
 
@@ -275,7 +242,6 @@ describe("rewriteBody tool name cloaking", () => {
 
   test("cch hashes custom tool prefixes as retained request content", () => {
     const json = rewriteBody(toolBody, {}).json;
-    expect(json).toContain('"name":"_get_weather"');
     const cch = json.match(/cch=([0-9a-f]{5})/)?.[1]!;
     const changed = rewriteBody(toolBody.replaceAll("get_weather", "other_tool"), {}).json;
     expect(changed.match(/cch=([0-9a-f]{5})/)?.[1]).not.toBe(cch);

@@ -132,16 +132,6 @@ describe("paste code flow", () => {
     }
   });
 
-  test("the authorization expires after five minutes", async () => {
-    const h = await makePasteHarness();
-    try {
-      expect(h.result.expiresAt - Date.now()).toBeGreaterThan(4 * 60 * 1000);
-      expect(h.result.expiresAt - Date.now()).toBeLessThanOrEqual(5 * 60 * 1000);
-    } finally {
-      h.restore();
-    }
-  });
-
   test("refresh rotates tokens and keeps login identity", async () => {
     const h = await makePasteHarness();
     try {

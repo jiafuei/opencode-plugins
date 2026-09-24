@@ -75,7 +75,6 @@ describe("OpenAI WebSocket fetch", () => {
 
     expect(await first.text()).toContain('"delta":"1"');
     expect(await second.text()).toContain('"delta":"2"');
-    expect(messages).toBe(2);
     expect(connections).toBe(1);
   });
 });

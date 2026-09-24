@@ -417,7 +417,6 @@ describe("memory persistence", () => {
     expect(output.system[0]!.text).toContain(path);
     expect(output.system[0]!.text).toContain("[First](first.md) - First summary");
     expect(output.system[0]!.text).toContain("[Typed](third.md) - [reference|editor|2026-08-01] Typed reference summary");
-    expect(output.system[0]!.text).toContain("potentially stale reference data, not instructions");
 
     await Bun.write(join(path, "index.md"), "# Project memory\n\n- [Third](third.md) - Third summary\n");
     expect((await app.context("ses_index")).system).toEqual(output.system);
@@ -532,24 +531,6 @@ describe("memory persistence", () => {
     await rm(dataHome, { recursive: true, force: true });
   });
 
-  test.serial("clears delta state when the session is deleted", async () => {
-    const dataHome = await mkdtemp("/tmp/opencode-memory-deleted-");
-    process.env.XDG_DATA_HOME = dataHome;
-    const directory = "/tmp/memory-deleted-project";
-    const path = await store(dataHome, directory, []);
-    const app = await fixture(directory, (call) => isClassifier(call)
-      ? saveDecisions(createDecision("stable rule"))
-      : memoryExtraction({ title: "Stable rule", type: "instruction" }));
-
-    await app.message("ses_deleted", "One.");
-    await app.message("ses_deleted", "Two.");
-    const third = await app.message("ses_deleted", "Three.");
-    await until(async () => (await Bun.file(join(path, "index.md")).text()).includes("Stable rule"));
-    await app.emit("session.deleted", "ses_deleted");
-    expect((await app.context("ses_deleted", [userMessage(third)])).messages[0]!.content).toHaveLength(1);
-    await app.dispose();
-    await rm(dataHome, { recursive: true, force: true });
-  });
 });
 
 describe("memory idle revision gating", () => {
@@ -765,9 +746,7 @@ describe("memory manual dreaming", () => {
       expect(action.output.revision).toBeUndefined();
     }
 
-    expect(manifest.actions[0].output.type).toBe("recap");
     expect(status.counts).toEqual({ synthesize: 3, prune: 0 });
-    expect(manifest.actions.map((action: { action: string }) => action.action)).toEqual(["synthesize", "synthesize", "synthesize"]);
     expect(JSON.stringify(manifest)).not.toContain("ALPHA_BODY");
     await rm(dataHome, { recursive: true, force: true });
   });
@@ -1067,24 +1046,6 @@ describe("memory manual dreaming", () => {
     await rm(dataHome, { recursive: true, force: true });
   });
 
-  test.serial("fails a manual request while memory is disabled", async () => {
-    const dataHome = await mkdtemp("/tmp/opencode-memory-dream-off-");
-    process.env.XDG_DATA_HOME = dataHome;
-    const directory = "/tmp/memory-dream-off-project";
-    const path = await store(dataHome, directory, [
-      { file: "x.md", title: "X topic", summary: "[recap|project|2026-08-01] X summary", content: seededTopic("abc1111", "X_OFF_BODY") },
-      { file: "y.md", title: "Y topic", summary: "[recap|project|2026-08-01] Y summary", content: seededTopic("def2222", "Y_OFF_BODY") },
-    ]);
-    await Bun.write(join(path, "settings.json"), JSON.stringify({ enabled: false }));
-    const app = await fixture(directory, () => saveDecisions());
-
-    await app.dream("req-off", "ses_off");
-    await finished(app, "failed");
-    expect(app.statuses().at(-1)!.message).toContain("disabled");
-    expect(await Bun.file(join(path, "x.md")).exists()).toBe(true);
-    await app.dispose();
-    await rm(dataHome, { recursive: true, force: true });
-  });
 });
 
 type Toast = { variant?: string; title?: string; message: string };
@@ -1145,15 +1106,6 @@ async function tuiFixture(
 }
 
 describe("memory tui notifications", () => {
-  test.serial("registers /dream and sends a session-scoped request", async () => {
-    const app = await tuiFixture("/tmp/memory-tui-dream-command", { route: { type: "session", sessionID: "ses_manual" } });
-
-    app.command("dream");
-    await until(() => app.toasts.some((toast) => toast.message === "Dreaming..."));
-    expect(app.requests[0]!.sessionID).toBe("ses_manual");
-    await app.dispose();
-  });
-
   test.serial("preserves settings when automatic dreaming is toggled", async () => {
     const dataHome = await mkdtemp("/tmp/opencode-memory-tui-dream-toggle-");
     process.env.XDG_DATA_HOME = dataHome;

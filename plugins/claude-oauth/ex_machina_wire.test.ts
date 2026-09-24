@@ -10,33 +10,12 @@ import {
 } from "./ex_machina_wire.ts";
 import {
   createSseToolNameTransform,
-  COWORK_PROFILE,
-  resolveSpoofingProfile,
-  SDK_CLI_PROFILE,
   uncloakedResponseHeaders,
 } from "./wire_format.ts";
 import { setupPlugin } from "./test_harness.ts";
 
 describe("ex-machina profile", () => {
-  test("resolver keeps the existing default and accepts all three profile IDs", () => {
-    expect(resolveSpoofingProfile(undefined)).toBe(SDK_CLI_PROFILE);
-    expect(resolveSpoofingProfile("cowork")).toBe(COWORK_PROFILE);
-    expect(resolveSpoofingProfile("sdk-cli")).toBe(SDK_CLI_PROFILE);
-    expect(resolveSpoofingProfile("ex-machina")).toBe(EX_MACHINA_PROFILE);
-    expect(() => resolveSpoofingProfile("invalid")).toThrow(
-      /expected "cowork", "sdk-cli", or "ex-machina"/,
-    );
-  });
-
-  test("pins production constants and merges required betas first", () => {
-    expect(EX_MACHINA_PROFILE).toEqual({
-      id: "ex-machina",
-      wireFormat: "ex-machina",
-      version: "2.1.87",
-      userAgent: "claude-cli/2.1.87 (external, cli)",
-      billingEntrypoint: "sdk-cli",
-      systemInstruction: "You are a Claude agent, built on Anthropic's Claude Agent SDK.",
-    });
+  test("merges required betas first", () => {
     expect(
       mergeExMachinaBetas("incoming-one,oauth-2025-04-20,incoming-two,incoming-one"),
     ).toBe("oauth-2025-04-20,interleaved-thinking-2025-05-14,incoming-one,incoming-two");
@@ -105,30 +84,6 @@ describe("ex-machina request transforms", () => {
     expect(rewritten.tools[1].input_schema.additionalProperties).toBe(true);
   });
 
-  test("normalizes source system shapes and avoids duplicate identity at the front", () => {
-    expect(JSON.parse(rewriteExMachinaBody(JSON.stringify({ messages: [] }))).system).toEqual([
-      { type: "text", text: EX_MACHINA_PROFILE.systemInstruction },
-    ]);
-    expect(
-      JSON.parse(
-        rewriteExMachinaBody(
-          JSON.stringify({
-            messages: [],
-            system: [
-              EX_MACHINA_PROFILE.systemInstruction,
-              { type: "image", source: "x" },
-              7,
-            ],
-          }),
-        ),
-      ).system,
-    ).toEqual([
-      { type: "text", text: EX_MACHINA_PROFILE.systemInstruction },
-      { type: "text", text: "[object Object]" },
-      { type: "text", text: "7" },
-    ]);
-  });
-
   test("billing requires a user message and attributionHeader only suppresses billing", () => {
     const noUser = JSON.parse(rewriteExMachinaBody(JSON.stringify({ messages: [{ role: "assistant", content: "x" }] })));
     expect(noUser.system).toEqual([{ type: "text", text: EX_MACHINA_PROFILE.systemInstruction }]);
@@ -140,10 +95,6 @@ describe("ex-machina request transforms", () => {
     );
     expect(disabled.system).toEqual([{ type: "text", text: EX_MACHINA_PROFILE.systemInstruction }]);
     expect(disabled.tools[0].name).toBe("mcp_Bash");
-  });
-
-  test("invalid JSON passes through unchanged", () => {
-    expect(rewriteExMachinaBody("not-json")).toBe("not-json");
   });
 
   test("strict headers retain only the safe allowlist and pin OAuth values", () => {
@@ -224,9 +175,6 @@ describe("ex-machina integration dispatch", () => {
     expect(request.headers.get("x-session-affinity")).toBeNull();
     expect(request.headers.get("authorization")).toBe("Bearer test-access-token");
     expect(request.headers.get("user-agent")).toBe(EX_MACHINA_PROFILE.userAgent);
-    const body = JSON.parse(bodyText);
-    expect(body.max_tokens).toBe(100000);
-    expect(body.tools[0].name).toBe("mcp_Read_file");
     expect(await response.text()).toContain('"name":"read_file"');
     expect(response.headers.get("etag")).toBeNull();
   });

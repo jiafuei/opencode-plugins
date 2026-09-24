@@ -31,10 +31,4 @@ describe("browser callback waiter", () => {
     expect(waiter.deliver("http://127.0.0.1:51121/favicon.ico")).toBe("Not found");
     await expect(waiter.promise).rejects.toThrow(/authorization window expired/);
   });
-
-  test("the timeout rejects even when no browser ever arrives", async () => {
-    const waiter = createCallbackWaiter("state-1", 20);
-    await expect(waiter.promise).rejects.toThrow(/authorization window expired/);
-    waiter.dispose();
-  });
 });

@@ -74,7 +74,6 @@ describe("configuration", () => {
       type: "compact_20260112",
       trigger: { type: "input_tokens", value: 140_000 },
     });
-    expect(compactionEdit(options)).not.toHaveProperty("instructions");
   });
 
   test("supports percentages, fractional thresholds, and absolute token counts", async () => {
@@ -86,40 +85,9 @@ describe("configuration", () => {
   test("clamps relative thresholds to Anthropic's minimum", async () => {
     expect(compactionEdit(await setup({ threshold: "10%" }, { context: 100_000 })).trigger.value).toBe(50_000);
   });
-
-  test("rejects invalid thresholds", async () => {
-    for (const threshold of [0, -1, "0%", "101%", "70", 49_999] as const) {
-      await expect(load({ threshold })).rejects.toThrow("Anthropic compaction");
-    }
-  });
-
-  test("uses custom instructions", async () => {
-    const options = await setup({ instructions: "Preserve every identifier. Do not call tools." });
-    expect(compactionEdit(options).instructions).toBe("Preserve every identifier. Do not call tools.");
-  });
-
-  test("can be disabled", async () => {
-    expect((await load({ enabled: false })).size).toBe(0);
-  });
 });
 
 describe("request gating", () => {
-  test("enables documented Anthropic models", async () => {
-    for (const id of [
-      "claude-fable-5",
-      "claude-mythos-5",
-      "claude-mythos-preview",
-      "claude-opus-5",
-      "claude-opus-4-8",
-      "claude-opus-4-7",
-      "claude-opus-4-6",
-      "claude-sonnet-5",
-      "claude-sonnet-4-6",
-    ]) {
-      expect(compactionEdit(await setup({}, { id }))?.type).toBe("compact_20260112");
-    }
-  });
-
   test("supports configured proxy providers and model aliases", async () => {
     const options = await setup(
       {

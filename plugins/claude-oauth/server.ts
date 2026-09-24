@@ -83,7 +83,7 @@ function nonEmpty(value: unknown): string | undefined {
 }
 
 /** Normalize the token response's account/organization blocks; empty/non-string values become undefined. */
-export function extractIdentity(data: TokenResponse): OAuthIdentity {
+function extractIdentity(data: TokenResponse): OAuthIdentity {
   return {
     accountId: nonEmpty(data.account?.uuid),
     email: nonEmpty(data.account?.email_address),

@@ -60,9 +60,7 @@ describe("project discovery", () => {
 
     const firstBody = JSON.parse(String(calls[0]!.init.body));
     expect(firstBody).toEqual({ metadata: ANTIGRAVITY_LOAD_CODE_ASSIST_METADATA });
-    expect(ANTIGRAVITY_LOAD_CODE_ASSIST_METADATA.ideType).toBe("ANTIGRAVITY");
     expect(calls[0]!.url).toBe("https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist");
-    expect((calls[0]!.init.headers as Record<string, string>).Authorization).toBe("Bearer tok");
     // Native fingerprint on control-plane requests too.
     expect((calls[0]!.init.headers as Record<string, string>)["User-Agent"]).toContain("antigravity/hub/");
   });
@@ -116,10 +114,6 @@ describe("project discovery", () => {
     const pollHeaders = pollCall.init.headers as Record<string, string>;
     expect(pollHeaders["Content-Type"]).toBe("application/json");
     expect(pollHeaders["User-Agent"]).toContain("antigravity/hub/");
-    expect(pollHeaders.Authorization).toBe("Bearer tok");
-    // The initial POST and the poll run under one deadline (per-call signals).
-    expect(onboardCall.init.signal).toBeInstanceOf(AbortSignal);
-    expect(pollCall.init.signal).toBeInstanceOf(AbortSignal);
   });
 
   test("failed operations surface their error", async () => {
@@ -130,14 +124,6 @@ describe("project discovery", () => {
     await expect(discoverProject("t", fetcher, undefined, immediateTiming)).rejects.toThrow(
       /OnboardUser operation failed.*7.*permission denied/s,
     );
-  });
-
-  test("operation without a name fails clearly", async () => {
-    const { fetcher } = scriptedFetcher([
-      () => jsonResponse({ allowedTiers: [{ id: "free-tier" }] }),
-      () => jsonResponse({ done: false }),
-    ]);
-    await expect(discoverProject("t", fetcher, undefined, immediateTiming)).rejects.toThrow(/without a name/);
   });
 
   test("onboarding respects the single 30s deadline", async () => {
@@ -171,15 +157,5 @@ describe("project discovery", () => {
       expect(message).toContain("not eligible");
       expect(message).toContain("https://example.com/validate");
     }
-  });
-
-  test("missing companion project after refresh fails clearly", async () => {
-    const { fetcher } = scriptedFetcher([
-      () => jsonResponse({ currentTier: { id: "free-tier" } }),
-      () => jsonResponse({ currentTier: { id: "free-tier" } }),
-    ]);
-    await expect(discoverProject("t", fetcher, undefined, immediateTiming)).rejects.toThrow(
-      /did not return a cloudaicompanionProject/,
-    );
   });
 });

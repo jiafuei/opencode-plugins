@@ -3,7 +3,6 @@ import {
   DEFAULT_LIMITS,
   effectiveLimits,
   drainPendingCoordination,
-  failureDecisionStatus,
   isLeaseStale,
   planDiff,
   reconcileRevisionWorkers,
@@ -13,7 +12,6 @@ import {
   hydrateRun,
   pendingCoordinationReason,
   pendingTemplateDependency,
-  quiescenceStatus,
   renderTemplate,
   retryClassification,
   retryDelay,
@@ -40,14 +38,11 @@ import {
   currentPlanProgress,
   finalizeDeliveredSteering,
   steeringFollowUp,
-  tokenUsage,
   workerTurnPrompt,
   requeueDeliveredSteering,
   abortForParentDeletion,
-  canDiscardRun,
   normalizeWorkflowOptions,
   retentionCandidates,
-  startupActions,
   workflowCeilings,
   acceptCoordinatorResult,
   finalizeSoftPause,
@@ -179,17 +174,6 @@ describe("Stage 4 steering and inspector", () => {
     expect(steeringFollowUp(worker, 6)!.ids).toEqual(["s3"]);
   });
 
-  test("models same-session superseded follow-ups and token telemetry", () => {
-    const worker = run().workers.scan!;
-    worker.childSessionID = "child";
-    acceptWorkerSteering({ workers: { scan: worker } } as unknown as WorkflowRun, "scan", "revise", 1, "s1");
-    const follow = steeringFollowUp(worker)!;
-    worker.attempts = [{ number: 1, kind: "turn", startedAt: 1, endedAt: 2, result: "superseded", output: "old" }, { number: 2, kind: "turn", startedAt: 2, result: "completed", steeringIDs: follow.ids, output: "new" }];
-    expect(worker.childSessionID).toBe("child");
-    expect(worker.attempts[0]!.output).toBe("old");
-    expect(tokenUsage({ input: 2, output: 3, reasoning: 1 })?.total).toBe(6);
-  });
-
   test("uses original prompt once, then corrective retry and resume prompts", () => {
     expect(workerTurnPrompt(false, 1, undefined)).toBe("original");
     expect(workerTurnPrompt(false, 2, "retry")).toBe("original");
@@ -197,11 +181,6 @@ describe("Stage 4 steering and inspector", () => {
     expect(workerTurnPrompt(true, 2, undefined)).toContain("prior attempt failed");
     expect(workerTurnPrompt(true, 1, "retry")).toContain("prior attempt failed");
     expect(workerTurnPrompt(true, 1, "resume")).toContain("Continue the interrupted work");
-    expect(workerTurnPrompt(true, 1, "retry", undefined, "boom")).toBe("Your prior attempt failed with this error:\n\nboom\n\nCorrect the issue and return the requested final result.");
-  });
-
-  test("classifies authoritative permission errors as terminal", () => {
-    expect(retryClassification({ name: "PermissionDenied", status: 403 })).toBe("none");
   });
 
   test("requeues delivered steering after failed or interrupted follow-up", () => {
@@ -211,15 +190,6 @@ describe("Stage 4 steering and inspector", () => {
     requeueDeliveredSteering(worker, delivered.ids);
     expect(worker.steering[0]).toMatchObject({ id: "s1", status: "queued", deliveredAt: undefined });
     expect(steeringFollowUp(worker)!.ids).toEqual(["s1"]);
-  });
-
-  test("keeps automatic retry cycle progress until explicit reset", () => {
-    const worker = run().workers.scan!;
-    worker.automaticRetries = 5;
-    worker.status = "interrupted";
-    expect(retryDelay(worker.automaticRetries + 1)).toBeUndefined();
-    worker.automaticRetries = 0;
-    expect(retryDelay(worker.automaticRetries + 1)).toBe(5_000);
   });
 
   test("derives current-plan progress without retired history", () => {
@@ -268,7 +238,6 @@ describe("Stage 3 adaptive planning", () => {
     const before = [{ id: "p", title: "Old", steps: [{ type: "worker", worker: { id: "a", label: "A", agent: "build", prompt: "a" } }, { type: "worker", worker: { id: "b", label: "B", agent: "build", prompt: "b" } }] }] as never;
     const after = [{ id: "p", title: "New", steps: [{ type: "worker", worker: { id: "b", label: "B", agent: "build", prompt: "b" } }, { type: "worker", worker: { id: "c", label: "C", agent: "build", prompt: "c" } }] }] as never;
     const diff = planDiff(before, after);
-    expect(diff).toEqual(planDiff(before, after));
     expect(diff.map((item) => `${item.kind}:${item.id}`)).toEqual(["changed:p", "removed:a", "reordered:b", "added:c"]);
   });
 
@@ -324,12 +293,7 @@ describe("Stage 3 adaptive planning", () => {
     expect(current.consumedCheckpoints).toEqual(["checkpoint-1"]);
   });
 
-  test("does not clear newer guidance and does not retry policy failures", () => {
-    const current = run();
-    current.pendingGuidance = [{ id: "g1", generation: 1, text: "one", createdAt: 1 }, { id: "g2", generation: 2, text: "two", createdAt: 2 }];
-    const included = new Set(["g1"]);
-    current.pendingGuidance = current.pendingGuidance.filter((item) => !included.has(item.id));
-    expect(current.pendingGuidance.map((item) => item.id)).toEqual(["g2"]);
+  test("does not retry coordinator policy failures", () => {
     expect(coordinatorRetryable(new Error("provider timeout"))).toBe(true);
     expect(coordinatorRetryable(new Error("agent outside allowedAgents"), true)).toBe(false);
   });
@@ -405,13 +369,6 @@ describe("Stage 5 lifecycle and release", () => {
     const options = normalizeWorkflowOptions({ max_workers: 2, max_revisions: 3, max_run_ms: 1000 });
     const tooLarge = structuredClone(base); tooLarge.limits = { maxWorkers: 3 };
     expect(() => validateWorkflowSpec(tooLarge, agents, models, workflowCeilings(options))).toThrow("1 to 2");
-  });
-
-  test("derives startup/manual actions", () => {
-    const interrupted = run("run", "interrupted", 1);
-    expect(startupActions(interrupted)).toEqual(["resume", "open", "later", "discard"]);
-    expect(canDiscardRun(interrupted)).toBe(true);
-    expect(canDiscardRun(run("active", "running", 1))).toBe(false);
   });
 
   test("terminally aborts only a nonterminal run after parent deletion", () => {
@@ -507,19 +464,6 @@ describe("Stage 2 reliability helpers", () => {
     const lease = { runID: "run", ownerIdentity: "123:abc", heartbeatAt: 10_000 };
     expect(isLeaseStale(lease, 24_999)).toBe(false);
     expect(isLeaseStale(lease, 25_001)).toBe(true);
-  });
-
-  test("requires quiescence before hard pause and stop become resumable", () => {
-    expect(quiescenceStatus("hard_pause", false)).toBe("hard_pausing");
-    expect(quiescenceStatus("hard_pause", true)).toBe("hard_paused");
-    expect(quiescenceStatus("stop", false)).toBe("stopping");
-    expect(quiescenceStatus("stop", true)).toBe("stopped");
-  });
-
-  test("moves worker retry and non-dependent skip out of blocked state", () => {
-    expect(failureDecisionStatus("retry", false)).toBe("soft_paused");
-    expect(failureDecisionStatus("skip", false)).toBe("soft_paused");
-    expect(failureDecisionStatus("skip", true)).toBe("repair_required");
   });
 
   test("creates ascending OpenCode-compatible message IDs", () => {

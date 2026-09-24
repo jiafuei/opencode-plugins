@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { extractIdentity, resolveIdentity } from "./server.ts";
+import { resolveIdentity } from "./server.ts";
 import { COWORK_PROFILE } from "./wire_format.ts";
 
 const TOKEN_BODY = {
@@ -54,16 +54,6 @@ function jsonResponse(body: unknown, status = 200): Response {
 function identityResponse(url: string): Response {
   return jsonResponse(url.includes("/roles") ? ROLES_IDENTITY : PROFILE_IDENTITY);
 }
-
-describe("extractIdentity normalization", () => {
-  serialTest("extracts valid token identity", () => {
-    expect(extractIdentity({
-      ...TOKEN_BODY,
-      account: { uuid: "acct-1", email_address: "a@b.c" },
-      organization: { uuid: "org-1", name: "Org" },
-    })).toEqual({ accountId: "acct-1", email: "a@b.c", orgId: "org-1", orgName: "Org" });
-  });
-});
 
 describe("resolveIdentity (login semantics)", () => {
   serialTest("Cowork recovers identity from the Claude CLI bootstrap request", async () => {

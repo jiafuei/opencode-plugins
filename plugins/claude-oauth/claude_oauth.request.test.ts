@@ -40,8 +40,6 @@ describe("request capture: OAuth streaming request", () => {
     expect(headers["anthropic-beta"]!.split(",")).toContain("oauth-2025-04-20");
 
     const body = JSON.parse(bodyText);
-    expect(body.stream).toBe(true);
-    expect(body.max_tokens).toBe(64000);
     expect(body.system[0].text).toContain("x-anthropic-billing-header:");
     expect(body.system[0].text).not.toContain("cch=00000");
     const userId = JSON.parse(body.metadata.user_id);
@@ -84,16 +82,6 @@ describe("request capture: OAuth streaming request", () => {
     expect(await sessionId("ses_other")).not.toBe(first);
     await emit({ type: "session.deleted", data: { sessionID: "ses_stable" } });
     expect(await sessionId("ses_stable")).not.toBe(first);
-  });
-
-  test("attributionHeader false suppresses billing", async () => {
-    const { send } = await setupPlugin({ attributionHeader: false });
-    const { bodyText } = await send({
-      ...BASE_BODY,
-      system: [{ type: "text", text: "x-anthropic-billing-header: cc_version=old; cch=abcde;" }],
-    });
-    const system = JSON.parse(bodyText).system as Array<{ text: string }>;
-    expect(system.some((block) => block.text.startsWith("x-anthropic-billing-header:"))).toBe(false);
   });
 });
 

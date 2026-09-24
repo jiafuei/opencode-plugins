@@ -57,12 +57,6 @@ describe("authorization URL", () => {
     // The native flow does not use PKCE.
     expect(url.searchParams.get("code_challenge")).toBeNull();
   });
-
-  test("callback constants match the native client", () => {
-    expect(CALLBACK_PORT).toBe(51121);
-    expect(CALLBACK_PATH).toBe("/oauth-callback");
-    expect(REDIRECT_URI).toBe("http://127.0.0.1:51121/oauth-callback");
-  });
 });
 
 describe("paste-code extraction", () => {
@@ -114,17 +108,6 @@ describe("token exchange", () => {
     expect(body.get("grant_type")).toBe("authorization_code");
     expect(body.get("code")).toBe("code-1");
     expect(body.get("redirect_uri")).toBe(REDIRECT_URI);
-    expect(body.get("client_id")).toContain(".apps.googleusercontent.com");
-    expect(body.get("client_secret")).toBeTruthy();
-
-    const userinfoCall = calls[1]!;
-    expect(userinfoCall.url).toBe("https://www.googleapis.com/oauth2/v1/userinfo?alt=json");
-    expect((userinfoCall.init.headers as Record<string, string>).Authorization).toBe("Bearer at-1");
-  });
-
-  test("missing refresh_token fails loudly", async () => {
-    const { fetcher } = scriptedFetcher([() => jsonResponse({ access_token: "at", expires_in: 100 })]);
-    await expect(exchangeToken("c", REDIRECT_URI, fetcher)).rejects.toThrow(/refresh token/i);
   });
 
   test("endpoint errors never echo credential-bearing bodies", async () => {

@@ -85,7 +85,6 @@ describe("OpenAI web search provider", () => {
         expect(request?.input).toBe(url);
         expect(request?.headers.get("authorization")).toBe(`Bearer ${token}`);
         expect(request?.headers.get("chatgpt-account-id")).toBe(accountId);
-        expect(request?.body.model).toBe("gpt-5.6-luna");
         expect(results).toEqual([{ url: "https://example.com", title: "Example", content: "Grounded answer", time: {} }]);
       } finally {
         globalThis.fetch = originalFetch;

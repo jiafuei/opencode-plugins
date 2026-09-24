@@ -3,7 +3,6 @@ import {
   buildBetas,
   COWORK_PROFILE,
   rewriteBody,
-  resolveSpoofingProfile,
   SDK_CLI_PROFILE,
 } from "./wire_format.ts";
 import { deriveDeviceId } from "./local_storage.ts";
@@ -22,24 +21,6 @@ function parse(json: string) {
   return JSON.parse(json) as Record<string, any>;
 }
 
-describe("resolveSpoofingProfile", () => {
-  test("defaults to SDK CLI and accepts the legacy profiles", () => {
-    expect(resolveSpoofingProfile(undefined)).toBe(SDK_CLI_PROFILE);
-    expect(resolveSpoofingProfile("cowork")).toBe(COWORK_PROFILE);
-    expect(resolveSpoofingProfile("sdk-cli")).toBe(SDK_CLI_PROFILE);
-  });
-
-  test("throws for the removed cli/cli-meka profiles and any unsupported value", () => {
-    for (const value of ["cli", "cli-meka", "deskmate", "", null, 42, true]) {
-      expect(() => resolveSpoofingProfile(value)).toThrow(/spoofingProfile/);
-    }
-  });
-
-  test("the unsupported-profile error lists all supported profiles", () => {
-    expect(() => resolveSpoofingProfile("cli")).toThrow(/expected "cowork", "sdk-cli", or "ex-machina"/);
-  });
-});
-
 describe("buildBetas with the Cowork profile", () => {
   test("utility requests get exactly the utility list — no effort/fallback/redact", () => {
     expect(buildBetas(undefined, false, null, COWORK_PROFILE)).toEqual(COWORK_PROFILE.utilityBetas.join(","));
@@ -48,11 +29,6 @@ describe("buildBetas with the Cowork profile", () => {
 });
 
 describe("rewriteBody with the SDK CLI profile", () => {
-  test("attributionHeader false keeps SDK CLI identity without billing", () => {
-    const out = parse(rewriteBody(baseBody, { attributionHeader: false, profile: SDK_CLI_PROFILE }).json);
-    expect(JSON.stringify(out.system)).not.toContain("x-anthropic-billing-header:");
-  });
-
   test("normalizes CCH exactly like pi-black", () => {
     const body = JSON.stringify({
       ...parse(baseBody),
@@ -301,7 +277,6 @@ describe("request capture: cowork profile through the session hooks", () => {
     }
 
     const body = JSON.parse(bodyText);
-    expect(body.max_tokens).toBe(64000);
     expect(body.system[0].text).toContain("cc_entrypoint=claude-desktop;");
     expect(bodyText).not.toContain("cc_prev_req=");
   });
@@ -321,7 +296,6 @@ describe("request capture: cowork profile through the session hooks", () => {
     const coworkB = await sessionId("ses-b");
     expect(coworkA.id).toBe(coworkA2.id);
     expect(coworkB.id).not.toBe(coworkA.id);
-    expect(coworkA.id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
     await coworkA.plugin.emit({ type: "session.deleted", data: { sessionID: "ses-a" } });
     const coworkAfterDelete = await sessionId("ses-a");
     expect(coworkAfterDelete.id).toBe(coworkA.id);

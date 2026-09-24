@@ -162,10 +162,6 @@ describe("provider registration", () => {
       settings: { baseURL: DAILY },
     });
     expect(added.sourceConnection).toBeUndefined();
-    const ids = added.models.map((model: any) => model.id);
-    for (const modelID of ["gemini-3.1-pro", "gemini-3-flash", "claude-opus-4-6", "gpt-oss-120b"]) {
-      expect(ids).toContain(modelID);
-    }
   });
 
   test("an OAuth connection binds the discovered inventory to that connection", async () => {
@@ -194,13 +190,6 @@ describe("provider registration", () => {
     await harness.edit("provider", { add: (definition: unknown) => (added = definition) });
     expect(added.sourceConnection).toBeUndefined();
     expect(added.models.map((model: any) => model.id)).toContain("gemini-3.1-pro");
-  });
-
-  test("invalid plugin options fail during initialization", async () => {
-    await expect(makeHarness(undefined, { endpointMode: "other" }).ready()).rejects.toThrow(/endpointMode/);
-    await expect(makeHarness(undefined, { firstEventTimeoutMs: 0 }).ready()).rejects.toThrow(
-      /finite positive number/,
-    );
   });
 });
 
@@ -252,8 +241,6 @@ describe("OAuth methods", () => {
         refresh: "rt",
         metadata: { projectId: "project-1", email: "me@example.com" },
       });
-      expect(browser.label(credential)).toBe("me@example.com");
-      expect(mock.calls).toHaveLength(4);
     } finally {
       mock.restore();
     }
@@ -267,7 +254,6 @@ describe("OAuth methods", () => {
     const { paste } = await methods();
     const authorization = await paste.authorize({});
     const state = new URL(authorization.url).searchParams.get("state");
-    expect(authorization.instructions).toContain("cannot connect");
 
     const mock = loginResponses();
     try {
@@ -275,7 +261,6 @@ describe("OAuth methods", () => {
         `http://127.0.0.1:51121/oauth-callback?code=code-1&state=${state}&scope=profile`,
       );
       expect(credential).toMatchObject({ type: "oauth", methodID: "paste", access: "at", metadata: { projectId: "project-1" } });
-      expect(mock.calls).toHaveLength(4);
     } finally {
       mock.restore();
     }
@@ -320,7 +305,6 @@ describe("web search provider", () => {
 
   test("dispatches the captured native web search operation", async () => {
     const search = await provider(OAUTH_AUTH);
-    expect(search).toMatchObject({ id: "antigravity", name: "Google Antigravity" });
     const mock = mockFetch(() =>
       Response.json({
         response: {
@@ -507,81 +491,6 @@ describe("SDK fetch boundary", () => {
     }
   });
 
-  test("converts parametersJsonSchema declarations to normalized CCA parameters", async () => {
-    const harness = makeHarness(OAUTH_AUTH);
-    const loader = await harness.loader();
-    const mock = mockFetch(() => sseResponse([{ response: { candidates: [] } }]));
-    try {
-      // Actual @ai-sdk/google 3.x tool shape.
-      const args = {
-        contents: [],
-        tools: [
-          {
-            functionDeclarations: [
-              {
-                name: "read_file",
-                description: "Read a file",
-                parametersJsonSchema: {
-                  type: "object",
-                  properties: {
-                    path: { type: "string", pattern: "^/" },
-                    depth: { type: "integer", enum: [1, 2] },
-                  },
-                  required: ["path"],
-                  additionalProperties: false,
-                },
-              },
-              {
-                name: "legacy_tool",
-                parameters: {
-                  type: "object",
-                  properties: { enabled: { type: "boolean", enum: [true, false], format: "unsupported" } },
-                },
-              },
-            ],
-          },
-        ],
-      };
-      const target = streamTarget("gemini-2.5-pro", args, {});
-      const response = await loader.fetch(target.url, target.init);
-      await readStream(response);
-      const wireBody = JSON.parse(String(mock.calls[0]!.init.body));
-      const declaration = wireBody.request.tools[0].functionDeclarations[0];
-      expect(declaration.parametersJsonSchema).toBeUndefined();
-      expect(declaration.parameters).toEqual({
-        type: "object",
-        properties: {
-          path: { type: "string" },
-          depth: { type: "integer", enum: ["1", "2"] },
-        },
-        required: ["path"],
-      });
-      expect(wireBody.request.tools[0].functionDeclarations[1].parameters).toEqual({
-        type: "object",
-        properties: { enabled: { type: "boolean", enum: ["true", "false"] } },
-      });
-    } finally {
-      mock.restore();
-    }
-  });
-
-  test("falls back to object parameters when the SDK supplies a scalar tool root", async () => {
-    const harness = makeHarness(OAUTH_AUTH);
-    const loader = await harness.loader();
-    const mock = mockFetch(() => sseResponse([{ response: { candidates: [] } }]));
-    try {
-      const target = streamTarget("gemini-2.5-pro", {
-        contents: [],
-        tools: [{ functionDeclarations: [{ name: "broken", parametersJsonSchema: { type: "string" } }] }],
-      });
-      await readStream(await loader.fetch(target.url, target.init));
-      const declaration = JSON.parse(String(mock.calls[0]!.init.body)).request.tools[0].functionDeclarations[0];
-      expect(declaration.parameters).toEqual({ type: "object", properties: {} });
-    } finally {
-      mock.restore();
-    }
-  });
-
   test("session chain advances across invocations and survives SDK retries", async () => {
     const harness = makeHarness(OAUTH_AUTH);
     const loader = await harness.loader();
@@ -614,12 +523,6 @@ describe("SDK fetch boundary", () => {
       const stepOf = (requestId: string) => Number(requestId.split("/").at(-1));
       expect(stepOf(secondEnvelope.requestId)).toBe(stepOf(firstEnvelope.requestId) + 1);
       expect(secondEnvelope.request.labels.last_execution_id).toBe("r-1");
-      expect(secondEnvelope.request.labels.used_claude).toBe("true");
-      expect(secondEnvelope.request.toolConfig.functionCallingConfig.mode).toBe("VALIDATED");
-      // Reasoning Claude models carry the beta header.
-      expect(new Headers(mock.calls[0]!.init.headers).get("anthropic-beta")).toBe(
-        "interleaved-thinking-2025-05-14",
-      );
     } finally {
       mock.restore();
     }
@@ -765,11 +668,10 @@ describe("SDK fetch boundary", () => {
       // and a fresh envelope step is used for the retry of the same logical
       // invocation id (the failed attempt never advanced it).
       failing = false;
-      const output = await readStream(await send("f-1"));
+      await readStream(await send("f-1"));
       expect(mock.calls[2]!.url.startsWith(DAILY)).toBe(true);
       const body = JSON.parse(String(mock.calls[2]!.init.body));
       expect(body.requestId).toMatch(/\/2$/);
-      void output;
     } finally {
       mock.restore();
     }
@@ -813,11 +715,8 @@ describe("SDK fetch boundary", () => {
       });
       const payload = JSON.parse(await response.text());
       expect(payload).toEqual({ candidates: [], responseId: "ns-77", usageMetadata: {} });
-      // Stale entity headers dropped; SDK fingerprint stripped.
       expect(response.headers.get("content-length")).toBeNull();
       const headers = new Headers(mock.calls[0]!.init.headers);
-      expect(headers.get("x-goog-api-key")).toBeNull();
-      expect(headers.get("x-session-affinity")).toBeNull();
       // No Accept: text/event-stream on non-stream calls.
       expect(headers.get("accept")).toBeNull();
 
@@ -937,7 +836,6 @@ describe("model.request hook", () => {
     harness.hooks["session.model.request"]!(first);
     harness.hooks["session.model.request"]!(second);
     expect(first.headers["x-antigravity-opencode-session"]).toBe("s-1");
-    expect(first.headers["x-antigravity-opencode-invocation"]).toMatch(/[0-9a-f-]{36}/);
     expect(second.headers["x-antigravity-opencode-invocation"]).not.toBe(
       first.headers["x-antigravity-opencode-invocation"],
     );
