@@ -443,11 +443,11 @@ const REFLECT_PROMPT = `Review this stretch of a coding conversation and catch d
 Types:
 - preference: a lasting general preference the user stated or confirmed.
 - instruction: a scoped rule for future work the user stated or confirmed.
-- recap: a hard-won finding, diagnosis, rejected alternative, or rationale that would be expensive to re-derive; it may come from the agent's own work.
+- recap: the settled conclusion of a question the transcript resolved (a confirmed root cause, a decided approach, a rejected alternative, or its rationale) that would be expensive to re-derive; it may come from the agent's own work. Record the conclusion, not the path to it.
 - reference: lasting external material worth returning to, such as a spec or dashboard URL.
 Use assistant turns to interpret what the user meant (for example what "yes, always do that" refers to), but preference and instruction must come from the user.
 
-Skip anything already covered by <session_saves> or the index, current task state, plans, routine receipts (commits, edits, passing tests), anything recoverable from code or git, and secrets. Tool input and output are truncated.
+Skip anything already covered by <session_saves> or the index, current task state, plans, unresolved investigations and their hypotheses, routine receipts (commits, edits, passing tests), anything recoverable from code or git, and secrets. Tool input and output are truncated.
 
 One subject per memory. Each memory becomes a new topic; when an indexed topic already covers the subject, skip it. The summary is a short one-line hook describing what the topic covers. The content is a few short sentences without frontmatter: the fact first, then why it matters or when it applies.`;
 
@@ -456,7 +456,7 @@ const MEMORY_TOOL_DESCRIPTION = `Save or delete a project memory: a durable note
 Save when:
 - the user states a lasting preference or instruction, or asks you to remember something (type preference or instruction; these must be user-stated);
 - the user corrects you in a way that should apply next time;
-- you reached a hard-won finding, diagnosis, or rejected alternative that would be expensive to re-derive (type recap);
+- a question is settled (the bug is fixed, the approach decided) and its conclusion or rejected alternatives would be expensive to re-derive (type recap); save the conclusion, not the path to it;
 - you found lasting external material worth returning to (type reference).
 
 Examples:
@@ -465,7 +465,7 @@ Examples:
 
 Keep one subject per topic. If an indexed topic already covers the subject, pass its filename as target to replace it: read it first and write the complete updated content. The summary is a short one-line hook describing what the topic covers. Write the content as a few short sentences: the fact first, then why it matters or when it applies. Skip background, narration, and anything the reader can see in the code.
 
-Current task state, anything recoverable from the code or git history, and secrets do not belong in memory. Most turns need no memory; saving nothing is fine. Use action delete with target to remove an obsolete topic.`;
+Current task state, in-progress investigation notes (hypotheses, step-by-step debug logs), anything recoverable from the code or git history, and secrets do not belong in memory; keep working notes in the conversation. Most turns need no memory; saving nothing is fine. Use action delete with target to remove an obsolete topic.`;
 
 const DREAM_SELECTOR_SYSTEM = "You are a project-memory consolidation selector. Return only the requested JSON result.";
 const DREAM_CURATOR_SYSTEM = "You are a project-memory curator. Return only the requested JSON result.";
