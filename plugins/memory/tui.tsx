@@ -1,33 +1,14 @@
 /** @jsxImportSource @opentui/solid */
 import { Plugin } from "@opencode/plugin/tui";
-import { mkdir, readdir, rename, rm, stat } from "node:fs/promises";
-import { homedir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { createSignal, Show } from "solid-js";
 import { MemoryRpc, type DreamStatus } from "./rpc.ts";
 
 type Choice =
-  | { type: "toggle" }
-  | { type: "dreamToggle" }
+  | { type: "toggle"; key: "enabled" | "dream_auto" }
   | { type: "dreamNow" }
-  | { type: "folder" }
-  | { type: "file"; name: string };
-
-const INDEX_FILE = "index.md";
-const SETTINGS_FILE = "settings.json";
-
-export function memoryProjectKey(directory: string): string {
-  const resolvedDirectory = resolve(directory);
-  return `${resolvedDirectory.toLowerCase().replace(/[^a-z._-]/g, "-")}-${Bun.hash.wyhash(resolvedDirectory).toString(16).padStart(8, "0").slice(0, 8)}`;
-}
-
-// Toggles one known settings flag while preserving every other field the file
-// may carry. `enabled` defaults to true when absent; `dream_auto` to false.
-export function toggledSettings(current: unknown, key: "enabled" | "dream_auto"): string {
-  const settings = current && typeof current === "object" ? { ...(current as Record<string, unknown>) } : {};
-  settings[key] = !(settings[key] ?? (key === "enabled"));
-  return `${JSON.stringify(settings, null, 2)}\n`;
-}
+  | { type: "topic"; file: string };
 
 // Concise operation counts for the dream completion toast.
 export function dreamCountsMessage(counts: Record<string, unknown> | undefined): string {
@@ -44,33 +25,10 @@ export function isDreamingForSession(status: DreamStatus | undefined, sessionID:
   return status?.state === "running" && status.sessionID === sessionID;
 }
 
-function projectDirectory(directory: string): string {
-  const dataHome = process.env.XDG_DATA_HOME ?? join(homedir(), ".local", "share");
-  return join(dataHome, "opencode", "memory", memoryProjectKey(directory));
-}
-
-async function atomicWrite(filePath: string, content: string): Promise<void> {
-  await mkdir(dirname(filePath), { recursive: true });
-  const temporary = `${filePath}.${crypto.randomUUID()}.tmp`;
-  try {
-    await Bun.write(temporary, content);
-    await rename(temporary, filePath);
-  } finally {
-    await rm(temporary, { force: true }).catch(() => {});
-  }
-}
-
-async function readSettings(directory: string): Promise<{ enabled: boolean; dream_auto: boolean; raw: unknown }> {
-  const file = Bun.file(join(directory, SETTINGS_FILE));
-  const raw: unknown = await file.exists() ? await file.json() : undefined;
-  const settings = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
-  return { enabled: settings.enabled !== false, dream_auto: settings.dream_auto === true, raw };
-}
-
 async function openInEditor(ctx: Plugin.Context, target: string, cwd: string): Promise<void> {
   const editor = process.env.VISUAL ?? process.env.EDITOR;
   if (!editor) {
-    ctx.ui.toast.show({ variant: "warning", title: "Memory", message: "Set VISUAL or EDITOR to open memory files" });
+    ctx.ui.toast.show({ variant: "warning", title: "Memory", message: "Set VISUAL or EDITOR to edit memory topics" });
     return;
   }
 
@@ -92,65 +50,6 @@ async function openInEditor(ctx: Plugin.Context, target: string, cwd: string): P
     ctx.renderer.resume();
     ctx.renderer.requestRender();
   }
-}
-
-async function showMemory(ctx: Plugin.Context, directory: string, requestDream: () => Promise<void>): Promise<void> {
-  const settings = await readSettings(directory);
-  const files = await stat(directory).then(() => true, () => false)
-    ? (await readdir(directory))
-      .filter((file) => file.endsWith(".md") && file !== INDEX_FILE)
-      .sort((left, right) => left.localeCompare(right))
-    : [];
-
-  const choice = await ctx.ui.dialog.select<Choice>({
-    title: "Project memory",
-    placeholder: "Search memory",
-    options: [
-      {
-        title: `Auto-memory: ${settings.enabled ? "enabled" : "disabled"}`,
-        description: settings.enabled ? "Disable recall and learning" : "Enable recall and learning",
-        value: { type: "toggle" },
-      },
-      {
-        title: `Auto-dream: ${settings.dream_auto ? "enabled" : "disabled"}`,
-        description: settings.dream_auto ? "Disable periodic memory dreaming" : "Enable periodic memory dreaming",
-        value: { type: "dreamToggle" },
-      },
-      {
-        title: "Dream now",
-        description: "Run one memory dreaming pass now",
-        value: { type: "dreamNow" },
-      },
-      {
-        title: "Open memory folder",
-        description: directory,
-        value: { type: "folder" },
-      },
-      {
-        title: INDEX_FILE,
-        description: "Project memory index",
-        value: { type: "file", name: INDEX_FILE },
-      },
-      ...files.map((name) => ({
-        title: name,
-        description: "Memory topic",
-        value: { type: "file" as const, name },
-      })),
-    ],
-  });
-  if (!choice) return;
-  if (choice.type === "toggle" || choice.type === "dreamToggle") {
-    await atomicWrite(join(directory, SETTINGS_FILE), toggledSettings(settings.raw, choice.type === "toggle" ? "enabled" : "dream_auto"));
-    await showMemory(ctx, directory, requestDream);
-    return;
-  }
-  if (choice.type === "dreamNow") {
-    await requestDream();
-    await showMemory(ctx, directory, requestDream);
-    return;
-  }
-  await mkdir(directory, { recursive: true });
-  await openInEditor(ctx, choice.type === "folder" ? directory : join(directory, choice.name), directory);
 }
 
 function DreamSidebar(props: { ctx: Plugin.Context; sessionID: string; status: () => DreamStatus | undefined }) {
@@ -193,7 +92,7 @@ export default Plugin.define({
   id: "memory",
   setup(ctx) {
     const workspace = ctx.location?.directory ?? ctx.data.location.default().directory;
-    const directory = projectDirectory(workspace);
+    const location = { location: { directory: workspace } };
     const memory = ctx.client.rpc(MemoryRpc);
     const [activeDream, setActiveDream] = createSignal<DreamStatus>();
     // The outstanding manual request this instance is waiting on.
@@ -203,14 +102,70 @@ export default Plugin.define({
       ctx.ui.toast.show({ variant: "error", title: "Memory", message: error instanceof Error ? error.message : String(error) });
     };
 
+    const currentSession = () => {
+      const route = ctx.ui.router.current();
+      return route.type === "session" ? route.sessionID : undefined;
+    };
+
     // The current session, when the route has one, owns the sidebar indicator.
     const requestDream = async () => {
       const requestID = crypto.randomUUID();
       outstandingRequestID = requestID;
-      const route = ctx.ui.router.current();
-      const sessionID = route.type === "session" ? route.sessionID : undefined;
-      await memory.dream({ requestID, sessionID }, { location: { directory: workspace } });
+      await memory.dream({ requestID, sessionID: currentSession() }, location);
       ctx.ui.toast.show({ variant: "info", title: "Memory", message: "Dreaming..." });
+    };
+
+    // Topics live in server storage; editing goes through a temporary file
+    // and saves back only when the body changed.
+    const showMemory = async (): Promise<void> => {
+      const state = await memory.state({}, location);
+      const choice = await ctx.ui.dialog.select<Choice>({
+        title: "Project memory",
+        placeholder: "Search memory",
+        options: [
+          {
+            title: `Auto-memory: ${state.enabled ? "enabled" : "disabled"}`,
+            description: state.enabled ? "Disable recall and learning" : "Enable recall and learning",
+            value: { type: "toggle", key: "enabled" },
+          },
+          {
+            title: `Auto-dream: ${state.dream_auto ? "enabled" : "disabled"}`,
+            description: state.dream_auto ? "Disable periodic memory dreaming" : "Enable periodic memory dreaming",
+            value: { type: "toggle", key: "dream_auto" },
+          },
+          {
+            title: "Dream now",
+            description: "Run one memory dreaming pass now",
+            value: { type: "dreamNow" },
+          },
+          ...state.topics.map((topic) => ({
+            title: topic.title,
+            description: topic.summary,
+            value: { type: "topic" as const, file: topic.file },
+          })),
+        ],
+      });
+      if (!choice) return;
+      if (choice.type === "toggle") {
+        await memory.toggle({ key: choice.key }, location);
+        await showMemory();
+        return;
+      }
+      if (choice.type === "dreamNow") {
+        await requestDream();
+        await showMemory();
+        return;
+      }
+      const { content } = await memory.topic({ file: choice.file }, location);
+      const path = join(tmpdir(), `opencode-memory-${choice.file}.md`);
+      await Bun.write(path, `${content}\n`);
+      try {
+        await openInEditor(ctx, path, workspace);
+        const edited = (await Bun.file(path).text()).trim();
+        if (edited !== content.trim()) await memory.edit({ file: choice.file, content: edited, sessionID: currentSession() }, location);
+      } finally {
+        await Bun.file(path).delete();
+      }
     };
 
     // Review and save notifications only surface for sessions this TUI knows.
@@ -242,7 +197,7 @@ export default Plugin.define({
         render: () => (
           <Commands
             ctx={ctx}
-            open={() => void showMemory(ctx, directory, requestDream).catch(toastError)}
+            open={() => void showMemory().catch(toastError)}
             dream={() => void requestDream().catch(toastError)}
           />
         ),

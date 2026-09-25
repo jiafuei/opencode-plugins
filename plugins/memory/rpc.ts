@@ -1,13 +1,35 @@
 import { Rpc } from "@opencode/plugin";
 import { Schema } from "effect";
 
-// Shared server <-> TUI contract. The TUI requests manual dreams and listens
-// for review, save, and dream status events instead of watching files.
+// Shared server <-> TUI contract. Memory lives in server plugin storage, so
+// the TUI reads settings and topics, toggles settings, edits topic bodies, and
+// requests manual dreams through these methods, and listens for review, save,
+// and dream status events.
 export const MemoryRpc = Rpc.define({
   id: "memory",
   methods: {
     dream: {
       input: Schema.toStandardSchemaV1(Schema.Struct({ requestID: Schema.String, sessionID: Schema.optional(Schema.String) })),
+      output: Schema.toStandardSchemaV1(Schema.Struct({})),
+    },
+    state: {
+      input: Schema.toStandardSchemaV1(Schema.Struct({})),
+      output: Schema.toStandardSchemaV1(Schema.Struct({
+        enabled: Schema.Boolean,
+        dream_auto: Schema.Boolean,
+        topics: Schema.Array(Schema.Struct({ file: Schema.String, title: Schema.String, summary: Schema.String })),
+      })),
+    },
+    toggle: {
+      input: Schema.toStandardSchemaV1(Schema.Struct({ key: Schema.Literals(["enabled", "dream_auto"]) })),
+      output: Schema.toStandardSchemaV1(Schema.Struct({})),
+    },
+    topic: {
+      input: Schema.toStandardSchemaV1(Schema.Struct({ file: Schema.String })),
+      output: Schema.toStandardSchemaV1(Schema.Struct({ content: Schema.String })),
+    },
+    edit: {
+      input: Schema.toStandardSchemaV1(Schema.Struct({ file: Schema.String, content: Schema.String, sessionID: Schema.optional(Schema.String) })),
       output: Schema.toStandardSchemaV1(Schema.Struct({})),
     },
   },
