@@ -13,7 +13,7 @@ Connect the OpenAI integration in OpenCode with an OpenAI API key (or `OPENAI_AP
 - API keys call `https://api.openai.com/v1/responses`.
 - ChatGPT subscriptions call the Codex backend (`https://chatgpt.com/backend-api/codex`) with the account id from the connection.
 
-The synthesized answer is returned on the first result, followed by the remaining cited sources.
+The synthesized answer is returned on the first result, followed by the remaining cited sources. If nothing was cited, the answer comes back as a single result with an empty `url`.
 
 For Google Antigravity search, install [`@jiafuei/opencode-antigravity-oauth`](../antigravity-oauth); it registers its own `antigravity` web search provider.
 
@@ -24,13 +24,13 @@ For Google Antigravity search, install [`@jiafuei/opencode-antigravity-oauth`](.
   "plugins": [
     {
       "package": "@jiafuei/opencode-websearch",
-      "options": { "model": "gpt-5.6-luna", "openaiSubscriptionTransport": "websocket" }
+      "options": { "model": "gpt-5.6-luna", "transport": "websocket" }
     }
   ]
 }
 ```
 
 - `model`: OpenAI model used for searches. Defaults to `gpt-5.6-luna`. ChatGPT subscriptions only accept Codex-eligible models.
-- `openaiSubscriptionTransport`: `"https"` (default) or `"websocket"` for a persistent WebSocket to the Codex backend. Only affects ChatGPT subscriptions; API-key requests always use HTTPS.
+- `transport`: `"https"` (default) or `"websocket"` for a persistent WebSocket to the Codex backend. Only affects ChatGPT subscriptions; API-key requests always use HTTPS.
 
 The plugin does not fetch or parse web pages locally.

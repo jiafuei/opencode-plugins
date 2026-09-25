@@ -51,6 +51,8 @@ function responsesStream() {
   });
 }
 
+const subscriptionToken = `header.${Buffer.from(JSON.stringify({ "https://api.openai.com/auth": { chatgpt_compute_residency: "eu" } })).toString("base64url")}.signature`;
+
 describe("OpenAI web search provider", () => {
   test("is only offered while an OpenAI connection exists", async () => {
     expect(await searchProvider(undefined)).toBeUndefined();
@@ -60,10 +62,11 @@ describe("OpenAI web search provider", () => {
     test.each([
       {
         name: "ChatGPT subscription",
-        credential: { type: "oauth", methodID: "chatgpt-browser", access: "subscription-token", refresh: "r", expires: 0, metadata: { accountID: "account" } },
+        credential: { type: "oauth", methodID: "chatgpt-browser", access: subscriptionToken, refresh: "r", expires: 0, metadata: { accountID: "account" } },
         url: "https://chatgpt.com/backend-api/codex/responses",
-        token: "subscription-token",
+        token: subscriptionToken,
         accountId: "account",
+        residency: "eu",
       },
       {
         name: "OpenAI API key",
@@ -71,8 +74,9 @@ describe("OpenAI web search provider", () => {
         url: "https://api.openai.com/v1/responses",
         token: "api-key",
         accountId: null,
+        residency: null,
       },
-    ])("uses HTTPS for $name", async ({ credential, url, token, accountId }) => {
+    ])("uses HTTPS for $name", async ({ credential, url, token, accountId, residency }) => {
       const provider = await searchProvider(credential);
       const originalFetch = globalThis.fetch;
       let request: { input: string; headers: Headers; body: any } | undefined;
@@ -85,6 +89,7 @@ describe("OpenAI web search provider", () => {
         expect(request?.input).toBe(url);
         expect(request?.headers.get("authorization")).toBe(`Bearer ${token}`);
         expect(request?.headers.get("chatgpt-account-id")).toBe(accountId);
+        expect(request?.headers.get("x-openai-internal-codex-residency")).toBe(residency);
         expect(results).toEqual([{ url: "https://example.com", title: "Example", content: "Grounded answer", time: {} }]);
       } finally {
         globalThis.fetch = originalFetch;
