@@ -1,7 +1,7 @@
 {
   "name": "@jiafuei/opencode-anthropic-compaction",
   "version": "0.0.1",
-  "description": "Enable Anthropic server-side compaction for OpenCode sessions",
+  "description": "Anthropic server-side compaction as a native compaction backend for OpenCode",
   "type": "module",
   "exports": {
     "./server": "./server.ts"

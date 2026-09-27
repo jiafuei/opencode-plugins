@@ -1,159 +1,76 @@
 import { describe, expect, test } from "bun:test";
 import plugin from "./server.ts";
 
-type Hook = (event: any) => Promise<void> | void;
+type Hook = (event: any) => Promise<void>;
 
-class Message {
-  constructor(input: Record<string, unknown>) {
-    Object.assign(this, input);
-  }
-}
-
-async function load(
-  config: Record<string, unknown> = {},
-  model: {
-    providerID?: string;
-    id?: string;
-    modelID?: string;
-    package?: string;
-    context?: number;
-  } = {},
-) {
-  const hooks = new Map<string, Hook>();
+async function load(options: Record<string, unknown>) {
+  const hooks: { name: string; callback: Hook; options: { providerID: string } }[] = [];
   const ctx = {
-    options: config,
-    model: {
-      list: async () => ({
-        data: [
-          {
-            providerID: model.providerID ?? "anthropic",
-            id: model.id ?? "claude-sonnet-4-6",
-            modelID: model.modelID ?? model.id ?? "claude-sonnet-4-6",
-            package: model.package ?? "@opencode/ai/providers/anthropic",
-            limit: { context: model.context ?? 200_000 },
-          },
-        ],
-      }),
-    },
+    options,
     session: {
-      hook: async (name: string, callback: Hook, options?: { providerID: string }) => {
-        hooks.set(options ? `${name}:${options.providerID}` : name, callback);
+      hook: async (name: string, callback: Hook, options: { providerID: string }) => {
+        hooks.push({ name, callback, options });
       },
     },
-    event: { subscribe: async function* () {} },
   };
   await plugin.setup(ctx as never);
   return hooks;
 }
 
-async function request(
-  hooks: Map<string, Hook>,
-  messages: Message[] = [new Message({ id: "msg_1", role: "user", content: [] })],
-  model = { providerID: "anthropic", id: "claude-sonnet-4-6" },
-) {
-  const event = { sessionID: "ses_1", model, messages, options: {} as Record<string, any> };
-  await hooks.get("context")?.(event);
-  return event;
+function compaction(content: unknown[]) {
+  const sent: Record<string, any>[] = [];
+  const event = {
+    send: async (input: { options: Record<string, any> }) => {
+      sent.push(input.options);
+      return { content };
+    },
+    result: undefined as { replacement: unknown[] } | undefined,
+  };
+  return { event, sent };
 }
 
-async function setup(config: Record<string, unknown> = {}, model: Parameters<typeof load>[1] = {}) {
-  const hooks = await load(config, model);
-  const event = await request(hooks, undefined, {
-    providerID: model.providerID ?? "anthropic",
-    id: model.id ?? "claude-sonnet-4-6",
-  });
-  return event.options;
-}
-
-const compactionEdit = (options: Record<string, any>) => options.contextManagement?.edits.at(-1);
-
-describe("configuration", () => {
-  test("uses 70% of the context window by default", async () => {
-    const options = await setup();
-    expect(compactionEdit(options)).toMatchObject({
-      type: "compact_20260112",
-      trigger: { type: "input_tokens", value: 140_000 },
-    });
-  });
-
-  test("supports percentages, fractional thresholds, and absolute token counts", async () => {
-    expect(compactionEdit(await setup({ threshold: "60%" })).trigger.value).toBe(120_000);
-    expect(compactionEdit(await setup({ threshold: 0.5 })).trigger.value).toBe(100_000);
-    expect(compactionEdit(await setup({ threshold: 80_000 }, { context: 0 })).trigger.value).toBe(80_000);
-  });
-
-  test("clamps relative thresholds to Anthropic's minimum", async () => {
-    expect(compactionEdit(await setup({ threshold: "10%" }, { context: 100_000 })).trigger.value).toBe(50_000);
-  });
-});
-
-describe("request gating", () => {
-  test("supports configured proxy providers and model aliases", async () => {
-    const options = await setup(
-      {
-        additionalProviders: ["bedrock-proxy"],
-        additionalModels: ["anthropic.claude-sonnet-4-6-v1:0"],
-      },
-      {
-        providerID: "bedrock-proxy",
-        id: "sonnet-alias",
-        modelID: "anthropic.claude-sonnet-4-6-v1:0",
-        package: "@opencode/ai/providers/anthropic-compatible",
-      },
-    );
-    expect(compactionEdit(options)?.type).toBe("compact_20260112");
-  });
-
-  test("leaves unconfigured providers, packages, and models untouched", async () => {
-    expect(await setup({}, { providerID: "proxy" })).toEqual({});
-    expect(await setup({}, { package: "@opencode/ai/providers/amazon-bedrock" })).toEqual({});
-    expect(await setup({}, { id: "claude-haiku-4-5" })).toEqual({});
-  });
-
-  test("skips unresolved percentage thresholds", async () => {
-    expect(await setup({}, { context: 0 })).toEqual({});
-  });
-});
-
-describe("compaction decide", () => {
-  test("defers OpenCode compaction to Anthropic once the trigger is reached", async () => {
-    const hooks = await load();
-    const decide = async (tokens: number, model = { providerID: "anthropic", id: "claude-sonnet-4-6" }) => {
-      const event = { sessionID: "ses_1", agent: "build", model, tokens, action: "compact" };
-      await hooks.get("experimental.compaction.decide:anthropic")!(event);
-      return event.action;
-    };
-    expect(await decide(140_000)).toBe("continue");
-    expect(await decide(139_999)).toBe("compact");
-    expect(await decide(180_000, { providerID: "proxy", id: "claude-sonnet-4-6" })).toBe("compact");
-  });
-});
-
-describe("compaction replay", () => {
-  test("records a streamed compaction block and replays it on the following response", async () => {
-    const hooks = await load();
-    await request(hooks);
-
-    const sse = [
-      `event: content_block_start\ndata: ${JSON.stringify({ type: "content_block_start", index: 0, content_block: { type: "compaction", content: null } })}`,
-      `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "compaction_delta", content: "Summary." } })}`,
-      `event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: 0 })}`,
-    ].join("\n\n");
-    const response = { sessionID: "ses_1", kind: "primary", response: new Response(`${sse}\n\n`) };
-    await hooks.get("http.response:anthropic")!(response);
-    expect(await response.response.text()).toBe(`${sse}\n\n`);
-    await Bun.sleep(0);
-
-    const next = await request(hooks, [
-      new Message({ id: "msg_0", role: "user", content: [] }),
-      new Message({ id: "msg_1", role: "user", content: [] }),
-      new Message({ id: "msg_2", role: "assistant", content: [{ type: "text", text: "Done." }] }),
-      new Message({ id: "msg_3", role: "user", content: [] }),
+describe("native compaction", () => {
+  test("registers only for opted-in providers", async () => {
+    expect(await load({})).toEqual([]);
+    const hooks = await load({ providers: ["anthropic", "my-proxy"] });
+    expect(hooks.map((hook) => [hook.name, hook.options])).toEqual([
+      ["experimental.compaction.native", { providerID: "anthropic" }],
+      ["experimental.compaction.native", { providerID: "my-proxy" }],
     ]);
-    expect(next.messages[2]).toBeInstanceOf(Message);
-    expect((next.messages[2] as any).content).toEqual([
-      { type: "compaction", provider: "anthropic", text: "Summary." },
-      { type: "text", text: "Done." },
+  });
+
+  test("installs Anthropic's compaction block after a synthetic user message", async () => {
+    const [hook] = await load({ providers: ["anthropic"], instructions: "Keep file paths." });
+    const block = { type: "compaction", provider: "anthropic", text: "Summary." };
+    const { event, sent } = compaction([block]);
+    await hook!.callback(event);
+    expect(sent).toEqual([
+      {
+        contextManagement: {
+          edits: [
+            {
+              type: "compact_20260112",
+              trigger: { type: "input_tokens", value: 50_000 },
+              pauseAfterCompaction: true,
+              instructions: "Keep file paths.",
+            },
+          ],
+        },
+      },
     ]);
+    expect(event.result?.replacement).toEqual([
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "<synthetic_user_message>The conversation so far was compacted.</synthetic_user_message>" },
+        ],
+      },
+      { role: "assistant", content: [block] },
+    ]);
+  });
+
+  test("fails when Anthropic returns no compaction block", async () => {
+    const [hook] = await load({ providers: ["anthropic"] });
+    await expect(hook!.callback(compaction([{ type: "text", text: "Hi" }]).event)).rejects.toThrow("50000 tokens");
   });
 });
