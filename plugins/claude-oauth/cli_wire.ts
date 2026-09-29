@@ -8,7 +8,7 @@ export const CLI_PROFILE = {
   userAgent: "claude-cli/2.1.280 (external, cli)",
   billingEntrypoint: "cli",
   systemInstruction: "You are Claude Code, Anthropic's official CLI for Claude.",
-  toolPrefix: "mcp__opencode__",
+  toolPrefix: "mcp__oc__",
 } as const;
 
 export const SDK_CLI_PROFILE = {
@@ -36,7 +36,7 @@ export interface CliAttribution {
 const IDENTITY = CLI_PROFILE.systemInstruction;
 const AGENT_IDENTITY = SDK_CLI_PROFILE.systemInstruction;
 const PREAMBLE = "You are an interactive agent that helps users with software engineering tasks. " +
-  "Workspace tools are provided by the opencode MCP server. Use the available tool schemas and follow the user's instructions.";
+  "Workspace tools are provided by the oc MCP server. Use the available tool schemas and follow the user's instructions.";
 const BILLING = "x-anthropic-billing-header:";
 
 /** Native byte-marker normalization, verified against all 61 September 29 captures. */

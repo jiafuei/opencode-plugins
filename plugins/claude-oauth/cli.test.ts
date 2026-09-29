@@ -36,10 +36,10 @@ test("CLI preserves instruction and tool semantics while namespacing definitions
   };
   const rewritten = rewriteCliBody(JSON.stringify(input), { sessionId: "session", requestClass: "main", promptId: "prompt", turnOrigin: "human" });
   const body = JSON.parse(rewritten.json);
-  expect(body.tools[0]).toEqual({ ...BODY.tools[0], name: "mcp__opencode__shell" });
+  expect(body.tools[0]).toEqual({ ...BODY.tools[0], name: "mcp__oc__shell" });
   expect(body.tools[1]).toEqual(input.tools[1]);
-  expect(body.tool_choice.name).toBe("mcp__opencode__shell");
-  expect(body.messages[1].content[0]).toEqual({ ...input.messages[1]!.content[0], name: "mcp__opencode__shell" });
+  expect(body.tool_choice.name).toBe("mcp__oc__shell");
+  expect(body.messages[1].content[0]).toEqual({ ...input.messages[1]!.content[0], name: "mcp__oc__shell" });
   expect(body.messages[0]).toEqual(input.messages[0]);
   expect(body.messages[2].content[0].content).toBe("OpenCode output");
   expect(body.system.at(-1).text).toContain(input.system[1]!.text);
@@ -115,7 +115,7 @@ async function fixture(options: Record<string, unknown> = { spoofingProfile: "cl
       const index = captures.length;
       return reply?.(index) ?? new Response([
         { type: "message_start", message: { type: "message", id: `msg_${index}`, content: [] } },
-        { type: "content_block_start", index: 0, content_block: { type: "tool_use", id: "toolu_1", name: "mcp__opencode__shell", input: {} } },
+        { type: "content_block_start", index: 0, content_block: { type: "tool_use", id: "toolu_1", name: "mcp__oc__shell", input: {} } },
         { type: "message_delta", delta: { stop_reason: "tool_use" } },
         { type: "message_stop" },
       ].map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join(""), {
@@ -161,7 +161,7 @@ test.each(["cli", "sdk-cli"] as const)("%s selects its captured identity and tra
     expect(betas.includes("fallback-credit-2026-06-01")).toBe(profile === "cli");
     expect(betas.includes("thinking-display-updates-2026-08-18")).toBe(profile === "cli");
     expect(first.capture.body.max_tokens).toBe(128000);
-    expect(first.capture.body.tools[0].name).toBe("mcp__opencode__shell");
+    expect(first.capture.body.tools[0].name).toBe("mcp__oc__shell");
     expect(first.text).toContain('"name":"shell"');
     expect(first.text).not.toContain(CLI_PROFILE.toolPrefix);
     const child = await f.send(await f.prepare("ses_child"));
@@ -225,7 +225,7 @@ test("late completions cannot overwrite a newer chain or revive deleted/credenti
 test("malformed JSON cannot advance attribution and compaction starts a fresh chain", async () => {
   const f = await fixture();
   try {
-    f.reply((i) => Response.json({ type: "message", id: `msg_${i}`, stop_reason: "tool_use", content: [{ type: "tool_use", id: "toolu_1", name: "mcp__opencode__shell", input: {} }] }, { headers: { "request-id": `req_${i}` } }));
+    f.reply((i) => Response.json({ type: "message", id: `msg_${i}`, stop_reason: "tool_use", content: [{ type: "tool_use", id: "toolu_1", name: "mcp__oc__shell", input: {} }] }, { headers: { "request-id": `req_${i}` } }));
     const first = await f.send();
     expect(JSON.parse(first.text!).content[0].name).toBe("shell");
     f.reply(() => new Response('{"type":"message","id":"broken"', { headers: { "content-type": "application/json", "request-id": "req_broken" } }));

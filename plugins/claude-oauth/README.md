@@ -75,7 +75,7 @@ is the default; set `spoofingProfile` to `cli` for interactive CLI identity.
 
 They share the following behavior:
 
-- Custom tools are exposed as `mcp__opencode__<name>`, retaining their schemas
+- Custom tools are exposed as `mcp__oc__<name>`, retaining their schemas
   and arguments. Definitions, forced tool choices, historical calls, and tool
   references are rewritten consistently; response tool names are restored.
 - The OpenCode harness opening is replaced by the selected identity. System blocks
