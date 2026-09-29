@@ -1189,7 +1189,6 @@ const setup = async (ctx: Plugin.Context) => {
     dream: async (request) => {
       queuedRequest = request;
       track(dreamTick());
-      return {};
     },
     state: async () => {
       const settings = await readSettings();
@@ -1206,7 +1205,6 @@ const setup = async (ctx: Plugin.Context) => {
         const settings = await readSettings();
         await ctx.storage.set(settingsKey, { ...settings, [key]: !(settings[key] ?? key === "enabled") });
       });
-      return {};
     },
     topic: async ({ file }) => ({ content: (await readTopic(file)).content }),
     // Replaces the body only; title, summary, type, and scope are kept.
@@ -1214,7 +1212,6 @@ const setup = async (ctx: Plugin.Context) => {
       const entry = (await readIndex()).find((entry) => entry.file === file);
       if (!entry) throw new Error(`Memory index does not contain ${file}`);
       await saveMemory(sessionID, { target: file, title: entry.title, summary: entry.summary, content, type: entry.type, scope: entry.scope });
-      return {};
     },
   });
 

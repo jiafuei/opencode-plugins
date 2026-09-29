@@ -10,7 +10,7 @@ export const MemoryRpc = Rpc.define({
   methods: {
     dream: {
       input: Schema.toStandardSchemaV1(Schema.Struct({ requestID: Schema.String, sessionID: Schema.optional(Schema.String) })),
-      output: Schema.toStandardSchemaV1(Schema.Struct({})),
+      output: Schema.toStandardSchemaV1(Schema.Void),
     },
     state: {
       input: Schema.toStandardSchemaV1(Schema.Struct({})),
@@ -22,7 +22,7 @@ export const MemoryRpc = Rpc.define({
     },
     toggle: {
       input: Schema.toStandardSchemaV1(Schema.Struct({ key: Schema.Literals(["enabled", "dream_auto"]) })),
-      output: Schema.toStandardSchemaV1(Schema.Struct({})),
+      output: Schema.toStandardSchemaV1(Schema.Void),
     },
     topic: {
       input: Schema.toStandardSchemaV1(Schema.Struct({ file: Schema.String })),
@@ -30,7 +30,7 @@ export const MemoryRpc = Rpc.define({
     },
     edit: {
       input: Schema.toStandardSchemaV1(Schema.Struct({ file: Schema.String, content: Schema.String, sessionID: Schema.optional(Schema.String) })),
-      output: Schema.toStandardSchemaV1(Schema.Struct({})),
+      output: Schema.toStandardSchemaV1(Schema.Void),
     },
   },
   events: {
