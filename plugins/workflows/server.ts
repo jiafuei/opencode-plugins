@@ -1080,7 +1080,7 @@ export default Plugin.define({
           "",
           "The run starts only after the user approves it in the TUI. Returns { runID, status } once the run is running or queued, or early with status \"blocked\" or \"repair_required\" if the run needs a user decision (worker failure, coordinator failure); the run stays resumable from the TUI dashboard and the final result still arrives later as a synthetic <workflow_result> message in this session — do not wait or poll for it.",
         ].join("\n"),
-        input: Schema.Struct({ spec: WORKFLOW_SPEC_SCHEMA }),
+        input: Schema.toStandardJSONSchemaV1(Schema.toStandardSchemaV1(Schema.Struct({ spec: WORKFLOW_SPEC_SCHEMA }))),
         execute: async (args, context) => {
           if (disposed) throw new Error("Workflow plugin is disposed");
           await refreshCatalog();
@@ -1132,7 +1132,7 @@ export default Plugin.define({
         name: "workflow_status",
         options: { codemode: false },
         description: "Return the current state of a workflow run: status, current phase, per-worker states, failure reason, and plan revision count. Read-only — use it to answer questions about a run's progress or diagnose a blocked/stopped run. The final result arrives separately as a synthetic <workflow_result> message.",
-        input: Schema.Struct({ runID: RUN_ID.annotate({ description: "The runID previously returned by the workflow tool" }) }),
+        input: Schema.toStandardJSONSchemaV1(Schema.toStandardSchemaV1(Schema.Struct({ runID: RUN_ID.annotate({ description: "The runID previously returned by the workflow tool" }) }))),
         execute: async ({ runID }) => {
           // Memory first: disk state can lag the live run. The disk fallback must work while another
           // process owns the lease, so this never acquires one.

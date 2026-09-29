@@ -712,7 +712,7 @@ export const WorkflowRpc = Rpc.define({
   methods: {
     list: { input: Schema.toStandardSchemaV1(Schema.Struct({})), output: Schema.toStandardSchemaV1(Schema.Struct({ runs: Schema.Array(RUN_VALUE) })) },
     control: {
-      input: Schema.toStandardSchemaV1(Schema.Struct({ runID: RUN_ID, action: Schema.Literals(CONTROL_ACTIONS), guidance: Schema.optional(Schema.String), workerID: Schema.optional(Schema.String) })),
+      input: Schema.toStandardSchemaV1(Schema.Struct({ runID: Schema.String, action: Schema.Literals(CONTROL_ACTIONS), guidance: Schema.optional(Schema.String), workerID: Schema.optional(Schema.String) })),
       output: Schema.toStandardSchemaV1(OUTCOME),
     },
   },
