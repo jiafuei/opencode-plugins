@@ -24,7 +24,8 @@ test("native CCH golden vector includes nested model/max_tokens, fallback arrays
 test("CLI preserves instruction and tool semantics while namespacing definitions, choice, and history", () => {
   const input = {
     ...BODY,
-    system: [...BODY.system, { type: "text", text: "Instructions from AGENTS.md: Always use OpenCode.\nDo not modify this text." }],
+    system: [...BODY.system, { type: "text", text: "Instructions from AGENTS.md: Always use OpenCode.\nDo not modify this text." },
+      { type: "text", text: "Here is some useful information about the environment you are running in:\n<env>\n</env>" }],
     messages: [
       { role: "user", content: [{ type: "text", text: "<system-reminder>Keep this exactly.</system-reminder>" }, { type: "text", text: "My OpenCode request" }] },
       { role: "assistant", content: [{ type: "tool_use", id: "toolu_1", name: "shell", input: { command: "echo OpenCode" } }] },
@@ -44,6 +45,7 @@ test("CLI preserves instruction and tool semantics while namespacing definitions
   expect(body.system.at(-1).text).toContain(input.system[1]!.text);
   expect(body.system.at(-1).text).toContain("Preserve my OpenCode instructions.");
   expect(body.system.at(-1).text).not.toContain("running in OpenCode");
+  expect(body.system.at(-1).text).toContain("You have been invoked in the following environment:\n<env>");
   expect(rewriteCliBody(JSON.stringify(input), { sessionId: "s", requestClass: "main" }, false).json).not.toContain("cch=");
 });
 

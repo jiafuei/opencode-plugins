@@ -2,12 +2,27 @@ import { randomUUID } from "node:crypto";
 import * as http from "node:http";
 import * as https from "node:https";
 import { Readable } from "node:stream";
+import * as tls from "node:tls";
 import { createBrotliDecompress, createGunzip, createInflate, createZstdDecompress } from "node:zlib";
 
 /** Own the last hop so Effect cannot add trace headers or reorder our headers. */
 export function createCliRelay() {
   const shutdown = new AbortController();
   const agent = new https.Agent({ keepAlive: true });
+  // node:https ignores proxy variables; tunnel explicitly so debugging proxies see the final wire request.
+  const proxy = process.env.HTTPS_PROXY || process.env.https_proxy;
+  if (proxy) {
+    const { hostname, port } = new URL(proxy);
+    agent.createConnection = (options, callback) => {
+      http.request({ host: hostname, port: port || 80, method: "CONNECT", path: `${options.host}:${options.port}` })
+        .on("connect", (response, socket) => response.statusCode === 200
+          ? callback!(null, tls.connect({ socket, servername: options.host! }))
+          : callback!(new Error(`HTTPS_PROXY CONNECT failed with HTTP ${response.statusCode}`), socket.destroy()))
+        .on("error", (error) => callback!(error, undefined!))
+        .end();
+      return undefined;
+    };
+  }
   const pending = new Map<string, { url: URL; headers: Record<string, string>; body: string; timer: ReturnType<typeof setTimeout> }>();
   const server = Bun.serve({
     hostname: "127.0.0.1",

@@ -104,9 +104,46 @@ plugin. One-use request capabilities select prepared upstream requests.
 `Bun.serve` handles the local hop; ordered `node:https` requests handle the
 upstream hop. This removes headers injected after OpenCode's HTTP hooks,
 including `b3` and `traceparent`, and preserves streaming and cancellation.
-The relay connects directly to the configured provider URL; environment HTTP
-proxy variables are not used. TLS ClientHello parity has not been established
+When `HTTPS_PROXY` is set, the relay tunnels its upstream connections through
+it with `CONNECT`, so debugging proxies capture the final wire request (trust
+the proxy's CA via `NODE_EXTRA_CA_CERTS`). TLS ClientHello parity has not been established
 from the Charles export.
+
+### Third-party classification
+
+Anthropic rejects requests it classifies as third-party apps with HTTP 400
+`invalid_request_error`: "Third-party apps now draw from your extra usage, not
+your plan limits." The response also carries
+`anthropic-ratelimit-unified-overage-disabled-reason`. The September 30 bisection
+replayed a failing `cli` opus request, swapping one part at a time for its
+counterpart from a genuine 2.1.284 CLI capture, with `cch` recomputed for each
+variant:
+
+| Variant | Status |
+| --- | --- |
+| Genuine CLI request replayed with the same token | 200 |
+| Failing request replayed | 400 |
+| Genuine global-scope system prompt instead of the plugin preamble | 400 |
+| Genuine tool set instead of `mcp__opencode__*` | 400 |
+| Genuine caller-instructions block | 200 |
+| Project `AGENTS.md` + OpenCode `<env>` block alone | 400 (repeatable) |
+| Either half alone | 200 |
+| Same, with the env preamble's "some" removed | 200 |
+| Full failing request with the env preamble reworded | 200 |
+
+The trigger was OpenCode's environment preamble,
+`Here is some useful information about the environment you are running in:`
+(from OpenCode core's built-in instructions), combined with the `<env>` lines
+that follow it. The phrase with only a working-directory line passed, so the
+check appears to score content rather than match one exact string. Neither CLI
+profile's `cch`, billing suffix, header order, betas, tool names, nor global
+preamble triggered it. Both CLI profiles rewrite the preamble to Claude Code's
+wording, "You have been invoked in the following environment:"; `ex-machina`
+already rewrote it. `cowork` does not rewrite it.
+
+When this error returns, capture the failing request (see the relay's
+`HTTPS_PROXY` support) and bisect the same way. Content in the system blocks is
+the likeliest cause.
 
 ### Billing attribution
 

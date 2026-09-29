@@ -117,7 +117,9 @@ export function rewriteCliBody(body: string, attribution: CliAttribution, attrib
       ? block.text.replace(/^You are an AI agent running in OpenCode, a coding agent harness\. ?/, "")
         .replace(/^You are OpenCode[^\n]*\n?/, "")
       : block.text)
-    .filter(Boolean).join("\n\n");
+    .filter(Boolean).join("\n\n")
+    // Anthropic flags OpenCode's environment preamble next to its <env> block as a third-party app.
+    .replace("Here is some useful information about the environment you are running in:", "You have been invoked in the following environment:");
   const cache = attribution.agentId ? { type: "ephemeral" } : { type: "ephemeral", ttl: "1h" };
   const utility = !params.tools?.length && !["enabled", "adaptive"].includes(params.thinking?.type);
   const system: any[] = [];
