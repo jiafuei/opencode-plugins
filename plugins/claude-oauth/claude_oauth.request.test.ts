@@ -7,12 +7,6 @@ import { OAUTH_CREDENTIAL, setupPlugin } from "./test_harness.ts";
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
-function headerRecord(request: Request): Record<string, string> {
-  const headers: Record<string, string> = {};
-  request.headers.forEach((value, key) => (headers[key] = value));
-  return headers;
-}
-
 const BASE_BODY = {
   model: "claude-sonnet-4-6",
   system: [{ type: "text", text: "You are a coding agent." }],
@@ -21,34 +15,40 @@ const BASE_BODY = {
   max_tokens: 128000,
 };
 
-describe("request capture: OAuth streaming request", () => {
+describe("request capture: Cowork OAuth streaming request", () => {
   test("reaches the wire fingerprinted as Claude Code", async () => {
-    const { send } = await setupPlugin();
+    const { send } = await setupPlugin({ spoofingProfile: "cowork" });
     const { request, bodyText } = await send(BASE_BODY);
 
     expect(request.url).toBe("https://api.anthropic.com/v1/messages?beta=true");
-    const headers = headerRecord(request);
+    const headers = Object.fromEntries(request.headers);
     expect(headers["authorization"]).toBe("Bearer test-access-token");
     expect(headers["x-api-key"]).toBeUndefined();
     expect(headers["x-session-affinity"]).toBeUndefined();
     expect(headers["x-session-id"]).toBeUndefined();
     expect(headers["x-opencode-session"]).toBeUndefined();
-    expect(headers["user-agent"]).toBe("claude-cli/2.1.224 (external, sdk-cli)");
+    expect(headers["user-agent"]).toBe("claude-cli/2.1.246 (external, claude-desktop)");
     expect(headers["x-app"]).toBe("cli");
     expect(headers["x-client-request-id"]).toMatch(UUID);
     expect(headers["x-claude-code-session-id"]).toMatch(UUID);
-    expect(headers["anthropic-beta"]!.split(",")).toContain("oauth-2025-04-20");
+    const betas = headers["anthropic-beta"]!.split(",");
+    expect(betas).toContain("oauth-2025-04-20");
+    for (const agentBeta of ["effort-2025-11-24", "fallback-credit-2026-06-01", "claude-code-20250219"]) {
+      expect(betas).not.toContain(agentBeta);
+    }
 
     const body = JSON.parse(bodyText);
     expect(body.system[0].text).toContain("x-anthropic-billing-header:");
     expect(body.system[0].text).not.toContain("cch=00000");
+    expect(body.system[0].text).toContain("cc_entrypoint=claude-desktop;");
+    expect(bodyText).not.toContain("cc_prev_req=");
     const userId = JSON.parse(body.metadata.user_id);
     expect(userId.session_id).toBe(headers["x-claude-code-session-id"]);
     expect(userId.account_uuid).toBe("acct-test-123");
   });
 
   test("tool names are cloaked on the way out and restored from the SSE stream", async () => {
-    const { send } = await setupPlugin();
+    const { send } = await setupPlugin({ spoofingProfile: "cowork" });
     const sse = [
       'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"_get_weather","input":{}}}',
       'event: message_stop\ndata: {"type":"message_stop"}',
@@ -73,16 +73,30 @@ describe("request capture: OAuth streaming request", () => {
     expect(text).not.toContain("_get_weather");
   });
 
-  test("model.request keeps a stable process-local UUID per session, rotated on deletion", async () => {
-    const { send, emit } = await setupPlugin();
-    const sessionId = async (sessionID: string) =>
-      (await send(BASE_BODY, undefined, sessionID)).request.headers.get("x-claude-code-session-id");
-    const first = await sessionId("ses_stable");
-    expect(await sessionId("ses_stable")).toBe(first);
-    expect(await sessionId("ses_other")).not.toBe(first);
-    await emit({ type: "session.deleted", data: { sessionID: "ses_stable" } });
-    expect(await sessionId("ses_stable")).not.toBe(first);
+  test("derives restart-stable Cowork UUIDs", async () => {
+    const plugins: Awaited<ReturnType<typeof setupPlugin>>[] = [];
+    const sessionId = async (raw: string) => {
+      const plugin = await setupPlugin({ spoofingProfile: "cowork" });
+      plugins.push(plugin);
+      const { request } = await plugin.send(BASE_BODY, undefined, raw);
+      return { plugin, id: request.headers.get("x-claude-code-session-id")! };
+    };
+    try {
+      const coworkA = await sessionId("ses-a");
+      const coworkA2 = await sessionId("ses-a");
+      const coworkB = await sessionId("ses-b");
+      expect(coworkA.id).toBe(coworkA2.id);
+      expect(coworkB.id).not.toBe(coworkA.id);
+      await coworkA.plugin.emit({ type: "session.deleted", data: { sessionID: "ses-a" } });
+      expect((await sessionId("ses-a")).id).toBe(coworkA.id);
+    } finally {
+      for (const plugin of plugins) plugin.cleanup?.();
+    }
   });
+});
+
+test("rejects unsupported spoofingProfile option values at the boundary", async () => {
+  await expect(setupPlugin({ spoofingProfile: "deskmate" })).rejects.toThrow(/spoofingProfile/);
 });
 
 describe("non-OAuth connections", () => {

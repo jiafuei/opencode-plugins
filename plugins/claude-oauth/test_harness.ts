@@ -14,9 +14,9 @@ export const OAUTH_CREDENTIAL = {
 };
 
 export async function setupPlugin(options: Record<string, unknown> = {}, credential: unknown = OAUTH_CREDENTIAL) {
-  const state = { credential, reloads: 0 };
+  const state = { credential, reloads: 0, sessions: {} as Record<string, { parentID?: string }> };
   const hooks: Record<string, (event: any) => unknown> = {};
-  const queue: any[] = [];
+  const queue: Array<{ event: any; done: () => void }> = [];
   let wake: (() => void) | undefined;
   let method: any;
   let modelTransform: any;
@@ -35,12 +35,19 @@ export async function setupPlugin(options: Record<string, unknown> = {}, credent
         state.reloads++;
       },
     },
-    session: { hook: async (name: string, callback: any) => (hooks[name] = callback) },
+    session: {
+      hook: async (name: string, callback: any) => (hooks[name] = callback),
+      get: async ({ sessionID }: { sessionID: string }) => ({ id: sessionID, ...state.sessions[sessionID] }),
+    },
     event: {
       subscribe: () => ({
         async *[Symbol.asyncIterator]() {
           for (;;) {
-            while (queue.length > 0) yield queue.shift();
+            while (queue.length > 0) {
+              const { event, done } = queue.shift()!;
+              yield event;
+              done();
+            }
             await new Promise<void>((resolve) => (wake = resolve));
           }
         },
@@ -48,11 +55,10 @@ export async function setupPlugin(options: Record<string, unknown> = {}, credent
     },
   } as never);
 
-  const emit = async (event: unknown) => {
-    queue.push(event);
+  const emit = (event: unknown) => new Promise<void>((done) => {
+    queue.push({ event, done });
     wake?.();
-    await Bun.sleep(5);
-  };
+  });
 
   /** Run one request through model.request -> http.request -> respond -> http.response. */
   const send = async (

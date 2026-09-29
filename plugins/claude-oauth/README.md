@@ -2,7 +2,7 @@
 
 Claude Pro/Max subscription login for OpenCode. Adds an OAuth connection method
 to the built-in `anthropic` integration and rewrites requests using selectable Agent SDK
-CLI (default), Cowork desktop-agent, or ex-machina wire profiles. Profiles pin
+CLI (default), interactive CLI, Cowork desktop-agent, or ex-machina wire profiles. Profiles pin
 their own headers, beta list, billing/system fingerprint, and tool-name
 transport.
 
@@ -18,7 +18,7 @@ transport.
 
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
-| `spoofingProfile` | `"cowork" \| "sdk-cli" \| "ex-machina"` | `"sdk-cli"` | Selects the complete client wire profile. |
+| `spoofingProfile` | `"cli" \| "cowork" \| "sdk-cli" \| "ex-machina"` | `"sdk-cli"` | Selects the complete client wire profile. |
 | `attributionHeader` | `boolean` | `true` | Controls the billing header and `cch`. Profile identity remains enabled when false. |
 
 ### Spoofing profiles
@@ -27,8 +27,9 @@ Each value selects one coherent wire identity:
 
 | Value | Reference | Version / entrypoint | CCH |
 | --- | --- | --- | --- |
+| `"cli"` | September 29 interactive CLI capture | `2.1.280` / `cli` | Native global byte-marker normalization |
 | `"cowork"` | oh-my-pi Cowork | `2.1.246` / `claude-desktop` | Raw serialized-body attestation |
-| `"sdk-cli"` | pi-black Agent SDK CLI | `2.1.224` / `sdk-cli` | Top-level model/max-token normalization |
+| `"sdk-cli"` | September 29 genuine SDK CLI capture | `2.1.280` / `sdk-cli` | Native global byte-marker normalization |
 | `"ex-machina"` | opencode-anthropic-auth production source | `2.1.87` / `sdk-cli` | SHA-256 of first user text |
 
 ```json
@@ -39,16 +40,73 @@ Each value selects one coherent wire identity:
 }
 ```
 
-The Cowork and SDK CLI profiles derive identity from this plugin's stable
+The CLI, Cowork, and SDK CLI profiles derive device identity from this plugin's stable
 install ID and the OAuth account. No profile reads `~/.claude.json` or
-`CLAUDE_CONFIG_DIR`, and none emits billing request-chain fields
+`CLAUDE_CONFIG_DIR`. Both `cli` and `sdk-cli` emit billing request-chain fields
 (`cc_prev_req` / `cc_prompt_id`).
 
-`sdk-cli` and `cowork` replace the request headers with the profile's
-complete header set. `ex-machina` keeps a strict inherited-header allowlist,
+`cowork` replaces the request headers with the profile's complete header set.
+`ex-machina` keeps a strict inherited-header allowlist,
 matching its source-derived behavior rather than synthesizing the other
-profiles' fingerprint headers. All profiles are sent by OpenCode's own HTTP
-client, so header order and casing are not controlled by the plugin.
+profiles' fingerprint headers. Those profiles use OpenCode's HTTP client.
+`cli` and `sdk-cli` share a local relay to control upstream header order and casing.
+
+### Interactive and SDK CLI
+
+```json
+{
+  "plugins": [
+    { "package": "@jiafuei/opencode-claude-oauth", "options": { "spoofingProfile": "cli" } }
+  ]
+}
+```
+
+Both CLI profiles use the Linux x64 Claude Code 2.1.280 captures. `sdk-cli`
+is the default; set `spoofingProfile` to `cli` for interactive CLI identity.
+
+| Wire behavior | `cli` | `sdk-cli` |
+| --- | --- | --- |
+| Main system identity | Official Claude Code CLI | Claude Agent SDK |
+| Billing entrypoint | `cli` | `sdk-cli` |
+| Turn origin | `human` / `task_notification` | `sdk` |
+| Modern Opus/Sonnet thinking display | `updates` | `omitted` |
+| Main fallback-credit beta | Present | Absent |
+| Thinking-display-updates beta | Present with updates | Absent |
+
+They share the following behavior:
+
+- Custom tools are exposed as `mcp__opencode__<name>`, retaining their schemas
+  and arguments. Definitions, forced tool choices, historical calls, and tool
+  references are rewritten consistently; response tool names are restored.
+- The OpenCode harness opening is replaced by the selected identity. System blocks
+  are regrouped into stable instructions and caller instructions; repository
+  rules, skills, memories, user messages, and tool results retain their text.
+  Main agent requests use 1-hour caches; child agents use short caches.
+- Headers and betas distinguish main, subagent, and auxiliary requests. The model's
+  supplied output limit is retained, including 128000-token Opus requests.
+- Child agents share the root's wire-session UUID and inherit its prompt ID,
+  while each raw OpenCode session has its own response chain. Auxiliary
+  requests do not advance the primary chain. Each new turn gets a prompt ID;
+  turn-origin markers follow the selected profile.
+- `cc_prev_req` and `diagnostics.previous_message_id` advance only after a
+  successful complete JSON message or an SSE stream ending with a parsed
+  `message_stop` and no error event. Retries reuse logical IDs and increment
+  `X-Stainless-Retry-Count`. Late completions cannot replace newer chains or
+  restore deleted, compacted, or credential-switched state.
+- Session attribution is process-local and resets when the plugin reloads.
+  Device identity remains stable across reloads.
+- CCH uses the native serialized-byte algorithm, including nested `model`
+  values and `max_tokens`/fallback exclusions. It reproduces all 61 message
+  checksums in the September 29 capture.
+
+The relay starts on a random loopback port on first use and closes with the
+plugin. One-use request capabilities select prepared upstream requests.
+`Bun.serve` handles the local hop; ordered `node:https` requests handle the
+upstream hop. This removes headers injected after OpenCode's HTTP hooks,
+including `b3` and `traceparent`, and preserves streaming and cancellation.
+The relay connects directly to the configured provider URL; environment HTTP
+proxy variables are not used. TLS ClientHello parity has not been established
+from the Charles export.
 
 ### Billing attribution
 
@@ -85,29 +143,27 @@ the plugin's session `model.request`, `http.request`, and `http.response`
 hooks apply the selected wire transform to `/v1/messages` calls. OpenCode
 itself sends the `Authorization: Bearer …` token and the `?beta=true` query.
 
-- Cowork and SDK CLI emit the selected profile's exact `User-Agent`, `x-app: cli`,
+- Cowork and both CLI profiles emit the selected profile's exact `User-Agent`, `x-app: cli`,
   a per-invocation `x-client-request-id` (stable across HTTP retries), the
   Stainless header set, and a stable per-session `X-Claude-Code-Session-Id`
   UUID. Cowork derives it deterministically from the install and OpenCode
-  session so it survives restarts; SDK CLI keeps a process-local mapping.
+  session so it survives restarts; both CLI profiles keep process-local mappings.
   OpenCode's session-routing, project, and client headers are dropped.
   `ex-machina` pins its `User-Agent` while retaining only the bearer and
   safe inherited Anthropic/Stainless headers; it never emits the request ID
   or Claude session ID.
-- Cowork and SDK CLI use a beta profile chosen per request shape (utility vs
+- Cowork and both CLI profiles use a beta profile chosen per request shape (utility vs
   agent profile). Other caller betas are preserved and deduplicated after the
   profile's list, except `fine-grained-tool-streaming-2025-05-14` (absent from
   the profile), the SDK's obsolete `structured-outputs-2025-11-13` tool beta,
   and `context-1m-2025-08-07` (hard-429'd for subscription credentials).
-- Cowork and SDK CLI body rewrite:
+- Cowork body rewrite (see above for the two CLI profiles):
   - `system[0]` = `x-anthropic-billing-header` with the selected version and
-    entrypoint. Cowork fingerprints the first user text like OMP; SDK CLI skips
-    leading `<system-reminder>` text blocks. `system[1]` carries the selected
-    Agent SDK identity. Cowork sanitizes OpenCode-identifying caller-system
+    entrypoint, fingerprinting the first user text like OMP. `system[1]`
+    carries the Agent SDK identity. Cowork sanitizes OpenCode-identifying caller-system
     lines and uses a generic coding-agent opening. Cowork skips both fingerprint
-    blocks for claude-3-5-haiku; SDK CLI does not.
-  - `metadata.user_id` uses Cowork's `{device_id, session_id, account_uuid}`
-    order and SDK CLI's `{device_id, account_uuid, session_id}` order. Device
+    blocks for claude-3-5-haiku.
+  - `metadata.user_id` uses `{device_id, session_id, account_uuid}` order. Device
     IDs derive deterministically from this plugin's install ID and the OAuth
     account, and existing valid CC attribution is preserved verbatim.
   - `max_tokens` clamped to ≤ 64000. Incoming `stream` is preserved as-is.
@@ -115,11 +171,10 @@ itself sends the `Authorization: Bearer …` token and the `?beta=true` query.
     selectively enables strict schemas for OMP's supported tool set, adds short
     prompt-cache breakpoints to the last two real messages, and applies
     model-aware thinking, sampling, forced-tool, and context-management rules.
-    SDK CLI retains its top-level schema closure and pass-through cache behavior.
   - The redundant default `tool_choice:{type:"auto"}` is omitted.
-- Cowork and SDK CLI use the selected `cch` algorithm from the profile table, patched over the
+- Cowork and both CLI profiles use the selected `cch` algorithm from the profile table, patched over the
   `cch=00000` placeholder as five lowercase hex characters.
-- Cowork and SDK CLI custom tool names are cloaked with one `_` prefix on the way out
+- Cowork custom tool names are cloaked with one `_` prefix on the way out
   (definitions, `tool_choice`, historical
   `tool_use` blocks) and the exact prefix is stripped on the way in from the
   streaming SSE response (`content_block_start`), so OpenCode's logical tool
@@ -160,7 +215,8 @@ credential store.
 
 - **Version-pinned parity.** The plugin mirrors the selected profile's headers,
   payload, beta profile, tool-name transport, and `cch` behavior, but not
-  Claude's TLS handshake, header order, or every runtime detail. Pinned
+  Claude's TLS handshake or every runtime detail. Both CLI profiles control
+  header order on their upstream connections. Pinned
   profile constants must be updated when their reference clients change.
 - **Session requests only.** The rewrite runs in OpenCode's session HTTP hooks,
   so it covers the model requests OpenCode sends for sessions (agent turns,

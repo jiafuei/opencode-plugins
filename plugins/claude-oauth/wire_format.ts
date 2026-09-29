@@ -2,6 +2,8 @@ import { createHash, randomUUID } from "node:crypto";
 import { deriveDeviceId } from "./local_storage.ts";
 import { EX_MACHINA_PROFILE } from "./ex_machina_wire.ts";
 import type { ExMachinaProfile } from "./ex_machina_wire.ts";
+import { CLI_PROFILE, SDK_CLI_PROFILE, type CliProfile } from "./cli_wire.ts";
+export { SDK_CLI_PROFILE } from "./cli_wire.ts";
 import {
   applyCoworkModelCompatibility,
   applyCoworkPromptCaching,
@@ -14,7 +16,6 @@ import {
 const CLAUDE_CODE_20250219_BETA = "claude-code-20250219";
 const OAUTH_BETA = "oauth-2025-04-20";
 const INTERLEAVED_THINKING_BETA = "interleaved-thinking-2025-05-14";
-const REDACT_THINKING_BETA = "redact-thinking-2026-02-12";
 const THINKING_TOKEN_COUNT_BETA = "thinking-token-count-2026-05-13";
 const CONTEXT_MANAGEMENT_BETA = "context-management-2025-06-27";
 const PROMPT_CACHING_SCOPE_BETA = "prompt-caching-scope-2026-01-05";
@@ -31,14 +32,11 @@ const FALLBACK_CREDIT_BETA = "fallback-credit-2026-06-01";
 // wires these pieces into the session HTTP hooks.
 
 /**
- * One client identity on the Anthropic wire. `cowork` mirrors oh-my-pi's
- * Cowork desktop-agent profile (packages/ai/src/providers/
- * {claude-code-fingerprint,anthropic,cowork-fetch}.ts); `sdk-cli` mirrors
- * pi-black's Agent SDK CLI profile (src/claude-code-protocol.ts) without any
- * local Claude configuration reads.
+ * Cowork mirrors oh-my-pi's desktop-agent wire format. The capture-based
+ * interactive and SDK CLI profiles live in cli_wire.ts.
  */
 export interface ClaudeCodeSpoofingProfile {
-  id: "cowork" | "sdk-cli";
+  id: "cowork";
   wireFormat: "claude-code";
   version: string;
   userAgent: string;
@@ -48,12 +46,6 @@ export interface ClaudeCodeSpoofingProfile {
   stainlessPackageVersion: string;
   deviceDomainInstall: string;
   deviceDomainAccount: string;
-  /**
-   * CCH attestation input: "raw" hashes the final serialized body with the
-   * placeholder in place; "sdk-normalized" clones the final body, blanks only
-   * the top-level model and drops top-level max_tokens (pi-black semantics).
-   */
-  cchMode: "raw" | "sdk-normalized";
   /** Skip billing + identity injection for claude-3-5-haiku (Cowork gate). */
   skipIdentityForHaiku: boolean;
   /** Advertise fallback credit on every request rather than agent requests only. */
@@ -62,7 +54,7 @@ export interface ClaudeCodeSpoofingProfile {
   agentBetas: readonly string[];
 }
 
-export type SpoofingProfile = ClaudeCodeSpoofingProfile | ExMachinaProfile;
+export type SpoofingProfile = ClaudeCodeSpoofingProfile | ExMachinaProfile | CliProfile;
 
 export const COWORK_PROFILE: ClaudeCodeSpoofingProfile = {
   id: "cowork",
@@ -75,7 +67,6 @@ export const COWORK_PROFILE: ClaudeCodeSpoofingProfile = {
   stainlessPackageVersion: "0.112.1",
   deviceDomainInstall: "omp-claude-device-id-v1:",
   deviceDomainAccount: "omp-claude-device-id-v2",
-  cchMode: "raw",
   skipIdentityForHaiku: true,
   fallbackOnAllRequests: false,
   utilityBetas: [
@@ -98,53 +89,8 @@ export const COWORK_PROFILE: ClaudeCodeSpoofingProfile = {
   ],
 };
 
-/**
- * pi-black's sdk-cli profile. Version/entrypoint/UA/system instruction mirror
- * src/claude-code-protocol.ts; betas mirror the plugin's former Claude CLI
- * profiles (pi-black's header was `claude-code-20250219,oauth-2025-04-20,…`),
- * and the Stainless baseline stays at the pinned CLI values since pi-black
- * does not pin a distinct package version. Identity is derived from this
- * plugin's install ID plus the OAuth account — never from `.claude.json` or
- * any local Claude configuration.
- */
-export const SDK_CLI_PROFILE: ClaudeCodeSpoofingProfile = {
-  id: "sdk-cli",
-  wireFormat: "claude-code",
-  version: "2.1.224",
-  userAgent: `claude-cli/2.1.224 (external, sdk-cli)`,
-  billingEntrypoint: "sdk-cli",
-  systemInstruction: "You are a Claude agent, built on Anthropic's Claude Agent SDK.",
-  toolPrefix: "_",
-  stainlessPackageVersion: "0.112.1",
-  deviceDomainInstall: "claude-oauth-device-id-v1:",
-  deviceDomainAccount: "claude-oauth-device-id-v2",
-  cchMode: "sdk-normalized",
-  // pi-black injects billing and identity for every model, haiku included.
-  skipIdentityForHaiku: false,
-  fallbackOnAllRequests: true,
-  utilityBetas: [
-    CLAUDE_CODE_20250219_BETA,
-    OAUTH_BETA,
-    INTERLEAVED_THINKING_BETA,
-    REDACT_THINKING_BETA,
-    THINKING_TOKEN_COUNT_BETA,
-    CONTEXT_MANAGEMENT_BETA,
-    PROMPT_CACHING_SCOPE_BETA,
-    STRUCTURED_OUTPUTS_BETA,
-  ],
-  agentBetas: [
-    CLAUDE_CODE_20250219_BETA,
-    OAUTH_BETA,
-    INTERLEAVED_THINKING_BETA,
-    REDACT_THINKING_BETA,
-    THINKING_TOKEN_COUNT_BETA,
-    CONTEXT_MANAGEMENT_BETA,
-    PROMPT_CACHING_SCOPE_BETA,
-    MID_CONVERSATION_SYSTEM_BETA,
-  ],
-};
-
 const SPOOFING_PROFILES: Record<string, SpoofingProfile> = {
+  cli: CLI_PROFILE,
   cowork: COWORK_PROFILE,
   "sdk-cli": SDK_CLI_PROFILE,
   "ex-machina": EX_MACHINA_PROFILE,
@@ -156,7 +102,7 @@ export function resolveSpoofingProfile(value: unknown): SpoofingProfile {
   const profile = SPOOFING_PROFILES[value as string];
   if (!profile) {
     throw new Error(
-      `claude-oauth: unsupported spoofingProfile "${String(value)}" — expected "cowork", "sdk-cli", or "ex-machina"`,
+      `claude-oauth: unsupported spoofingProfile "${String(value)}" — expected "cli", "cowork", "sdk-cli", or "ex-machina"`,
     );
   }
   return profile;
@@ -179,15 +125,14 @@ function isActiveThinking(thinking: unknown): boolean {
  * Build the final anthropic-beta header: the profile's betas first, then
  * deduplicated SDK/caller extras (compact, PDF, MCP, skills/files, fast mode,
  * task budgets, ...). `incoming` is the request's existing anthropic-beta
- * header value, if any. Effort/fallback follow each profile's rules: sdk-cli
- * advertises fallback credit on every request; Cowork (matching OMP) adds
- * effort and fallback credit only on agent requests.
+ * header value, if any. Cowork adds effort and fallback credit only on agent
+ * requests, matching OMP.
  */
 export function buildBetas(
   thinking: unknown,
   hasTools: boolean,
   incoming?: string | null,
-  profile: ClaudeCodeSpoofingProfile = SDK_CLI_PROFILE,
+  profile: ClaudeCodeSpoofingProfile = COWORK_PROFILE,
 ): string {
   const agent = hasTools || isActiveThinking(thinking);
   const betas = [...(agent ? profile.agentBetas : profile.utilityBetas)];
@@ -203,8 +148,7 @@ export function buildBetas(
     push(ADVANCED_TOOL_USE_BETA);
   }
   if (agent && isActiveThinking(thinking)) push(EFFORT_BETA);
-  // sdk-cli advertises fallback credit on every request; Cowork (matching
-  // OMP) only on agent requests.
+  // Cowork matches OMP's agent-only fallback credit.
   if (agent || profile.fallbackOnAllRequests) push(FALLBACK_CREDIT_BETA);
   if (incomingBetas.length > 0) {
     for (const beta of incomingBetas) {
@@ -273,7 +217,7 @@ export function buildEnforcedHeaders(
 // Custom tool name cloaking
 // ---------------------------------------------------------------------------
 
-// Cowork and SDK CLI cloak custom tool names under a single leading
+// Cowork cloaks custom tool names under a single leading
 // underscore. Anthropic built-ins are exempt.
 const TOOL_PREFIX = "_";
 
@@ -306,19 +250,11 @@ export function stripClaudeToolPrefix(name: string, prefix: string = TOOL_PREFIX
  * `type`), `tool_choice.name`, and historical assistant `tool_use` blocks. IDs,
  * SDK-only fields, and `tool_result` blocks are preserved verbatim.
  */
-export function prefixRequestToolNames(params: Record<string, any>, profile: ClaudeCodeSpoofingProfile = SDK_CLI_PROFILE): void {
+export function prefixRequestToolNames(params: Record<string, any>, profile: ClaudeCodeSpoofingProfile = COWORK_PROFILE): void {
   const prefix = profile.toolPrefix;
   if (Array.isArray(params.tools)) {
     for (const tool of params.tools) {
       if (!tool || typeof tool !== "object") continue;
-      if (
-        profile.id !== "cowork" &&
-        tool.input_schema &&
-        typeof tool.input_schema === "object" &&
-        !Array.isArray(tool.input_schema)
-      ) {
-        tool.input_schema.additionalProperties = false;
-      }
       // Provider/server tools are identified by a versioned `type`
       // (web_search_20250305, computer_20250124, ...); custom function tools
       // have no `type` at all.
@@ -369,6 +305,7 @@ const SSE_EVENT_BUFFER_LIMIT = 1024 * 1024;
 export function createSseToolNameTransform(
   prefix: string = TOOL_PREFIX,
   transformName?: (name: string) => string,
+  completion?: { event(value: any): void; end(): void },
 ): TransformStream<Uint8Array, Uint8Array> {
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
@@ -433,7 +370,10 @@ export function createSseToolNameTransform(
       let parsed: unknown;
       try {
         parsed = JSON.parse(dataValues.join("\n"));
-      } catch {}
+      } catch (error) {
+        if (completion) throw error;
+      }
+      completion?.event(parsed);
       const next = uncloak(parsed);
       if (next !== undefined) {
         // Re-emit the event verbatim except for its data lines: the first
@@ -497,6 +437,7 @@ export function createSseToolNameTransform(
         pending = "";
       }
       dispatch(controller);
+      completion?.end();
     },
   });
 }
@@ -612,21 +553,6 @@ function extractFirstUserText(messages: unknown, skipSystemReminders: boolean): 
   return "";
 }
 
-const CANONICAL_BODY_KEYS = [
-  "model",
-  "messages",
-  "system",
-  "tools",
-  "metadata",
-  "max_tokens",
-  "thinking",
-  "context_management",
-  "temperature",
-  "output_config",
-  "fallbacks",
-  "stream",
-];
-
 const COWORK_BODY_KEYS = [
   "model",
   "messages",
@@ -653,10 +579,8 @@ const COWORK_BODY_KEYS = [
  * - metadata.user_id in the CC attribution envelope (valid incoming
  *   attribution preserved verbatim)
  * - max_tokens clamped to <= 64000
- * - SDK fields (thinking.display, eager_input_streaming) preserved, caches
- *   untouched, tool input schemas closed, and active thinking emits a single
- *   keep-all clear-thinking edit; the CCH mode follows OMP (cowork) or
- *   pi-black (sdk-cli)
+ * - Cowork model compatibility, schema normalization, and prompt caching;
+ *   active thinking emits a single keep-all clear-thinking edit
  * - known keys rebuilt in canonical order (incl. output_config / fallbacks),
  *   remaining keys appended in their original relative order;
  *   incoming `stream` is preserved as-is
@@ -670,7 +594,7 @@ export function rewriteBody(
     profile?: ClaudeCodeSpoofingProfile;
   },
 ): { json: string; thinking: unknown; hasTools: boolean; model: string; sessionId: string } {
-  const profile = ctx.profile ?? SDK_CLI_PROFILE;
+  const profile = ctx.profile ?? COWORK_PROFILE;
   const params = JSON.parse(body) as Record<string, any>;
   if (
     params.tool_choice?.type === "auto" &&
@@ -679,11 +603,9 @@ export function rewriteBody(
   ) {
     delete params.tool_choice;
   }
-  if (profile.id === "cowork") {
-    normalizeCoworkTools(params.tools);
-    applyCoworkModelCompatibility(params);
-    applyCoworkPromptCaching(params.messages);
-  }
+  normalizeCoworkTools(params.tools);
+  applyCoworkModelCompatibility(params);
+  applyCoworkPromptCaching(params.messages);
   // Cloak custom tool names before anything else, so cch hashes the
   // already-prefixed final body.
   prefixRequestToolNames(params, profile);
@@ -691,7 +613,7 @@ export function rewriteBody(
 
   const modelId: string = params.model ?? "";
   // Cowork follows CC's gate: neither the billing header nor the identity
-  // instruction goes to haiku. pi-black's sdk-cli injects for every model.
+  // instruction goes to claude-3-5-haiku.
   const injectFingerprint =
     !profile.skipIdentityForHaiku || !modelId.startsWith("claude-3-5-haiku");
 
@@ -708,9 +630,7 @@ export function rewriteBody(
   const hasBillingBlock =
     (typeof incomingSystem === "string" && incomingSystem.startsWith(BILLING_HEADER_PREFIX)) ||
     systemBlocks.some((block) => typeof block?.text === "string" && block.text.startsWith(BILLING_HEADER_PREFIX));
-  const coworkBillingBlocks = profile.id === "cowork"
-    ? systemBlocks.filter((block) => typeof block?.text === "string" && block.text.startsWith(BILLING_HEADER_PREFIX))
-    : [];
+  const coworkBillingBlocks = systemBlocks.filter((block) => typeof block?.text === "string" && block.text.startsWith(BILLING_HEADER_PREFIX));
 
   if (ctx.attributionHeader === false) {
     systemBlocks = systemBlocks.filter(
@@ -718,21 +638,19 @@ export function rewriteBody(
     );
   }
 
-  if (profile.id === "cowork") {
-    systemBlocks = systemBlocks.filter(
-      (block) => block?.text !== profile.systemInstruction &&
-        (typeof block?.text !== "string" || !block.text.startsWith(BILLING_HEADER_PREFIX)),
-    );
-    systemBlocks = sanitizeCoworkSystem(systemBlocks as Array<Record<string, any>>);
-  }
+  systemBlocks = systemBlocks.filter(
+    (block) => block?.text !== profile.systemInstruction &&
+      (typeof block?.text !== "string" || !block.text.startsWith(BILLING_HEADER_PREFIX)),
+  );
+  systemBlocks = sanitizeCoworkSystem(systemBlocks as Array<Record<string, any>>);
 
   const hasIdentityBlock = systemBlocks.some((block) => block?.text === profile.systemInstruction);
   const fingerprintBlocks: ContentBlock[] = [];
-  if (profile.id === "cowork" && ctx.attributionHeader !== false) fingerprintBlocks.push(...coworkBillingBlocks);
+  if (ctx.attributionHeader !== false) fingerprintBlocks.push(...coworkBillingBlocks);
   if (injectFingerprint && ctx.attributionHeader !== false && !hasBillingBlock) {
     fingerprintBlocks.push({
       type: "text",
-      text: createBillingHeader(extractFirstUserText(params.messages, profile.id !== "cowork"), profile),
+      text: createBillingHeader(extractFirstUserText(params.messages, false), profile),
     });
   }
   if (injectFingerprint && !hasIdentityBlock) {
@@ -757,28 +675,20 @@ export function rewriteBody(
     const envelope: Record<string, string> = {
       device_id: deriveDeviceId(accountId, profile.deviceDomainInstall, profile.deviceDomainAccount),
     };
-    if (profile.id === "cowork") {
-      envelope.session_id = ctx.sessionId ?? randomUUID().toLowerCase();
-      if (accountId) envelope.account_uuid = accountId;
-    } else {
-      if (accountId) envelope.account_uuid = accountId;
-      envelope.session_id = ctx.sessionId ?? randomUUID().toLowerCase();
-    }
+    envelope.session_id = ctx.sessionId ?? randomUUID().toLowerCase();
+    if (accountId) envelope.account_uuid = accountId;
     userId = JSON.stringify(envelope);
     sessionId = envelope.session_id;
   }
-  const metadata = profile.id === "cowork" ? { user_id: userId } : { ...params.metadata, user_id: userId };
+  const metadata = { user_id: userId };
 
   const thinking =
     params.thinking && typeof params.thinking === "object" ? { ...params.thinking } : params.thinking;
   // Active thinking emits a single keep-all edit, replacing whatever arrived.
   // Incoming objects are copied, never mutated.
-  const incomingContextManagement = params.context_management;
   let contextManagement: Record<string, any> | undefined;
   if (isActiveThinking(thinking)) {
     contextManagement = { edits: [{ type: "clear_thinking_20251015", keep: "all" }] };
-  } else if (incomingContextManagement && profile.id !== "cowork") {
-    contextManagement = incomingContextManagement;
   }
 
   const overrides: Record<string, any> = {
@@ -798,14 +708,14 @@ export function rewriteBody(
   // its original relative order. Incoming `stream` is preserved as-is (the
   // normal SDK path sends true); undefined values drop out on stringify.
   const rewritten: Record<string, any> = {};
-  for (const key of profile.id === "cowork" ? COWORK_BODY_KEYS : CANONICAL_BODY_KEYS) {
+  for (const key of COWORK_BODY_KEYS) {
     if (merged[key] !== undefined) rewritten[key] = merged[key];
   }
   for (const [key, value] of Object.entries(params)) {
     if (!(key in rewritten) && value !== undefined) rewritten[key] = value;
   }
 
-  if (profile.id === "cowork") makeStringsWellFormed(rewritten);
+  makeStringsWellFormed(rewritten);
 
   const billingBlock = system.find(
     (block) =>
@@ -815,13 +725,8 @@ export function rewriteBody(
   );
   if (billingBlock?.text) {
     // Cowork attests the raw final serialized body: hash it with the
-    // placeholder still in place (OMP's wrapFetchForCch behavior, applied
-    // before serialization here). pi-black's sdk-cli clones the final body,
-    // blanks only the top-level model, and drops top-level max_tokens.
-    const attested =
-      profile.cchMode === "raw"
-        ? JSON.stringify(rewritten)
-        : JSON.stringify({ ...rewritten, model: "", max_tokens: undefined });
+    // placeholder still in place (OMP's wrapFetchForCch behavior).
+    const attested = JSON.stringify(rewritten);
     const hash = Bun.hash.xxHash64(cchEncoder.encode(attested), CCH_SEED);
     const cch = (hash & 0xfffffn).toString(16).padStart(5, "0");
     billingBlock.text = billingBlock.text.replace(CCH_PLACEHOLDER_STR, `cch=${cch}`);

@@ -57,32 +57,6 @@ function authorizeParams(url: string): { redirectUri: string; state: string } {
 }
 
 describe("paste code flow", () => {
-  test("uses Claude Code's registered authorization endpoint and redirect URI", async () => {
-    const h = await makePasteHarness();
-    try {
-      const url = new URL(h.result.url);
-      expect(url.origin + url.pathname).toBe("https://claude.com/cai/oauth/authorize");
-      expect(url.searchParams.get("redirect_uri")).toBe("https://platform.claude.com/oauth/code/callback");
-    } finally {
-      h.restore();
-    }
-  });
-
-  test("generates Claude Code's 32-byte base64url PKCE verifier", async () => {
-    const h = await makePasteHarness();
-    try {
-      const { state } = authorizeParams(h.result.url);
-      expect((await h.result.callback(`good-code#${state}`)).type).toBe("oauth");
-      const verifier = h.tokenCalls[0]!.body.code_verifier as string;
-      expect(verifier).toMatch(/^[A-Za-z0-9_-]{43}$/);
-      expect(new URL(h.result.url).searchParams.get("code_challenge")).toBe(
-        createHash("sha256").update(verifier).digest("base64url"),
-      );
-    } finally {
-      h.restore();
-    }
-  });
-
   test("mismatched state fails locally for redirect URL and code#state formats", async () => {
     for (const format of ["redirect", "fragment"] as const) {
       const h = await makePasteHarness();
@@ -104,11 +78,14 @@ describe("paste code flow", () => {
     }
   });
 
-  test("valid redirect URL and code#state formats exchange the generated state", async () => {
+  test("redirect URL and code#state logins exchange the generated state and matching PKCE challenge", async () => {
     for (const format of ["redirect", "fragment"] as const) {
       const h = await makePasteHarness();
       try {
+        const url = new URL(h.result.url);
+        expect(url.origin + url.pathname).toBe("https://claude.com/cai/oauth/authorize");
         const { redirectUri, state } = authorizeParams(h.result.url);
+        expect(redirectUri).toBe("https://platform.claude.com/oauth/code/callback");
         const pasted =
           format === "redirect"
             ? `${redirectUri}?${new URLSearchParams({ code: "good-code", state })}`
@@ -126,6 +103,9 @@ describe("paste code flow", () => {
         expect(h.tokenCalls[0]!.body.code).toBe("good-code");
         expect(h.tokenCalls[0]!.body.state).toBe(state);
         expect(h.tokenCalls[0]!.body.redirect_uri).toBe("https://platform.claude.com/oauth/code/callback");
+        const verifier = h.tokenCalls[0]!.body.code_verifier as string;
+        expect(verifier).toMatch(/^[A-Za-z0-9_-]{43}$/);
+        expect(url.searchParams.get("code_challenge")).toBe(createHash("sha256").update(verifier).digest("base64url"));
       } finally {
         h.restore();
       }

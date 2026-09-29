@@ -16,7 +16,7 @@ const BILLING_SALT = "59cf53e54c78";
 const TOOL_PREFIX = "mcp_";
 const REMOVAL_ANCHORS = ["You are OpenCode", "github.com/anomalyco/opencode", "opencode.ai/docs"];
 
-export function mergeExMachinaBetas(incoming?: string | null): string {
+function mergeExMachinaBetas(incoming?: string | null): string {
   const betas: string[] = [...REQUIRED_BETAS];
   const seen = new Set<string>(betas);
   for (const beta of incoming?.split(",").map((value) => value.trim()).filter(Boolean) ?? []) {
@@ -27,7 +27,7 @@ export function mergeExMachinaBetas(incoming?: string | null): string {
   return betas.join(",");
 }
 
-export function sanitizeExMachinaSystemText(text: string): string {
+function sanitizeExMachinaSystemText(text: string): string {
   const paragraphs = text
     .split(/\n\n+/)
     .filter((paragraph) => !REMOVAL_ANCHORS.some((anchor) => paragraph.includes(anchor)));
@@ -86,7 +86,7 @@ function firstUserText(messages: unknown): string {
   })?.text ?? "";
 }
 
-export function buildExMachinaBillingHeader(messages: unknown): string {
+function buildExMachinaBillingHeader(messages: unknown): string {
   const text = firstUserText(messages);
   const sampled = [4, 7, 20].map((position) => text[position] || "0").join("");
   const suffix = createHash("sha256")

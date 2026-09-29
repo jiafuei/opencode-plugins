@@ -11,6 +11,8 @@ import {
 import type { SpoofingProfile } from "./wire_format.ts";
 import { deriveCoworkSessionId } from "./local_storage.ts";
 import { buildExMachinaHeaders, rewriteExMachinaBody, unprefixExMachinaName } from "./ex_machina_wire.ts";
+import { cliHeaders, rewriteCliBody, type CliAttribution } from "./cli_wire.ts";
+import { createCliRelay } from "./cli_transport.ts";
 
 // Configure in `opencode.json` like:
 //
@@ -239,7 +241,7 @@ export interface ClaudeOAuthOptions {
   attributionHeader?: boolean;
   /**
    * Client identity spoofed on the Anthropic wire: "sdk-cli" (default),
-   * "cowork", or the source-derived "ex-machina" profile.
+   * "cli" (interactive), "cowork", or the source-derived "ex-machina" profile.
    */
   spoofingProfile?: SpoofingProfile["id"];
 }
@@ -251,12 +253,53 @@ export default Plugin.define({
     // Validated once at the option boundary; unsupported values throw here.
     const profile = resolveSpoofingProfile(options.spoofingProfile);
     const attributionHeader = options.attributionHeader !== false;
-    // Non-Cowork profiles map raw OpenCode session ids to process-local UUIDv4s.
-    // Cowork derives a restart-stable UUID-shaped id from the install and session.
-    const wireSessionIds = new Map<string, string>();
     // The active Anthropic credential when it is this plugin's OAuth grant;
     // every wire rewrite below is gated on it.
     let oauth: Credential.OAuth | undefined;
+    let credentialIdentity: string | undefined;
+    let cliGeneration = 0;
+    let relay: ReturnType<typeof createCliRelay> | undefined;
+    type CliState = {
+      parentId?: string;
+      wireId: string;
+      agentId?: string;
+      turn?: string;
+      promptId?: string;
+      turnOrigin?: CliAttribution["turnOrigin"];
+      previousRequestId?: string;
+      previousMessageId?: string;
+      sequence: number;
+      committed: number;
+    };
+    type CliCall = {
+      rawSessionId: string;
+      state: CliState;
+      sequence: number;
+      attribution: CliAttribution;
+      kind: string;
+      attempts: number;
+      timer: ReturnType<typeof setTimeout>;
+    };
+    const cliStates = new Map<string, CliState>();
+    const cliCalls = new Map<string, CliCall>();
+    const cliResponses = new WeakMap<Request, CliCall>();
+    const cliState = async (sessionID: Parameters<typeof ctx.session.get>[0]["sessionID"]): Promise<CliState> => {
+      const current = cliStates.get(sessionID);
+      if (current) return current;
+      const generation = cliGeneration;
+      const session = await ctx.session.get({ sessionID });
+      const parent = session.parentID ? await cliState(session.parentID) : undefined;
+      if (generation !== cliGeneration) throw new Error("Claude CLI session changed while preparing the request");
+      const created: CliState = {
+        parentId: session.parentID,
+        wireId: parent?.wireId ?? randomUUID(),
+        ...(parent ? { agentId: `a${randomBytes(8).toString("hex")}`, promptId: parent.promptId } : {}),
+        sequence: 0, committed: 0,
+      };
+      const winner = cliStates.get(sessionID) ?? created;
+      cliStates.set(sessionID, winner);
+      return winner;
+    };
 
     const load = async () => {
       const connection = await ctx.integration.connection.active("anthropic");
@@ -264,6 +307,12 @@ export default Plugin.define({
         ? await ctx.integration.connection.resolve(connection).catch(() => undefined)
         : undefined;
       oauth = credential?.type === "oauth" && credential.methodID === METHOD_ID ? credential : undefined;
+      const identity = oauth ? `${JSON.stringify(connection)}:${oauth.metadata?.accountId ?? ""}` : undefined;
+      if (credentialIdentity !== identity) {
+        cliGeneration++;
+        cliStates.clear();
+      }
+      credentialIdentity = identity;
     };
 
     await ctx.integration.transform((editor) => {
@@ -341,6 +390,23 @@ export default Plugin.define({
 
     await load();
 
+    if (profile.wireFormat === "cli") {
+      await ctx.session.hook("context", async (event) => {
+        if (!oauth) return;
+        const state = await cliState(event.sessionID);
+        const user = event.messages.findLast((message) => message.role === "user");
+        if (!user || state.agentId) return;
+        const turn = user.id ?? new Bun.CryptoHasher("sha256").update(JSON.stringify(user.content)).digest("hex");
+        if (turn !== state.turn) {
+          state.turn = turn;
+          state.promptId = randomUUID();
+          // Core retains metadata (even an empty object) on human messages;
+          // synthetic task notifications are lowered without it.
+          state.turnOrigin = profile.id === "sdk-cli" ? "sdk" : user.metadata !== undefined ? "human" : "task_notification";
+        }
+      }, { providerID: "anthropic" });
+    }
+
     // Subscription-billed: zero out costs so usage tracking doesn't report
     // API spend for Pro/Max requests.
     await ctx.model.transform((editor) => {
@@ -354,15 +420,31 @@ export default Plugin.define({
 
     await ctx.session.hook(
       "model.request",
-      (event) => {
+      async (event) => {
         if (!oauth || profile.wireFormat === "ex-machina") return;
-        let wireSessionId =
-          profile.id === "cowork" ? deriveCoworkSessionId(event.sessionID) : wireSessionIds.get(event.sessionID);
-        if (!wireSessionId) {
-          wireSessionId = randomUUID().toLowerCase();
-          wireSessionIds.set(event.sessionID, wireSessionId);
+        if (profile.wireFormat === "cli") {
+          const state = await cliState(event.sessionID);
+          const id = randomUUID();
+          const timer = setTimeout(() => cliCalls.delete(id), 60 * 60 * 1000);
+          timer.unref();
+          cliCalls.set(id, {
+            rawSessionId: event.sessionID, state, sequence: ++state.sequence, kind: event.kind, attempts: 0, timer,
+            attribution: {
+              sessionId: state.wireId,
+              accountId: oauth.metadata?.accountId as string | undefined,
+              agentId: state.agentId,
+              agentType: state.agentId ? event.agent : undefined,
+              requestClass: event.kind === "primary" ? state.agentId ? "subagent" : "main" : "auxiliary",
+              ...(event.kind !== "title" ? {
+                promptId: state.promptId, turnOrigin: state.turnOrigin,
+                previousRequestId: state.previousRequestId, previousMessageId: state.previousMessageId,
+              } : {}),
+            },
+          });
+          event.headers[REQUEST_ID_HEADER] = id;
+          return;
         }
-        event.headers[SESSION_ID_HEADER] = wireSessionId;
+        event.headers[SESSION_ID_HEADER] = deriveCoworkSessionId(event.sessionID);
         // Fresh UUID per logical invocation; HTTP retries of the prepared
         // request reuse it.
         event.headers[REQUEST_ID_HEADER] = randomUUID();
@@ -377,6 +459,17 @@ export default Plugin.define({
         const url = new URL(request.url);
         if (!oauth || url.pathname !== "/v1/messages") return;
         const body = await request.text();
+        if (profile.wireFormat === "cli") {
+          const id = request.headers.get(REQUEST_ID_HEADER)!;
+          const call = cliCalls.get(id)!;
+          if (!call || cliStates.get(event.sessionID) !== call.state) throw new Error("Claude CLI request belongs to an inactive session");
+          const rewritten = rewriteCliBody(body, call.attribution, attributionHeader, profile);
+          const headers = cliHeaders(request.headers, call.attribution, rewritten, id, call.attempts++, profile);
+          relay ??= createCliRelay();
+          event.request = relay.forward(url, headers, rewritten.json, request.signal);
+          cliResponses.set(event.request, call);
+          return;
+        }
         if (profile.wireFormat === "ex-machina") {
           event.request = new Request(url, {
             method: request.method,
@@ -412,8 +505,49 @@ export default Plugin.define({
     // headers stripped.
     await ctx.session.hook(
       "http.response",
-      (event) => {
+      async (event) => {
         const response = event.response;
+        if (profile.wireFormat === "cli") {
+          const call = cliResponses.get(event.request);
+          if (!call || !response.ok || !response.body) return;
+          const requestId = response.headers.get("request-id");
+          const complete = (messageId: string) => {
+            if (requestId && cliStates.get(call.rawSessionId) === call.state && call.sequence >= call.state.committed && call.kind === "primary") {
+              call.state.previousRequestId = requestId;
+              call.state.previousMessageId = messageId;
+              call.state.committed = call.sequence;
+            }
+            clearTimeout(call.timer);
+            for (const [id, item] of cliCalls) if (item === call) cliCalls.delete(id);
+          };
+          if ((response.headers.get("content-type") ?? "").includes("text/event-stream")) {
+            let messageId: string | undefined;
+            let stopped = false;
+            let failed = false;
+            const transform = createSseToolNameTransform(profile.toolPrefix, undefined, {
+              event(value) {
+                if (stopped) failed = true;
+                if (value?.type === "message_start" && value.message?.type === "message" && typeof value.message.id === "string") messageId = value.message.id;
+                if (value?.type === "message_stop") stopped = true;
+                if (value?.type === "error") failed = true;
+              },
+              end() { if (stopped && !failed && messageId) complete(messageId); },
+            });
+            event.response = new Response(response.body.pipeThrough(transform), {
+              status: response.status, headers: uncloakedResponseHeaders(response),
+            });
+          } else if ((response.headers.get("content-type") ?? "").includes("application/json")) {
+            const message = await response.json() as Record<string, any>;
+            if (message.type === "message" && typeof message.id === "string" && message.stop_reason) {
+              complete(message.id);
+            }
+            for (const block of message.content ?? []) {
+              if (block.type === "tool_use" && block.name.startsWith(profile.toolPrefix)) block.name = block.name.slice(profile.toolPrefix.length);
+            }
+            event.response = Response.json(message, { status: response.status, headers: uncloakedResponseHeaders(response) });
+          }
+          return;
+        }
         if (!oauth || new URL(event.request.url).pathname !== "/v1/messages" || !response.body) return;
         if (!(response.headers.get("content-type") ?? "").includes("text/event-stream")) return;
         const transform =
@@ -432,17 +566,48 @@ export default Plugin.define({
     // Subscriptions close with the plugin scope.
     void (async () => {
       for await (const event of ctx.event.subscribe()) {
-        if (event.type === "session.deleted") wireSessionIds.delete(event.data.sessionID);
+        if (event.type === "session.deleted") {
+          cliGeneration++;
+          const removed = new Set<string>([event.data.sessionID]);
+          // Parents enter this map before their children.
+          for (const [id, state] of cliStates) {
+            if (removed.has(id) || (state.parentId && removed.has(state.parentId))) {
+              removed.add(id);
+              cliStates.delete(id);
+            }
+          }
+        }
+        if (event.type === "session.compacted") {
+          cliGeneration++;
+          const state = cliStates.get(event.data.sessionID);
+          if (state) {
+            // A new chain owner fences old completions without changing the
+            // session UUID shared by the root and its running child agents.
+            cliStates.set(event.data.sessionID, {
+              ...state, previousRequestId: undefined, previousMessageId: undefined, sequence: 0, committed: 0,
+            });
+          }
+        }
         if (
           event.type === "credential.updated" ||
           (event.type === "credential.switched" && event.data.integrationID === "anthropic")
         ) {
+          if (event.type === "credential.switched") {
+            cliGeneration++;
+            cliStates.clear();
+          }
           await load();
           await ctx.model.reload();
         }
       }
     })();
 
-    return () => wireSessionIds.clear();
+    return () => {
+      cliGeneration++;
+      cliStates.clear();
+      for (const call of cliCalls.values()) clearTimeout(call.timer);
+      cliCalls.clear();
+      relay?.close();
+    };
   },
 });

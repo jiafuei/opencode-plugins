@@ -11,6 +11,8 @@
     "wire_format.ts",
     "cowork_wire.ts",
     "ex_machina_wire.ts",
+    "cli_wire.ts",
+    "cli_transport.ts",
     "local_storage.ts",
     "README.md"
   ],

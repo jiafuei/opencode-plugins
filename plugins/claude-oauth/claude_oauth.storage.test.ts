@@ -9,7 +9,7 @@ import path from "node:path";
 // filesystem races that cannot be reproduced in-process.
 // ---------------------------------------------------------------------------
 
-const MODULE_PATH = new URL("./wire_format.ts", import.meta.url).pathname;
+const MODULE_PATH = new URL("./cli_wire.ts", import.meta.url).pathname;
 
 function isolatedDataDir(prefix: string): { dir: string; restore: () => void } {
   const dir = mkdtempSync(path.join(tmpdir(), prefix));
@@ -48,9 +48,9 @@ async function settle(procs: Bun.Subprocess[]): Promise<string[]> {
 describe("install id (stable local identity)", () => {
   const SCRIPT = `
     const mod = await import(process.env.MODULE_PATH);
-    const { json } = mod.rewriteBody(
+    const { json } = mod.rewriteCliBody(
       JSON.stringify({ model: "claude-sonnet-4-6", messages: [{ role: "user", content: "hi" }], max_tokens: 1 }),
-      {},
+      { sessionId: "session", requestClass: "main" }, true, mod.SDK_CLI_PROFILE,
     );
     const userId = JSON.parse(JSON.parse(json).metadata.user_id);
     console.log(userId.device_id);
