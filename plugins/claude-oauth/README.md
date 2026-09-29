@@ -227,8 +227,6 @@ credential store.
 - **No speculative model filtering.** OpenCode's Anthropic catalog remains
   visible while using OAuth. If Anthropic rejects a model for subscription
   credentials, the error is surfaced when that model is called.
-- **Bounded response rewriting.** A single SSE event larger than 1 MiB is
-  rejected instead of buffered without limit.
 
 ## Development
 

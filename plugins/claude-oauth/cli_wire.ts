@@ -67,7 +67,6 @@ export function patchCliCch(body: string): string {
         else if (char === "[") depth++;
         else if (char === "]") depth--;
       }
-      if (depth !== 0) continue;
     }
     if (body[end] === ",") end++;
     else if (start > cursor && body[start - 1] === ",") start--;

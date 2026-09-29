@@ -37,12 +37,6 @@ describe("SSE tool-name restoration", () => {
     }
   });
 
-  test("leaves malformed data lines untouched", async () => {
-    const payload = 'data: not-json{"type":"content_block_start"\n\n';
-    const output = await new Response(fragmentedStream(payload, [3]).pipeThrough(createSseToolNameTransform())).text();
-    expect(output).toBe(payload);
-  });
-
   test("joins multiple data lines before JSON parsing and rewrites as one", async () => {
     const payload = 'data: {"type":"content_block_start","index":9,\n' +
       'data: "content_block":{"type":"tool_use","id":"toolu_09","name":"_split_name","input":{}}}\n\n';
@@ -61,11 +55,5 @@ describe("SSE tool-name restoration", () => {
       '{"type":"text","text":"hi"},{"type":"tool_use","id":"toolu_10","name":"_prefixed","input":{}}]}}\r\n\r\n';
     const output = await new Response(fragmentedStream(payload, [17]).pipeThrough(createSseToolNameTransform())).text();
     expect(output).toBe(payload.replace('"name":"_prefixed"', '"name":"prefixed"'));
-  });
-
-  test("fails when an unfinished event exceeds the assembly cap", async () => {
-    const payload = `data: "${"x".repeat(2 * 1024 * 1024)}"\n`;
-    await expect(new Response(fragmentedStream(payload, [4096]).pipeThrough(createSseToolNameTransform())).text())
-      .rejects.toThrow(/exceeded.*bytes/i);
   });
 });

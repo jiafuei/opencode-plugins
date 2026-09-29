@@ -46,10 +46,6 @@ export interface ClaudeCodeSpoofingProfile {
   stainlessPackageVersion: string;
   deviceDomainInstall: string;
   deviceDomainAccount: string;
-  /** Skip billing + identity injection for claude-3-5-haiku (Cowork gate). */
-  skipIdentityForHaiku: boolean;
-  /** Advertise fallback credit on every request rather than agent requests only. */
-  fallbackOnAllRequests: boolean;
   utilityBetas: readonly string[];
   agentBetas: readonly string[];
 }
@@ -67,8 +63,6 @@ export const COWORK_PROFILE: ClaudeCodeSpoofingProfile = {
   stainlessPackageVersion: "0.112.1",
   deviceDomainInstall: "omp-claude-device-id-v1:",
   deviceDomainAccount: "omp-claude-device-id-v2",
-  skipIdentityForHaiku: true,
-  fallbackOnAllRequests: false,
   utilityBetas: [
     OAUTH_BETA,
     INTERLEAVED_THINKING_BETA,
@@ -97,12 +91,11 @@ const SPOOFING_PROFILES: Record<string, SpoofingProfile> = {
 };
 
 /** Resolve the plugin's spoofingProfile option once at the boundary. Undefined selects SDK CLI. */
-export function resolveSpoofingProfile(value: unknown): SpoofingProfile {
-  if (value === undefined) return SDK_CLI_PROFILE;
-  const profile = SPOOFING_PROFILES[value as string];
+export function resolveSpoofingProfile(value: string | undefined): SpoofingProfile {
+  const profile = SPOOFING_PROFILES[value ?? "sdk-cli"];
   if (!profile) {
     throw new Error(
-      `claude-oauth: unsupported spoofingProfile "${String(value)}" — expected "cli", "cowork", "sdk-cli", or "ex-machina"`,
+      `claude-oauth: unsupported spoofingProfile "${value}" — expected "cli", "cowork", "sdk-cli", or "ex-machina"`,
     );
   }
   return profile;
@@ -116,9 +109,8 @@ const STRIPPED_BETAS = new Set([
   "structured-outputs-2025-11-13",
 ]);
 
-function isActiveThinking(thinking: unknown): boolean {
-  const type = (thinking as { type?: unknown } | undefined)?.type;
-  return type === "enabled" || type === "adaptive";
+function isActiveThinking(thinking: any): boolean {
+  return thinking?.type === "enabled" || thinking?.type === "adaptive";
 }
 
 /**
@@ -135,58 +127,14 @@ export function buildBetas(
   profile: ClaudeCodeSpoofingProfile = COWORK_PROFILE,
 ): string {
   const agent = hasTools || isActiveThinking(thinking);
-  const betas = [...(agent ? profile.agentBetas : profile.utilityBetas)];
-  const seen = new Set(betas);
-  const push = (beta: string) => {
-    if (!seen.has(beta)) {
-      seen.add(beta);
-      betas.push(beta);
-    }
-  };
-  const incomingBetas = incoming?.split(",").map((beta) => beta.trim()) ?? [];
-  if (agent && incomingBetas.includes(ADVANCED_TOOL_USE_BETA)) {
-    push(ADVANCED_TOOL_USE_BETA);
+  const betas = new Set(agent ? profile.agentBetas : profile.utilityBetas);
+  if (isActiveThinking(thinking)) betas.add(EFFORT_BETA);
+  if (agent) betas.add(FALLBACK_CREDIT_BETA);
+  for (const beta of incoming?.split(",") ?? []) {
+    if (beta.trim() && !STRIPPED_BETAS.has(beta.trim())) betas.add(beta.trim());
   }
-  if (agent && isActiveThinking(thinking)) push(EFFORT_BETA);
-  // Cowork matches OMP's agent-only fallback credit.
-  if (agent || profile.fallbackOnAllRequests) push(FALLBACK_CREDIT_BETA);
-  if (incomingBetas.length > 0) {
-    for (const beta of incomingBetas) {
-      if (!beta || seen.has(beta) || STRIPPED_BETAS.has(beta)) continue;
-      push(beta);
-    }
-  }
-  return betas.join(",");
+  return [...betas].join(",");
 }
-
-export function mapStainlessArch(arch: string): "x64" | "arm64" | "x86" | `other::${string}` {
-  switch (arch.toLowerCase()) {
-    case "amd64":
-    case "x64":
-      return "x64";
-    case "arm64":
-    case "aarch64":
-      return "arm64";
-    case "386":
-    case "x86":
-    case "ia32":
-      return "x86";
-    default:
-      return `other::${arch.toLowerCase()}`;
-  }
-}
-
-// Static Stainless headers emitted by the Claude runtime.
-export const STAINLESS_HEADERS: Record<string, string> = {
-  "X-Stainless-Arch": mapStainlessArch(process.arch),
-  "X-Stainless-Lang": "js",
-  "X-Stainless-OS": "Linux",
-  "X-Stainless-Package-Version": "0.112.1",
-  "X-Stainless-Retry-Count": "0",
-  "X-Stainless-Runtime": "node",
-  "X-Stainless-Runtime-Version": "v26.3.0",
-  "X-Stainless-Timeout": "600",
-};
 
 /**
  * The complete /v1/messages header set for a Claude Code profile. Every
@@ -197,14 +145,21 @@ export function buildEnforcedHeaders(
   profile: ClaudeCodeSpoofingProfile,
   fields: { sessionId: string; betas: string; authorization: string; clientRequestId: string },
 ): Headers {
+  const arch = process.arch === "ia32" ? "x86" : process.arch === "x64" || process.arch === "arm64" ? process.arch : `other::${process.arch}`;
   return new Headers({
     Accept: "application/json",
     Authorization: fields.authorization,
     "Content-Type": "application/json",
     "User-Agent": profile.userAgent,
     "X-Claude-Code-Session-Id": fields.sessionId,
-    ...STAINLESS_HEADERS,
+    "X-Stainless-Arch": arch,
+    "X-Stainless-Lang": "js",
+    "X-Stainless-OS": "Linux",
     "X-Stainless-Package-Version": profile.stainlessPackageVersion,
+    "X-Stainless-Retry-Count": "0",
+    "X-Stainless-Runtime": "node",
+    "X-Stainless-Runtime-Version": "v26.3.0",
+    "X-Stainless-Timeout": "600",
     "anthropic-beta": fields.betas,
     "anthropic-dangerous-direct-browser-access": "true",
     "anthropic-version": "2023-06-01",
@@ -217,68 +172,31 @@ export function buildEnforcedHeaders(
 // Custom tool name cloaking
 // ---------------------------------------------------------------------------
 
-// Cowork cloaks custom tool names under a single leading
-// underscore. Anthropic built-ins are exempt.
-const TOOL_PREFIX = "_";
-
-// Anthropic built-in tool names are never prefixed or stripped. Server tools
-// from the pinned @ai-sdk/anthropic additionally carry versioned `type` fields
+// Anthropic built-in tool names are never prefixed. Server tools from the
+// pinned @ai-sdk/anthropic additionally carry versioned `type` fields
 // (web_search_20250305, text_editor_20250429, computer_20250124,
 // code_execution_20250522, ...) on their definitions; any tool definition with
 // a string `type` is a provider tool and is left untouched.
 const BUILTIN_TOOL_NAMES = new Set(["web_search", "code_execution", "text_editor", "computer"]);
 
-function isBuiltinToolName(name: string): boolean {
-  return BUILTIN_TOOL_NAMES.has(name.toLowerCase());
-}
-
-export function applyClaudeToolPrefix(name: string, prefix: string = TOOL_PREFIX): string {
-  if (isBuiltinToolName(name)) return name;
-  // Always prepend, including when a logical name already starts with the
-  // namespace, so stripping exactly one prefix always round-trips.
-  return `${prefix}${name}`;
-}
-
-export function stripClaudeToolPrefix(name: string, prefix: string = TOOL_PREFIX): string {
-  if (!name.startsWith(prefix)) return name;
-  return name.slice(prefix.length);
-}
-
 /**
- * Close top-level input schemas and prefix every custom tool name carried by
- * an Anthropic request body, in place: custom tool definitions (no versioned
- * `type`), `tool_choice.name`, and historical assistant `tool_use` blocks. IDs,
- * SDK-only fields, and `tool_result` blocks are preserved verbatim.
+ * Prefix every custom tool name carried by an Anthropic request body, in
+ * place: custom tool definitions (no versioned `type`), `tool_choice.name`,
+ * and historical assistant `tool_use` blocks. IDs, SDK-only fields, and
+ * `tool_result` blocks are preserved verbatim. Always prepend, including when
+ * a logical name already starts with the prefix, so stripping exactly one
+ * prefix always round-trips.
  */
-export function prefixRequestToolNames(params: Record<string, any>, profile: ClaudeCodeSpoofingProfile = COWORK_PROFILE): void {
-  const prefix = profile.toolPrefix;
-  if (Array.isArray(params.tools)) {
-    for (const tool of params.tools) {
-      if (!tool || typeof tool !== "object") continue;
-      // Provider/server tools are identified by a versioned `type`
-      // (web_search_20250305, computer_20250124, ...); custom function tools
-      // have no `type` at all.
-      if (typeof tool.type === "string") continue;
-      if (typeof tool.name === "string") tool.name = applyClaudeToolPrefix(tool.name, prefix);
-    }
+function prefixRequestToolNames(params: Record<string, any>, prefix: string): void {
+  const apply = (name: string) => (BUILTIN_TOOL_NAMES.has(name.toLowerCase()) ? name : `${prefix}${name}`);
+  for (const tool of params.tools ?? []) {
+    if (typeof tool.type !== "string") tool.name = apply(tool.name);
   }
-  const toolChoice = params.tool_choice;
-  if (
-    toolChoice &&
-    typeof toolChoice === "object" &&
-    toolChoice.type === "tool" &&
-    typeof toolChoice.name === "string"
-  ) {
-    toolChoice.name = applyClaudeToolPrefix(toolChoice.name, prefix);
-  }
-  if (Array.isArray(params.messages)) {
-    for (const message of params.messages) {
-      if (!message || typeof message !== "object" || !Array.isArray(message.content)) continue;
-      for (const block of message.content) {
-        if (block?.type === "tool_use" && typeof block.name === "string") {
-          block.name = applyClaudeToolPrefix(block.name, prefix);
-        }
-      }
+  if (params.tool_choice?.type === "tool") params.tool_choice.name = apply(params.tool_choice.name);
+  for (const message of params.messages) {
+    if (!Array.isArray(message.content)) continue;
+    for (const block of message.content) {
+      if (block.type === "tool_use") block.name = apply(block.name);
     }
   }
 }
@@ -287,11 +205,6 @@ export function prefixRequestToolNames(params: Record<string, any>, profile: Cla
 // Bounded response uncloaking (incremental SSE)
 // ---------------------------------------------------------------------------
 
-// One complete SSE event may be buffered while it is assembled across chunks.
-// Anthropic messages events sit far below this; exceeding it means the stream
-// is not well-formed SSE and buffering further would be unbounded.
-const SSE_EVENT_BUFFER_LIMIT = 1024 * 1024;
-
 /**
  * Incremental SSE transformer that strips exactly one cloaking prefix from
  * tool_use names inside content_block_start events and in any
@@ -299,32 +212,27 @@ const SSE_EVENT_BUFFER_LIMIT = 1024 * 1024;
  * are parsed across arbitrary chunk boundaries (CRLF/LF), joining multiple
  * `data:` lines per the SSE rules before JSON parsing. Events that need no
  * rewrite pass through byte-for-byte, and only the current partial event is
- * ever buffered — never the full stream. A partial event that exceeds the
- * assembly cap fails the stream with a clear error.
+ * ever buffered — never the full stream.
  */
 export function createSseToolNameTransform(
-  prefix: string = TOOL_PREFIX,
+  prefix: string = COWORK_PROFILE.toolPrefix,
   transformName?: (name: string) => string,
   completion?: { event(value: any): void; end(): void },
 ): TransformStream<Uint8Array, Uint8Array> {
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
+  const strip = (name: string) => (name.startsWith(prefix) ? name.slice(prefix.length) : name);
   let pending = "";
   // Lines of the event being assembled: text without its terminator, plus the
   // exact terminator bytes that followed it ("\n" or "\r\n"). The terminating
   // blank line is included, so re-emitting the list reproduces the raw bytes.
   let eventLines: Array<{ text: string; eol: string }> = [];
-  let eventBytes = 0;
 
   function uncloak(event: any): any | undefined {
     if (transformName) {
       let changed = false;
       const visit = (value: unknown): void => {
         if (!value || typeof value !== "object") return;
-        if (Array.isArray(value)) {
-          for (const item of value) visit(item);
-          return;
-        }
         for (const [key, item] of Object.entries(value)) {
           if (key === "name" && typeof item === "string") {
             const next = transformName(item);
@@ -340,21 +248,14 @@ export function createSseToolNameTransform(
       visit(event);
       return changed ? event : undefined;
     }
-    if (event?.type === "content_block_start") {
-      const block = event.content_block;
-      if (block?.type === "tool_use" && typeof block.name === "string") {
-        return { ...event, content_block: { ...block, name: stripClaudeToolPrefix(block.name, prefix) } };
-      }
-      return undefined;
+    if (event.type === "content_block_start" && event.content_block.type === "tool_use") {
+      return { ...event, content_block: { ...event.content_block, name: strip(event.content_block.name) } };
     }
-    if (event?.type === "message_start" && Array.isArray(event.message?.content)) {
-      let changed = false;
-      const content = event.message.content.map((block: any) => {
-        if (block?.type !== "tool_use" || typeof block.name !== "string") return block;
-        changed = true;
-        return { ...block, name: stripClaudeToolPrefix(block.name, prefix) };
-      });
-      return changed ? { ...event, message: { ...event.message, content } } : undefined;
+    if (event.type === "message_start" && event.message.content?.some((block: any) => block.type === "tool_use")) {
+      const content = event.message.content.map((block: any) =>
+        block.type === "tool_use" ? { ...block, name: strip(block.name) } : block,
+      );
+      return { ...event, message: { ...event.message, content } };
     }
     return undefined;
   }
@@ -362,80 +263,47 @@ export function createSseToolNameTransform(
   /** Emit one completed event: rewritten only when its data payload carried a cloaked name. */
   function dispatch(controller: TransformStreamDefaultController<Uint8Array>): void {
     if (eventLines.length === 0) return;
-    let rebuilt: string[] | undefined;
-    const dataValues = eventLines
+    const lines = eventLines;
+    eventLines = [];
+    const data = lines
       .filter((line) => line.text.startsWith("data:"))
-      .map((line) => (line.text.slice(5).startsWith(" ") ? line.text.slice(6) : line.text.slice(5)));
-    if (dataValues.length > 0) {
-      let parsed: unknown;
-      try {
-        parsed = JSON.parse(dataValues.join("\n"));
-      } catch (error) {
-        if (completion) throw error;
-      }
+      .map((line) => line.text.slice(line.text.startsWith("data: ") ? 6 : 5));
+    let next: unknown;
+    if (data.length > 0) {
+      const parsed = JSON.parse(data.join("\n"));
       completion?.event(parsed);
-      const next = uncloak(parsed);
-      if (next !== undefined) {
-        // Re-emit the event verbatim except for its data lines: the first
-        // carries the rewritten JSON, any additional ones are folded into it.
-        const newData = `data: ${JSON.stringify(next)}`;
-        rebuilt = [];
-        let replaced = false;
-        for (const line of eventLines) {
-          if (line.text.startsWith("data:")) {
-            if (!replaced) {
-              rebuilt.push(`${newData}${line.eol}`);
-              replaced = true;
-            }
-          } else {
-            rebuilt.push(`${line.text}${line.eol}`);
-          }
-        }
+      next = uncloak(parsed);
+    }
+    // Re-emit the event verbatim except for its data lines: the first carries
+    // the rewritten JSON, any additional ones are folded into it.
+    let output = "";
+    let replaced = false;
+    for (const line of lines) {
+      if (next === undefined || !line.text.startsWith("data:")) output += `${line.text}${line.eol}`;
+      else if (!replaced) {
+        output += `data: ${JSON.stringify(next)}${line.eol}`;
+        replaced = true;
       }
     }
-    controller.enqueue(
-      encoder.encode(rebuilt ? rebuilt.join("") : eventLines.map((line) => `${line.text}${line.eol}`).join("")),
-    );
-    eventLines = [];
-    eventBytes = 0;
+    controller.enqueue(encoder.encode(output));
   }
 
   return new TransformStream({
     transform(chunk, controller) {
       pending += decoder.decode(chunk, { stream: true });
-      for (;;) {
-        const newlineIdx = pending.indexOf("\n");
-        if (newlineIdx === -1) break;
-        let text = pending.slice(0, newlineIdx);
-        pending = pending.slice(newlineIdx + 1);
-        let eol = "\n";
-        if (text.endsWith("\r")) {
-          text = text.slice(0, -1);
-          eol = "\r\n";
-        }
-        eventBytes += text.length + eol.length;
-        if (eventBytes > SSE_EVENT_BUFFER_LIMIT) {
-          throw new Error(
-            `claude-oauth: buffered SSE event exceeded ${SSE_EVENT_BUFFER_LIMIT} bytes without a record boundary; aborting the response stream`,
-          );
-        }
-        eventLines.push({ text, eol });
+      for (let newline = pending.indexOf("\n"); newline >= 0; newline = pending.indexOf("\n")) {
+        const raw = pending.slice(0, newline);
+        pending = pending.slice(newline + 1);
+        const text = raw.endsWith("\r") ? raw.slice(0, -1) : raw;
+        eventLines.push({ text, eol: text === raw ? "\n" : "\r\n" });
         // A blank line terminates the SSE event record.
         if (text === "") dispatch(controller);
-      }
-      if (eventBytes + pending.length > SSE_EVENT_BUFFER_LIMIT) {
-        throw new Error(
-          `claude-oauth: buffered SSE event exceeded ${SSE_EVENT_BUFFER_LIMIT} bytes without a record boundary; aborting the response stream`,
-        );
       }
     },
     flush(controller) {
       pending += decoder.decode();
-      if (pending.length > 0) {
-        // A final line without a terminator completes the last event.
-        eventLines.push({ text: pending, eol: "" });
-        pending = "";
-      }
+      // A final line without a terminator completes the last event.
+      if (pending) eventLines.push({ text: pending, eol: "" });
       dispatch(controller);
       completion?.end();
     },
@@ -450,14 +318,7 @@ export function createSseToolNameTransform(
 export function uncloakedResponseHeaders(response: Response): Headers {
   const headers = new Headers(response.headers);
   for (const key of [...headers.keys()]) {
-    const lower = key.toLowerCase();
-    if (
-      lower === "content-length" ||
-      lower === "content-encoding" ||
-      lower === "etag" ||
-      lower === "content-md5" ||
-      lower.includes("checksum")
-    ) {
+    if (["content-length", "content-encoding", "etag", "content-md5"].includes(key) || key.includes("checksum")) {
       headers.delete(key);
     }
   }
@@ -469,86 +330,50 @@ export function uncloakedResponseHeaders(response: Response): Headers {
 // ---------------------------------------------------------------------------
 
 type ContentBlock = {
-  type?: string;
-  text?: string;
+  type: string;
+  text: string;
   cache_control?: { type?: unknown; ttl?: unknown; scope?: unknown; [key: string]: unknown };
 };
 
 const BILLING_SALT = "59cf53e54c78";
 const BILLING_HEADER_PREFIX = "x-anthropic-billing-header:";
 const MAX_OUTPUT_TOKENS = 64000;
+// cch attestation: XXHash64(body_with_placeholder, seed) low-20-bits as 5 hex chars.
+const CCH_SEED = 0x4d659218e32a3268n;
+const CCH_PLACEHOLDER = "cch=00000";
 
 function createBillingHeader(firstUserMessageText: string, profile: SpoofingProfile): string {
   // Fingerprint: SHA256(salt + msg[4] + msg[7] + msg[20] + version)[:3],
-  // chars taken from the first non-meta user text block (not the system prompt).
-  const k = [4, 7, 20]
-    .map((i) => firstUserMessageText[i] ?? "0")
-    .join("");
-  const versionSuffix = createHash("sha256")
-    .update(`${BILLING_SALT}${k}${profile.version}`)
-    .digest("hex")
-    .slice(0, 3);
+  // chars taken from the first user text block (not the system prompt).
+  const k = [4, 7, 20].map((i) => firstUserMessageText[i] ?? "0").join("");
+  const versionSuffix = createHash("sha256").update(`${BILLING_SALT}${k}${profile.version}`).digest("hex").slice(0, 3);
   // The CCH placeholder is replaced after the complete request object is assembled.
-  return `${BILLING_HEADER_PREFIX} cc_version=${profile.version}.${versionSuffix}; cc_entrypoint=${profile.billingEntrypoint}; ${CCH_PLACEHOLDER_STR};`;
+  return `${BILLING_HEADER_PREFIX} cc_version=${profile.version}.${versionSuffix}; cc_entrypoint=${profile.billingEntrypoint}; ${CCH_PLACEHOLDER};`;
 }
-
-// cch attestation: XXHash64(body_with_placeholder, seed) low-20-bits as 5 hex chars.
-function rot13(value: string): string {
-  return value.replace(/[a-z]/gi, (char) => String.fromCharCode(char.charCodeAt(0) + (char.toLowerCase() < "n" ? 13 : -13)));
-}
-
-const CCH_SEED = BigInt(rot13("0k4q659218r32n3268"));
-const CCH_PLACEHOLDER_STR = rot13("ppu=00000");
-const cchEncoder = new TextEncoder();
 
 // Valid legacy cloaking id: user_<64 hex>_account_<uuid>_session_<uuid>.
 const CLOAKING_USER_ID_REGEX =
-  /^user_[0-9a-fA-F]{64}_account_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}_session_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+  /^user_[0-9a-fA-F]{64}_account_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}_session_([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/;
 
 /**
  * Session id carried by a valid CC attribution user_id: the legacy cloaking
  * id's trailing session, or the `session_id` of the `{device_id, session_id,
  * ...}` JSON envelope. Undefined for anything that must be regenerated.
  */
-export function extractUserIdSessionId(userId: string): string | undefined {
-  if (CLOAKING_USER_ID_REGEX.test(userId)) return userId.slice(userId.lastIndexOf("_session_") + "_session_".length);
-  if (userId.startsWith("{")) {
-    try {
-      const sessionId = (JSON.parse(userId) as Record<string, unknown>).session_id;
-      if (typeof sessionId === "string" && sessionId.length > 0) return sessionId;
-    } catch {}
-  }
+function extractUserIdSessionId(userId: unknown): string | undefined {
+  if (typeof userId !== "string") return undefined;
+  const legacy = CLOAKING_USER_ID_REGEX.exec(userId);
+  if (legacy) return legacy[1];
+  if (userId.startsWith("{")) return JSON.parse(userId).session_id || undefined;
   return undefined;
 }
 
-// Generated user ids prefer an account already present in metadata over the
-// auth-derived one.
-function readMetadataAccountId(metadata: unknown): string | undefined {
-  if (!metadata || typeof metadata !== "object") return undefined;
-  for (const key of ["account_uuid", "accountId", "account_id"]) {
-    const value = (metadata as Record<string, unknown>)[key];
-    if (typeof value === "string" && value.length > 0) return value;
-  }
-  return undefined;
-}
-
-function extractFirstUserText(messages: unknown, skipSystemReminders: boolean): string {
-  if (!Array.isArray(messages)) return "";
+function extractFirstUserText(messages: any[]): string {
   for (const message of messages) {
-    if (!message || typeof message !== "object") continue;
-    const m = message as { role?: string; content?: unknown };
-    if (m.role !== "user") continue;
-    if (typeof m.content === "string") {
-      if (!skipSystemReminders || !m.content.startsWith("<system-reminder>")) return m.content;
-      continue;
-    }
-    if (Array.isArray(m.content)) {
-      for (const block of m.content) {
-        if (!block || typeof block !== "object" || (block as ContentBlock).type !== "text") continue;
-        const text = (block as ContentBlock).text ?? "";
-        if (!skipSystemReminders || !text.startsWith("<system-reminder>")) return text;
-      }
-    }
+    if (message.role !== "user") continue;
+    if (typeof message.content === "string") return message.content;
+    const block = message.content.find((block: ContentBlock) => block.type === "text");
+    if (block) return block.text;
   }
   return "";
 }
@@ -593,114 +418,73 @@ export function rewriteBody(
     attributionHeader?: boolean;
     profile?: ClaudeCodeSpoofingProfile;
   },
-): { json: string; thinking: unknown; hasTools: boolean; model: string; sessionId: string } {
+): { json: string; thinking: unknown; hasTools: boolean; sessionId: string } {
   const profile = ctx.profile ?? COWORK_PROFILE;
   const params = JSON.parse(body) as Record<string, any>;
-  if (
-    params.tool_choice?.type === "auto" &&
-    typeof params.tool_choice === "object" &&
-    Object.keys(params.tool_choice).length === 1
-  ) {
-    delete params.tool_choice;
-  }
+  if (params.tool_choice?.type === "auto" && Object.keys(params.tool_choice).length === 1) delete params.tool_choice;
   normalizeCoworkTools(params.tools);
   applyCoworkModelCompatibility(params);
   applyCoworkPromptCaching(params.messages);
   // Cloak custom tool names before anything else, so cch hashes the
   // already-prefixed final body.
-  prefixRequestToolNames(params, profile);
-  const hasTools = Array.isArray(params.tools) && params.tools.length > 0;
+  prefixRequestToolNames(params, profile.toolPrefix);
+  const hasTools = params.tools?.length > 0;
 
-  const modelId: string = params.model ?? "";
   // Cowork follows CC's gate: neither the billing header nor the identity
   // instruction goes to claude-3-5-haiku.
-  const injectFingerprint =
-    !profile.skipIdentityForHaiku || !modelId.startsWith("claude-3-5-haiku");
+  const injectFingerprint = !(params.model ?? "").startsWith("claude-3-5-haiku");
 
-  // Normalize incoming system content (string → text block, array kept as-is,
-  // including caller fields like cache_control). Skip injection entirely when a
-  // billing block already exists so rewrites never stack duplicate fingerprints.
-  const incomingSystem = params.system;
-  let systemBlocks: ContentBlock[] =
-    typeof incomingSystem === "string"
-      ? [{ type: "text", text: incomingSystem }]
-      : Array.isArray(incomingSystem)
-        ? incomingSystem
-        : [];
-  const hasBillingBlock =
-    (typeof incomingSystem === "string" && incomingSystem.startsWith(BILLING_HEADER_PREFIX)) ||
-    systemBlocks.some((block) => typeof block?.text === "string" && block.text.startsWith(BILLING_HEADER_PREFIX));
-  const coworkBillingBlocks = systemBlocks.filter((block) => typeof block?.text === "string" && block.text.startsWith(BILLING_HEADER_PREFIX));
-
-  if (ctx.attributionHeader === false) {
-    systemBlocks = systemBlocks.filter(
-      (block) => typeof block?.text !== "string" || !block.text.startsWith(BILLING_HEADER_PREFIX),
-    );
+  // Incoming billing blocks are kept (never stacked with a fresh one) unless
+  // attribution is disabled; incoming identity blocks are re-emitted in front.
+  const incomingSystem: ContentBlock[] =
+    typeof params.system === "string" ? [{ type: "text", text: params.system }] : params.system ?? [];
+  const billingBlocks = incomingSystem.filter((block) => block.text.startsWith(BILLING_HEADER_PREFIX));
+  const system: ContentBlock[] = [];
+  if (ctx.attributionHeader !== false) {
+    if (billingBlocks.length > 0) system.push(...billingBlocks);
+    else if (injectFingerprint) {
+      system.push({ type: "text", text: createBillingHeader(extractFirstUserText(params.messages), profile) });
+    }
   }
-
-  systemBlocks = systemBlocks.filter(
-    (block) => block?.text !== profile.systemInstruction &&
-      (typeof block?.text !== "string" || !block.text.startsWith(BILLING_HEADER_PREFIX)),
-  );
-  systemBlocks = sanitizeCoworkSystem(systemBlocks as Array<Record<string, any>>);
-
-  const hasIdentityBlock = systemBlocks.some((block) => block?.text === profile.systemInstruction);
-  const fingerprintBlocks: ContentBlock[] = [];
-  if (ctx.attributionHeader !== false) fingerprintBlocks.push(...coworkBillingBlocks);
-  if (injectFingerprint && ctx.attributionHeader !== false && !hasBillingBlock) {
-    fingerprintBlocks.push({
-      type: "text",
-      text: createBillingHeader(extractFirstUserText(params.messages, false), profile),
-    });
-  }
-  if (injectFingerprint && !hasIdentityBlock) {
-    fingerprintBlocks.push({ type: "text", text: profile.systemInstruction });
-  }
-  const system = [...fingerprintBlocks, ...systemBlocks];
+  if (injectFingerprint) system.push({ type: "text", text: profile.systemInstruction });
+  system.push(...sanitizeCoworkSystem(incomingSystem.filter(
+    (block) => block.text !== profile.systemInstruction && !block.text.startsWith(BILLING_HEADER_PREFIX),
+  )));
 
   // Preserve valid CC attribution verbatim — the legacy cloaking id or the
   // `{device_id, session_id, ...}` JSON envelope with a nonempty session_id.
   // Anything else gets a freshly generated envelope whose session matches the
-  // header-provided sessionId so Step 5 can keep header and body attribution
-  // consistent.
-  const incomingUserId = params.metadata?.user_id;
-  const preservedSession = typeof incomingUserId === "string" ? extractUserIdSessionId(incomingUserId) : undefined;
+  // header-provided sessionId so header and body attribution stay consistent.
+  const preservedSession = extractUserIdSessionId(params.metadata?.user_id);
   let userId: string;
   let sessionId: string;
   if (preservedSession !== undefined) {
-    userId = incomingUserId;
+    userId = params.metadata.user_id;
     sessionId = preservedSession;
   } else {
-    const accountId = readMetadataAccountId(params.metadata) ?? ctx.accountId;
-    const envelope: Record<string, string> = {
+    // Generated user ids prefer an account already present in metadata over
+    // the auth-derived one.
+    const accountId: string | undefined =
+      params.metadata?.account_uuid || params.metadata?.accountId || params.metadata?.account_id || ctx.accountId;
+    sessionId = ctx.sessionId ?? randomUUID();
+    userId = JSON.stringify({
       device_id: deriveDeviceId(accountId, profile.deviceDomainInstall, profile.deviceDomainAccount),
-    };
-    envelope.session_id = ctx.sessionId ?? randomUUID().toLowerCase();
-    if (accountId) envelope.account_uuid = accountId;
-    userId = JSON.stringify(envelope);
-    sessionId = envelope.session_id;
-  }
-  const metadata = { user_id: userId };
-
-  const thinking =
-    params.thinking && typeof params.thinking === "object" ? { ...params.thinking } : params.thinking;
-  // Active thinking emits a single keep-all edit, replacing whatever arrived.
-  // Incoming objects are copied, never mutated.
-  let contextManagement: Record<string, any> | undefined;
-  if (isActiveThinking(thinking)) {
-    contextManagement = { edits: [{ type: "clear_thinking_20251015", keep: "all" }] };
+      session_id: sessionId,
+      ...(accountId && { account_uuid: accountId }),
+    });
   }
 
+  const thinking = params.thinking;
   const overrides: Record<string, any> = {
     model: params.model,
     messages: params.messages,
     ...(system.length > 0 && { system }),
     // OAuth requests always carry a tools array, even an empty one (CC does).
-    tools: Array.isArray(params.tools) ? params.tools : [],
-    metadata,
+    tools: params.tools ?? [],
+    metadata: { user_id: userId },
     max_tokens: Math.min(MAX_OUTPUT_TOKENS, params.max_tokens ?? MAX_OUTPUT_TOKENS),
-    ...(thinking && { thinking }),
-    ...(contextManagement && { context_management: contextManagement }),
+    // Active thinking emits a single keep-all edit, replacing whatever arrived.
+    ...(isActiveThinking(thinking) && { context_management: { edits: [{ type: "clear_thinking_20251015", keep: "all" }] } }),
   };
   const merged = { ...params, ...overrides };
 
@@ -718,19 +502,15 @@ export function rewriteBody(
   makeStringsWellFormed(rewritten);
 
   const billingBlock = system.find(
-    (block) =>
-      typeof block?.text === "string" &&
-      block.text.startsWith(BILLING_HEADER_PREFIX) &&
-      block.text.includes(CCH_PLACEHOLDER_STR),
+    (block) => block.text.startsWith(BILLING_HEADER_PREFIX) && block.text.includes(CCH_PLACEHOLDER),
   );
-  if (billingBlock?.text) {
+  if (billingBlock) {
     // Cowork attests the raw final serialized body: hash it with the
     // placeholder still in place (OMP's wrapFetchForCch behavior).
-    const attested = JSON.stringify(rewritten);
-    const hash = Bun.hash.xxHash64(cchEncoder.encode(attested), CCH_SEED);
+    const hash = Bun.hash.xxHash64(JSON.stringify(rewritten), CCH_SEED);
     const cch = (hash & 0xfffffn).toString(16).padStart(5, "0");
-    billingBlock.text = billingBlock.text.replace(CCH_PLACEHOLDER_STR, `cch=${cch}`);
+    billingBlock.text = billingBlock.text.replace(CCH_PLACEHOLDER, `cch=${cch}`);
   }
 
-  return { json: JSON.stringify(rewritten), thinking, hasTools, model: modelId, sessionId };
+  return { json: JSON.stringify(rewritten), thinking, hasTools, sessionId };
 }

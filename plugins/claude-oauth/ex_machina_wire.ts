@@ -11,21 +11,19 @@ export const EX_MACHINA_PROFILE = {
 
 export type ExMachinaProfile = typeof EX_MACHINA_PROFILE;
 
-const REQUIRED_BETAS = ["oauth-2025-04-20", "interleaved-thinking-2025-05-14"] as const;
+const REQUIRED_BETAS = ["oauth-2025-04-20", "interleaved-thinking-2025-05-14"];
 const BILLING_SALT = "59cf53e54c78";
 const TOOL_PREFIX = "mcp_";
 const REMOVAL_ANCHORS = ["You are OpenCode", "github.com/anomalyco/opencode", "opencode.ai/docs"];
-
-function mergeExMachinaBetas(incoming?: string | null): string {
-  const betas: string[] = [...REQUIRED_BETAS];
-  const seen = new Set<string>(betas);
-  for (const beta of incoming?.split(",").map((value) => value.trim()).filter(Boolean) ?? []) {
-    if (seen.has(beta)) continue;
-    seen.add(beta);
-    betas.push(beta);
-  }
-  return betas.join(",");
-}
+const FORWARDED_HEADERS = new Set([
+  "authorization",
+  "accept",
+  "content-type",
+  "anthropic-version",
+  "anthropic-dangerous-direct-browser-access",
+  "anthropic-beta",
+  "x-app",
+]);
 
 function sanitizeExMachinaSystemText(text: string): string {
   const paragraphs = text
@@ -43,51 +41,17 @@ function sanitizeExMachinaSystemText(text: string): string {
 
 type SystemBlock = { type: string; text: string; [key: string]: unknown };
 
-function normalizeSystem(system: unknown): SystemBlock[] {
-  const identity: SystemBlock = { type: "text", text: EX_MACHINA_PROFILE.systemInstruction };
-  if (system == null) return [identity];
-  if (typeof system === "string") {
-    const text = sanitizeExMachinaSystemText(system);
-    return text === identity.text ? [identity] : [identity, { type: "text", text }];
-  }
-  if (typeof system === "object" && !Array.isArray(system)) {
-    const record = system as Record<string, unknown>;
-    const type = typeof record.type === "string" ? record.type : "text";
-    const text = sanitizeExMachinaSystemText(typeof record.text === "string" ? record.text : "");
-    return [identity, { ...record, type, text } as SystemBlock];
-  }
-  if (!Array.isArray(system)) return [identity];
-  const blocks = system.map((item): SystemBlock => {
-    if (typeof item === "string") return { type: "text", text: sanitizeExMachinaSystemText(item) };
-    if (
-      item !== null &&
-      typeof item === "object" &&
-      !Array.isArray(item) &&
-      (item as Record<string, unknown>).type === "text" &&
-      typeof (item as Record<string, unknown>).text === "string"
-    ) {
-      const block = item as Record<string, unknown>;
-      return { ...block, type: "text", text: sanitizeExMachinaSystemText(block.text as string) } as SystemBlock;
-    }
-    return { type: "text", text: String(item) };
-  });
-  return blocks[0]?.text === identity.text ? blocks : [identity, ...blocks];
+function normalizeSystem(system: string | SystemBlock[] | undefined): SystemBlock[] {
+  const blocks = typeof system === "string" ? [{ type: "text", text: system }] : system ?? [];
+  const sanitized = blocks.map((block) => ({ ...block, text: sanitizeExMachinaSystemText(block.text) }));
+  const identity = EX_MACHINA_PROFILE.systemInstruction;
+  return sanitized[0]?.text === identity ? sanitized : [{ type: "text", text: identity }, ...sanitized];
 }
 
-function firstUserText(messages: unknown): string {
-  if (!Array.isArray(messages)) return "";
-  const message = messages.find((item) => item?.role === "user");
-  if (!message) return "";
-  if (typeof message.content === "string") return message.content;
-  if (!Array.isArray(message.content)) return "";
-  return message.content.find((block: unknown) => {
-    const record = block as { type?: unknown; text?: unknown };
-    return record?.type === "text" && !!record.text;
-  })?.text ?? "";
-}
-
-function buildExMachinaBillingHeader(messages: unknown): string {
-  const text = firstUserText(messages);
+function buildExMachinaBillingHeader(firstUserContent: string | Array<{ type: string; text?: string }>): string {
+  const text = typeof firstUserContent === "string"
+    ? firstUserContent
+    : firstUserContent.find((block) => block.type === "text" && block.text)?.text ?? "";
   const sampled = [4, 7, 20].map((position) => text[position] || "0").join("");
   const suffix = createHash("sha256")
     .update(`${BILLING_SALT}${sampled}${EX_MACHINA_PROFILE.version}`)
@@ -102,32 +66,20 @@ function prefixToolName(name: string): string {
 }
 
 export function rewriteExMachinaBody(body: string, attributionHeader = true): string {
-  try {
-    const parsed = JSON.parse(body) as Record<string, any>;
-    const hasUser = Array.isArray(parsed.messages) && parsed.messages.some((message) => message?.role === "user");
-    parsed.system = normalizeSystem(parsed.system);
-    if (attributionHeader && hasUser) {
-      parsed.system.unshift({ type: "text", text: buildExMachinaBillingHeader(parsed.messages) });
-    }
-    if (Array.isArray(parsed.tools)) {
-      for (const tool of parsed.tools) {
-        if (typeof tool?.name === "string" && tool.name) tool.name = prefixToolName(tool.name);
-      }
-    }
-    if (Array.isArray(parsed.messages)) {
-      for (const message of parsed.messages) {
-        if (!Array.isArray(message?.content)) continue;
-        for (const block of message.content) {
-          if (block?.type === "tool_use" && typeof block.name === "string" && block.name) {
-            block.name = prefixToolName(block.name);
-          }
-        }
-      }
-    }
-    return JSON.stringify(parsed);
-  } catch {
-    return body;
+  const parsed = JSON.parse(body) as Record<string, any>;
+  parsed.system = normalizeSystem(parsed.system);
+  const firstUser = parsed.messages.find((message: any) => message.role === "user");
+  if (attributionHeader && firstUser) {
+    parsed.system.unshift({ type: "text", text: buildExMachinaBillingHeader(firstUser.content) });
   }
+  for (const tool of parsed.tools ?? []) tool.name = prefixToolName(tool.name);
+  for (const message of parsed.messages) {
+    if (!Array.isArray(message.content)) continue;
+    for (const block of message.content) {
+      if (block.type === "tool_use") block.name = prefixToolName(block.name);
+    }
+  }
+  return JSON.stringify(parsed);
 }
 
 export function unprefixExMachinaName(name: string): string {
@@ -140,21 +92,10 @@ export function unprefixExMachinaName(name: string): string {
 export function buildExMachinaHeaders(incoming: Headers): Headers {
   const headers = new Headers();
   incoming.forEach((value, key) => {
-    const lower = key.toLowerCase();
-    if (
-      lower === "authorization" ||
-      lower === "accept" ||
-      lower === "content-type" ||
-      lower === "anthropic-version" ||
-      lower === "anthropic-dangerous-direct-browser-access" ||
-      lower === "anthropic-beta" ||
-      lower === "x-app" ||
-      lower.startsWith("x-stainless-")
-    ) {
-      headers.set(key, value);
-    }
+    if (FORWARDED_HEADERS.has(key) || key.startsWith("x-stainless-")) headers.set(key, value);
   });
-  headers.set("anthropic-beta", mergeExMachinaBetas(headers.get("anthropic-beta")));
+  const incomingBetas = headers.get("anthropic-beta")?.split(",").map((beta) => beta.trim()).filter(Boolean) ?? [];
+  headers.set("anthropic-beta", [...new Set([...REQUIRED_BETAS, ...incomingBetas])].join(","));
   headers.set("User-Agent", EX_MACHINA_PROFILE.userAgent);
   return headers;
 }

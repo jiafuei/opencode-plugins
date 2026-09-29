@@ -46,20 +46,6 @@ const REQUEST_ID_HEADER = "x-client-request-id";
 const METHOD_ID = Integration.MethodID.make("claude-pro-max");
 const FLOW_TIMEOUT_MS = 5 * 60 * 1000;
 
-// ---------------------------------------------------------------------------
-// PKCE + token plumbing
-// ---------------------------------------------------------------------------
-
-function base64UrlEncode(buffer: ArrayBuffer): string {
-  return Buffer.from(buffer).toString("base64url");
-}
-
-async function generatePKCE(): Promise<{ verifier: string; challenge: string }> {
-  const verifier = randomBytes(32).toString("base64url");
-  const challenge = base64UrlEncode(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier)));
-  return { verifier, challenge };
-}
-
 interface TokenResponse {
   access_token: string;
   refresh_token?: string;
@@ -73,25 +59,11 @@ interface TokenResponse {
  * the OAuth profile, Claude CLI roles, or Cowork bootstrap endpoints. Stored
  * as the credential's metadata.
  */
-export interface OAuthIdentity {
+interface OAuthIdentity {
   accountId?: string;
   email?: string;
   orgId?: string;
   orgName?: string;
-}
-
-function nonEmpty(value: unknown): string | undefined {
-  return typeof value === "string" && value.length > 0 ? value : undefined;
-}
-
-/** Normalize the token response's account/organization blocks; empty/non-string values become undefined. */
-function extractIdentity(data: TokenResponse): OAuthIdentity {
-  return {
-    accountId: nonEmpty(data.account?.uuid),
-    email: nonEmpty(data.account?.email_address),
-    orgId: nonEmpty(data.organization?.uuid),
-    orgName: nonEmpty(data.organization?.name),
-  };
 }
 
 /**
@@ -107,14 +79,11 @@ async function postToken(body: Record<string, string>): Promise<TokenResponse> {
     signal: AbortSignal.timeout(30_000),
   });
   if (response.ok) return (await response.json()) as TokenResponse;
-  const parsed = (await response.json().catch(() => undefined)) as
-    | { error?: string | { type?: string }; error_description?: string }
-    | undefined;
-  const oauthError = typeof parsed?.error === "string" ? parsed.error : parsed?.error?.type;
-  const description = parsed?.error_description?.slice(0, 300);
+  const parsed = (await response.json().catch(() => ({}))) as { error?: string | { type?: string }; error_description?: string };
+  const oauthError = typeof parsed.error === "string" ? parsed.error : parsed.error?.type;
   throw new Error(
     `Anthropic OAuth token request failed (HTTP ${response.status}${oauthError ? `, ${oauthError}` : ""})` +
-      (description ? `: ${description}` : "") +
+      (parsed.error_description ? `: ${parsed.error_description}` : "") +
       (oauthError === "invalid_grant" ? " — reconnect Anthropic with Claude Pro/Max." : ""),
   );
 }
@@ -122,10 +91,10 @@ async function postToken(body: Record<string, string>): Promise<TokenResponse> {
 /**
  * Identity recovery from Claude Code's profile and roles endpoints. Profile
  * failures are surfaced to callers; roles are optional and only enrich the
- * organization name.
+ * organization.
  */
-export async function fetchOAuthIdentity(accessToken: string): Promise<OAuthIdentity> {
-  const [profileResult, rolesResult] = await Promise.allSettled([
+async function fetchOAuthIdentity(accessToken: string): Promise<OAuthIdentity> {
+  const [profileResponse, roles] = await Promise.all([
     fetch(PROFILE_URL, {
       headers: {
         Accept: AXIOS_ACCEPT,
@@ -143,35 +112,25 @@ export async function fetchOAuthIdentity(accessToken: string): Promise<OAuthIden
         "User-Agent": AXIOS_USER_AGENT,
       },
       signal: AbortSignal.timeout(10_000),
-    }),
+    })
+      .then((response) => response.json() as Promise<{ organization_uuid?: string; organization_name?: string }>)
+      .catch(() => ({ organization_uuid: undefined, organization_name: undefined })),
   ]);
-  if (profileResult.status === "rejected") throw profileResult.reason;
-  const profileResponse = profileResult.value;
   if (!profileResponse.ok) throw new Error(`Anthropic profile request failed: ${profileResponse.status}`);
   const data = (await profileResponse.json()) as {
     account?: { uuid?: string; email?: string };
     organization?: { uuid?: string; name?: string };
   };
-  let roles: { organization_uuid?: string; organization_name?: string } | undefined;
-  if (rolesResult.status === "fulfilled" && rolesResult.value.ok) {
-    try {
-      roles = (await rolesResult.value.json()) as typeof roles;
-    } catch {}
-  }
   return {
-    accountId: nonEmpty(data.account?.uuid),
-    email: nonEmpty(data.account?.email),
-    orgId: nonEmpty(data.organization?.uuid) ?? nonEmpty(roles?.organization_uuid),
-    orgName: nonEmpty(data.organization?.name) ?? nonEmpty(roles?.organization_name),
+    accountId: data.account?.uuid,
+    email: data.account?.email,
+    orgId: data.organization?.uuid ?? roles.organization_uuid,
+    orgName: data.organization?.name ?? roles.organization_name,
   };
 }
 
-async function fetchCoworkBootstrapIdentity(
-  accessToken: string,
-  profile: SpoofingProfile,
-): Promise<OAuthIdentity> {
+async function fetchCoworkBootstrapIdentity(accessToken: string, profile: SpoofingProfile): Promise<OAuthIdentity> {
   const response = await fetch(`${BOOTSTRAP_URL}?entrypoint=cli&model=claude-opus-4-8`, {
-    method: "GET",
     headers: {
       Accept: AXIOS_ACCEPT,
       Authorization: `Bearer ${accessToken}`,
@@ -182,7 +141,7 @@ async function fetchCoworkBootstrapIdentity(
     signal: AbortSignal.timeout(30_000),
   });
   if (!response.ok) throw new Error(`Anthropic bootstrap request failed: ${response.status}`);
-  const data = (await response.json()) as {
+  const { oauth_account: account } = (await response.json()) as {
     oauth_account?: {
       account_uuid?: string;
       account_email?: string;
@@ -191,10 +150,10 @@ async function fetchCoworkBootstrapIdentity(
     };
   };
   return {
-    accountId: nonEmpty(data.oauth_account?.account_uuid),
-    email: nonEmpty(data.oauth_account?.account_email),
-    orgId: nonEmpty(data.oauth_account?.organization_uuid),
-    orgName: nonEmpty(data.oauth_account?.organization_name),
+    accountId: account?.account_uuid,
+    email: account?.account_email,
+    orgId: account?.organization_uuid,
+    orgName: account?.organization_name,
   };
 }
 
@@ -205,21 +164,23 @@ async function fetchCoworkBootstrapIdentity(
  * successful token exchange.
  */
 export async function resolveIdentity(data: TokenResponse, profile?: SpoofingProfile): Promise<OAuthIdentity> {
-  const identity = extractIdentity(data);
+  const identity: OAuthIdentity = {
+    accountId: data.account?.uuid,
+    email: data.account?.email_address,
+    orgId: data.organization?.uuid,
+    orgName: data.organization?.name,
+  };
   if (identity.accountId && identity.email && identity.orgId) return identity;
-  try {
-    const recovered = profile?.id === "cowork"
-      ? await fetchCoworkBootstrapIdentity(data.access_token, profile)
-      : await fetchOAuthIdentity(data.access_token);
-    return {
-      accountId: identity.accountId ?? recovered.accountId,
-      email: identity.email ?? recovered.email,
-      orgId: identity.orgId ?? recovered.orgId,
-      orgName: identity.orgName ?? recovered.orgName,
-    };
-  } catch {
-    return identity;
-  }
+  const recovered: OAuthIdentity = await (profile?.id === "cowork"
+    ? fetchCoworkBootstrapIdentity(data.access_token, profile)
+    : fetchOAuthIdentity(data.access_token)
+  ).catch(() => ({}));
+  return {
+    accountId: identity.accountId ?? recovered.accountId,
+    email: identity.email ?? recovered.email,
+    orgId: identity.orgId ?? recovered.orgId,
+    orgName: identity.orgName ?? recovered.orgName,
+  };
 }
 
 function buildAuthorizeUrl(challenge: string, state: string): string {
@@ -237,7 +198,7 @@ function buildAuthorizeUrl(challenge: string, state: string): string {
   return `${AUTHORIZE_URL}?${params.toString()}`;
 }
 
-export interface ClaudeOAuthOptions {
+interface ClaudeOAuthOptions {
   attributionHeader?: boolean;
   /**
    * Client identity spoofed on the Anthropic wire: "sdk-cli" (default),
@@ -272,6 +233,7 @@ export default Plugin.define({
       committed: number;
     };
     type CliCall = {
+      id: string;
       rawSessionId: string;
       state: CliState;
       sequence: number;
@@ -321,10 +283,11 @@ export default Plugin.define({
         method: { id: METHOD_ID, type: "oauth", label: "Claude Pro/Max" },
         label: (credential) => credential.metadata?.email as string | undefined,
         authorize: async () => {
-          const pkce = await generatePKCE();
-          const state = base64UrlEncode(crypto.getRandomValues(new Uint8Array(32)).buffer);
+          const verifier = randomBytes(32).toString("base64url");
+          const challenge = new Bun.CryptoHasher("sha256").update(verifier).digest("base64url");
+          const state = randomBytes(32).toString("base64url");
           return {
-            url: buildAuthorizeUrl(pkce.challenge, state),
+            url: buildAuthorizeUrl(challenge, state),
             instructions:
               "Complete login in your browser, then paste the authorization code shown by Claude within 5 minutes. It may look like `<code>#<state>`.",
             expiresAt: Date.now() + FLOW_TIMEOUT_MS,
@@ -333,31 +296,22 @@ export default Plugin.define({
               // Accept a bare code (`code#state`) or the full redirect URL,
               // and validate any accompanying state locally BEFORE the
               // token exchange.
-              let code = pasted.trim();
-              let pastedState = "";
-              if (URL.canParse(code)) {
-                const parsed = new URL(code);
-                const urlCode = parsed.searchParams.get("code");
-                if (urlCode) {
-                  code = urlCode;
-                  pastedState = parsed.searchParams.get("state") ?? "";
-                }
+              let [code, pastedState] = pasted.trim().split("#");
+              if (URL.canParse(code!)) {
+                const params = new URL(code!).searchParams;
+                code = params.get("code")!;
+                pastedState = params.get("state") ?? undefined;
               }
-              const fragment = code.indexOf("#");
-              if (fragment >= 0) {
-                pastedState = code.slice(fragment + 1);
-                code = code.slice(0, fragment);
-              }
-              if (pastedState.length > 0 && pastedState !== state) {
+              if (pastedState && pastedState !== state) {
                 throw new Error("The pasted state does not match this login session. Restart the Claude Pro/Max login.");
               }
               const tokens = await postToken({
                 grant_type: "authorization_code",
                 client_id: CLIENT_ID,
-                code,
+                code: code!,
                 state,
                 redirect_uri: REDIRECT_URI,
-                code_verifier: pkce.verifier,
+                code_verifier: verifier,
               });
               return {
                 type: "oauth",
@@ -428,7 +382,7 @@ export default Plugin.define({
           const timer = setTimeout(() => cliCalls.delete(id), 60 * 60 * 1000);
           timer.unref();
           cliCalls.set(id, {
-            rawSessionId: event.sessionID, state, sequence: ++state.sequence, kind: event.kind, attempts: 0, timer,
+            id, rawSessionId: event.sessionID, state, sequence: ++state.sequence, kind: event.kind, attempts: 0, timer,
             attribution: {
               sessionId: state.wireId,
               accountId: oauth.metadata?.accountId as string | undefined,
@@ -461,7 +415,7 @@ export default Plugin.define({
         const body = await request.text();
         if (profile.wireFormat === "cli") {
           const id = request.headers.get(REQUEST_ID_HEADER)!;
-          const call = cliCalls.get(id)!;
+          const call = cliCalls.get(id);
           if (!call || cliStates.get(event.sessionID) !== call.state) throw new Error("Claude CLI request belongs to an inactive session");
           const rewritten = rewriteCliBody(body, call.attribution, attributionHeader, profile);
           const headers = cliHeaders(request.headers, call.attribution, rewritten, id, call.attempts++, profile);
@@ -507,9 +461,10 @@ export default Plugin.define({
       "http.response",
       async (event) => {
         const response = event.response;
+        const contentType = response.headers.get("content-type") ?? "";
         if (profile.wireFormat === "cli") {
           const call = cliResponses.get(event.request);
-          if (!call || !response.ok || !response.body) return;
+          if (!call || !response.ok) return;
           const requestId = response.headers.get("request-id");
           const complete = (messageId: string) => {
             if (requestId && cliStates.get(call.rawSessionId) === call.state && call.sequence >= call.state.committed && call.kind === "primary") {
@@ -518,43 +473,39 @@ export default Plugin.define({
               call.state.committed = call.sequence;
             }
             clearTimeout(call.timer);
-            for (const [id, item] of cliCalls) if (item === call) cliCalls.delete(id);
+            cliCalls.delete(call.id);
           };
-          if ((response.headers.get("content-type") ?? "").includes("text/event-stream")) {
-            let messageId: string | undefined;
+          if (contentType.includes("text/event-stream")) {
+            let messageId = "";
             let stopped = false;
             let failed = false;
             const transform = createSseToolNameTransform(profile.toolPrefix, undefined, {
               event(value) {
-                if (stopped) failed = true;
-                if (value?.type === "message_start" && value.message?.type === "message" && typeof value.message.id === "string") messageId = value.message.id;
-                if (value?.type === "message_stop") stopped = true;
-                if (value?.type === "error") failed = true;
+                if (stopped || value.type === "error") failed = true;
+                if (value.type === "message_start") messageId = value.message.id;
+                if (value.type === "message_stop") stopped = true;
               },
-              end() { if (stopped && !failed && messageId) complete(messageId); },
+              end() { if (stopped && !failed) complete(messageId); },
             });
-            event.response = new Response(response.body.pipeThrough(transform), {
+            event.response = new Response(response.body!.pipeThrough(transform), {
               status: response.status, headers: uncloakedResponseHeaders(response),
             });
-          } else if ((response.headers.get("content-type") ?? "").includes("application/json")) {
+          } else if (contentType.includes("application/json")) {
             const message = await response.json() as Record<string, any>;
-            if (message.type === "message" && typeof message.id === "string" && message.stop_reason) {
-              complete(message.id);
-            }
-            for (const block of message.content ?? []) {
+            complete(message.id);
+            for (const block of message.content) {
               if (block.type === "tool_use" && block.name.startsWith(profile.toolPrefix)) block.name = block.name.slice(profile.toolPrefix.length);
             }
             event.response = Response.json(message, { status: response.status, headers: uncloakedResponseHeaders(response) });
           }
           return;
         }
-        if (!oauth || new URL(event.request.url).pathname !== "/v1/messages" || !response.body) return;
-        if (!(response.headers.get("content-type") ?? "").includes("text/event-stream")) return;
+        if (!oauth || new URL(event.request.url).pathname !== "/v1/messages" || !contentType.includes("text/event-stream")) return;
         const transform =
           profile.wireFormat === "ex-machina"
             ? createSseToolNameTransform("mcp_", unprefixExMachinaName)
             : createSseToolNameTransform(profile.toolPrefix);
-        event.response = new Response(response.body.pipeThrough(transform), {
+        event.response = new Response(response.body!.pipeThrough(transform), {
           status: response.status,
           statusText: response.statusText,
           headers: uncloakedResponseHeaders(response),

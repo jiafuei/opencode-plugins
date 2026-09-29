@@ -86,10 +86,6 @@ function normalizeNode(
   return result;
 }
 
-export function normalizeCoworkToolSchema(schema: unknown): unknown {
-  return normalizeNode(schema, new WeakMap(), true);
-}
-
 function isArrayNode(schema: Record<string, any>): boolean {
   return schema.type === "array" ||
     (Array.isArray(schema.type) && schema.type.includes("array") && !schema.type.includes("object")) ||
@@ -207,21 +203,20 @@ function hasStrictIncompatible(value: unknown, seen = new Set<object>()): boolea
     Object.values(record).some((entry) => hasStrictIncompatible(entry, seen));
 }
 
-export function normalizeCoworkTools(tools: unknown): void {
-  if (!Array.isArray(tools)) return;
+export function normalizeCoworkTools(tools: Array<Record<string, any>> | undefined): void {
+  if (!tools) return;
   const candidates: number[] = [];
   for (let index = 0; index < tools.length; index++) {
-    const tool = tools[index];
-    if (!isRecord(tool) || typeof tool.type === "string") continue;
-    const rawSchema = isRecord(tool.input_schema) ? tool.input_schema : {};
-    const logicalName = tool.name;
-    tool.input_schema = normalizeCoworkToolSchema({
+    const tool = tools[index]!;
+    if (typeof tool.type === "string") continue;
+    const rawSchema = tool.input_schema;
+    tool.input_schema = normalizeNode({
       ...rawSchema,
       type: "object",
-      properties: isRecord(rawSchema.properties) ? rawSchema.properties : {},
-      required: Array.isArray(rawSchema.required) ? rawSchema.required.filter((entry) => typeof entry === "string") : [],
-    });
-    if (typeof logicalName === "string" && STRICT_TOOLS.has(logicalName) && tool.strict !== false && !hasStrictIncompatible(rawSchema)) {
+      properties: rawSchema.properties ?? {},
+      required: rawSchema.required ?? [],
+    }, new WeakMap(), true);
+    if (STRICT_TOOLS.has(tool.name) && tool.strict !== false && !hasStrictIncompatible(rawSchema)) {
       candidates.push(index);
     }
   }
@@ -236,24 +231,20 @@ export function normalizeCoworkTools(tools: unknown): void {
       optionalCount: 0,
       unionCount: 0,
     };
-    const normalized = strictNode(tools[index].input_schema, budget, new WeakMap());
-    if (!isRecord(normalized)) continue;
-    tools[index].input_schema = normalized;
-    tools[index].strict = true;
+    const normalized = strictNode(tools[index]!.input_schema, budget, new WeakMap());
+    if (normalized === undefined) continue;
+    tools[index]!.input_schema = normalized;
+    tools[index]!.strict = true;
     strictCount++;
     optionalCount += budget.optionalCount;
     unionCount += budget.unionCount;
   }
 }
 
-export function sanitizeCoworkSystem(blocks: Array<Record<string, any>>): Array<Record<string, any>> {
+export function sanitizeCoworkSystem<T extends { text: string }>(blocks: T[]): T[] {
   let openingSeen = false;
-  const output: Array<Record<string, any>> = [];
+  const output: T[] = [];
   for (const block of blocks) {
-    if (block?.type !== "text" || typeof block.text !== "string") {
-      output.push(block);
-      continue;
-    }
     let text = block.text.replace(/\r\n?/g, "\n");
     const firstContent = text.search(/\S/);
     if (firstContent >= 0) {
@@ -291,17 +282,16 @@ function applyCacheToLastBlock(blocks: Array<Record<string, any>>): void {
   }
 }
 
-export function applyCoworkPromptCaching(messages: unknown): void {
-  if (!Array.isArray(messages)) return;
+export function applyCoworkPromptCaching(messages: Array<Record<string, any>>): void {
   const trailingIndex = messages.length - 1;
   const trailing = messages[trailingIndex];
   const hasPad = trailing?.role === "user" && trailing.content === "Continue." && messages[trailingIndex - 1]?.role === "assistant";
   const end = hasPad ? trailingIndex - 1 : trailingIndex;
   for (let index = end; index >= Math.max(0, end - 1); index--) {
-    const message = messages[index];
-    if (typeof message?.content === "string") {
+    const message = messages[index]!;
+    if (typeof message.content === "string") {
       message.content = [{ type: "text", text: message.content, cache_control: { ...CACHE_CONTROL } }];
-    } else if (Array.isArray(message?.content)) {
+    } else {
       applyCacheToLastBlock(message.content);
     }
   }
@@ -317,9 +307,6 @@ function parseClaudeModel(modelId: string): ClaudeModel | undefined {
   const familyFirst = modelId.match(
     /(?:^|[/.:])claude-(opus|sonnet|fable|mythos|haiku)-(\d+)(?:[.-](\d{1,2}))?(?:[.@-]|$)/i,
   );
-  const versionFirst = modelId.match(
-    /(?:^|[/.:])claude-(\d+)(?:[.-](\d{1,2}))?-(opus|sonnet|fable|mythos|haiku)(?:[.@-]|$)/i,
-  );
   if (familyFirst) {
     return {
       family: familyFirst[1]!.toLowerCase() as ClaudeModel["family"],
@@ -327,14 +314,15 @@ function parseClaudeModel(modelId: string): ClaudeModel | undefined {
       minor: +(familyFirst[3] ?? 0),
     };
   }
-  if (versionFirst) {
-    return {
-      family: versionFirst[3]!.toLowerCase() as ClaudeModel["family"],
-      major: +versionFirst[1]!,
-      minor: +(versionFirst[2] ?? 0),
-    };
-  }
-  return undefined;
+  const versionFirst = modelId.match(
+    /(?:^|[/.:])claude-(\d+)(?:[.-](\d{1,2}))?-(opus|sonnet|fable|mythos|haiku)(?:[.@-]|$)/i,
+  );
+  if (!versionFirst) return undefined;
+  return {
+    family: versionFirst[3]!.toLowerCase() as ClaudeModel["family"],
+    major: +versionFirst[1]!,
+    minor: +(versionFirst[2] ?? 0),
+  };
 }
 
 function atLeast(model: ClaudeModel, major: number, minor = 0): boolean {
@@ -342,18 +330,18 @@ function atLeast(model: ClaudeModel, major: number, minor = 0): boolean {
 }
 
 export function applyCoworkModelCompatibility(params: Record<string, any>): void {
-  const model = parseClaudeModel(typeof params.model === "string" ? params.model : "");
+  const model = parseClaudeModel(params.model);
   if (!model) return;
   const adaptiveOnly = model.family !== "haiku" && atLeast(model, 4, 6);
+  // Modern adaptive models are also the ones that support thinking.display.
   const modernAdaptive = model.family === "opus"
     ? atLeast(model, 4, 7)
     : ["sonnet", "fable", "mythos"].includes(model.family) && atLeast(model, 5);
-  const supportsDisplay = modernAdaptive;
   const supportsForced = model.family !== "fable" && model.family !== "mythos";
-  let thinking = isRecord(params.thinking) ? { ...params.thinking } : params.thinking;
-  if (isRecord(thinking) && !supportsDisplay) delete thinking.display;
-  const outputConfig = isRecord(params.output_config) ? { ...params.output_config } : {};
-  if (isRecord(thinking) && thinking.type === "disabled" && adaptiveOnly) {
+  let thinking: Record<string, any> | undefined = params.thinking && { ...params.thinking };
+  if (thinking && !modernAdaptive) delete thinking.display;
+  const outputConfig: Record<string, any> = { ...params.output_config };
+  if (thinking?.type === "disabled" && adaptiveOnly) {
     thinking = undefined;
     outputConfig.effort = "low";
   }
@@ -365,14 +353,14 @@ export function applyCoworkModelCompatibility(params: Record<string, any>): void
     else delete outputConfig.effort;
   }
   params.max_tokens = Math.min(MAX_OUTPUT_TOKENS, params.max_tokens ?? MAX_OUTPUT_TOKENS);
-  if (isRecord(thinking) && thinking.type === "enabled" && Number(thinking.budget_tokens) > 0) {
+  if (thinking?.type === "enabled" && thinking.budget_tokens > 0) {
     params.max_tokens = Math.min(MAX_OUTPUT_TOKENS, Math.max(params.max_tokens, thinking.budget_tokens + OUTPUT_BUFFER));
     if (thinking.budget_tokens + OUTPUT_BUFFER > params.max_tokens) {
       thinking.budget_tokens = params.max_tokens - OUTPUT_BUFFER;
     }
   }
   delete params.context_management;
-  if (modernAdaptive || (isRecord(thinking) && thinking.type !== "disabled")) {
+  if (modernAdaptive || (thinking && thinking.type !== "disabled")) {
     delete params.temperature;
     delete params.top_p;
     delete params.top_k;

@@ -1,36 +1,23 @@
 import { createHash, randomBytes } from "node:crypto";
-import { chmodSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, linkSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
 function getInstallId(): string {
   const dir = path.join(process.env.XDG_DATA_HOME ?? path.join(os.homedir(), ".local", "share"), "opencode");
-  mkdirSync(dir, { recursive: true, mode: 0o700 });
   const file = path.join(dir, "claude-oauth-install-id");
-  let existing = "";
-  try {
-    existing = readFileSync(file, "utf8").trim();
-  } catch {}
-  if (existing) {
-    if ((statSync(file).mode & 0o777) !== 0o600) chmodSync(file, 0o600);
-    return existing;
+  if (!existsSync(file)) {
+    // Publish a fully written candidate with an atomic hard link: concurrent
+    // processes that lose the race adopt the winner's id.
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const candidate = `${file}.${process.pid}`;
+    writeFileSync(candidate, randomBytes(16).toString("hex"), { mode: 0o600 });
+    try {
+      linkSync(candidate, file);
+    } catch {}
+    unlinkSync(candidate);
   }
-  const id = randomBytes(16).toString("hex");
-  try {
-    writeFileSync(file, id, { mode: 0o600, flag: "wx" });
-    return id;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-    for (let attempt = 0; attempt < 50; attempt++) {
-      Bun.sleepSync(5);
-      const winner = readFileSync(file, "utf8").trim();
-      if (winner) {
-        chmodSync(file, 0o600);
-        return winner;
-      }
-    }
-    throw new Error("claude-oauth install id file was created but never populated");
-  }
+  return readFileSync(file, "utf8").trim();
 }
 
 /**
