@@ -1,6 +1,5 @@
 /** @jsxImportSource @opentui/solid */
 import { Plugin } from "@opencode/plugin/tui";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createSignal, Show } from "solid-js";
 import { MemoryRpc, type DreamStatus } from "./rpc.ts";
@@ -115,8 +114,7 @@ export default Plugin.define({
       ctx.ui.toast.show({ variant: "info", title: "Memory", message: "Dreaming..." });
     };
 
-    // Topics live in server storage; editing goes through a temporary file
-    // and saves back only when the body changed.
+    // Choosing a topic opens its markdown file directly in the editor.
     const showMemory = async (): Promise<void> => {
       const state = await memory.state({}, location);
       const choice = await ctx.ui.dialog.select<Choice>({
@@ -156,16 +154,7 @@ export default Plugin.define({
         await showMemory();
         return;
       }
-      const { content } = await memory.topic({ file: choice.file }, location);
-      const path = join(tmpdir(), `opencode-memory-${choice.file}.md`);
-      await Bun.write(path, `${content}\n`);
-      try {
-        await openInEditor(ctx, path, workspace);
-        const edited = (await Bun.file(path).text()).trim();
-        if (edited !== content.trim()) await memory.edit({ file: choice.file, content: edited, sessionID: currentSession() }, location);
-      } finally {
-        await Bun.file(path).delete();
-      }
+      await openInEditor(ctx, join(state.directory, choice.file), workspace);
     };
 
     // Review and save notifications only surface for sessions this TUI knows.

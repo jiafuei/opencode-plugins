@@ -1,16 +1,19 @@
-import { describe, expect, jest, test } from "bun:test";
-import { mkdir, rm, stat } from "node:fs/promises";
+import { afterAll, describe, expect, jest, test } from "bun:test";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { rm } from "node:fs/promises";
 import { join } from "node:path";
 import MemoryModule, {
   dreamDue,
   indexLine,
   memoryProjectKey,
+  parseIndex,
 } from "./server.tsx";
 import MemoryTui from "./tui.tsx";
 
-// Keeps the one-time legacy import away from the real data directory.
+// Keeps memory files away from the real data directory.
 const dataHome = `/tmp/opencode-memory-test-${crypto.randomUUID()}`;
 process.env.XDG_DATA_HOME = dataHome;
+afterAll(() => rm(dataHome, { recursive: true, force: true }));
 
 type WorkerCall = { prompt: string; model?: { providerID: string; id: string; variant?: string } };
 type FakeMessage = { id: string; role: string; content: Array<{ type: string; text: string }> };
@@ -19,7 +22,6 @@ type Hook = (event: never) => Promise<void> | void;
 type MemoryTool = { execute: (input: unknown, context: { sessionID: string; agent: string }) => Promise<{ content: string }> };
 type Handlers = Record<string, (input: never) => Promise<unknown>>;
 type Entry = { title: string; file: string; summary: string; type: string; scope: string; updated: string };
-type Topic = { content: string; type: string; scope: string; revision: string; updatedAt: string; sessionId?: string; dreamRunId?: string };
 
 async function fixture(
   directory: string,
@@ -117,25 +119,33 @@ async function fixture(
 
 const userMessage = (id: string, text = id): FakeMessage => ({ id, role: "user", content: [{ type: "text", text }] });
 
-// Storage accessors scoped to one project's `memory/<projectKey>/` keys.
+// Accessors for one project's markdown files and `memory/<projectKey>/`
+// storage keys.
 function memory(storage: Map<string, unknown>, directory: string) {
   const key = (suffix: string) => `memory/${memoryProjectKey(directory)}/${suffix}`;
+  const root = join(dataHome, "opencode", "memory", memoryProjectKey(directory));
+  const write = (file: string, text: string) => {
+    mkdirSync(root, { recursive: true });
+    writeFileSync(join(root, file), text);
+  };
   return {
     key,
     get: (suffix: string) => storage.get(key(suffix)) as any,
     set: (suffix: string, value: unknown) => storage.set(key(suffix), value),
-    index: () => (storage.get(key("index")) ?? []) as Entry[],
-    topic: (file: string) => storage.get(key(`topic/${file}`)) as Topic | undefined,
+    index: () => existsSync(join(root, "index.md")) ? parseIndex(readFileSync(join(root, "index.md"), "utf8")) : [],
+    setIndex: (entries: Entry[]) => write("index.md", entries.map((entry) => `${indexLine(entry as never)}\n`).join("")),
+    topic: (file: string) => existsSync(join(root, file)) ? readFileSync(join(root, file), "utf8").trim() : undefined,
+    setTopic: (file: string, content: string) => write(file, `${content}\n`),
   };
 }
 
 function store(
   storage: Map<string, unknown>,
   directory: string,
-  entries: { file: string; title?: string; summary?: string; content?: string; type?: string; revision?: string }[],
+  entries: { file: string; title?: string; summary?: string; content?: string; type?: string }[],
 ) {
   const project = memory(storage, directory);
-  project.set("index", entries.map((entry) => ({
+  project.setIndex(entries.map((entry) => ({
     title: entry.title ?? entry.file,
     file: entry.file,
     summary: entry.summary ?? "Stored topic",
@@ -143,16 +153,7 @@ function store(
     scope: "project",
     updated: "2026-08-01",
   })));
-  for (const entry of entries) {
-    project.set(`topic/${entry.file}`, {
-      content: entry.content ?? `${entry.file} body`,
-      type: entry.type ?? "recap",
-      scope: "project",
-      revision: entry.revision ?? crypto.randomUUID(),
-      updatedAt: "2026-08-01",
-      sessionId: "ses_seed",
-    });
-  }
+  for (const entry of entries) project.setTopic(entry.file, entry.content ?? `${entry.file} body`);
   return project;
 }
 
@@ -190,58 +191,35 @@ async function settle() {
 }
 
 describe("memory index lines", () => {
-  test("renders typed entries", () => {
-    expect(indexLine({ title: "Typed", file: "typed", summary: "Be concise", type: "preference", scope: "editor", updated: "2026-08-01" }))
-      .toBe("- [Typed](typed) - [preference|editor|2026-08-01] Be concise");
+  test("renders and parses typed entries", () => {
+    const entry = { title: "Typed", file: "typed.md", summary: "Be concise", type: "preference" as const, scope: "editor", updated: "2026-08-01" };
+    expect(indexLine(entry)).toBe("- [Typed](typed.md) - [preference|editor|2026-08-01] Be concise");
+    expect(parseIndex(`# Notes\n${indexLine(entry)}\n- [Loose](loose.md) - No prefix\n`)).toEqual([entry]);
   });
 });
 
 describe("memory persistence", () => {
-  test.serial("imports a legacy memory directory once and removes it", async () => {
-    const directory = "/tmp/memory-import-project";
-    const legacy = join(dataHome, "opencode", "memory", memoryProjectKey(directory));
-    await mkdir(join(legacy, ".dreams"), { recursive: true });
-    await Bun.write(join(legacy, "index.md"), [
-      "# Project memory",
-      "",
-      "- [Typed](typed-a1b2c3d4.md) - [instruction|testing|2026-08-02] Run focused tests",
-      "- [Legacy](legacy.md) - Old summary",
-      "- [Missing](missing.md) - Gone",
-      "",
-    ].join("\n"));
-    await Bun.write(join(legacy, "typed-a1b2c3d4.md"), `---\nrevision: "abc123"\ntype: "instruction"\nscope: "testing"\nsessionId: "ses_old"\nupdatedAt: "2026-08-02"\n---\n\nRun the focused suite first.\n`);
-    await Bun.write(join(legacy, "legacy.md"), "Legacy body without frontmatter.\n");
-    await Bun.write(join(legacy, "settings.json"), JSON.stringify({ dream_auto: true }));
-    await Bun.write(join(legacy, ".dreams", "run.json"), "{}");
+  test.serial("exports the plugin-storage store to markdown files once", async () => {
+    const directory = "/tmp/memory-export-project";
     const storage = new Map<string, unknown>([["session/ses_stale", { system: "<memory>stale</memory>", pending: [], frozen: [], saved: [] }]]);
+    const project = memory(storage, directory);
+    project.set("index", [{ title: "Typed", file: "typed-a1b2c3d4", summary: "Run focused tests", type: "instruction", scope: "testing", updated: "2026-08-02" }]);
+    project.set("topic/typed-a1b2c3d4", { content: "Run the focused suite first.", type: "instruction", scope: "testing", revision: "abc", updatedAt: "2026-08-02" });
+    project.set("settings", { dream_auto: true });
     const app = await fixture(directory, noMemories, {}, storage);
     await app.dispose();
 
-    expect(storage.has("session/ses_stale")).toBe(false);
-    const project = memory(storage, directory);
     expect(project.index()).toEqual([
-      { title: "Typed", file: "typed-a1b2c3d4", summary: "Run focused tests", type: "instruction", scope: "testing", updated: "2026-08-02" },
-      { title: "Legacy", file: "legacy", summary: "Old summary", type: "project", scope: "project", updated: expect.any(String) },
+      { title: "Typed", file: "typed-a1b2c3d4.md", summary: "Run focused tests", type: "instruction", scope: "testing", updated: "2026-08-02" },
     ]);
-    expect(project.topic("typed-a1b2c3d4")).toEqual({
-      content: "Run the focused suite first.",
-      type: "instruction",
-      scope: "testing",
-      revision: "abc123",
-      updatedAt: "2026-08-02",
-      sessionId: "ses_old",
-    });
-    expect(project.topic("legacy")!.content).toBe("Legacy body without frontmatter.");
-    expect(project.get("settings")).toEqual({ dream_auto: true });
-    expect([...storage.keys()].some((key) => key.includes("dreams/"))).toBe(false);
-    expect(await stat(legacy).catch(() => undefined)).toBeUndefined();
-    await rm(dataHome, { recursive: true, force: true });
+    expect(project.topic("typed-a1b2c3d4.md")).toBe("Run the focused suite first.");
+    expect([...storage.keys()]).toEqual([project.key("settings")]);
   });
 
   test.serial("memory tool saves a topic and queues its delta only for other sessions", async () => {
     const directory = "/tmp/memory-tool-project";
     const storage = new Map<string, unknown>();
-    const project = store(storage, directory, [{ file: "first", title: "First", summary: "First summary", content: "first" }]);
+    const project = store(storage, directory, [{ file: "first.md", title: "First", summary: "First summary", content: "first" }]);
     const app = await fixture(directory, noMemories, {}, storage);
 
     // Both sessions snapshot the index before the save.
@@ -255,7 +233,7 @@ describe("memory persistence", () => {
       scope: "testing",
     });
     const file = result.content.replace("Saved ", "");
-    expect(project.topic(file)).toMatchObject({ type: "instruction", sessionId: "ses_origin" });
+    expect(project.topic(file)).toBe("Run the affected plugin's focused Bun test before the full suite.");
     expect(indexLine(project.index()[0]!)).toStartWith(`- [Focused tests first](${file}) - [instruction|testing|`);
     expect(app.saved()).toEqual([{ sessionID: "ses_origin", title: "Focused tests first" }]);
 
@@ -273,9 +251,9 @@ describe("memory persistence", () => {
   test.serial("memory tool reads a topic body with its header", async () => {
     const directory = "/tmp/memory-read-project";
     const storage = new Map<string, unknown>();
-    store(storage, directory, [{ file: "rule", title: "Rule", content: "Always run the focused suite.", type: "instruction" }]);
+    store(storage, directory, [{ file: "rule.md", title: "Rule", content: "Always run the focused suite.", type: "instruction" }]);
     const app = await fixture(directory, noMemories, {}, storage);
-    expect((await app.read("ses_read", "rule")).content)
+    expect((await app.read("ses_read", "rule.md")).content)
       .toBe("Rule\ntype: instruction | scope: project | updated: 2026-08-01\n\nAlways run the focused suite.");
     await app.dispose();
   });
@@ -284,14 +262,14 @@ describe("memory persistence", () => {
     const directory = "/tmp/memory-consolidation-project";
     const storage = new Map<string, unknown>();
     const project = store(storage, directory, Array.from({ length: 201 }, (_, index) => ({
-      file: `topic-${index}`,
+      file: `topic-${index}.md`,
       content: `COMPLETE_START_${index}\n${"x".repeat(80)}\nCOMPLETE_END_${index}`,
     })));
     let consolidationPrompt = "";
     let selections = 0;
     const app = await fixture(directory, (call) => {
       if (isDreamSelector(call)) return ++selections === 1
-        ? { action: "synthesize", files: ["topic-0", "topic-1"], reason: "related topics" }
+        ? { action: "synthesize", files: ["topic-0.md", "topic-1.md"], reason: "related topics" }
         : { action: "none" };
       if (isDreamCurator(call)) {
         consolidationPrompt = call.prompt;
@@ -306,9 +284,8 @@ describe("memory persistence", () => {
     expect(consolidationPrompt).toContain("COMPLETE_END_0");
     expect(consolidationPrompt).toContain("COMPLETE_END_1");
     const output = project.index().find((entry) => entry.file.startsWith("consolidated-topic-"))!;
-    expect(project.topic(output.file)!.sessionId).toBe("ses_maintenance_writer");
-    expect(project.topic("topic-0")).toBeUndefined();
-    expect(project.topic("topic-1")).toBeUndefined();
+    expect(project.topic("topic-0.md")).toBeUndefined();
+    expect(project.topic("topic-1.md")).toBeUndefined();
     expect(app.statuses().at(-1)!.counts).toEqual({ synthesize: 1, prune: 0 });
   });
 
@@ -316,27 +293,27 @@ describe("memory persistence", () => {
     const directory = "/tmp/memory-system-context";
     const storage = new Map<string, unknown>();
     const project = store(storage, directory, [
-      { file: "first", title: "First", summary: "First summary", content: "FIRST_BODY" },
-      { file: "second", title: "Second", summary: "Second summary", content: "SECOND_BODY", type: "instruction" },
-      { file: "third", title: "Typed", summary: "Typed reference summary", content: "THIRD_BODY", type: "reference" },
+      { file: "first.md", title: "First", summary: "First summary", content: "FIRST_BODY" },
+      { file: "second.md", title: "Second", summary: "Second summary", content: "SECOND_BODY", type: "instruction" },
+      { file: "third.md", title: "Typed", summary: "Typed reference summary", content: "THIRD_BODY", type: "reference" },
     ]);
     const app = await fixture(directory, noMemories, {}, storage);
 
     const output = await app.context("ses_index");
-    expect(output.system[0]!.text).toContain("[First](first) - [recap|project|2026-08-01] First summary");
-    expect(output.system[0]!.text).toContain("[Typed](third) - [reference|project|2026-08-01] Typed reference summary");
+    expect(output.system[0]!.text).toContain("[First](first.md) - [recap|project|2026-08-01] First summary");
+    expect(output.system[0]!.text).toContain("[Typed](third.md) - [reference|project|2026-08-01] Typed reference summary");
     expect(output.system[0]!.text).not.toContain("FIRST_BODY");
     expect(output.tools.memory).toBeDefined();
 
     for (const restricted of [await app.context("ses_sub"), await app.context("ses_worker_1")]) {
-      expect(restricted.system[0]!.text).toContain("[Second](second)");
+      expect(restricted.system[0]!.text).toContain("[Second](second.md)");
       expect(restricted.system[0]!.text).toContain("SECOND_BODY");
-      expect(restricted.system[0]!.text).not.toContain("(first)");
-      expect(restricted.system[0]!.text).not.toContain("(third)");
+      expect(restricted.system[0]!.text).not.toContain("(first.md)");
+      expect(restricted.system[0]!.text).not.toContain("(third.md)");
       expect(restricted.tools.memory).toBeUndefined();
     }
 
-    project.set("index", [{ title: "Third", file: "third", summary: "Third summary", type: "recap", scope: "project", updated: "2026-08-01" }]);
+    project.setIndex([{ title: "Third", file: "third.md", summary: "Third summary", type: "recap", scope: "project", updated: "2026-08-01" }]);
     expect((await app.context("ses_index")).system).toEqual(output.system);
     expect((await app.context("ses_new")).system[0]!.text).toContain("Third summary");
 
@@ -376,7 +353,7 @@ describe("memory persistence", () => {
   test.serial("restores the identical system block and frozen delta after a restart, and refreshes after compaction", async () => {
     const directory = "/tmp/memory-restore-project";
     const storage = new Map<string, unknown>();
-    const project = store(storage, directory, [{ file: "first", title: "First", summary: "First summary", content: "first" }]);
+    const project = store(storage, directory, [{ file: "first.md", title: "First", summary: "First summary", content: "first" }]);
     let app = await fixture(directory, noMemories, {}, storage);
 
     const initial = await app.context("ses_restore");
@@ -386,8 +363,8 @@ describe("memory persistence", () => {
     const request = await app.context("ses_restore", history());
     await app.dispose();
 
-    // The index changes in storage; the restored session still renders its snapshot.
-    project.set("index", [{ title: "Changed", file: "changed", summary: "Changed summary", type: "recap", scope: "project", updated: "2026-08-01" }]);
+    // The index file changes; the restored session still renders its snapshot.
+    project.setIndex([{ title: "Changed", file: "changed.md", summary: "Changed summary", type: "recap", scope: "project", updated: "2026-08-01" }]);
     app = await fixture(directory, noMemories, {}, storage);
     const restored = await app.context("ses_restore", history());
     expect(restored.system).toEqual(initial.system);
@@ -481,9 +458,9 @@ describe("memory auto dreaming", () => {
     const directory = "/tmp/memory-dream-init-project";
     const storage = new Map<string, unknown>();
     const project = store(storage, directory, [
-      { file: "one", title: "One" },
-      { file: "two", title: "Two" },
-      { file: "three", title: "Three" },
+      { file: "one.md", title: "One" },
+      { file: "two.md", title: "Two" },
+      { file: "three.md", title: "Three" },
     ]);
     project.set("settings", { dream_auto: true });
     const app = await fixture(directory, () => noMemories(), {}, storage);
@@ -499,8 +476,8 @@ describe("memory auto dreaming", () => {
     const directory = "/tmp/memory-dream-gate-project";
     const storage = new Map<string, unknown>();
     const project = store(storage, directory, [
-      { file: "one", title: "One" },
-      { file: "two", title: "Two" },
+      { file: "one.md", title: "One" },
+      { file: "two.md", title: "Two" },
     ]);
     project.set("settings", { dream_auto: true });
     project.set("dream", { auto: true, additions: 7, since: Date.now() - 37 * 3_600_000 });
@@ -523,8 +500,8 @@ describe("memory manual dreaming", () => {
     const directory = "/tmp/memory-dream-rpc-project";
     const storage = new Map<string, unknown>();
     store(storage, directory, [
-      { file: "x", title: "X" },
-      { file: "y", title: "Y" },
+      { file: "x.md", title: "X" },
+      { file: "y.md", title: "Y" },
     ]);
     const app = await fixture(
       directory,
@@ -549,10 +526,10 @@ describe("memory manual dreaming", () => {
     const synthesizedBody = Array.from({ length: 80 }, (_, i) => `- Fact ${i}: retain its distinct condition and qualification.`).join("\n");
     const storage = new Map<string, unknown>();
     const project = store(storage, directory, [
-      { file: "a", title: "Alpha plan", summary: "Alpha summary", content: "ALPHA_BODY_ONE shared duplicate fact" },
-      { file: "b", title: "Alpha variant", summary: "Alpha variant summary", content: "ALPHA_BODY_TWO shared duplicate fact" },
-      { file: "c", title: "Gamma outcome", summary: "Gamma summary", content: "GAMMA_BODY outdated claim" },
-      { file: "d", title: "Delta note", summary: "Delta summary", content: sourceBody, type: "insight" },
+      { file: "a.md", title: "Alpha plan", summary: "Alpha summary", content: "ALPHA_BODY_ONE shared duplicate fact" },
+      { file: "b.md", title: "Alpha variant", summary: "Alpha variant summary", content: "ALPHA_BODY_TWO shared duplicate fact" },
+      { file: "c.md", title: "Gamma outcome", summary: "Gamma summary", content: "GAMMA_BODY outdated claim" },
+      { file: "d.md", title: "Delta note", summary: "Delta summary", content: sourceBody, type: "insight" },
     ]);
 
     const findPrefix = (prefix: string) => project.index().find((entry) => entry.file.startsWith(prefix))!.file;
@@ -561,9 +538,9 @@ describe("memory manual dreaming", () => {
     const app = await fixture(directory, async (call) => {
       if (isDreamSelector(call)) {
         selections += 1;
-        if (selections === 1) return { action: "synthesize", files: ["a", "b"], reason: "duplicate alpha recaps" };
-        if (selections === 2) return { action: "synthesize", files: [findPrefix("merged-alpha-"), "c"], reason: "corrected gamma outcome" };
-        if (selections === 3) return { action: "synthesize", files: [findPrefix("superseding-gamma-"), "d"], reason: "shared stable pattern" };
+        if (selections === 1) return { action: "synthesize", files: ["a.md", "b.md"], reason: "duplicate alpha recaps" };
+        if (selections === 2) return { action: "synthesize", files: [findPrefix("merged-alpha-"), "c.md"], reason: "corrected gamma outcome" };
+        if (selections === 3) return { action: "synthesize", files: [findPrefix("superseding-gamma-"), "d.md"], reason: "shared stable pattern" };
         return { action: "none" };
       }
       if (isDreamCurator(call)) {
@@ -585,14 +562,12 @@ describe("memory manual dreaming", () => {
     const merged = manifest.actions[0].output.file as string;
     const superseded = manifest.actions[1].output.file as string;
     const insight = manifest.actions[2].output.file as string;
-    for (const gone of ["a", "b", "c", "d", merged, superseded]) expect(project.topic(gone)).toBeUndefined();
+    for (const gone of ["a.md", "b.md", "c.md", "d.md", merged, superseded]) expect(project.topic(gone)).toBeUndefined();
     expect(project.index().map((entry) => entry.file)).toEqual([insight]);
 
-    expect(project.topic(insight)).toMatchObject({ type: "insight", sessionId: "ses_dreamer", dreamRunId: status.runID, content: synthesizedBody });
-    for (const action of manifest.actions) {
-      expect(action.sources).toBeUndefined();
-      expect(action.output.revision).toBeUndefined();
-    }
+    expect(project.index()[0]!.type).toBe("insight");
+    expect(project.topic(insight)).toBe(synthesizedBody);
+    for (const action of manifest.actions) expect(action.sources).toBeUndefined();
 
     expect(status.counts).toEqual({ synthesize: 3, prune: 0 });
     expect(JSON.stringify(manifest)).not.toContain("ALPHA_BODY");
@@ -602,16 +577,16 @@ describe("memory manual dreaming", () => {
     const directory = "/tmp/memory-dream-prune-project";
     const storage = new Map<string, unknown>();
     const project = store(storage, directory, [{
-      file: "receipt",
+      file: "receipt.md",
       title: "Completed cleanup",
       summary: "Cleanup receipt",
       content: "The cleanup commit landed and tests pass.",
     }]);
     const app = await fixture(directory, (call) => {
-      if (isDreamSelector(call)) return { action: "prune", files: ["receipt"], reason: "task receipt" };
+      if (isDreamSelector(call)) return { action: "prune", files: ["receipt.md"], reason: "task receipt" };
       if (isDreamCurator(call)) {
         return { verdicts: [{
-          file: "receipt",
+          file: "receipt.md",
           verdict: "remove",
           category: "task_receipt",
           reason: "Only records completed cleanup and passing tests.",
@@ -626,14 +601,14 @@ describe("memory manual dreaming", () => {
     await app.dispose();
 
     const status = app.statuses().at(-1)!;
-    expect(project.topic("receipt")).toBeUndefined();
-    expect(project.get(`trash/${status.runID}/receipt`).content).toContain("cleanup commit landed");
+    expect(project.topic("receipt.md")).toBeUndefined();
+    expect(project.get(`trash/${status.runID}/receipt.md`).content).toContain("cleanup commit landed");
     expect(project.index()).toEqual([]);
     expect(project.get(`dreams/${status.runID}`).actions[0].verdicts[0]).toMatchObject({
-      file: "receipt",
+      file: "receipt.md",
       verdict: "remove",
       evidence: ["plugins/memory/memory.test.ts"],
-      quarantinePath: `trash/${status.runID}/receipt`,
+      quarantinePath: `trash/${status.runID}/receipt.md`,
     });
   });
 
@@ -641,19 +616,19 @@ describe("memory manual dreaming", () => {
     const directory = "/tmp/memory-dream-prune-keep-project";
     const storage = new Map<string, unknown>();
     const project = store(storage, directory, [
-      { file: "a", title: "A", content: "Potentially durable rationale." },
-      { file: "b", title: "B", content: "Another durable constraint." },
+      { file: "a.md", title: "A", content: "Potentially durable rationale." },
+      { file: "b.md", title: "B", content: "Another durable constraint." },
     ]);
     let selectors = 0;
     const app = await fixture(directory, (call) => {
       if (isDreamSelector(call)) {
         selectors += 1;
-        if (selectors === 1) return { action: "prune", files: ["a"], reason: "verify repository state" };
-        expect(call.prompt).not.toContain("(a)");
+        if (selectors === 1) return { action: "prune", files: ["a.md"], reason: "verify repository state" };
+        expect(call.prompt).not.toContain("(a.md)");
         return { action: "none" };
       }
       if (isDreamCurator(call)) return { verdicts: [{
-        file: "a",
+        file: "a.md",
         verdict: "remove",
         category: "repo_recoverable_state",
         reason: "Probably visible in the repository.",
@@ -666,33 +641,33 @@ describe("memory manual dreaming", () => {
     await finished(app, "noop");
     await app.dispose();
 
-    expect(project.topic("a")).toBeDefined();
-    expect(project.get(`dreams/${app.statuses().at(-1)!.runID}`).actions[0].verdicts[0]).toMatchObject({ file: "a", verdict: "keep" });
+    expect(project.topic("a.md")).toBeDefined();
+    expect(project.get(`dreams/${app.statuses().at(-1)!.runID}`).actions[0].verdicts[0]).toMatchObject({ file: "a.md", verdict: "keep" });
   });
 
   test.serial("purges successful older quarantine only after a later successful run", async () => {
     const directory = "/tmp/memory-dream-trash-retention-project";
     const storage = new Map<string, unknown>();
-    const project = store(storage, directory, [{ file: "old", content: "Task receipt." }]);
+    const project = store(storage, directory, [{ file: "old.md", content: "Task receipt." }]);
 
     let app = await fixture(directory, (call) => {
-      if (isDreamSelector(call)) return { action: "prune", files: ["old"], reason: "receipt" };
-      if (isDreamCurator(call)) return { verdicts: [{ file: "old", verdict: "remove", category: "task_receipt", reason: "Receipt only.", evidence: [] }] };
+      if (isDreamSelector(call)) return { action: "prune", files: ["old.md"], reason: "receipt" };
+      if (isDreamCurator(call)) return { verdicts: [{ file: "old.md", verdict: "remove", category: "task_receipt", reason: "Receipt only.", evidence: [] }] };
       return noMemories();
     }, {}, storage);
     await app.dream("req-trash-1", "ses_trash");
     await finished(app, "changed");
     const firstRun = app.statuses().at(-1)!.runID;
     await app.dispose();
-    expect(project.get(`trash/${firstRun}/old`)).toBeDefined();
+    expect(project.get(`trash/${firstRun}/old.md`)).toBeDefined();
 
-    store(storage, directory, [{ file: "new", title: "New", content: "Still durable." }]);
+    store(storage, directory, [{ file: "new.md", title: "New", content: "Still durable." }]);
 
     app = await fixture(directory, (call) => isDreamSelector(call) ? { action: "prune", files: [], reason: "malformed" } : noMemories(), {}, storage);
     await app.dream("req-trash-2", "ses_trash");
     await finished(app, "failed");
     await app.dispose();
-    expect(project.get(`trash/${firstRun}/old`)).toBeDefined();
+    expect(project.get(`trash/${firstRun}/old.md`)).toBeDefined();
 
     // Quarantine without a successful manifest is kept.
     project.set("trash/unfinished-run/recoverable", { content: "quarantined" });
@@ -701,7 +676,7 @@ describe("memory manual dreaming", () => {
     await app.dream("req-trash-3", "ses_trash");
     await finished(app, "noop");
     await app.dispose();
-    expect(project.get(`trash/${firstRun}/old`)).toBeUndefined();
+    expect(project.get(`trash/${firstRun}/old.md`)).toBeUndefined();
     expect(project.get("trash/unfinished-run/recoverable")).toBeDefined();
   });
 
@@ -709,15 +684,15 @@ describe("memory manual dreaming", () => {
     const directory = "/tmp/memory-dream-stale-project";
     const storage = new Map<string, unknown>();
     const project = store(storage, directory, [
-      { file: "x", title: "X topic", summary: "X summary", content: "X_SHARED_BODY" },
-      { file: "y", title: "Y topic", summary: "Y summary", content: "Y_SHARED_BODY" },
+      { file: "x.md", title: "X topic", summary: "X summary", content: "X_SHARED_BODY" },
+      { file: "y.md", title: "Y topic", summary: "Y summary", content: "Y_SHARED_BODY" },
     ]);
     project.set("dream", { auto: true, additions: 3, since: Date.now() });
 
     const started = Promise.withResolvers<void>();
     const gate = Promise.withResolvers<Extraction>();
     const app = await fixture(directory, (call) => {
-      if (isDreamSelector(call)) return { action: "synthesize", files: ["x", "y"], reason: "duplicate topics" };
+      if (isDreamSelector(call)) return { action: "synthesize", files: ["x.md", "y.md"], reason: "duplicate topics" };
       if (isDreamCurator(call)) {
         started.resolve();
         return gate.promise;
@@ -728,16 +703,16 @@ describe("memory manual dreaming", () => {
     await app.dream("req-stale", "ses_dreamer");
     await started.promise;
     // One source changes while the executor runs: the commit must detect the
-    // stale revision and abort the whole run.
-    project.set("topic/x", { ...project.topic("x"), revision: "mutated", content: "X_MUTATED_BODY" });
+    // stale content and abort the whole run.
+    project.setTopic("x.md", "X_MUTATED_BODY");
     gate.resolve(memoryExtraction({ title: "Merged xy" }));
     await finished(app, "failed");
     await app.dispose();
 
     const status = app.statuses().at(-1)!;
     expect(status.message).toContain("changed");
-    expect(project.topic("x")!.content).toBe("X_MUTATED_BODY");
-    expect(project.topic("y")!.content).toBe("Y_SHARED_BODY");
+    expect(project.topic("x.md")).toBe("X_MUTATED_BODY");
+    expect(project.topic("y.md")).toBe("Y_SHARED_BODY");
     expect(project.get(`dreams/${status.runID}`).state).toBe("failed");
     const state = project.get("dream");
     expect(state.additions).toBe(3);
@@ -748,11 +723,11 @@ describe("memory manual dreaming", () => {
     const directory = "/tmp/memory-dream-delta-project";
     const storage = new Map<string, unknown>();
     store(storage, directory, [
-      { file: "x", title: "X topic", summary: "X summary", content: "X_DELTA_BODY" },
-      { file: "y", title: "Y topic", summary: "Y summary", content: "Y_DELTA_BODY" },
+      { file: "x.md", title: "X topic", summary: "X summary", content: "X_DELTA_BODY" },
+      { file: "y.md", title: "Y topic", summary: "Y summary", content: "Y_DELTA_BODY" },
     ]);
     const app = await fixture(directory, (call) => {
-      if (isDreamSelector(call)) return { action: "synthesize", files: ["x", "y"], reason: "duplicate topics" };
+      if (isDreamSelector(call)) return { action: "synthesize", files: ["x.md", "y.md"], reason: "duplicate topics" };
       if (isDreamCurator(call)) return memoryExtraction({ title: "Unified story" });
       return noMemories();
     }, {}, storage);
@@ -770,7 +745,7 @@ describe("memory manual dreaming", () => {
     for (const [sessionID, messageID] of messages) {
       const part = (await app.context(sessionID, [userMessage(messageID)])).messages[0]!.content[1]!;
       expect(part.text).toContain("- [Unified story](");
-      expect(part.text).toContain("Removed topics: x, y");
+      expect(part.text).toContain("Removed topics: x.md, y.md");
     }
   });
 
@@ -778,15 +753,15 @@ describe("memory manual dreaming", () => {
     const directory = "/tmp/memory-dream-keep-project";
     const storage = new Map<string, unknown>();
     const project = store(storage, directory, [
-      { file: "x", title: "X topic", summary: "X summary", content: "X_KEEP_BODY" },
-      { file: "y", title: "Y topic", summary: "Y summary", content: "Y_KEEP_BODY" },
+      { file: "x.md", title: "X topic", summary: "X summary", content: "X_KEEP_BODY" },
+      { file: "y.md", title: "Y topic", summary: "Y summary", content: "Y_KEEP_BODY" },
     ]);
     project.set("dream", { auto: true, additions: 4, since: Date.now() });
 
     const curatorGate = Promise.withResolvers<Extraction>();
     const curatorStarted = Promise.withResolvers<void>();
     const app = await fixture(directory, (call) => {
-      if (isDreamSelector(call)) return { action: "synthesize", files: ["x", "y"], reason: "duplicate topics" };
+      if (isDreamSelector(call)) return { action: "synthesize", files: ["x.md", "y.md"], reason: "duplicate topics" };
       if (isDreamCurator(call)) {
         curatorStarted.resolve();
         return curatorGate.promise;

@@ -1,6 +1,6 @@
 import { Plugin } from "@opencode/plugin";
 import { Schema } from "effect";
-import { rm, stat } from "node:fs/promises";
+import { rename, rm } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { MemoryRpc, type DreamStatus } from "./rpc.ts";
@@ -45,18 +45,6 @@ type IndexEntry = {
   type: StoredType;
   scope: string;
   updated: string;
-};
-
-// Stored as `memory/<projectKey>/topic/<file>`; the index entry carries the
-// title and summary.
-type StoredTopic = {
-  content: string;
-  type: StoredType;
-  scope: string;
-  revision: string;
-  updatedAt: string;
-  sessionId?: string;
-  dreamRunId?: string;
 };
 
 type Delta = [file: string, entry: IndexEntry | null];
@@ -201,6 +189,16 @@ function parseModel(value: string | undefined): WorkerModel | undefined {
   return { providerID: model!.slice(0, separator), modelID: model!.slice(separator + 1), variant: variant || undefined };
 }
 
+// Entry lines look like `- [Title](file.md) - [type|scope|YYYY-MM-DD] Summary`;
+// any other line is ignored and dropped on the next index write.
+export function parseIndex(text: string): IndexEntry[] {
+  return text.split(/\r?\n/).flatMap((line) => {
+    const match = line.match(/^- \[([^\]]+)]\(([^)/]+\.md)\) - \[([a-z]+)\|([^|\]]+)\|(\d{4}-\d{2}-\d{2})\] (.*)$/);
+    if (!match) return [];
+    return [{ title: match[1]!, file: match[2]!, type: match[3] as StoredType, scope: match[4]!.trim(), updated: match[5]!, summary: match[6]! }];
+  });
+}
+
 export function indexLine(entry: IndexEntry): string {
   const title = entry.title.replace(/[\[\]\r\n]/g, " ").trim();
   const summary = entry.summary.replace(/[\r\n]/g, " ").trim();
@@ -212,7 +210,7 @@ function isoDate(): string {
   return new Date().toISOString().slice(0, 10);
 }
 
-type DreamSource = { entry: IndexEntry; content: string; revision: string };
+type DreamSource = { entry: IndexEntry; content: string };
 
 type DreamTransformManifestAction = {
   action: "synthesize";
@@ -233,7 +231,7 @@ type PruneVerdict = {
 type DreamPruneManifestAction = {
   action: "prune";
   reason: string;
-  sources: Array<{ file: string; revision: string }>;
+  sources: string[];
   verdicts: PruneVerdict[];
 };
 
@@ -410,56 +408,26 @@ export function memoryProjectKey(directory: string): string {
   return `${resolvedDirectory.toLowerCase().replace(/[^a-z._-]/g, "-")}-${Bun.hash.wyhash(resolvedDirectory).toString(16).padStart(8, "0").slice(0, 8)}`;
 }
 
-// One-time import of the legacy filesystem store into plugin storage. Index
-// lines use `- [Title](file.md) - Summary`, optionally with a
-// `[type|scope|YYYY-MM-DD]` summary prefix; topic files carry frontmatter.
-// Dream manifests, quarantine, and dream state are not imported. The legacy
-// directory is removed afterwards, also when storage already had an index.
-async function importLegacyMemory(storage: Plugin.Context["storage"], projectKey: string) {
-  const legacy = join(process.env.XDG_DATA_HOME ?? join(homedir(), ".local", "share"), "opencode", "memory", projectKey);
-  if (!(await stat(legacy).catch(() => undefined))) return;
+// One-time export of the plugin-storage store (index and topics) back to
+// markdown files. Cached session blocks and deltas name the old topic ids
+// (without `.md`), so every session takes a fresh snapshot on its next request.
+async function exportStoredMemory(storage: Plugin.Context["storage"], projectKey: string, root: string) {
   const prefix = `memory/${projectKey}`;
-  if (await storage.get(`${prefix}/index`) === undefined) {
-    const settings = Bun.file(join(legacy, "settings.json"));
-    if (await settings.exists()) await storage.set(`${prefix}/settings`, await settings.json());
-    const indexFile = Bun.file(join(legacy, "index.md"));
-    const index: IndexEntry[] = [];
-    for (const line of await indexFile.exists() ? (await indexFile.text()).split(/\r?\n/) : []) {
-      const match = line.match(/^- \[([^\]]+)]\(([^)/]+)\.md\) - (.+)$/);
-      if (!match) continue;
-      const topicFile = Bun.file(join(legacy, `${match[2]}.md`));
-      if (!(await topicFile.exists())) continue;
-      const text = await topicFile.text();
-      const frontmatter = text.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n/);
-      const field = (name: string) => frontmatter?.[1]!.match(new RegExp(`^${name}:\\s*["']?(.*?)["']?\\s*$`, "m"))?.[1];
-      const meta = match[3]!.match(/^\[([a-z]+)\|([^|\]]+)\|(\d{4}-\d{2}-\d{2})\]\s*/);
-      const file = match[2]!;
-      const type = (field("type") ?? "project") as StoredType;
-      const scope = field("scope") ?? meta?.[2]!.trim() ?? "project";
-      const updatedAt = field("updatedAt") ?? meta?.[3] ?? isoDate();
-      const topic: StoredTopic = {
-        content: text.slice(frontmatter?.[0].length ?? 0).trim(),
-        type,
-        scope,
-        revision: field("revision") ?? crypto.randomUUID().replaceAll("-", ""),
-        updatedAt,
-        sessionId: field("sessionId"),
-        dreamRunId: field("dreamRunId"),
-      };
-      await storage.set(`${prefix}/topic/${file}`, topic as Schema.Json);
-      index.push({ title: match[1]!, file, summary: meta ? match[3]!.slice(meta[0].length) : match[3]!, type, scope, updated: updatedAt });
-    }
-    await storage.set(`${prefix}/index`, index as Schema.Json);
+  const index = await storage.get(`${prefix}/index`) as IndexEntry[] | undefined;
+  if (index === undefined) return;
+  for (const entry of index) {
+    const topic = await storage.get(`${prefix}/topic/${entry.file}`) as { content: string };
+    await Bun.write(join(root, `${entry.file}.md`), `${topic.content.trim()}\n`);
   }
-  // Cached session blocks and deltas point at the legacy directory; dropping
-  // them makes every session take a fresh snapshot on its next request.
+  await Bun.write(join(root, "index.md"), index.map((entry) => `${indexLine({ ...entry, file: `${entry.file}.md` })}\n`).join(""));
+  for (const entry of index) await storage.remove(`${prefix}/topic/${entry.file}`);
+  await storage.remove(`${prefix}/index`);
   for (let after: string | undefined; ;) {
     const { entries, next } = await storage.scan({ prefix: "session/", after });
     for (const entry of entries) await storage.remove(entry.key);
     if (!next) break;
     after = next;
   }
-  await rm(legacy, { recursive: true, force: true });
 }
 
 const setup = async (ctx: Plugin.Context) => {
@@ -472,14 +440,16 @@ const setup = async (ctx: Plugin.Context) => {
   if (!Number.isInteger(idleDelay) || idleDelay < 1_000) throw new Error("Memory idle_delay_ms must be at least 1000");
 
   const projectKey = memoryProjectKey(directory);
-  await importLegacyMemory(ctx.storage, projectKey);
-  // Plugin storage is shared by every project, so each key carries the
+  // The index and topics are markdown files so they stay easy to edit by
+  // hand; settings, dream bookkeeping, and session state live in plugin
+  // storage, which is shared by every project, so each key carries the
   // project key.
+  const root = join(process.env.XDG_DATA_HOME ?? join(homedir(), ".local", "share"), "opencode", "memory", projectKey);
+  const indexPath = join(root, "index.md");
+  await exportStoredMemory(ctx.storage, projectKey, root);
   const prefix = `memory/${projectKey}`;
-  const indexKey = `${prefix}/index`;
   const settingsKey = `${prefix}/settings`;
   const dreamStateKey = `${prefix}/dream`;
-  const topicKey = (file: string) => `${prefix}/topic/${file}`;
   // Loaded session states, plus the in-flight loads that fill them.
   const states = new Map<string, SessionState>();
   const loading = new Map<string, Promise<SessionState>>();
@@ -508,16 +478,30 @@ const setup = async (ctx: Plugin.Context) => {
 
   const enabled = async () => (await readSettings()).enabled !== false;
 
-  const readIndex = async () => (await ctx.storage.get(indexKey) ?? []) as IndexEntry[];
+  // Files are read fresh on every access, so hand edits apply immediately.
+  const readIndex = async () => {
+    const file = Bun.file(indexPath);
+    return await file.exists() ? parseIndex(await file.text()) : [];
+  };
 
-  const readTopic = async (file: string) => (await ctx.storage.get(topicKey(file))) as StoredTopic;
+  const readTopic = async (file: string) => (await Bun.file(join(root, file)).text()).trim();
 
   const indexContext = async () => {
     return (await readIndex()).map(indexLine).join("\n");
   };
 
-  // Every storage call is atomic on its own; multi-key memory writes are
-  // serialized in-process through this queue.
+  // Temp file plus rename, so readers never see a partial file.
+  const atomicWrite = async (path: string, content: string) => {
+    const temporary = `${path}.${crypto.randomUUID()}.tmp`;
+    await Bun.write(temporary, content);
+    await rename(temporary, path);
+  };
+
+  const writeIndex = (entries: IndexEntry[]) => atomicWrite(indexPath, entries.map((entry) => `${indexLine(entry)}\n`).join(""));
+
+  const writeTopic = (file: string, content: string) => atomicWrite(join(root, file), `${content.trim()}\n`);
+
+  // Multi-file memory writes are serialized in-process through this queue.
   const serializeWrite = <Value,>(work: () => Promise<Value>) => {
     const next = writeQueue.then(work, work);
     writeQueue = next.then(() => {}, () => {});
@@ -609,46 +593,37 @@ const setup = async (ctx: Plugin.Context) => {
     track(persist(sessionID, state).catch((error) => console.error("Memory session persist failed:", error)));
   };
 
-  // The one commit path for the memory tool, reflection, and TUI edits:
-  // creates a topic, or replaces the indexed `target` (an existing insight
-  // stays an insight). TUI edits may have no session.
-  const saveMemory = async (sessionID: string | undefined, input: MemoryInput) => {
+  // The one commit path for the memory tool and reflection: creates a topic,
+  // or replaces the indexed `target` (an existing insight stays an insight).
+  const saveMemory = async (sessionID: string, input: MemoryInput) => {
     const { entry, index } = await serializeWrite(async () => {
       if (!(await enabled())) throw new Error("Project memory is disabled");
       const currentIndex = await readIndex();
       let file: string;
-      let previous: StoredTopic | undefined;
+      let previous: string | undefined;
       let type: StoredType = input.type;
 
       if (input.target !== undefined) {
         file = input.target;
-        if (!currentIndex.some((entry) => entry.file === file)) throw new Error(`Memory index does not contain ${file}`);
+        const current = currentIndex.find((entry) => entry.file === file);
+        if (!current) throw new Error(`Memory index does not contain ${file}`);
         previous = await readTopic(file);
-        if (previous.type === "insight") type = "insight";
+        if (current.type === "insight") type = "insight";
       } else {
         const slug = input.title.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 48) || "memory";
-        file = `${slug}-${crypto.randomUUID().replaceAll("-", "").slice(0, 8)}`;
+        file = `${slug}-${crypto.randomUUID().replaceAll("-", "").slice(0, 8)}.md`;
       }
 
-      const updatedAt = isoDate();
-      const topic: StoredTopic = {
-        content: input.content,
-        type,
-        scope: input.scope,
-        revision: crypto.randomUUID().replaceAll("-", ""),
-        updatedAt,
-        sessionId: sessionID,
-      };
-      await ctx.storage.set(topicKey(file), topic as Schema.Json);
-      const entry: IndexEntry = { title: input.title, file, summary: input.summary, type, scope: input.scope, updated: updatedAt };
+      await writeTopic(file, input.content);
+      const entry: IndexEntry = { title: input.title, file, summary: input.summary, type, scope: input.scope, updated: isoDate() };
       const index = input.target === undefined
         ? [entry, ...currentIndex]
         : currentIndex.map((current) => current.file === file ? entry : current);
       try {
-        await ctx.storage.set(indexKey, index as Schema.Json);
+        await writeIndex(index);
       } catch (error) {
-        if (previous === undefined) await ctx.storage.remove(topicKey(file));
-        else await ctx.storage.set(topicKey(file), previous as Schema.Json);
+        if (previous === undefined) await rm(join(root, file));
+        else await writeTopic(file, previous);
         throw error;
       }
       // Creates and replacements feed the auto-dream gate. The counter is
@@ -657,10 +632,8 @@ const setup = async (ctx: Plugin.Context) => {
       return { entry, index };
     });
     broadcastDelta(entry.file, entry, sessionID);
-    if (sessionID) {
-      recordSaved(sessionID, entry.file, entry.title);
-      await rpc.events.emit("saved", { sessionID, title: entry.title });
-    }
+    recordSaved(sessionID, entry.file, entry.title);
+    await rpc.events.emit("saved", { sessionID, title: entry.title });
     if (index.length > TOPIC_LIMIT || Buffer.byteLength(index.map(indexLine).join("\n")) > INDEX_BYTES) {
       startDream({ trigger: "auto", sessionID });
     }
@@ -673,8 +646,8 @@ const setup = async (ctx: Plugin.Context) => {
       if (!(await enabled())) throw new Error("Project memory is disabled");
       const currentIndex = await readIndex();
       if (!currentIndex.some((entry) => entry.file === file)) throw new Error(`Memory index does not contain ${file}`);
-      await ctx.storage.set(indexKey, currentIndex.filter((entry) => entry.file !== file) as Schema.Json);
-      await ctx.storage.remove(topicKey(file));
+      await writeIndex(currentIndex.filter((entry) => entry.file !== file));
+      await rm(join(root, file));
     });
     broadcastDelta(file, null, sessionID);
     recordSaved(sessionID, file);
@@ -786,10 +759,7 @@ const setup = async (ctx: Plugin.Context) => {
     // this snapshot.
     const snapshot = await serializeWrite(async () => {
       const files = new Map<string, DreamSource>();
-      for (const entry of await readIndex()) {
-        const topic = await readTopic(entry.file);
-        files.set(entry.file, { entry, content: topic.content, revision: topic.revision });
-      }
+      for (const entry of await readIndex()) files.set(entry.file, { entry, content: await readTopic(entry.file) });
       return files;
     });
 
@@ -867,15 +837,15 @@ const setup = async (ctx: Plugin.Context) => {
             const currentIndex = await readIndex();
             const indexed = new Set(currentIndex.map((entry) => entry.file));
             for (const source of removalSources) {
-              if (!indexed.has(source.entry.file) || (await readTopic(source.entry.file)).revision !== source.revision) return { kind: "stale" };
+              if (!indexed.has(source.entry.file) || await readTopic(source.entry.file) !== source.content) return { kind: "stale" };
             }
             // Quarantine copies first, then publish the index, then drop the
             // topics; a failure leaves the topics indexed.
             for (const source of removalSources) {
-              await ctx.storage.set(`${prefix}/trash/${input.runID}/${source.entry.file}`, await ctx.storage.get(topicKey(source.entry.file)) as Schema.Json);
+              await ctx.storage.set(`${prefix}/trash/${input.runID}/${source.entry.file}`, { ...source.entry, content: source.content });
             }
-            await ctx.storage.set(indexKey, currentIndex.filter((entry) => !removals.has(entry.file)) as Schema.Json);
-            for (const source of removalSources) await ctx.storage.remove(topicKey(source.entry.file));
+            await writeIndex(currentIndex.filter((entry) => !removals.has(entry.file)));
+            for (const source of removalSources) await rm(join(root, source.entry.file));
             return { kind: "applied" };
           });
           if (committed.kind === "stale") {
@@ -898,7 +868,7 @@ const setup = async (ctx: Plugin.Context) => {
         actions.push({
           action: "prune",
           reason: chosen.reason,
-          sources: sources.map((source) => ({ file: source.entry.file, revision: source.revision })),
+          sources: chosen.files,
           verdicts,
         });
         // Kept nominations remain stored but are not offered again in this run.
@@ -920,40 +890,30 @@ const setup = async (ctx: Plugin.Context) => {
 
       const slug = extracted.title.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 48) || "memory";
       const committed = await serializeWrite(async (): Promise<
-        { kind: "applied"; entry: IndexEntry; revision: string } | { kind: "stale" } | { kind: "disabled" }
+        { kind: "applied"; entry: IndexEntry } | { kind: "stale" } | { kind: "disabled" }
       > => {
         if (!(await enabled())) return { kind: "disabled" };
-        // Revalidate index membership and source revisions against the
+        // Revalidate index membership and source contents against the
         // immutable snapshot evidence before every commit.
         const currentIndex = await readIndex();
         const indexed = new Set(currentIndex.map((entry) => entry.file));
         for (const source of sources) {
-          if (!indexed.has(source.entry.file) || (await readTopic(source.entry.file)).revision !== source.revision) return { kind: "stale" };
+          if (!indexed.has(source.entry.file) || await readTopic(source.entry.file) !== source.content) return { kind: "stale" };
         }
 
-        const file = `${slug}-${crypto.randomUUID().replaceAll("-", "").slice(0, 8)}`;
-        const updatedAt = isoDate();
-        const entry: IndexEntry = { title: extracted.title, file, summary: extracted.summary, type: extracted.type, scope: extracted.scope, updated: updatedAt };
-        const topic: StoredTopic = {
-          content: extracted.content,
-          type: extracted.type,
-          scope: extracted.scope,
-          revision: crypto.randomUUID().replaceAll("-", ""),
-          updatedAt,
-          sessionId: input.sessionID,
-          dreamRunId: input.runID,
-        };
-        await ctx.storage.set(topicKey(file), topic as Schema.Json);
+        const file = `${slug}-${crypto.randomUUID().replaceAll("-", "").slice(0, 8)}.md`;
+        const entry: IndexEntry = { title: extracted.title, file, summary: extracted.summary, type: extracted.type, scope: extracted.scope, updated: isoDate() };
+        await writeTopic(file, extracted.content);
         try {
           // Publish the index last; a failed write rolls the output topic back.
           const chosenFiles = new Set(chosen.files);
-          await ctx.storage.set(indexKey, [entry, ...currentIndex.filter((current) => !chosenFiles.has(current.file))] as Schema.Json);
+          await writeIndex([entry, ...currentIndex.filter((current) => !chosenFiles.has(current.file))]);
         } catch (error) {
-          await ctx.storage.remove(topicKey(file));
+          await rm(join(root, file));
           throw error;
         }
-        for (const name of chosen.files) await ctx.storage.remove(topicKey(name));
-        return { kind: "applied", entry, revision: topic.revision };
+        for (const name of chosen.files) await rm(join(root, name));
+        return { kind: "applied", entry };
       });
       if (committed.kind === "stale") {
         abortReason = "Memory topics changed during the dream";
@@ -978,7 +938,7 @@ const setup = async (ctx: Plugin.Context) => {
         snapshot.delete(source.entry.file);
         deltas.push([source.entry.file, null]);
       }
-      snapshot.set(committed.entry.file, { entry: committed.entry, content: extracted.content, revision: committed.revision });
+      snapshot.set(committed.entry.file, { entry: committed.entry, content: extracted.content.trim() });
       generated.add(committed.entry.file);
       indexedCount -= sources.length - 1;
       candidates.set(committed.entry.file, snapshot.get(committed.entry.file)!);
@@ -1195,6 +1155,7 @@ const setup = async (ctx: Plugin.Context) => {
       return {
         enabled: settings.enabled !== false,
         dream_auto: settings.dream_auto === true,
+        directory: root,
         topics: (await readIndex()).map(({ file, title, summary }) => ({ file, title, summary })),
       };
     },
@@ -1205,13 +1166,6 @@ const setup = async (ctx: Plugin.Context) => {
         const settings = await readSettings();
         await ctx.storage.set(settingsKey, { ...settings, [key]: !(settings[key] ?? key === "enabled") });
       });
-    },
-    topic: async ({ file }) => ({ content: (await readTopic(file)).content }),
-    // Replaces the body only; title, summary, type, and scope are kept.
-    edit: async ({ file, content, sessionID }) => {
-      const entry = (await readIndex()).find((entry) => entry.file === file);
-      if (!entry) throw new Error(`Memory index does not contain ${file}`);
-      await saveMemory(sessionID, { target: file, title: entry.title, summary: entry.summary, content, type: entry.type, scope: entry.scope });
     },
   });
 
@@ -1242,8 +1196,7 @@ const setup = async (ctx: Plugin.Context) => {
           if (!(await enabled())) throw new Error("Project memory is disabled");
           const entry = (await readIndex()).find((entry) => entry.file === input.target);
           if (!entry) throw new Error(`Memory index does not contain ${input.target}`);
-          const topic = await readTopic(entry.file);
-          return { content: `${entry.title}\ntype: ${entry.type} | scope: ${entry.scope} | updated: ${entry.updated}\n\n${topic.content}` };
+          return { content: `${entry.title}\ntype: ${entry.type} | scope: ${entry.scope} | updated: ${entry.updated}\n\n${await readTopic(entry.file)}` };
         }
         if (input.action === "delete") {
           if (!input.target) throw new Error("delete requires target");
@@ -1273,7 +1226,7 @@ const setup = async (ctx: Plugin.Context) => {
     if (restricted) {
       const topics: string[] = [];
       for (const entry of entries) {
-        if (entry.type === "preference" || entry.type === "instruction") topics.push(`${indexLine(entry)}\n${(await readTopic(entry.file)).content}`);
+        if (entry.type === "preference" || entry.type === "instruction") topics.push(`${indexLine(entry)}\n${await readTopic(entry.file)}`);
       }
       return topics.length > 0
         ? `<memory>\nProject preferences and instructions stated by the user: follow them unless the current conversation says otherwise.\n\n${topics.join("\n\n")}\n</memory>`

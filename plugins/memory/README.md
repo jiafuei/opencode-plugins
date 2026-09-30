@@ -17,33 +17,39 @@ Workers (reflection and dreaming) are one-shot text generations with no session 
 
 ## Storage
 
-Memory lives in the server plugin's key-value storage (`ctx.storage`). That storage is shared by every project, so each key carries a project key derived from the lowercase absolute project path, with characters outside `a-z`, `.`, `_`, and `-` replaced by `-`, followed by an 8-character hash of the resolved path. Different paths, including Git worktrees, use separate memory.
+The index and topics are plain markdown files outside the repository, so they are easy to read and edit by hand. Each project directory name is derived from the lowercase absolute project path, with characters outside `a-z`, `.`, `_`, and `-` replaced by `-`, followed by an 8-character hash of the resolved path. Different paths, including Git worktrees, use separate memory directories.
 
 ```text
-memory/<project-key>/index                 [{ title, file, summary, type, scope, updated }]
-memory/<project-key>/topic/<file>          { content, type, scope, revision, updatedAt, sessionId?, dreamRunId? }
+${XDG_DATA_HOME:-~/.local/share}/opencode/memory/-home-alice-project-a1b2c3d4/
+|-- index.md
+`-- <short-title>-<random>.md
+```
+
+`index.md` has one line per topic, and the prompt renders the same lines. The link target is the topic id:
+
+```markdown
+- [Short title](short-title-a1b2c3d4.md) - [preference|editor|2026-08-23] One-line summary
+```
+
+Topic files are the body alone, with no frontmatter. Title, summary, type, scope, and the plugin-owned write date live only in the index line. Files are read fresh on every access, so hand edits take effect at the next snapshot (a new session or after a compaction), but they are not pushed to live sessions as deltas. Index lines not in the exact format above are ignored and dropped the next time the plugin writes the index.
+
+Settings, dream bookkeeping, and per-session state live in the server plugin's key-value storage (`ctx.storage`), keyed by the same project key:
+
+```text
 memory/<project-key>/settings              { enabled?, dream_auto? }
 memory/<project-key>/dream                 automatic-dream counters
 memory/<project-key>/dreams/<run-id>       decision-only manifest
-memory/<project-key>/trash/<run-id>/<file> quarantined topic
+memory/<project-key>/trash/<run-id>/<file> quarantined index entry and body
 session/<session-id>                       per-session snapshot and deltas
-```
-
-Topic ids look like `short-title-a1b2c3d4`. The prompt renders each index entry as:
-
-```markdown
-- [Short title](short-title-a1b2c3d4) - [preference|editor|2026-08-23] One-line summary
 ```
 
 Saves create topics classified as `preference` (durable general preferences stated by the user), `instruction` (scoped general instructions that apply to future work), `recap` (hard-won completed-task context worth avoiding re-derivation), or `reference` (lasting external material). Replacing an existing insight preserves its type. Synthesis preserves a shared source type; mixed-type groups produce an `insight`, a non-authoritative memory that distinguishes derived conclusions from user-stated facts. A group containing an insight cannot become an instruction or preference. Existing topics classified as the retired `feedback` and `project` types stay readable and are reclassified into the current taxonomy when replaced.
 
 Summaries are short one-line hooks describing the topic's coverage, not substitutes for the facts. Topic bodies are a few short sentences: the fact first, then why it matters or when it applies. This is prompt guidance; the plugin enforces no character or byte limits. Meaningful dates may remain in the body; the plugin separately records when the topic was written.
 
-Topics carry plugin-owned metadata. `sessionId` is the last writer: the originating session for creation/replacement and the requesting or most recently active session for synthesis (omitted when no session is known). `scope` names where the memory applies, and `updatedAt` is the plugin-owned ISO write date. Synthesis outputs also carry `dreamRunId`, linking them to the run's manifest.
+Writes are serialized in-process only; concurrent writes from separate OpenCode processes on the same project are not coordinated. Every file write goes through a temporary file and a rename. Each save writes the topic, then the index, and rolls the topic back if the index write fails; a delete writes the index, then removes the topic. Dream commits recheck enabled state, index membership, and source contents, and abort the run when a source changed.
 
-Writes are serialized in-process. Each save writes the topic, then the index, and rolls the topic back if the index write fails; a delete writes the index, then removes the topic. Dream commits recheck enabled state, index membership, and source `revision`s, and abort the run when a source changed.
-
-On first start, an older filesystem store at `${XDG_DATA_HOME:-~/.local/share}/opencode/memory/<project-key>/` is imported once (index, topics, and settings; not dream history or quarantine) and the directory is then deleted.
+On first start after upgrading from the storage-backed version, the index and topics in `ctx.storage` are exported once to these files and removed from storage, and cached session state is cleared.
 
 ## Installation
 
@@ -85,7 +91,7 @@ Options:
 
 Models use `provider/model` or `provider/model#variant`.
 
-`/memory` toggles memory and automatic dreaming, starts a dream, and lists topics; choosing one opens its body in `$VISUAL` or `$EDITOR` through a temporary file and saves it back when changed. `/dream` starts a manual dream without adding a conversation message.
+`/memory` toggles memory and automatic dreaming, starts a dream, and lists topics; choosing one opens its markdown file in `$VISUAL` or `$EDITOR`. `/dream` starts a manual dream without adding a conversation message.
 
 Disclosure: reflection sends the session's user text, assistant text, and truncated tool input and output to `reflect_model`, along with the memory index. Dreaming sends the index and selected complete topics to `dream_model`. Choose both within your intended data-disclosure boundary.
 
