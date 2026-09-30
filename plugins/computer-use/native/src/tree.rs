@@ -36,7 +36,24 @@ pub fn render(roots: &[Node], display: &Display) -> (String, Vec<Element>) {
             break;
         }
     }
+    if roots.iter().any(empty_content) {
+        out.push_str(
+            "Note: some content areas are empty. Chrome, Edge and Electron apps build their accessibility tree on first \
+             access, so a later computer_tree may show more.\n",
+        );
+    }
     (out, elements)
+}
+
+/// A visible, sizeable document or pane with no children, e.g. a Chromium page whose accessibility tree is still being
+/// built. Small empty documents (hidden extension frames) don't count.
+fn empty_content(node: &Node) -> bool {
+    let [_, _, w, h] = node.rect;
+    if node.hidden {
+        return false;
+    }
+    let content = matches!(node.role.as_str(), "Document" | "Pane" | "WebArea");
+    (content && node.children.is_empty() && w >= 50.0 && h >= 50.0) || node.children.iter().any(empty_content)
 }
 
 /// Returns false once the element cap is reached.

@@ -100,6 +100,8 @@ flattened, and output stops at 400 elements. Limits:
   or x/y there, or switch back to screenshot mode.
 - Browsers expose page content only after their accessibility engine starts. Firefox and Chromium start it when the
   first UI Automation client connects, so the first tree of a browser can be slow or thin. Large pages take 1–2s.
+  Chrome, Edge and Electron apps (Discord, VS Code) take a few seconds after that first access; until then their
+  content areas are empty panes, and the tree ends with a note that a later `computer_tree` may show more.
 - The foreground window is often the terminal running OpenCode; the model switches with alt+Tab / Start / Spotlight.
 - macOS reads each attribute with a cross-process call and stops after 3000 elements, so very large web views are cut
   short.
