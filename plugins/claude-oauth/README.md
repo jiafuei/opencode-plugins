@@ -99,8 +99,10 @@ They share the following behavior:
 - Main requests carry `x-claude-code-prompt-id` and billing `cc_prompt_index` /
   `cc_turn_index`: every turn advances the turn index, and task notifications do not
   count as prompts. Subagents carry the prompt ID header but no indexes.
-- Session attribution is process-local and resets when the plugin reloads.
-  Device identity remains stable across reloads.
+- The main thread's turn attribution (prompt ID and prompt/turn indexes) is saved in
+  the session's metadata under `claude-oauth.turn`, so it survives plugin reloads and
+  restarts. The wire session UUID and the `cc_prev_req` chain are process-local and
+  reset when the plugin reloads. Device identity remains stable across reloads.
 - CCH uses the native serialized-byte algorithm, including nested `model`
   values and `max_tokens`/fallback exclusions. It reproduces all 61 2.1.280 and
   176 2.1.284 message checksums in the September 29–30 captures.

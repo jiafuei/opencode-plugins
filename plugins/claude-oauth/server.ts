@@ -31,6 +31,8 @@ const REFRESH_SCOPES = rot13("hfre:cebsvyr hfre:vasrerapr hfre:frffvbaf:pynhqr_p
 const AXIOS_USER_AGENT = "axios/1.15.2";
 const AXIOS_ACCEPT = "application/json, text/plain, */*";
 const REQUEST_ID_HEADER = "x-client-request-id";
+// Session metadata key holding the main thread's turn attribution, so it survives plugin reloads.
+const TURN_METADATA_KEY = "claude-oauth.turn";
 const METHOD_ID = Integration.MethodID.make("claude-pro-max");
 const FLOW_TIMEOUT_MS = 5 * 60 * 1000;
 
@@ -201,6 +203,7 @@ export default Plugin.define({
       attempts: number;
       timer: ReturnType<typeof setTimeout>;
     };
+    type SavedTurn = Pick<CliState, "turn" | "promptId" | "promptIndex" | "turnIndex">;
     const cliStates = new Map<string, CliState>();
     const cliCalls = new Map<string, CliCall>();
     const cliResponses = new WeakMap<Request, CliCall>();
@@ -214,7 +217,10 @@ export default Plugin.define({
       const created: CliState = {
         parentId: session.parentID,
         wireId: parent?.wireId ?? randomUUID(),
-        ...(parent ? { agentId: `a${randomBytes(8).toString("hex")}`, promptId: parent.promptId } : {}),
+        // Children inherit the parent's metadata but not its turn attribution.
+        ...(parent
+          ? { agentId: `a${randomBytes(8).toString("hex")}`, promptId: parent.promptId }
+          : session.metadata?.[TURN_METADATA_KEY] as SavedTurn | undefined),
         sequence: 0, committed: 0,
       };
       const winner = cliStates.get(sessionID) ?? created;
@@ -309,15 +315,18 @@ export default Plugin.define({
       const user = event.messages.findLast((message) => message.role === "user");
       if (!user || state.agentId) return;
       const turn = user.id ?? new Bun.CryptoHasher("sha256").update(JSON.stringify(user.content)).digest("hex");
+      // Core retains metadata (even an empty object) on human messages;
+      // synthetic task notifications are lowered without it.
+      state.turnOrigin = profile.id === "sdk-cli" ? "sdk" : user.metadata !== undefined ? "human" : "task_notification";
       if (turn !== state.turn) {
         state.turn = turn;
         state.promptId = randomUUID();
-        // Core retains metadata (even an empty object) on human messages;
-        // synthetic task notifications are lowered without it.
-        state.turnOrigin = profile.id === "sdk-cli" ? "sdk" : user.metadata !== undefined ? "human" : "task_notification";
         // Every turn advances the turn index; task notifications are not prompts.
         state.turnIndex = (state.turnIndex ?? 0) + 1;
         state.promptIndex = (state.promptIndex ?? 0) + (state.turnOrigin === "task_notification" ? 0 : 1);
+        const saved: SavedTurn = { turn, promptId: state.promptId, promptIndex: state.promptIndex, turnIndex: state.turnIndex };
+        const { metadata } = await ctx.session.get({ sessionID: event.sessionID });
+        await ctx.session.update({ sessionID: event.sessionID, metadata: { ...metadata, [TURN_METADATA_KEY]: saved } });
       }
     }, { providerID: "anthropic" });
 

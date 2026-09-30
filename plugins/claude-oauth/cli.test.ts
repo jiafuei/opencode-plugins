@@ -255,6 +255,24 @@ test("late completions cannot overwrite a newer chain or revive deleted/credenti
   } finally { f.close(); }
 });
 
+test("turn attribution survives a plugin reload through session metadata", async () => {
+  const before = await fixture();
+  const after = await fixture();
+  try {
+    before.plugin.state.sessions.ses_root = { metadata: { other: "kept" } };
+    const first = await before.send();
+    const promptId = first.capture.headers.get("x-claude-code-prompt-id");
+    // A fresh plugin instance sees only the persisted session metadata.
+    after.plugin.state.sessions = before.plugin.state.sessions;
+    const sameTurn = await after.send();
+    expect(sameTurn.capture.headers.get("x-claude-code-prompt-id")).toBe(promptId);
+    expect(sameTurn.capture.body.system[0].text).toContain("cc_turn_origin=human; cc_prompt_index=1; cc_turn_index=1;");
+    const nextTurn = await after.send(await after.prepare("ses_root", "primary", "msg_user2"));
+    expect(nextTurn.capture.body.system[0].text).toContain("cc_prompt_index=2; cc_turn_index=2;");
+    expect(before.plugin.state.sessions.ses_root!.metadata!.other).toBe("kept");
+  } finally { before.close(); after.close(); }
+});
+
 test("malformed JSON cannot advance attribution and compaction starts a fresh chain", async () => {
   const f = await fixture();
   try {
