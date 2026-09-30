@@ -54,8 +54,8 @@ type Delta = [file: string, entry: IndexEntry | null];
 type PersistedSession = {
   system?: string;
   restricted?: boolean;
-  pending: Delta[];
-  frozen: Array<[messageID: string, deltas: Delta[]]>;
+  knownIndex?: IndexEntry[];
+  frozen: Array<[messageID: string, update: string | Delta[]]>;
   cursor?: string;
   saved: Array<{ file: string; title: string }>;
 };
@@ -69,11 +69,10 @@ type SessionState = {
   restricted?: boolean;
   // Genuine user prompt message IDs not yet seen by the context hook.
   prompts: Set<string>;
-  // Index updates queued for the session's next genuine user message (keyed
-  // by topic id; a null value is a tombstone for a removed topic), and
-  // per-message frozen sets already shown in model history.
-  pending: Map<string, IndexEntry | null>;
-  frozen: Map<string, Map<string, IndexEntry | null>>;
+  // The latest index this session knows, separate from its cached snapshot.
+  knownIndex: Map<string, IndexEntry>;
+  // Exact update text already shown on each user message.
+  frozen: Map<string, string>;
   // Last session message ID covered by a successful reflection.
   cursor?: string;
   // Topics saved from this session, shown to reflection to avoid duplicates.
@@ -189,13 +188,14 @@ function parseModel(value: string | undefined): WorkerModel | undefined {
   return { providerID: model!.slice(0, separator), modelID: model!.slice(separator + 1), variant: variant || undefined };
 }
 
-// Entry lines look like `- [Title](file.md) - [type|scope|YYYY-MM-DD] Summary`;
-// any other line is ignored and dropped on the next index write.
+// Cached snapshots from the storage-backed version use extensionless ids.
+// Accept those too, without rewriting the cached text.
 export function parseIndex(text: string): IndexEntry[] {
   return text.split(/\r?\n/).flatMap((line) => {
-    const match = line.match(/^- \[([^\]]+)]\(([^)/]+\.md)\) - \[([a-z]+)\|([^|\]]+)\|(\d{4}-\d{2}-\d{2})\] (.*)$/);
+    const match = line.match(/^- \[([^\]]+)]\(([^)/]+)\) - \[([a-z]+)\|([^|\]]+)\|(\d{4}-\d{2}-\d{2})\] (.*)$/);
     if (!match) return [];
-    return [{ title: match[1]!, file: match[2]!, type: match[3] as StoredType, scope: match[4]!.trim(), updated: match[5]!, summary: match[6]! }];
+    const file = match[2]!.endsWith(".md") ? match[2]! : `${match[2]}.md`;
+    return [{ title: match[1]!, file, type: match[3] as StoredType, scope: match[4]!.trim(), updated: match[5]!, summary: match[6]! }];
   });
 }
 
@@ -409,8 +409,8 @@ export function memoryProjectKey(directory: string): string {
 }
 
 // One-time export of the plugin-storage store (index and topics) back to
-// markdown files. Cached session blocks and deltas name the old topic ids
-// (without `.md`), so every session takes a fresh snapshot on its next request.
+// markdown files. Cached session blocks and updates remain unchanged; the
+// memory tool also accepts their old extensionless topic ids.
 async function exportStoredMemory(storage: Plugin.Context["storage"], projectKey: string, root: string) {
   const prefix = `memory/${projectKey}`;
   const index = await storage.get(`${prefix}/index`) as IndexEntry[] | undefined;
@@ -422,12 +422,6 @@ async function exportStoredMemory(storage: Plugin.Context["storage"], projectKey
   await Bun.write(join(root, "index.md"), index.map((entry) => `${indexLine({ ...entry, file: `${entry.file}.md` })}\n`).join(""));
   for (const entry of index) await storage.remove(`${prefix}/topic/${entry.file}`);
   await storage.remove(`${prefix}/index`);
-  for (let after: string | undefined; ;) {
-    const { entries, next } = await storage.scan({ prefix: "session/", after });
-    for (const entry of entries) await storage.remove(entry.key);
-    if (!next) break;
-    after = next;
-  }
 }
 
 const setup = async (ctx: Plugin.Context) => {
@@ -513,13 +507,25 @@ const setup = async (ctx: Plugin.Context) => {
     let load = loading.get(sessionID);
     if (!load) {
       load = (async () => {
-        const saved = (await ctx.storage.get(`session/${sessionID}`) ?? { pending: [], frozen: [], saved: [] }) as PersistedSession;
+        const saved = (await ctx.storage.get(`session/${sessionID}`) ?? { frozen: [], saved: [] }) as PersistedSession;
+        const knownIndex = new Map((saved.knownIndex ?? parseIndex(saved.system ?? "")).map((entry) => [entry.file, entry]));
+        // Older sessions stored frozen entry sets, not text or a known index.
+        if (saved.knownIndex === undefined) {
+          for (const [, deltas] of saved.frozen) {
+            if (typeof deltas === "string") continue;
+            for (const [id, entry] of deltas) {
+              const file = id.endsWith(".md") ? id : `${id}.md`;
+              if (entry) knownIndex.set(file, { ...entry, file });
+              else knownIndex.delete(file);
+            }
+          }
+        }
         const state: SessionState = {
           system: saved.system,
           restricted: saved.restricted,
           prompts: new Set(),
-          pending: new Map(saved.pending),
-          frozen: new Map(saved.frozen.map(([messageID, deltas]) => [messageID, new Map(deltas)])),
+          knownIndex,
+          frozen: new Map(saved.frozen.map(([messageID, update]) => [messageID, typeof update === "string" ? update : renderDelta(update)])),
           cursor: saved.cursor,
           saved: saved.saved,
           reflecting: false,
@@ -547,8 +553,8 @@ const setup = async (ctx: Plugin.Context) => {
     const saved: PersistedSession = {
       system: state.system,
       restricted: state.restricted,
-      pending: [...state.pending],
-      frozen: [...state.frozen].map(([messageID, deltas]) => [messageID, [...deltas]]),
+      knownIndex: [...state.knownIndex.values()],
+      frozen: [...state.frozen],
       cursor: state.cursor,
       saved: state.saved,
     };
@@ -563,18 +569,6 @@ const setup = async (ctx: Plugin.Context) => {
     );
   };
 
-  // Queue an index update (or a null tombstone for a removed topic) for every
-  // live unrestricted session's next genuine user message, except the
-  // originating session, which already knows. Sessions without a snapshot yet
-  // skip it: their upcoming snapshot reads the committed index.
-  const broadcastDelta = (file: string, entry: IndexEntry | null, except?: string) => {
-    for (const [sessionID, state] of states) {
-      if (sessionID === except || state.deleted || state.restricted || state.system === undefined) continue;
-      state.pending.set(file, entry);
-      track(persist(sessionID, state).catch((error) => console.error("Memory session persist failed:", error)));
-    }
-  };
-
   // Workers are one-shot text generations without tools; the prompt demands
   // JSON matching the schema and the reply is decoded strictly.
   const runWorker = async <S extends Schema.Top>(model: WorkerModel | undefined, schema: S, system: string, prompt: string): Promise<S["Type"]> => {
@@ -585,11 +579,14 @@ const setup = async (ctx: Plugin.Context) => {
     return Schema.decodeUnknownSync(Schema.fromJsonString(schema))(text.trim().replace(/^```(?:json)?\s*|\s*```$/g, ""));
   };
 
-  const recordSaved = (sessionID: string, file: string, title?: string) => {
+  const recordSaved = (sessionID: string, file: string, entry?: IndexEntry) => {
     const state = states.get(sessionID);
     if (!state) return;
     state.saved = state.saved.filter((item) => item.file !== file);
-    if (title) state.saved.push({ file, title });
+    if (entry) {
+      state.saved.push({ file, title: entry.title });
+      state.knownIndex.set(file, entry);
+    } else state.knownIndex.delete(file);
     track(persist(sessionID, state).catch((error) => console.error("Memory session persist failed:", error)));
   };
 
@@ -631,8 +628,7 @@ const setup = async (ctx: Plugin.Context) => {
       await bumpAdditions().catch(() => {});
       return { entry, index };
     });
-    broadcastDelta(entry.file, entry, sessionID);
-    recordSaved(sessionID, entry.file, entry.title);
+    recordSaved(sessionID, entry.file, entry);
     await rpc.events.emit("saved", { sessionID, title: entry.title });
     if (index.length > TOPIC_LIMIT || Buffer.byteLength(index.map(indexLine).join("\n")) > INDEX_BYTES) {
       startDream({ trigger: "auto", sessionID });
@@ -647,9 +643,8 @@ const setup = async (ctx: Plugin.Context) => {
       const currentIndex = await readIndex();
       if (!currentIndex.some((entry) => entry.file === file)) throw new Error(`Memory index does not contain ${file}`);
       await writeIndex(currentIndex.filter((entry) => entry.file !== file));
-      await rm(join(root, file));
+      await rm(join(root, file), { force: true });
     });
-    broadcastDelta(file, null, sessionID);
     recordSaved(sessionID, file);
   };
 
@@ -768,7 +763,6 @@ const setup = async (ctx: Plugin.Context) => {
     const selectorLines = () => [...candidates.values()].map((candidate) => indexLine(candidate.entry)).join("\n");
 
     const actions: DreamManifestAction[] = [];
-    const deltas: Array<[string, IndexEntry | null]> = [];
     const generated = new Set<string>();
     let abortReason: string | undefined;
     let indexedCount = snapshot.size;
@@ -835,9 +829,9 @@ const setup = async (ctx: Plugin.Context) => {
           const committed = await serializeWrite(async (): Promise<{ kind: "applied" } | { kind: "stale" } | { kind: "disabled" }> => {
             if (!(await enabled())) return { kind: "disabled" };
             const currentIndex = await readIndex();
-            const indexed = new Set(currentIndex.map((entry) => entry.file));
             for (const source of removalSources) {
-              if (!indexed.has(source.entry.file) || await readTopic(source.entry.file) !== source.content) return { kind: "stale" };
+              const current = currentIndex.find((entry) => entry.file === source.entry.file);
+              if (!current || indexLine(current) !== indexLine(source.entry) || await readTopic(source.entry.file) !== source.content) return { kind: "stale" };
             }
             // Quarantine copies first, then publish the index, then drop the
             // topics; a failure leaves the topics indexed.
@@ -860,7 +854,6 @@ const setup = async (ctx: Plugin.Context) => {
           for (const [file] of removals) {
             candidates.delete(file);
             snapshot.delete(file);
-            deltas.push([file, null]);
           }
           indexedCount -= removals.size;
         }
@@ -893,12 +886,12 @@ const setup = async (ctx: Plugin.Context) => {
         { kind: "applied"; entry: IndexEntry } | { kind: "stale" } | { kind: "disabled" }
       > => {
         if (!(await enabled())) return { kind: "disabled" };
-        // Revalidate index membership and source contents against the
+        // Recheck metadata and source contents against the
         // immutable snapshot evidence before every commit.
         const currentIndex = await readIndex();
-        const indexed = new Set(currentIndex.map((entry) => entry.file));
         for (const source of sources) {
-          if (!indexed.has(source.entry.file) || await readTopic(source.entry.file) !== source.content) return { kind: "stale" };
+          const current = currentIndex.find((entry) => entry.file === source.entry.file);
+          if (!current || indexLine(current) !== indexLine(source.entry) || await readTopic(source.entry.file) !== source.content) return { kind: "stale" };
         }
 
         const file = `${slug}-${crypto.randomUUID().replaceAll("-", "").slice(0, 8)}.md`;
@@ -929,14 +922,12 @@ const setup = async (ctx: Plugin.Context) => {
         reason: chosen.reason,
         output: { file: committed.entry.file, title: extracted.title, type: extracted.type },
       });
-      deltas.push([committed.entry.file, committed.entry]);
 
       // Keep the candidate view current so later iterations cannot repeat a
       // transformation over already-consumed evidence.
       for (const source of sources) {
         candidates.delete(source.entry.file);
         snapshot.delete(source.entry.file);
-        deltas.push([source.entry.file, null]);
       }
       snapshot.set(committed.entry.file, { entry: committed.entry, content: extracted.content.trim() });
       generated.add(committed.entry.file);
@@ -951,10 +942,6 @@ const setup = async (ctx: Plugin.Context) => {
       else counts[action.action] += 1;
     }
     const changed = counts.synthesize + counts.prune > 0;
-
-    // Broadcast whatever was applied even if a later iteration aborted: the
-    // committed changes are real and cached snapshots must follow them.
-    for (const [file, entry] of deltas) broadcastDelta(file, entry);
 
     if (abortReason) {
       // Failed or stale runs keep their progress counters; a simple fixed
@@ -1190,7 +1177,8 @@ const setup = async (ctx: Plugin.Context) => {
         additionalProperties: false,
       },
       execute: async (args, context) => {
-        const input = args as { action: "save" | "read" | "delete" } & Partial<MemoryInput>;
+        const input = { ...(args as { action: "save" | "read" | "delete" } & Partial<MemoryInput>) };
+        if (input.target && !input.target.endsWith(".md")) input.target += ".md";
         if (input.action === "read") {
           if (!input.target) throw new Error("read requires target");
           if (!(await enabled())) throw new Error("Project memory is disabled");
@@ -1221,8 +1209,7 @@ const setup = async (ctx: Plugin.Context) => {
 
   // Restricted sessions have no memory tool, so their block inlines the full
   // content of the user-stated entries instead of index lines.
-  const snapshot = async (restricted: boolean) => {
-    const entries = await readIndex();
+  const snapshot = async (restricted: boolean, entries: IndexEntry[]) => {
     if (restricted) {
       const topics: string[] = [];
       for (const entry of entries) {
@@ -1247,13 +1234,17 @@ const setup = async (ctx: Plugin.Context) => {
       if (state.restricted || !on) delete event.tools.memory;
       if (on) {
         if (state.system === undefined) {
-          state.system = await snapshot(state.restricted);
+          const entries = await readIndex();
+          state.system = await snapshot(state.restricted, entries);
+          state.knownIndex = new Map(entries.map((entry) => [entry.file, entry]));
           changed = true;
         }
         if (state.system) event.system.push({ type: "text", text: state.system });
       }
 
-      if (!state.restricted) {
+      const latestUserID = event.messages.findLast((message) => message.role === "user")?.id;
+      const newTurn = latestUserID && state.prompts.delete(latestUserID);
+      if (on && !state.restricted) {
         const userIDs = new Set(event.messages.flatMap((message) => message.role === "user" && message.id ? [message.id] : []));
 
         // Frozen assignments persist per user message so reconstructed history
@@ -1266,23 +1257,27 @@ const setup = async (ctx: Plugin.Context) => {
           }
         }
 
-        // Pending deltas freeze onto the latest user message only when it is a
-        // genuine prompt seen by the prompt hook, so saves committing later in
-        // the same tool loop defer to the next genuine user turn. A synthetic
-        // latest user message never receives pending deltas.
-        const latestUser = event.messages.findLast((message) => message.role === "user");
-        if (latestUser?.id && state.prompts.delete(latestUser.id) && state.pending.size > 0) {
-          state.frozen.set(latestUser.id, state.pending);
-          state.pending = new Map();
+        // Reconcile only once on a genuine new user turn. This also catches
+        // edits made while the session was unloaded, without changing its prefix.
+        if (newTurn) {
+          const current = new Map((await readIndex()).map((entry) => [entry.file, entry]));
+          const deltas = new Map<string, IndexEntry | null>();
+          for (const [file, entry] of current) {
+            const known = state.knownIndex.get(file);
+            if (!known || indexLine(known) !== indexLine(entry)) deltas.set(file, entry);
+          }
+          for (const file of state.knownIndex.keys()) if (!current.has(file)) deltas.set(file, null);
+          if (deltas.size > 0) state.frozen.set(latestUserID!, `<system>\n${renderDelta(deltas)}\n</system>`);
+          state.knownIndex = current;
           changed = true;
         }
 
         // Requests are rebuilt from history, so every message with a frozen
         // assignment gets its delta text part again.
         event.messages.forEach((message, index) => {
-          const entries = message.id ? state.frozen.get(message.id) : undefined;
-          if (!entries) return;
-          event.messages[index] = { ...message, content: [...message.content, { type: "text", text: renderDelta(entries) }] } as typeof message;
+          const update = message.id ? state.frozen.get(message.id) : undefined;
+          if (!update) return;
+          event.messages[index] = { ...message, content: [...message.content, { type: "text", text: update }] } as typeof message;
         });
       }
       if (changed) await persist(event.sessionID, state);
@@ -1290,12 +1285,12 @@ const setup = async (ctx: Plugin.Context) => {
   });
 
   // After a compaction the next request takes a fresh snapshot, which already
-  // contains every committed update, so queued and frozen deltas are dropped.
+  // contains every committed update, so the old known index and updates are dropped.
   await ctx.session.hook("compaction", async (event) => {
     await failOpen("Memory compaction handling failed", async () => {
       const state = await sessionState(event.sessionID);
       state.system = undefined;
-      state.pending.clear();
+      state.knownIndex.clear();
       state.frozen.clear();
       await persist(event.sessionID, state);
     });

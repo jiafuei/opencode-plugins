@@ -11,7 +11,7 @@ import MemoryModule, {
 import MemoryTui from "./tui.tsx";
 
 // Keeps memory files away from the real data directory.
-const dataHome = `/tmp/opencode-memory-test-${crypto.randomUUID()}`;
+const dataHome = `/tmp/opencode/memory-test-${crypto.randomUUID()}`;
 process.env.XDG_DATA_HOME = dataHome;
 afterAll(() => rm(dataHome, { recursive: true, force: true }));
 
@@ -96,6 +96,7 @@ async function fixture(
     saved: () => emitted.flatMap((event) => event.name === "saved" ? [event.data] : []),
     save: (sessionID: string, input: Record<string, unknown>) => tool!.execute({ action: "save", ...input }, { sessionID, agent: "build" }),
     read: (sessionID: string, target: string) => tool!.execute({ action: "read", target }, { sessionID, agent: "build" }),
+    delete: (sessionID: string, target: string) => tool!.execute({ action: "delete", target }, { sessionID, agent: "build" }),
     history: (sessionID: string, messages: unknown[]) => histories.set(sessionID, messages),
     message: async (sessionID: string, text: string) => {
       const messageID = `msg_${crypto.randomUUID()}`;
@@ -201,19 +202,37 @@ describe("memory index lines", () => {
 describe("memory persistence", () => {
   test.serial("exports the plugin-storage store to markdown files once", async () => {
     const directory = "/tmp/memory-export-project";
-    const storage = new Map<string, unknown>([["session/ses_stale", { system: "<memory>stale</memory>", pending: [], frozen: [], saved: [] }]]);
+    const unrelated = { system: "<memory>other project</memory>", pending: [], frozen: [], saved: [] };
+    const entry = { title: "Typed", file: "typed-a1b2c3d4", summary: "Run focused tests", type: "instruction", scope: "testing", updated: "2026-08-02" };
+    const cached = "<memory>cached index</memory>";
+    const storage = new Map<string, unknown>([
+      ["session/ses_other_project", unrelated],
+      ["session/ses_migrated", { system: cached, pending: [], frozen: [["msg_existing", [[entry.file, entry]]]], saved: [] }],
+    ]);
     const project = memory(storage, directory);
-    project.set("index", [{ title: "Typed", file: "typed-a1b2c3d4", summary: "Run focused tests", type: "instruction", scope: "testing", updated: "2026-08-02" }]);
+    project.set("index", [entry]);
     project.set("topic/typed-a1b2c3d4", { content: "Run the focused suite first.", type: "instruction", scope: "testing", revision: "abc", updatedAt: "2026-08-02" });
     project.set("settings", { dream_auto: true });
     const app = await fixture(directory, noMemories, {}, storage);
+    const next = await app.message("ses_migrated", "Next.");
+    const request = await app.context("ses_migrated", [userMessage("msg_existing"), userMessage(next)]);
+    expect(request.system).toEqual([{ type: "text", text: cached }]);
+    expect(request.messages[0]!.content[1]!.text).toBe(`<memory_update>
+These index changes supersede matching entries in the <memory> index; the same guidance applies.
+
+- [Typed](typed-a1b2c3d4) - [instruction|testing|2026-08-02] Run focused tests
+</memory_update>`);
+    expect(request.messages[1]!.content).toHaveLength(1);
+    expect((await app.read("ses_migrated", entry.file)).content).toContain("Run the focused suite first.");
     await app.dispose();
 
     expect(project.index()).toEqual([
       { title: "Typed", file: "typed-a1b2c3d4.md", summary: "Run focused tests", type: "instruction", scope: "testing", updated: "2026-08-02" },
     ]);
     expect(project.topic("typed-a1b2c3d4.md")).toBe("Run the focused suite first.");
-    expect([...storage.keys()]).toEqual([project.key("settings")]);
+    expect(project.get("index")).toBeUndefined();
+    expect(project.get(`topic/${entry.file}`)).toBeUndefined();
+    expect(storage.get("session/ses_other_project")).toEqual(unrelated);
   });
 
   test.serial("memory tool saves a topic and queues its delta only for other sessions", async () => {
@@ -256,6 +275,38 @@ describe("memory persistence", () => {
     expect((await app.read("ses_read", "rule.md")).content)
       .toBe("Rule\ntype: instruction | scope: project | updated: 2026-08-01\n\nAlways run the focused suite.");
     await app.dispose();
+  });
+
+  test.each([false, true])("deletes topics, including missing bodies, and updates live and resumed sessions (missing: %s)", async (missing) => {
+    const directory = `/tmp/memory-delete-project-${missing}`;
+    const storage = new Map<string, unknown>();
+    const project = store(storage, directory, [{ file: "rule.md", title: "Rule" }]);
+    let app = await fixture(directory, noMemories, {}, storage);
+    const before = await app.context("ses_dormant");
+    await app.dispose();
+    app = await fixture(directory, noMemories, {}, storage);
+    try {
+      await app.context("ses_origin");
+      await app.context("ses_live");
+      if (missing) await rm(join(dataHome, "opencode", "memory", memoryProjectKey(directory), "rule.md"));
+      expect((await app.delete("ses_origin", "rule.md")).content).toBe("Deleted rule.md");
+      expect(project.index()).toEqual([]);
+      expect(project.topic("rule.md")).toBeUndefined();
+      await expect(app.read("ses_origin", "rule.md")).rejects.toThrow("Memory index does not contain rule.md");
+
+      for (const sessionID of ["ses_live", "ses_dormant"]) {
+        const next = await app.message(sessionID, "Next.");
+        const history = () => [userMessage(next)];
+        const request = await app.context(sessionID, history());
+        expect(request.system).toEqual(before.system);
+        expect(request.messages[0]!.content[1]!.text).toContain("Removed topics: rule.md");
+        expect((await app.context(sessionID, history())).messages).toEqual(request.messages);
+      }
+      const next = await app.message("ses_origin", "Next.");
+      expect((await app.context("ses_origin", [userMessage(next)])).messages[0]!.content).toHaveLength(1);
+    } finally {
+      await app.dispose();
+    }
   });
 
   test.serial("uses the dream engine to synthesize complete sources above the size threshold", async () => {
@@ -342,12 +393,44 @@ describe("memory persistence", () => {
     const fourth = await app.message("ses_freeze", "Four.");
     const request = await app.context("ses_freeze", [userMessage(third), userMessage(fourth)]);
     expect(request.messages[1]!.content).toHaveLength(2);
+    expect(request.messages[1]!.content[1]!.text).toStartWith("<system>\n<memory_update>");
     expect(request.messages[1]!.content[1]!.text).toContain("Deferred rule");
 
     // History is rebuilt for each request; the delta is injected again.
     const again = await app.context("ses_freeze", [userMessage(third), userMessage(fourth)]);
     expect(again.messages[1]!.content[1]!.text).toBe(request.messages[1]!.content[1]!.text);
     await app.dispose();
+  });
+
+  test.serial("disabling removes memory context without consuming changes or rewriting frozen updates", async () => {
+    const directory = "/tmp/memory-disabled-updates-project";
+    const storage = new Map<string, unknown>();
+    const project = memory(storage, directory);
+    const app = await fixture(directory, noMemories, {}, storage);
+    try {
+      const before = await app.context("ses_reader");
+      await app.save("ses_writer", memoryExtraction({ title: "Pending rule" }));
+      project.set("settings", { enabled: false });
+      const disabledTurn = await app.message("ses_reader", "Next.");
+      const disabled = await app.context("ses_reader", [userMessage(disabledTurn)]);
+      expect(disabled.system).toEqual([]);
+      expect(disabled.tools.memory).toBeUndefined();
+      expect(disabled.messages[0]!.content).toHaveLength(1);
+
+      project.set("settings", { enabled: true });
+      expect((await app.context("ses_reader", [userMessage(disabledTurn)])).messages[0]!.content).toHaveLength(1);
+      const next = await app.message("ses_reader", "Next enabled turn.");
+      const history = () => [userMessage(disabledTurn), userMessage(next)];
+      const request = await app.context("ses_reader", history());
+      expect(request.system).toEqual(before.system);
+      expect(request.messages[1]!.content[1]!.text).toContain("Pending rule");
+      project.set("settings", { enabled: false });
+      expect((await app.context("ses_reader", history())).messages.map((message) => message.content.length)).toEqual([1, 1]);
+      project.set("settings", { enabled: true });
+      expect((await app.context("ses_reader", history())).messages).toEqual(request.messages);
+    } finally {
+      await app.dispose();
+    }
   });
 
   test.serial("restores the identical system block and frozen delta after a restart, and refreshes after compaction", async () => {
@@ -680,8 +763,13 @@ describe("memory manual dreaming", () => {
     expect(project.get("trash/unfinished-run/recoverable")).toBeDefined();
   });
 
-  test.serial("aborts a stale run without resetting the counters but keeps its manifest", async () => {
-    const directory = "/tmp/memory-dream-stale-project";
+  test.each([
+    { action: "synthesize", change: "body" },
+    { action: "synthesize", change: "metadata" },
+    { action: "prune", change: "body" },
+    { action: "prune", change: "metadata" },
+  ])("aborts stale $action after a $change change without resetting the counters", async ({ action, change }) => {
+    const directory = `/tmp/memory-dream-stale-project-${action}-${change}`;
     const storage = new Map<string, unknown>();
     const project = store(storage, directory, [
       { file: "x.md", title: "X topic", summary: "X summary", content: "X_SHARED_BODY" },
@@ -690,9 +778,9 @@ describe("memory manual dreaming", () => {
     project.set("dream", { auto: true, additions: 3, since: Date.now() });
 
     const started = Promise.withResolvers<void>();
-    const gate = Promise.withResolvers<Extraction>();
+    const gate = Promise.withResolvers<unknown>();
     const app = await fixture(directory, (call) => {
-      if (isDreamSelector(call)) return { action: "synthesize", files: ["x.md", "y.md"], reason: "duplicate topics" };
+      if (isDreamSelector(call)) return { action, files: ["x.md", "y.md"], reason: "duplicate topics" };
       if (isDreamCurator(call)) {
         started.resolve();
         return gate.promise;
@@ -702,20 +790,24 @@ describe("memory manual dreaming", () => {
 
     await app.dream("req-stale", "ses_dreamer");
     await started.promise;
-    // One source changes while the executor runs: the commit must detect the
-    // stale content and abort the whole run.
-    project.setTopic("x.md", "X_MUTATED_BODY");
-    gate.resolve(memoryExtraction({ title: "Merged xy" }));
-    await finished(app, "failed");
+    // Metadata-only edits must invalidate the snapshot just like body edits.
+    if (change === "body") project.setTopic("x.md", "X_MUTATED_BODY");
+    else await app.save("ses_editor", { target: "x.md", ...memoryExtraction({ title: "New instruction", type: "instruction", content: "X_SHARED_BODY" }) });
+    gate.resolve(action === "synthesize" ? memoryExtraction({ title: "Merged xy" }) : { verdicts: ["x.md", "y.md"].map((file) => ({
+      file, verdict: "remove", category: "task_receipt", reason: "Receipt", evidence: [],
+    })) });
+    await until(() => app.statuses().some((status) => status.state !== "running"));
     await app.dispose();
 
     const status = app.statuses().at(-1)!;
+    expect(status.state).toBe("failed");
     expect(status.message).toContain("changed");
-    expect(project.topic("x.md")).toBe("X_MUTATED_BODY");
+    expect(project.topic("x.md")).toBe(change === "body" ? "X_MUTATED_BODY" : "X_SHARED_BODY");
+    if (change === "metadata") expect(project.index().find((entry) => entry.file === "x.md")!.type).toBe("instruction");
     expect(project.topic("y.md")).toBe("Y_SHARED_BODY");
     expect(project.get(`dreams/${status.runID}`).state).toBe("failed");
     const state = project.get("dream");
-    expect(state.additions).toBe(3);
+    expect(state.additions).toBe(change === "body" ? 3 : 4);
     expect(typeof state.failAt).toBe("number");
   });
 
