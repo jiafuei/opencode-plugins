@@ -10,7 +10,7 @@ v1 targets:
 - **Windows host, OpenCode server in WSL2** (primary)
 - **macOS, OpenCode server native** (second)
 
-Out of scope for v1: Linux X11/Wayland, remote servers/VMs, multi-monitor selection, accessibility trees, TUI panel,
+Out of scope for v1: Linux X11/Wayland, remote servers/VMs, multi-monitor selection, TUI panel,
 provider-native computer-use toolsets, clipboard paste. Browser work is possible but a CDP/Playwright tool is the better
 fit; not optimized here.
 
@@ -127,6 +127,30 @@ OpenCode; code signing and a stable helper identity are deferred to phase 3.
 Decide how the plugin obtains the helper: per-platform npm packages vs. download from GitHub releases on first use.
 Build Windows and macOS binaries in CI. Sign the macOS helper if permissions should attach to it rather than the
 terminal.
+
+### Tree mode — implemented; Windows verified by helper-level checks, macOS unbuilt
+
+`COMPUTER_USE_MODE=tree` swaps screenshots for the foreground window's accessibility tree (text only), for text-only
+models, token cost, and element-precise targeting. Decisions:
+
+- **Element IDs**: sequential per tree. The helper keeps id → native element (UIA element / AXUIElement) from the latest
+  tree only, re-reads the element's live bounds on use, and acts at the center. Pointer tools take `element`
+  (`start_element`/`end_element` for drag); x/y stay as a fallback and are optional in tree mode.
+- **Scope**: foreground window, plus the top-level window or AXMenu holding keyboard focus when it lies outside (open
+  menus), then a list of other windows (xcap's window list: title, app, bounds, minimized).
+- **Pruning**: skip offscreen and zero-size elements; flatten unnamed pane/group containers; cap at 400 rendered elements.
+- **Windows**: `uiautomation` crate, one cached Subtree request with the rendered properties. The cached subtree stops
+  at browser documents (separate providers), so an empty Document gets a second cached request rooted at itself.
+  Toggle/expand/selection states are only read when the pattern is available (otherwise UIA returns a sentinel).
+- **macOS**: `accessibility-sys` + `core-foundation`: AXFocusedApplication → AXFocusedWindow → AXChildren recursion,
+  bounded at 3000 visited elements; elements outside the window rect count as offscreen.
+- Coordinates stay in the screenshot space (the helper still captures once per observation to keep the mapping fresh),
+  so x/y and tree bounds agree across modes.
+- **Text limits**: labels of elements with children are cut at 80 characters (web containers repeat their children), leaf
+  text at 2,000; a cut leaf points at `computer_read`. No per-call length argument: the element cap bounds output.
+- **`computer_read({ element, offset? })`**: full text of one element without acting or resetting IDs. Windows reads
+  the Text-pattern document when available (terminals, editors, browser documents), else name + value; macOS reads
+  AXValue/AXTitle/AXDescription (no text-range APIs). Right-trimmed lines, 50,000-character pages with a next-offset note.
 
 ## Open questions
 

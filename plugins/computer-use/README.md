@@ -45,10 +45,64 @@ echo '{"id":1,"action":"screenshot"}' | bin/computer-use-helper.exe
 # {"id":1,"ok":true,"image":"<base64 jpeg>","width":1430,"height":804,"cursor":[779,981]}
 ```
 
-Actions: `screenshot`, `zoom` (`region`), `click` (`coordinate`, `button?`, `count?`), `move` (`coordinate`), `drag`
-(`start`, `end`), `scroll` (`coordinate`, `direction`, `amount`), `type` (`text`), `key` (`keys`, `repeat?`), `wait`
-(`seconds`). Coordinates are in screenshot pixel space; the helper scales them to the primary monitor. Responses also
-carry `screenshot` (full-screenshot size), `native` (capture pixels), `scale`, and `cursor` (OS input units).
+Actions: `screenshot`, `tree`, `zoom` (`region`), `click` (`element?` or `x`, `y`; `button?`, `count?`), `move`
+(`element?` or `x`, `y`), `drag` (`start_element?` or `start_x`, `start_y`; `end_element?` or `end_x`, `end_y`), `scroll`
+(`element?` or `x`, `y`; `direction`, `amount`), `type` (`text`), `key` (`keys`, `repeat?`), `wait` (`seconds`),
+`read` (`element`, `offset?`; tree mode, answers with `text` and keeps the current IDs).
+Coordinates are in screenshot pixel space; the helper scales them to the primary monitor. Responses carry `image`
+(screenshot mode) or `tree` (tree mode, helper started with `--tree`), plus `screenshot` (full-screenshot size), `native`
+(capture pixels), `scale`, and `cursor` (OS input units).
+
+## Tree mode
+
+Set `COMPUTER_USE_MODE=tree` in OpenCode's environment to observe through the accessibility tree instead of
+screenshots (UI Automation on Windows, the AX API on macOS). This works with text-only models and costs fewer tokens on
+form-heavy apps. It is also more precise, because actions can target elements instead of pixels. In tree mode:
+
+- `computer_tree` replaces `computer_screenshot` and `computer_zoom`, and every result is text only.
+- `computer_click`, `computer_move` and `computer_scroll` take an `element` ID, and `computer_drag` takes
+  `start_element`/`end_element`. The helper acts at the element's current center. x/y still work as a fallback in the
+  same coordinate space the tree's bounds use.
+- IDs come from the latest tree; every action returns a fresh tree, and an ID that no longer resolves returns an
+  error asking for `computer_tree`.
+- `computer_read({ element, offset? })` returns the full text of one element without acting or resetting IDs: the
+  Text-pattern document on Windows when the element has the `text` state (terminal and editor buffers, browser
+  documents), otherwise its name and value (AXValue/AXTitle/AXDescription on macOS). Lines are right-trimmed and
+  trailing blank lines dropped. Pages hold 50,000 characters and end with the offset for the next page.
+- Text in the tree is cut at 80 characters for elements with children (web containers repeat their children's text)
+  and at 2,000 for leaves. A cut leaf ends with `…(truncated; computer_read [id])`.
+
+Example (trimmed):
+
+```
+Accessibility tree. @(x,y wxh) bounds and all computer_* x/y are in a 1430x804 space covering the primary display (native 2560x1440, scale 0.5585). Element IDs stay valid until the next computer_tree call or action; computer_read does not reset them.
+
+Foreground window:
+[1] Window "Tibo (@thsottiaux) / X — Mozilla Firefox" @(0,0 1430x783)
+  [2] ToolBar "Menu Bar" @(0,0 1430x15)
+    [3] MenuBar "Application" @(0,0 194x12)
+      [4] MenuItem "File" @(0,0 17x12) collapsed
+  [17] Button "Back" @(22,15 21x23) collapsed
+  [18] Button "Forward" @(42,15 21x23) disabled collapsed
+  [27] ComboBox "Search with Google or enter address" value="…" @(218,17 867x18) collapsed
+  [75] Document "Tibo (@thsottiaux) / X" value="https://x.com/thsottiaux" @(7,53 1424x729) focused
+    [79] Hyperlink "Home" value="https://x.com/home" @(365,85 145x33)
+Other windows:
+- "#ramen-street | … - Discord" (Discord) @(8,12 1417x747)
+- "Inbox - … - Mozilla Thunderbird" (Thunderbird) minimized
+```
+
+The tree covers the foreground window, plus an open menu or popup that holds keyboard focus outside it, followed by the
+other top-level windows. Offscreen (scrolled-out or collapsed) elements are skipped. Unnamed layout containers are
+flattened, and output stops at 400 elements. Limits:
+
+- Apps that draw their own UI (games, canvas apps, some custom toolkits) expose little or nothing. Use keyboard tools
+  or x/y there, or switch back to screenshot mode.
+- Browsers expose page content only after their accessibility engine starts. Firefox and Chromium start it when the
+  first UI Automation client connects, so the first tree of a browser can be slow or thin. Large pages take 1–2s.
+- The foreground window is often the terminal running OpenCode; the model switches with alt+Tab / Start / Spotlight.
+- macOS reads each attribute with a cross-process call and stops after 3000 elements, so very large web views are cut
+  short.
 
 ## Build the helper (macOS)
 
@@ -95,6 +149,21 @@ Consider gating the tools with `"permission": { "computer_*": "ask" }`.
    the click must land (zoom must not shift coordinates).
 7. Set Windows display scaling to 125% or 150%, restart OpenCode, and repeat a small-target click.
 8. Double-click and right-click a desktop item.
+
+## Manual test checklist (tree mode)
+
+Run with `COMPUTER_USE_MODE=tree` (restart OpenCode after changing it), ideally once with a text-only model.
+
+1. `computer_tree` with a normal app in front (Notepad / TextEdit, Explorer / Finder): the tree lists its controls
+   with sensible roles, names and bounds.
+2. Open an app via the keyboard (Start / Spotlight → type → Return), then click a toolbar button or menu by `element`.
+3. Open a menu (e.g. File) and confirm the open menu appears as a focused popup, then click an item in it by ID.
+4. In a browser, read a page and click a link by ID; scroll the page with `computer_scroll` on the document element.
+5. Check a checkbox in a settings dialog and confirm its state flips between `unchecked` and `checked`.
+6. Call a stale ID after the UI changed: the error asks for `computer_tree`.
+7. In Firefox, open an article and `computer_read` its `Document` element: the article text comes back (or only the
+   title and URL if the document has no `text` state), paged if long.
+8. With the terminal in front, `computer_read` its `text` element: the scrollback comes back without padding.
 
 ## Manual test checklist (macOS)
 
