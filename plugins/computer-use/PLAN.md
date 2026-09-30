@@ -1,0 +1,130 @@
+# computer-use plugin — plan
+
+Screenshot-driven desktop control for OpenCode. The plugin exposes ordinary tools; a small Rust helper does
+capture and input. OpenCode keeps the agent loop — the helper only ever receives concrete actions.
+
+## Scope
+
+v1 targets:
+
+- **Windows host, OpenCode server in WSL2** (primary)
+- **macOS, OpenCode server native** (second)
+
+Out of scope for v1: Linux X11/Wayland, remote servers/VMs, multi-monitor selection, accessibility trees, TUI panel,
+provider-native computer-use toolsets, clipboard paste. Browser work is possible but a CDP/Playwright tool is the better
+fit; not optimized here.
+
+## Architecture
+
+```
+OpenCode (WSL or macOS)
+  plugins/computer-use/server.ts
+    - registers computer_* tools via ctx.tool.transform
+    - spawns helper lazily on first call, keeps it alive, respawns if it dies
+    - serializes tool calls through one promise chain
+        │  stdin/stdout, JSON lines
+        ▼
+  helper binary (Rust)
+    - WSL:   helper.exe spawned through WSL interop (Windows process)
+    - macOS: native helper binary
+    - xcap (capture), enigo (input), image (resize + JPEG encode)
+```
+
+No sockets, named pipes, daemon, or cross-process lock. One helper per OpenCode server process. Detect WSL via
+`process.env.WSL_DISTRO_NAME`.
+
+## Protocol
+
+One JSON object per line.
+
+```
+→ {"id":1,"action":"click","coordinate":[640,400],"button":"left","count":1}
+← {"id":1,"ok":true,"image":"<base64 jpeg>","width":1280,"height":720}
+← {"id":1,"ok":false,"error":"..."}
+```
+
+Every action response carries a fresh screenshot (helper waits a short settle delay first, ~300ms). `wait` sleeps
+then screenshots.
+
+## Tools
+
+Vocabulary follows Anthropic's computer toolset (xdotool key names, screenshot-space coordinates), kept
+provider-neutral as ordinary OpenCode tools. Clicks are merged into one tool.
+
+See the tool table in README.md (x/y are separate fields; some providers reject tuple schemas).
+
+Result: `content: [{ type: "text", text: "<coordinate contract>" }, { type: "file", uri: "data:image/jpeg;base64,...", mime: "image/jpeg" }]`
+(same shape MCP image results use in `~/git/opencode/packages/core/src/tool/mcp.ts`).
+
+Tool access is gated by normal OpenCode permission config (e.g. `"computer_*": "ask"`).
+
+## Coordinates
+
+The helper owns scaling. On each capture it computes
+
+```
+scale = min(1, 1568 / longEdge, sqrt(1_150_000 / (w*h)))
+```
+
+resizes the image, and stores `scale` plus the monitor origin. Incoming coordinates map as
+`screen = origin + model / scale`. `zoom` coordinates are in full-screenshot space too; zoom crops the native capture
+and resizes the crop to the same limits.
+
+Platform notes:
+
+- **Windows:** the helper must be per-monitor DPI aware (`SetProcessDpiAwarenessContext(PER_MONITOR_AWARE_V2)` at
+  startup or via manifest), otherwise capture and input disagree on pixel spaces under fractional scaling.
+- **macOS:** capture is in physical pixels, CGEvent input is in points — divide by the backing scale factor (2 on Retina).
+
+v1 uses the primary monitor only.
+
+## Keyboard
+
+- `computer_key`: parse `mod+mod+key`; modifiers `ctrl`, `alt`, `shift`, `super` (Win/Cmd). Map xdotool names
+  (`Return`, `Escape`, `Tab`, `BackSpace`, `Delete`, `Home`, `End`, `Page_Up`, `Page_Down`, arrows, `F1`–`F12`) to enigo
+  keys; single characters map to `Key::Unicode`. Press modifiers, tap key, release in reverse.
+- `computer_type`: enigo `text()` — `KEYEVENTF_UNICODE` on Windows, `CGEventKeyboardSetUnicodeString` on macOS. Layout-
+  and IME-independent for normal apps.
+
+## Cancellation
+
+If `context.signal` is aborted while a call is queued, skip it. In-flight actions are short and are not interrupted or
+replayed. The helper releases any modifiers it pressed within the same action, so nothing stays held.
+
+## Phases
+
+### 0. Spike (Windows via WSL) — done
+
+Goal: prove the three risky parts in one pass.
+
+1. Rust helper with `screenshot` and `click` only; built from WSL with the Windows MSVC toolchain (see README).
+2. Plugin spawns `helper.exe` via interop from the Linux filesystem path; confirm stdio works (and whether a UNC cwd
+   causes trouble).
+3. `computer_screenshot` returns the data-URI file part; confirm the model actually receives the image (check with the
+   claude-oauth provider and one non-Anthropic provider).
+4. On a display with 125–150% scaling, ask the model to click a specific small target; confirm it lands.
+
+### 1. Full Windows tool set — implemented, awaiting manual checklist
+
+All tools above, key mapping, Unicode typing (test with CJK text), call serialization, cancellation, helper respawn.
+Manual checklist run against Notepad, Explorer, and one of the user's own GUI apps.
+
+Decided during phase 1: fixed 300ms post-action settle with no per-call override — `computer_wait` covers slower
+animations (the Start menu was captured mid-animation in testing). Coordinates are `Schema.Number` (plugin-side `Int`
+checks fail inside opencode's effect copy); the helper rounds. Every result states the coordinate contract.
+
+### 2. macOS backend
+
+Same helper, macOS build. Screen Recording + Accessibility permission flow (helper reports a clear error when not
+granted), Retina scaling, code signing so permission grants survive helper updates.
+
+### 3. Distribution
+
+Decide how the plugin obtains the helper: per-platform npm packages vs. download from GitHub releases on first use.
+Build Windows and macOS binaries in CI.
+
+## Open questions
+
+- Helper delivery mechanism (phase 3).
+- JPEG quality (80 now): check small-text legibility in phase 1; `zoom` is the fallback.
+- Whether a per-action screenshot is too token-heavy for long sessions; option to skip it for `move`/`key`.

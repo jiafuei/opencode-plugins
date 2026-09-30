@@ -1,0 +1,26 @@
+{
+  "name": "@jiafuei/opencode-computer-use",
+  "version": "0.0.1",
+  "description": "Screenshot-driven desktop control for OpenCode",
+  "type": "module",
+  "private": true,
+  "exports": {
+    "./server": "./server.ts"
+  },
+  "files": [
+    "server.ts",
+    "README.md"
+  ],
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "computer-use"
+  ],
+  "engines": {
+    "opencode": ">=2.0.15"
+  },
+  "dependencies": {
+    "@opencode/plugin": "2.0.15",
+    "effect": "4.0.0-rc.112"
+  }
+}
