@@ -91,7 +91,7 @@ test("SDK billing skips leading reminders and retains legacy model thinking opti
     thinking: { type: "adaptive", display: "summarized", budget_tokens: 2048 },
   };
   const body = JSON.parse(rewriteCliBody(JSON.stringify(input), { sessionId: "s", requestClass: "main" }, true, SDK_CLI_PROFILE).json);
-  expect(body.system[0].text).toContain("cc_version=2.1.280.11c;");
+  expect(body.system[0].text).toContain("cc_version=2.1.284.bdd;");
   expect(body.thinking).toEqual(input.thinking);
 });
 
@@ -181,7 +181,7 @@ test.each(["cli", "sdk-cli"] as const)("%s selects its captured identity and tra
   try {
     f.plugin.state.sessions.ses_child = { parentID: "ses_root" };
     const first = await f.send();
-    expect(first.capture.headers.get("user-agent")).toBe(`claude-cli/2.1.280 (external, ${profile})`);
+    expect(first.capture.headers.get("user-agent")).toBe(`claude-cli/2.1.284 (external, ${profile})`);
     expect(first.capture.body.system[0].text).toContain(`cc_entrypoint=${profile};`);
     expect(first.capture.body.system[0].text).toContain(`cc_turn_origin=${profile === "sdk-cli" ? "sdk" : "human"};`);
     expect(first.capture.body.system[1].text).toBe(profile === "sdk-cli"
@@ -189,7 +189,9 @@ test.each(["cli", "sdk-cli"] as const)("%s selects its captured identity and tra
       : "You are Claude Code, Anthropic's official CLI for Claude.");
     expect(first.capture.body.thinking).toEqual({ type: "adaptive", display: profile === "sdk-cli" ? "omitted" : "updates" });
     const betas = first.capture.headers.get("anthropic-beta")!.split(",");
-    expect(betas.includes("fallback-credit-2026-06-01")).toBe(profile === "cli");
+    expect(betas.includes("fallback-credit-2026-06-01")).toBe(false);
+    expect(first.capture.body.system[0].text).toContain("cc_prompt_index=1; cc_turn_index=1;");
+    expect(first.capture.headers.get("x-claude-code-prompt-id")).toBeTruthy();
     expect(betas.includes("thinking-display-updates-2026-08-18")).toBe(profile === "cli");
     expect(first.capture.body.max_tokens).toBe(128000);
     expect(first.capture.body.tools[0].name).toBe("mcp__oc__shell");

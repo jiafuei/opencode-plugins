@@ -27,9 +27,9 @@ Each value selects one coherent wire identity:
 
 | Value | Reference | Version / entrypoint | CCH |
 | --- | --- | --- | --- |
-| `"cli"` | September 29 interactive CLI capture | `2.1.280` / `cli` | Native global byte-marker normalization |
+| `"cli"` | September 29–30 interactive CLI captures | `2.1.284` / `cli` | Native global byte-marker normalization |
 | `"cowork"` | oh-my-pi Cowork | `2.1.246` / `claude-desktop` | Raw serialized-body attestation |
-| `"sdk-cli"` | September 29 genuine SDK CLI capture | `2.1.280` / `sdk-cli` | Native global byte-marker normalization |
+| `"sdk-cli"` | September 29 genuine SDK CLI capture | `2.1.284` / `sdk-cli` | Native global byte-marker normalization |
 
 ```json
 {
@@ -58,8 +58,9 @@ and uses OpenCode's HTTP client.
 }
 ```
 
-Both CLI profiles use the Linux x64 Claude Code 2.1.280 captures. `sdk-cli`
-is the default; set `spoofingProfile` to `cli` for interactive CLI identity.
+Both CLI profiles follow the Linux x64 Claude Code 2.1.284 captures. Only the interactive
+CLI was captured at 2.1.284; `sdk-cli` applies the same 2.1.284 changes to its 2.1.280 SDK
+capture. `sdk-cli` is the default; set `spoofingProfile` to `cli` for interactive CLI identity.
 
 | Wire behavior | `cli` | `sdk-cli` |
 | --- | --- | --- |
@@ -67,7 +68,7 @@ is the default; set `spoofingProfile` to `cli` for interactive CLI identity.
 | Billing entrypoint | `cli` | `sdk-cli` |
 | Turn origin | `human` / `task_notification` | `sdk` |
 | Modern Opus/Sonnet thinking display | `updates` | `omitted` |
-| Main fallback-credit beta | Present | Absent |
+| Fallback-credit beta | Auxiliary and compaction requests | Absent |
 | Thinking-display-updates beta | Present with updates | Absent |
 
 They share the following behavior:
@@ -98,11 +99,14 @@ They share the following behavior:
   `message_stop` and no error event. Retries reuse logical IDs and increment
   `X-Stainless-Retry-Count`. Late completions cannot replace newer chains or
   restore deleted, compacted, or credential-switched state.
+- Main requests carry `x-claude-code-prompt-id` and billing `cc_prompt_index` /
+  `cc_turn_index`: every turn advances the turn index, and task notifications do not
+  count as prompts. Subagents carry the prompt ID header but no indexes.
 - Session attribution is process-local and resets when the plugin reloads.
   Device identity remains stable across reloads.
 - CCH uses the native serialized-byte algorithm, including nested `model`
-  values and `max_tokens`/fallback exclusions. It reproduces all 61 message
-  checksums in the September 29 capture.
+  values and `max_tokens`/fallback exclusions. It reproduces all 61 2.1.280 and
+  176 2.1.284 message checksums in the September 29–30 captures.
 
 The relay starts on a random loopback port on first use and closes with the
 plugin. One-use request capabilities select prepared upstream requests.

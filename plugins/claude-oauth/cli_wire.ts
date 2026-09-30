@@ -4,8 +4,8 @@ import { deriveDeviceId } from "./local_storage.ts";
 export const CLI_PROFILE = {
   id: "cli",
   wireFormat: "cli",
-  version: "2.1.280",
-  userAgent: "claude-cli/2.1.280 (external, cli)",
+  version: "2.1.284",
+  userAgent: "claude-cli/2.1.284 (external, cli)",
   billingEntrypoint: "cli",
   systemInstruction: "You are Claude Code, Anthropic's official CLI for Claude.",
   toolPrefix: "mcp__oc__",
@@ -14,7 +14,7 @@ export const CLI_PROFILE = {
 export const SDK_CLI_PROFILE = {
   ...CLI_PROFILE,
   id: "sdk-cli",
-  userAgent: "claude-cli/2.1.280 (external, sdk-cli)",
+  userAgent: "claude-cli/2.1.284 (external, sdk-cli)",
   billingEntrypoint: "sdk-cli",
   systemInstruction: "You are a Claude agent, built on Anthropic's Claude Agent SDK.",
 } as const;
@@ -29,6 +29,9 @@ export interface CliAttribution {
   requestClass: "main" | "subagent" | "auxiliary" | "compaction";
   promptId?: string;
   turnOrigin?: "human" | "task_notification" | "sdk";
+  /** Main-thread turns and the prompts among them, both from 1. */
+  promptIndex?: number;
+  turnIndex?: number;
   previousRequestId?: string;
   previousMessageId?: string;
 }
@@ -39,7 +42,7 @@ const PREAMBLE = "You are an interactive agent that helps users with software en
   "Workspace tools are provided by the oc MCP server. Use the available tool schemas and follow the user's instructions.";
 const BILLING = "x-anthropic-billing-header:";
 
-/** Native byte-marker normalization, verified against all 61 September 29 captures. */
+/** Native byte-marker normalization, verified against the 61 2.1.280 and 176 2.1.284 requests captured September 29–30. */
 export function patchCliCch(body: string): string {
   const anchor = body.indexOf('"system":[');
   const placeholder = body.indexOf("cch=00000", anchor);
@@ -132,6 +135,7 @@ export function rewriteCliBody(body: string, attribution: CliAttribution, attrib
     if (attribution.previousRequestId) billing += ` cc_prev_req=${attribution.previousRequestId};`;
     if (attribution.promptId) billing += ` cc_prompt_id=${attribution.promptId};`;
     if (!attribution.agentId && attribution.turnOrigin) billing += ` cc_turn_origin=${attribution.turnOrigin};`;
+    if (!attribution.agentId && attribution.turnIndex) billing += ` cc_prompt_index=${attribution.promptIndex}; cc_turn_index=${attribution.turnIndex};`;
     system.push({ type: "text", text: billing });
   }
   system.push({ type: "text", text: attribution.agentId ? AGENT_IDENTITY : profile.systemInstruction,
@@ -198,7 +202,7 @@ export function cliHeaders(
       "mid-conversation-system-2026-04-07",
       ...(!attribution.agentId ? ["per-turn-control-2026-07-01", "mid-conversation-tool-changes-2026-07-01"] : []),
       "advanced-tool-use-2025-11-20", "mid-conversation-system-clear-at-2026-08-21", "effort-2025-11-24",
-      ...(!attribution.agentId && profile.id === "cli" ? ["fallback-credit-2026-06-01"] : []),
+      ...(profile.id === "cli" && ["auxiliary", "compaction"].includes(attribution.requestClass) ? ["fallback-credit-2026-06-01"] : []),
       "thinking-binding-controls-2026-08-01",
       ...(body.thinking?.display === "updates" ? ["thinking-display-updates-2026-08-18"] : []),
       ...(!attribution.agentId && attribution.requestClass !== "compaction" ? ["extended-cache-ttl-2025-04-11"] : []),
@@ -233,6 +237,7 @@ export function cliHeaders(
     ...(attribution.requestClass === "compaction" ? { "x-cc-compaction-request": "manual", "x-claude-code-compaction": "manual" } : {}),
     ...(attribution.agentId ? { "x-claude-code-agent-id": attribution.agentId } : {}),
     ...(attribution.agentType && attribution.requestClass === "subagent" ? { "x-claude-code-agent-type": attribution.agentType } : {}),
+    ...(attribution.promptId && !body.utility ? { "x-claude-code-prompt-id": attribution.promptId } : {}),
     "x-claude-code-request-class": attribution.requestClass,
     "x-client-request-id": requestId,
   };

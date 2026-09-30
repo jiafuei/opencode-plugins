@@ -226,6 +226,8 @@ export default Plugin.define({
       turn?: string;
       promptId?: string;
       turnOrigin?: CliAttribution["turnOrigin"];
+      promptIndex?: number;
+      turnIndex?: number;
       previousRequestId?: string;
       previousMessageId?: string;
       sequence: number;
@@ -356,6 +358,9 @@ export default Plugin.define({
           // Core retains metadata (even an empty object) on human messages;
           // synthetic task notifications are lowered without it.
           state.turnOrigin = profile.id === "sdk-cli" ? "sdk" : user.metadata !== undefined ? "human" : "task_notification";
+          // Every turn advances the turn index; task notifications are not prompts.
+          state.turnIndex = (state.turnIndex ?? 0) + 1;
+          state.promptIndex = (state.promptIndex ?? 0) + (state.turnOrigin === "task_notification" ? 0 : 1);
         }
       }, { providerID: "anthropic" });
     }
@@ -391,6 +396,7 @@ export default Plugin.define({
                 : event.kind === "compaction" ? "compaction" : "auxiliary",
               // CC's compaction billing line carries only the previous request.
               ...(event.kind !== "title" && event.kind !== "compaction" ? { promptId: state.promptId, turnOrigin: state.turnOrigin } : {}),
+              ...(event.kind === "primary" ? { promptIndex: state.promptIndex, turnIndex: state.turnIndex } : {}),
               ...(event.kind !== "title" ? {
                 previousRequestId: state.previousRequestId, previousMessageId: state.previousMessageId,
               } : {}),
