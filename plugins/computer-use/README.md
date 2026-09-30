@@ -32,12 +32,12 @@ via AX and makes its app frontmost.
 
 ## Build the helper (Windows / WSL)
 
-From WSL, with the Windows Rust toolchain (MSVC target):
+From WSL, with the Windows Rust toolchain (MSVC target). Replace `<username>` with your Windows user folder name:
 
 ```sh
 cd plugins/computer-use/native
-/mnt/c/Users/RAY/.cargo/bin/cargo.exe build --release --target-dir 'C:\Users\RAY\AppData\Local\Temp\computer-use-target'
-mkdir -p ../bin && cp /mnt/c/Users/RAY/AppData/Local/Temp/computer-use-target/release/computer-use-helper.exe ../bin/
+"/mnt/c/Users/<username>/.cargo/bin/cargo.exe" build --release --target-dir 'C:\Users\<username>\AppData\Local\Temp\computer-use-target'
+mkdir -p ../bin && cp "/mnt/c/Users/<username>/AppData/Local/Temp/computer-use-target/release/computer-use-helper.exe" ../bin/
 ```
 
 The source can stay on the Linux filesystem; only the target directory lives on the Windows side. The plugin runs
@@ -86,14 +86,14 @@ Example (trimmed):
 Accessibility tree. @(x,y wxh) bounds and all computer_* x/y are in a 1430x804 space covering the primary display (native 2560x1440, scale 0.5585). Element IDs stay valid until the next computer_tree call or action; computer_read does not reset them.
 
 Foreground window:
-[1] Window "Tibo (@thsottiaux) / X — Mozilla Firefox" @(0,0 1430x783)
+[1] Window "Example article — Mozilla Firefox" @(0,0 1430x783)
   [2] ToolBar "Menu Bar" @(0,0 1430x15)
     [3] MenuBar "Application" @(0,0 194x12)
       [4] MenuItem "File" @(0,0 17x12) collapsed
   [17] Button "Back" @(22,15 21x23) collapsed
   [18] Button "Forward" @(42,15 21x23) disabled collapsed
   [27] ComboBox "Search with Google or enter address" value="…" @(218,17 867x18) collapsed
-  [75] Document "Tibo (@thsottiaux) / X" value="https://x.com/thsottiaux" @(7,53 1424x729) focused
+  [75] Document "Example article" value="https://example.com/article" @(7,53 1424x729) focused
     [79] Hyperlink "Home" value="https://x.com/home" @(365,85 145x33)
 Other windows:
 - "#ramen-street | … - Discord" (Discord) @(8,12 1417x747)
@@ -141,7 +141,7 @@ system prompts and every call returns an error naming the missing permission. To
 Add the plugin directory by absolute path to the `plugins` array in `opencode.json`:
 
 ```json
-{ "plugins": ["/home/jf/git/opencode-plugins/plugins/computer-use"] }
+{ "plugins": ["/absolute/path/to/opencode-plugins/plugins/computer-use"] }
 ```
 
 Consider gating the tools with `"permission": { "computer_*": "ask" }`.

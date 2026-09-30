@@ -54,7 +54,7 @@ provider-neutral as ordinary OpenCode tools. Clicks are merged into one tool.
 See the tool table in README.md (x/y are separate fields; some providers reject tuple schemas).
 
 Result: `content: [{ type: "text", text: "<coordinate contract>" }, { type: "file", uri: "data:image/jpeg;base64,...", mime: "image/jpeg" }]`
-(same shape MCP image results use in `~/git/opencode/packages/core/src/tool/mcp.ts`).
+(same shape MCP image results use in OpenCode's `packages/core/src/tool/mcp.ts`).
 
 Tool access is gated by normal OpenCode permission config (e.g. `"computer_*": "ask"`).
 
