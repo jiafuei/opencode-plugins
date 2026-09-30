@@ -1,7 +1,7 @@
 {
   "name": "@jiafuei/opencode-websearch",
   "version": "0.0.1",
-  "description": "OpenAI-native web search provider for OpenCode",
+  "description": "Native web search for OpenCode through OpenAI, Google, or Anthropic providers",
   "type": "module",
   "exports": {
     "./server": "./server.ts"
@@ -15,6 +15,10 @@
     "opencode",
     "opencode-plugin",
     "openai",
+    "google",
+    "gemini",
+    "anthropic",
+    "claude",
     "websearch"
   ],
   "engines": {
@@ -24,6 +28,8 @@
     "access": "public"
   },
   "dependencies": {
+    "@ai-sdk/anthropic": "3.0.125",
+    "@ai-sdk/google": "3.0.129",
     "@ai-sdk/openai": "3.0.104",
     "@opencode/plugin": "2.0.15",
     "ai": "6.0.168",
