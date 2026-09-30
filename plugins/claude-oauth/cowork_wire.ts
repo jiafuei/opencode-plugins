@@ -359,7 +359,10 @@ export function applyCoworkModelCompatibility(params: Record<string, any>): void
       thinking.budget_tokens = params.max_tokens - OUTPUT_BUFFER;
     }
   }
+  // OMP drops caller context edits; threshold compaction edits are kept so compaction still works.
+  const compaction = (params.context_management?.edits ?? []).filter((edit: any) => edit.type === "compact_20260112");
   delete params.context_management;
+  if (compaction.length) params.context_management = { edits: compaction };
   if (modernAdaptive || (thinking && thinking.type !== "disabled")) {
     delete params.temperature;
     delete params.top_p;

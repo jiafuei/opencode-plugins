@@ -388,9 +388,11 @@ export default Plugin.define({
               accountId: oauth.metadata?.accountId as string | undefined,
               agentId: state.agentId,
               agentType: state.agentId ? event.agent : undefined,
-              requestClass: event.kind === "primary" ? state.agentId ? "subagent" : "main" : "auxiliary",
+              requestClass: event.kind === "primary" ? state.agentId ? "subagent" : "main"
+                : event.kind === "compaction" ? "compaction" : "auxiliary",
+              // CC's compaction billing line carries only the previous request.
+              ...(event.kind !== "title" && event.kind !== "compaction" ? { promptId: state.promptId, turnOrigin: state.turnOrigin } : {}),
               ...(event.kind !== "title" ? {
-                promptId: state.promptId, turnOrigin: state.turnOrigin,
                 previousRequestId: state.previousRequestId, previousMessageId: state.previousMessageId,
               } : {}),
             },

@@ -82,8 +82,16 @@ They share the following behavior:
   are regrouped into stable instructions and caller instructions; repository
   rules, skills, memories, user messages, and tool results retain their text.
   Main agent requests use 1-hour caches; child agents use short caches.
-- Headers and betas distinguish main, subagent, and auxiliary requests. The model's
+- Headers and betas distinguish main, subagent, auxiliary, and compaction requests. The model's
   supplied output limit is retained, including 128000-token Opus requests.
+- Compaction requests follow CC's manual compaction wire (the September 30 capture): the `compaction`
+  request class and headers, a billing line with only `cc_prev_req`, 5-minute caching up to the block
+  before the summary prompt, and no extended cache TTL beta. Auto compaction has not been captured, so
+  every compaction is reported as manual.
+- Anthropic server-side compaction (`@jiafuei/opencode-anthropic-compaction`) works over OAuth with
+  both mechanisms, verified live on September 30. A threshold `compact_20260112` edit is kept after the
+  keep-all clear-thinking edit, and an on-demand `compaction` request carries no `context_management`,
+  which the API rejects alongside it.
 - Child agents share the root's wire-session UUID and inherit its prompt ID,
   while each raw OpenCode session has its own response chain. Auxiliary
   requests do not advance the primary chain. Each new turn gets a prompt ID;

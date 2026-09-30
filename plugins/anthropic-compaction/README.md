@@ -60,9 +60,13 @@ The plugin sends the conversation with `compaction: { type: "summarize" }`. Anth
 
 ### Threshold
 
-The plugin sends the conversation with the `compact_20260112` context-management edit, a 50,000-token trigger, and `pauseAfterCompaction`, so Anthropic compacts and stops without answering. The returned block becomes the checkpoint, after a `<synthetic_user_message>` that keeps the conversation opening with a user message. Later requests replay the block and Anthropic ignores everything before it.
+The plugin sends the conversation with the `compact_20260112` context-management edit, a 50,000-token trigger, and `pauseAfterCompaction`, so Anthropic compacts and stops without answering. The returned block becomes the checkpoint, after a `<synthetic_user_message>` that keeps the conversation opening with a user message. Later requests replay the block and Anthropic ignores everything before it. Anthropic only accepts a replayed threshold block alongside the `compact_20260112` strategy, so OpenCode sends it on those requests with a trigger they never reach.
 
 Anthropic only compacts once input reaches 50,000 tokens. Below that it answers normally instead, so a manual `/compact` on a smaller conversation is billed for a reply and then fails. Automatic compaction runs near the context limit, which for Claude models is well above the minimum.
+
+## Claude subscriptions
+
+Both mechanisms work over a Claude Pro or Max subscription with [`@jiafuei/opencode-claude-oauth`](../claude-oauth/README.md), which keeps the compaction fields intact when it rewrites requests.
 
 ## Anthropic proxies backed by Bedrock
 
@@ -84,7 +88,7 @@ Bedrock model support differs by mechanism. Check the model's card in the Bedroc
 - OpenCode's `amazon-bedrock` provider uses Bedrock Converse and does not expose Anthropic compaction blocks, so it cannot be listed in `providers`.
 - The compaction summary is not shown in the transcript.
 - Images, documents, and fetched URLs in the summarized conversation do not survive compaction.
-- On-demand compaction needs an OpenCode build that replays compaction block signatures.
+- Both mechanisms need an OpenCode build that replays compaction block signatures and the threshold strategy.
 
 ## Tests
 

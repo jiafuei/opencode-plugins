@@ -475,6 +475,10 @@ export function rewriteBody(
   }
 
   const thinking = params.thinking;
+  const edits = [
+    ...(isActiveThinking(thinking) ? [{ type: "clear_thinking_20251015", keep: "all" }] : []),
+    ...(params.context_management?.edits ?? []),
+  ];
   const overrides: Record<string, any> = {
     model: params.model,
     messages: params.messages,
@@ -483,8 +487,9 @@ export function rewriteBody(
     tools: params.tools ?? [],
     metadata: { user_id: userId },
     max_tokens: Math.min(MAX_OUTPUT_TOKENS, params.max_tokens ?? MAX_OUTPUT_TOKENS),
-    // Active thinking emits a single keep-all edit, replacing whatever arrived.
-    ...(isActiveThinking(thinking) && { context_management: { edits: [{ type: "clear_thinking_20251015", keep: "all" }] } }),
+    // Active thinking emits a single keep-all edit ahead of any kept compaction edit. On-demand compaction rejects
+    // context_management entirely.
+    ...(!params.compaction && edits.length > 0 && { context_management: { edits } }),
   };
   const merged = { ...params, ...overrides };
 

@@ -49,6 +49,37 @@ test("CLI preserves instruction and tool semantics while namespacing definitions
   expect(rewriteCliBody(JSON.stringify(input), { sessionId: "s", requestClass: "main" }, false).json).not.toContain("cch=");
 });
 
+test("compaction requests match CC's compaction wire and keep both compaction mechanisms working", () => {
+  const attribution = { sessionId: "s", requestClass: "compaction" as const, previousRequestId: "req_prev" };
+  const messages = [
+    { role: "user", content: [{ type: "text", text: "hello" }] },
+    { role: "assistant", content: [{ type: "text", text: "hi" }] },
+    { role: "user", content: [{ type: "text", text: "Summarize the conversation." }] },
+  ];
+  const threshold = rewriteCliBody(JSON.stringify({
+    ...BODY,
+    messages,
+    context_management: { edits: [{ type: "compact_20260112", trigger: { type: "input_tokens", value: 50000 }, pause_after_compaction: true }] },
+  }), attribution);
+  const body = JSON.parse(threshold.json);
+  expect(body.context_management.edits.map((edit: any) => edit.type)).toEqual(["clear_thinking_20251015", "compact_20260112"]);
+  expect(body.system[0].text).toContain("cc_prev_req=req_prev;");
+  expect(body.system[0].text).not.toContain("cc_prompt_id");
+  expect(body.messages[1].content[0].cache_control).toEqual({ type: "ephemeral" });
+  expect(body.messages[2].content[0].cache_control).toBeUndefined();
+
+  const onDemand = JSON.parse(rewriteCliBody(JSON.stringify({ ...BODY, messages, compaction: { type: "summarize" } }), attribution).json);
+  expect(onDemand.context_management).toBeUndefined();
+  expect(onDemand.compaction).toEqual({ type: "summarize" });
+
+  const headers = cliHeaders(new Headers({ authorization: "Bearer t", "anthropic-beta": "compact-2026-09-04" }), attribution, threshold, "id", 0);
+  expect(headers["x-cc-compaction-request"]).toBe("manual");
+  expect(headers["x-claude-code-compaction"]).toBe("manual");
+  expect(headers["x-claude-code-request-class"]).toBe("compaction");
+  expect(headers["anthropic-beta"]).not.toContain("extended-cache-ttl");
+  expect(headers["anthropic-beta"]).toContain("compact-2026-09-04");
+});
+
 test("SDK billing skips leading reminders and retains legacy model thinking options", () => {
   const input = {
     ...BODY,

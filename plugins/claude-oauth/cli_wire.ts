@@ -26,7 +26,7 @@ export interface CliAttribution {
   accountId?: string;
   agentId?: string;
   agentType?: string;
-  requestClass: "main" | "subagent" | "auxiliary";
+  requestClass: "main" | "subagent" | "auxiliary" | "compaction";
   promptId?: string;
   turnOrigin?: "human" | "task_notification" | "sdk";
   previousRequestId?: string;
@@ -120,7 +120,8 @@ export function rewriteCliBody(body: string, attribution: CliAttribution, attrib
     .filter(Boolean).join("\n\n")
     // Anthropic flags OpenCode's environment preamble next to its <env> block as a third-party app.
     .replace("Here is some useful information about the environment you are running in:", "You have been invoked in the following environment:");
-  const cache = attribution.agentId ? { type: "ephemeral" } : { type: "ephemeral", ttl: "1h" };
+  const compaction = attribution.requestClass === "compaction";
+  const cache = attribution.agentId || compaction ? { type: "ephemeral" } : { type: "ephemeral", ttl: "1h" };
   const utility = !params.tools?.length && !["enabled", "adaptive"].includes(params.thinking?.type);
   const system: any[] = [];
   if (attributionHeader) {
@@ -140,7 +141,8 @@ export function rewriteCliBody(body: string, attribution: CliAttribution, attrib
   }
   if (instructions) system.push({ type: "text", text: instructions, ...(!utility ? { cache_control: cache } : {}) });
   if (!utility && params.messages.length) {
-    const last = params.messages.at(-1);
+    // CC's compaction request reads the conversation's cache up to the block before its summary prompt.
+    const last = (compaction && params.messages.at(-2)) || params.messages.at(-1);
     if (typeof last.content === "string") last.content = [{ type: "text", text: last.content }];
     const block = last.content.findLast((part: any) => !["thinking", "redacted_thinking"].includes(part.type));
     if (block) block.cache_control = cache;
@@ -152,7 +154,14 @@ export function rewriteCliBody(body: string, attribution: CliAttribution, attrib
     thinking.display = profile.id === "sdk-cli" ? "omitted" : "updates";
     delete thinking.block_binding;
   }
-  const context = params.context_management ?? (activeThinking ? { edits: [{ type: "clear_thinking_20251015", keep: "all" }] } : undefined);
+  // CC sends a keep-all clear-thinking edit with active thinking, which must come before any caller edit such as
+  // threshold compaction. On-demand compaction rejects context_management entirely.
+  const edits = [
+    ...(activeThinking ? [{ type: "clear_thinking_20251015", keep: "all" }] : []),
+    ...(params.context_management?.edits ?? []).filter((edit: any) => edit.type !== "clear_thinking_20251015"),
+  ];
+  const context = !params.compaction && edits.length ? { ...params.context_management, edits } : undefined;
+  delete params.context_management;
   const rewritten: Record<string, any> = {
     model: params.model,
     messages: params.messages,
@@ -192,7 +201,7 @@ export function cliHeaders(
       ...(!attribution.agentId && profile.id === "cli" ? ["fallback-credit-2026-06-01"] : []),
       "thinking-binding-controls-2026-08-01",
       ...(body.thinking?.display === "updates" ? ["thinking-display-updates-2026-08-18"] : []),
-      ...(!attribution.agentId ? ["extended-cache-ttl-2025-04-11"] : []),
+      ...(!attribution.agentId && attribution.requestClass !== "compaction" ? ["extended-cache-ttl-2025-04-11"] : []),
     ]),
     "cache-diagnosis-2026-04-07",
   ];
@@ -220,6 +229,8 @@ export function cliHeaders(
     "anthropic-dangerous-direct-browser-access": "true",
     "anthropic-version": "2023-06-01",
     "x-app": "cli",
+    // No auto-compaction capture yet, so every compaction is reported as manual.
+    ...(attribution.requestClass === "compaction" ? { "x-cc-compaction-request": "manual", "x-claude-code-compaction": "manual" } : {}),
     ...(attribution.agentId ? { "x-claude-code-agent-id": attribution.agentId } : {}),
     ...(attribution.agentType && attribution.requestClass === "subagent" ? { "x-claude-code-agent-type": attribution.agentType } : {}),
     "x-claude-code-request-class": attribution.requestClass,

@@ -276,7 +276,7 @@ describe("rewriteBody with the Cowork profile", () => {
     expect(budgeted.thinking.budget_tokens).toBe(60000);
   });
 
-  test("active thinking emits OMP's exact single keep-all clear-thinking edit, replacing incoming edits", () => {
+  test("active thinking emits OMP's keep-all clear-thinking edit, keeping only compaction edits", () => {
     const incoming = {
       edits: [
         { type: "compact_20260112", trigger: { type: "input_tokens", value: 100000 } },
@@ -289,7 +289,12 @@ describe("rewriteBody with the Cowork profile", () => {
       context_management: incoming,
     });
     const out = parse(rewriteBody(body, { profile: COWORK_PROFILE }).json);
-    expect(out.context_management).toEqual({ edits: [{ type: "clear_thinking_20251015", keep: "all" }] });
+    expect(out.context_management).toEqual({
+      edits: [
+        { type: "clear_thinking_20251015", keep: "all" },
+        { type: "compact_20260112", trigger: { type: "input_tokens", value: 100000 } },
+      ],
+    });
   });
 
   test("Cowork device IDs are stable and distinct from sdk-cli for the same account", () => {
