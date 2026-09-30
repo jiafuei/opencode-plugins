@@ -31,6 +31,9 @@ export interface CliAttribution {
   /** Main-thread turns and the prompts among them, both from 1. */
   promptIndex?: number;
   turnIndex?: number;
+  /** What triggered a compaction request, and on the first main request after one, the compaction it follows. */
+  compactionKind?: "auto" | "manual";
+  contextCompacted?: "auto" | "manual";
   previousRequestId?: string;
   previousMessageId?: string;
 }
@@ -232,8 +235,12 @@ export function cliHeaders(
     "anthropic-dangerous-direct-browser-access": "true",
     "anthropic-version": "2023-06-01",
     "x-app": "cli",
-    // No auto-compaction capture yet, so every compaction is reported as manual.
-    ...(attribution.requestClass === "compaction" ? { "x-cc-compaction-request": "manual", "x-claude-code-compaction": "manual" } : {}),
+    ...(attribution.contextCompacted ? {
+      "x-cc-context-compacted": attribution.contextCompacted, "x-claude-code-context-compacted": attribution.contextCompacted,
+    } : {}),
+    ...(attribution.compactionKind ? {
+      "x-cc-compaction-request": attribution.compactionKind, "x-claude-code-compaction": attribution.compactionKind,
+    } : {}),
     ...(attribution.agentId ? { "x-claude-code-agent-id": attribution.agentId } : {}),
     ...(attribution.agentType && attribution.requestClass === "subagent" ? { "x-claude-code-agent-type": attribution.agentType } : {}),
     ...(attribution.promptId && !body.utility ? { "x-claude-code-prompt-id": attribution.promptId } : {}),

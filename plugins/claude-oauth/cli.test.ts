@@ -50,7 +50,7 @@ test("CLI preserves instruction and tool semantics while namespacing definitions
 });
 
 test("compaction requests match CC's compaction wire and keep both compaction mechanisms working", () => {
-  const attribution = { sessionId: "s", requestClass: "compaction" as const, previousRequestId: "req_prev" };
+  const attribution = { sessionId: "s", requestClass: "compaction" as const, compactionKind: "auto" as const, previousRequestId: "req_prev" };
   const messages = [
     { role: "user", content: [{ type: "text", text: "hello" }] },
     { role: "assistant", content: [{ type: "text", text: "hi" }] },
@@ -73,8 +73,8 @@ test("compaction requests match CC's compaction wire and keep both compaction me
   expect(onDemand.compaction).toEqual({ type: "summarize" });
 
   const headers = cliHeaders(new Headers({ authorization: "Bearer t", "anthropic-beta": "compact-2026-09-04" }), attribution, threshold, "id", 0);
-  expect(headers["x-cc-compaction-request"]).toBe("manual");
-  expect(headers["x-claude-code-compaction"]).toBe("manual");
+  expect(headers["x-cc-compaction-request"]).toBe("auto");
+  expect(headers["x-claude-code-compaction"]).toBe("auto");
   expect(headers["x-claude-code-request-class"]).toBe("compaction");
   expect(headers["anthropic-beta"]).not.toContain("extended-cache-ttl");
   expect(headers["anthropic-beta"]).toContain("compact-2026-09-04");
@@ -280,7 +280,7 @@ test("session state survives a plugin reload through session metadata, like a Cl
   } finally { before.close(); after.close(); }
 });
 
-test("malformed JSON cannot advance attribution and compaction starts a fresh chain", async () => {
+test("malformed JSON cannot advance attribution and compaction keeps the chain like CC", async () => {
   const f = await fixture();
   try {
     f.reply((i) => Response.json({ type: "message", id: `msg_${i}`, stop_reason: "tool_use", content: [{ type: "tool_use", id: "toolu_1", name: "mcp__oc__shell", input: {} }] }, { headers: { "request-id": `req_${i}` } }));
@@ -290,12 +290,22 @@ test("malformed JSON cannot advance attribution and compaction starts a fresh ch
     await expect(f.send()).rejects.toThrow(SyntaxError);
     f.reply(undefined);
     expect((await f.send()).capture.body.diagnostics.previous_message_id).toBe("msg_1");
-    const pending = await f.send(await f.prepare(), false);
-    await f.plugin.emit({ type: "session.compacted", data: { sessionID: "ses_root" } });
-    await pending.response.text();
+    // Captured September 30: the compaction repeats the last main request's position, the next main request
+    // continues from that request and reports the compaction once.
+    await f.plugin.emit({ type: "session.compaction.started", data: { sessionID: "ses_root", reason: "manual" } });
+    const compaction = await f.send(await f.prepare("ses_root", "compaction"));
+    expect(compaction.capture.headers.get("x-claude-code-compaction")).toBe("manual");
+    expect(compaction.capture.body.diagnostics.previous_message_id).toBe("msg_1");
+    await f.plugin.emit({ type: "session.compaction.ended", data: { sessionID: "ses_root", reason: "manual" } });
     const compacted = await f.send();
-    expect(compacted.capture.body.diagnostics.previous_message_id).toBeNull();
+    expect(compacted.capture.headers.get("x-claude-code-context-compacted")).toBe("manual");
+    expect(compacted.capture.headers.get("x-cc-context-compacted")).toBe("manual");
+    expect(compacted.capture.body.diagnostics.previous_message_id).toBe("msg_3");
     expect(compacted.capture.headers.get("x-claude-code-session-id")).toBe(first.capture.headers.get("x-claude-code-session-id"));
+    expect((await f.send()).capture.headers.get("x-claude-code-context-compacted")).toBeNull();
+    // Native compaction can send before core announces an auto compaction.
+    const auto = await f.send(await f.prepare("ses_root", "compaction"));
+    expect(auto.capture.headers.get("x-claude-code-compaction")).toBe("auto");
   } finally { f.close(); }
 });
 

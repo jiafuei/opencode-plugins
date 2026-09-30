@@ -79,10 +79,13 @@ They share the following behavior:
   Main agent requests use 1-hour caches; child agents use short caches.
 - Headers and betas distinguish main, subagent, auxiliary, and compaction requests. The model's
   supplied output limit is retained, including 128000-token Opus requests.
-- Compaction requests follow CC's manual compaction wire (the September 30 capture): the `compaction`
-  request class and headers, a billing line with only `cc_prev_req`, 5-minute caching up to the block
-  before the summary prompt, and no extended cache TTL beta. Auto compaction has not been captured, so
-  every compaction is reported as manual.
+- Compaction requests follow CC's compaction wire (the September 30 manual and auto captures): the
+  `compaction` request class, `x-cc-compaction-request` / `x-claude-code-compaction` set to `manual` or
+  `auto` from OpenCode's compaction reason, a billing line with only `cc_prev_req`, 5-minute caching up
+  to the block before the summary prompt, and no extended cache TTL beta. Like CC's fork, the request
+  repeats the chain position of the last main request and does not advance the chain.
+- The chain, session UUID, and indices survive a compaction. The next main request alone carries
+  `x-cc-context-compacted` / `x-claude-code-context-compacted` with the compaction's reason.
 - Anthropic server-side compaction (`@jiafuei/opencode-anthropic-compaction`) works over OAuth with
   both mechanisms, verified live on September 30. A threshold `compact_20260112` edit is kept after the
   keep-all clear-thinking edit, and an on-demand `compaction` request carries no `context_management`,
@@ -95,7 +98,7 @@ They share the following behavior:
   successful complete JSON message or an SSE stream ending with a parsed
   `message_stop` and no error event. Retries reuse logical IDs and increment
   `X-Stainless-Retry-Count`. Late completions cannot replace newer chains or
-  restore deleted, compacted, or account-switched state.
+  restore deleted or account-switched state.
 - Main requests carry `x-claude-code-prompt-id` and billing `cc_prompt_index` /
   `cc_turn_index`: every turn advances the turn index, and task notifications do not
   count as prompts. Subagents carry the prompt ID header but no indexes.

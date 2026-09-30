@@ -191,6 +191,11 @@ export default Plugin.define({
       turnIndex?: number;
       previousRequestId?: string;
       previousMessageId?: string;
+      // The chain position the last main request carried, which CC's compaction request repeats.
+      mainChain?: Pick<CliAttribution, "previousRequestId" | "previousMessageId">;
+      compactionKind?: CliAttribution["compactionKind"];
+      // Like CC's, armed by a compaction and consumed by the next main request; not persisted.
+      contextCompacted?: CliAttribution["contextCompacted"];
       sequence: number;
       committed: number;
     };
@@ -358,6 +363,13 @@ export default Plugin.define({
       async (event) => {
         if (!oauth) return;
         const state = await cliState(event.sessionID);
+        const main = event.kind === "primary" && !state.agentId;
+        const chain = { previousRequestId: state.previousRequestId, previousMessageId: state.previousMessageId };
+        const contextCompacted = main ? state.contextCompacted : undefined;
+        if (main) {
+          state.mainChain = chain;
+          delete state.contextCompacted;
+        }
         const id = randomUUID();
         const timer = setTimeout(() => cliCalls.delete(id), 60 * 60 * 1000);
         timer.unref();
@@ -373,9 +385,11 @@ export default Plugin.define({
             // CC's compaction billing line carries only the previous request.
             ...(event.kind !== "title" && event.kind !== "compaction" ? { promptId: state.promptId, turnOrigin: state.turnOrigin } : {}),
             ...(event.kind === "primary" ? { promptIndex: state.promptIndex, turnIndex: state.turnIndex } : {}),
-            ...(event.kind !== "title" ? {
-              previousRequestId: state.previousRequestId, previousMessageId: state.previousMessageId,
-            } : {}),
+            // A manual compaction starts before its request; an auto one can send first, as native compaction does.
+            ...(event.kind === "compaction" ? { compactionKind: state.compactionKind ?? "auto" } : {}),
+            contextCompacted,
+            // CC's compaction forks the last main request, so it repeats that request's chain position.
+            ...(event.kind === "compaction" ? state.mainChain ?? chain : event.kind !== "title" ? chain : {}),
           },
         });
         event.headers[REQUEST_ID_HEADER] = id;
@@ -464,15 +478,16 @@ export default Plugin.define({
             }
           }
         }
-        if (event.type === "session.compacted") {
-          cliGeneration++;
+        // CC keeps the session's chain and indices across a compaction; only the compaction headers change.
+        if (event.type === "session.compaction.started") {
+          const state = cliStates.get(event.data.sessionID);
+          if (state) state.compactionKind = event.data.reason;
+        }
+        if (event.type === "session.compaction.ended" || event.type === "session.compaction.failed") {
           const state = cliStates.get(event.data.sessionID);
           if (state) {
-            // A new chain owner fences old completions without changing the
-            // session UUID shared by the root and its running child agents.
-            const reset = { ...state, previousRequestId: undefined, previousMessageId: undefined, sequence: 0, committed: 0 };
-            cliStates.set(event.data.sessionID, reset);
-            void persist(event.data.sessionID, reset);
+            delete state.compactionKind;
+            if (event.type === "session.compaction.ended") state.contextCompacted = event.data.reason;
           }
         }
         if (
