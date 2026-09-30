@@ -17,9 +17,10 @@ async function load(options: Record<string, unknown>) {
   return hooks;
 }
 
-function compaction(content: unknown[]) {
+function compaction(content: unknown[], modelID = "claude-opus-4-6") {
   const sent: Record<string, any>[] = [];
   const event = {
+    model: { id: modelID },
     send: async (input: { options: Record<string, any> }) => {
       sent.push(input.options);
       return { content };
@@ -42,7 +43,25 @@ describe("native compaction", () => {
       ["experimental.compaction.native", "my-proxy"],
       ["http.request", "my-proxy"],
     ]);
-    await expect(load({ providers: { anthropic: {} } })).rejects.toThrow('"on-demand" or "threshold"');
+  });
+
+  test("picks the mechanism from models, then the on-demand default, then the provider", async () => {
+    const [hook] = await load({
+      providers: { anthropic: { mechanism: "threshold", models: { "claude-opus-5-5": "threshold" } } },
+    });
+    const sent = async (modelID: string) => {
+      const run = compaction([block], modelID);
+      await hook!.callback(run.event);
+      return Object.keys(run.sent[0]!)[0];
+    };
+    expect(await sent("claude-opus-5-5")).toBe("contextManagement");
+    expect(await sent("us.anthropic.claude-sonnet-5-5-v1")).toBe("compaction");
+    expect(await sent("claude-fable-5")).toBe("compaction");
+    expect(await sent("claude-opus-4-20250514")).toBe("contextManagement");
+    expect(await sent("claude-sonnet-5")).toBe("contextManagement");
+
+    const [unset] = await load({ providers: { anthropic: {} } });
+    await expect(unset!.callback(compaction([block]).event)).rejects.toThrow("anthropic/claude-opus-4-6");
   });
 
   test("on-demand installs the signed block first in the conversation", async () => {

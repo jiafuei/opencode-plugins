@@ -12,7 +12,7 @@ opencode plugin add @jiafuei/opencode-anthropic-compaction
 
 ## Enable
 
-The plugin is opt-in per provider. List the providers it should handle in its `providers` option, pick a compaction mechanism for each, and turn on native compaction for them, as for any provider with native compaction:
+The plugin is opt-in per provider. List the providers it should handle in its `providers` option, and turn on native compaction for them, as for any provider with native compaction:
 
 ```json
 {
@@ -21,8 +21,8 @@ The plugin is opt-in per provider. List the providers it should handle in its `p
       "package": "@jiafuei/opencode-anthropic-compaction",
       "options": {
         "providers": {
-          "anthropic": { "mechanism": "on-demand" },
-          "my-bedrock-proxy": { "mechanism": "threshold", "aws": true }
+          "anthropic": { "mechanism": "threshold" },
+          "my-bedrock-proxy": { "aws": true, "models": { "claude-opus-4-6": "threshold" } }
         }
       }
     }
@@ -39,9 +39,12 @@ The plugin is opt-in per provider. List the providers it should handle in its `p
 ```
 
 - `providers` maps the OpenCode provider IDs the plugin compacts for to their settings. Without it the plugin does nothing. Each provider must use the Anthropic Messages package (`@opencode/ai/providers/anthropic` or `@opencode/ai/providers/anthropic-compatible`).
-  - `mechanism` is required: `"on-demand"` ([compaction on demand](https://platform.claude.com/docs/en/build-with-claude/compaction-on-demand), beta `compact-2026-09-04`) or `"threshold"` ([compaction at a token threshold](https://platform.claude.com/docs/en/build-with-claude/compaction-threshold), beta `compact-2026-01-12`).
+  - `mechanism` is `"on-demand"` ([compaction on demand](https://platform.claude.com/docs/en/build-with-claude/compaction-on-demand), beta `compact-2026-09-04`) or `"threshold"` ([compaction at a token threshold](https://platform.claude.com/docs/en/build-with-claude/compaction-threshold), beta `compact-2026-01-12`).
+  - `models` sets the mechanism for individual model IDs, for a provider whose models support different mechanisms.
   - `aws` marks a provider that forwards requests to Bedrock InvokeModel. See [Anthropic proxies backed by Bedrock](#anthropic-proxies-backed-by-bedrock).
 - `instructions` replaces Anthropic's default compaction prompt, for both mechanisms.
+
+Each compaction picks its mechanism from the model's entry in `models`. Without one, Claude Haiku, Sonnet, and Opus 5.5 and later, and Claude Fable and Mythos 5 and later, use on-demand; the version is read from the model ID, so `claude-opus-5-5`, `us.anthropic.claude-opus-5-5-v1`, and `opus-5.5` all match. Other models use the provider's `mechanism`, and compaction fails for a model none of these cover.
 
 A model setting overrides the provider setting, so one model can stay on OpenCode's summary with `{ "type": "summary" }`. Use that for models without compaction support, such as Haiku. Native compaction on a provider the plugin does not handle, and whose route has no native compaction, is rejected when the model resolves.
 

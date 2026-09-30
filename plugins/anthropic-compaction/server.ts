@@ -8,8 +8,8 @@ import { Plugin } from "@opencode/plugin";
 //       "package": "@jiafuei/opencode-anthropic-compaction",
 //       "options": {
 //         "providers": {
-//           "anthropic": { "mechanism": "on-demand" },
-//           "my-bedrock-proxy": { "mechanism": "threshold", "aws": true }
+//           "anthropic": { "mechanism": "threshold" },
+//           "my-bedrock-proxy": { "aws": true, "models": { "claude-opus-4-6": "threshold" } }
 //         }
 //       }
 //     }
@@ -19,8 +19,12 @@ import { Plugin } from "@opencode/plugin";
 //   }
 // }
 
+type Mechanism = "on-demand" | "threshold";
+
 type ProviderOptions = {
-  mechanism: "on-demand" | "threshold";
+  // Used for models that neither `models` nor the on-demand default covers.
+  mechanism?: Mechanism;
+  models?: Record<string, Mechanism>;
   // The provider forwards the body to Bedrock InvokeModel, which reads betas from the body, not the header.
   aws?: boolean;
 };
@@ -35,6 +39,7 @@ type ContentPart = { type: string } | CompactionPart;
 
 // The published plugin types predate this hook, so it is typed here.
 type NativeCompaction = {
+  model: { id: string };
   send: (input: { options: Record<string, unknown> }) => Promise<{ content: ReadonlyArray<ContentPart> }>;
   result?: { replacement: ReadonlyArray<unknown> };
 };
@@ -49,19 +54,32 @@ const OPENING = {
   ],
 };
 
+// Claude models with on-demand compaction: Haiku, Sonnet, and Opus from 5.5, Fable and Mythos from 5. Matches
+// Anthropic, Bedrock, and proxy IDs such as `claude-opus-5-5`, `us.anthropic.claude-sonnet-5-5-v1`, or `opus-5.5`,
+// without reading a date suffix (`claude-opus-4-20250514`) as a minor version.
+function onDemandByDefault(modelID: string) {
+  const match = modelID.match(/(haiku|sonnet|opus|fable|mythos)-(\d+)(?:[-.](\d{1,2}))?(?!\d)/);
+  if (!match) return false;
+  const version = Number(match[2]) * 100 + Number(match[3] ?? 0);
+  return version >= (match[1] === "fable" || match[1] === "mythos" ? 500 : 505);
+}
+
 export default Plugin.define({
   id: "anthropic_compaction",
   setup: async (ctx) => {
     const { providers = {}, instructions } = ctx.options as CompactionOptions;
 
-    for (const [providerID, { mechanism, aws }] of Object.entries(providers)) {
-      if (mechanism !== "on-demand" && mechanism !== "threshold") {
-        throw new Error(`anthropic_compaction: provider "${providerID}" needs a mechanism of "on-demand" or "threshold"`);
-      }
-
+    for (const [providerID, { mechanism: fallback, models = {}, aws }] of Object.entries(providers)) {
       await (ctx.session.hook as any)(
         "experimental.compaction.native",
         async (event: NativeCompaction) => {
+          const modelID = event.model.id;
+          const mechanism = models[modelID] ?? (onDemandByDefault(modelID) ? "on-demand" : fallback);
+          if (mechanism !== "on-demand" && mechanism !== "threshold") {
+            throw new Error(
+              `anthropic_compaction: set "on-demand" or "threshold" for ${providerID}/${modelID} in the provider's "mechanism" or "models"`,
+            );
+          }
           const options =
             mechanism === "on-demand"
               ? { compaction: { type: "summarize", ...(instructions ? { instructions } : {}) } }
