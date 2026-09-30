@@ -4,7 +4,8 @@ use uiautomation::core::UICacheRequest;
 use uiautomation::patterns::{UITextPattern, UIValuePattern};
 use uiautomation::types::{ControlType, Handle, TreeScope, UIProperty};
 use uiautomation::{UIAutomation, UIElement};
-use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+use windows::Win32::Foundation::HWND;
+use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, IsIconic, SetForegroundWindow, ShowWindow, SW_RESTORE};
 
 pub type Element = UIElement;
 
@@ -77,6 +78,29 @@ impl Backend {
         }
         let value = element.get_pattern::<UIValuePattern>().and_then(|p| p.get_value()).unwrap_or_default();
         Ok([name, value].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join("\n"))
+    }
+
+    /// Control type and name of the element with keyboard focus.
+    pub fn focused(&self) -> Option<(String, String)> {
+        let element = self.automation.get_focused_element().ok()?;
+        Some((format!("{:?}", element.get_control_type().ok()?), element.get_name().unwrap_or_default()))
+    }
+
+    /// Restore the window if minimized and make it the foreground window. The caller has just tapped Alt, which lifts
+    /// Windows' foreground lock for this process.
+    pub fn raise(&self, window: &xcap::Window) -> Result<(), Box<dyn Error>> {
+        // xcap's window id is the HWND.
+        let hwnd = HWND(window.id()? as usize as *mut std::ffi::c_void);
+        unsafe {
+            if IsIconic(hwnd).as_bool() {
+                let _ = ShowWindow(hwnd, SW_RESTORE);
+            }
+            let _ = SetForegroundWindow(hwnd);
+            if GetForegroundWindow() != hwnd {
+                return Err("Windows refused to bring the window to the front; click it or its taskbar button instead".into());
+            }
+        }
+        Ok(())
     }
 }
 

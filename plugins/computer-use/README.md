@@ -13,14 +13,22 @@ Targets: Windows host with the OpenCode server in WSL2, and macOS with OpenCode 
 | `computer_move` | `x`, `y` — hover |
 | `computer_drag` | `start_x`, `start_y`, `end_x`, `end_y` — left-button drag |
 | `computer_scroll` | `x`, `y`, `direction` (`up`/`down`/`left`/`right`), `amount` (wheel clicks) |
-| `computer_type` | `text` — Unicode, layout-independent |
+| `computer_type` | `text` — Unicode, layout-independent; returns only the focused element, no screenshot |
+| `computer_focus` | `title` — bring a window to the front (exact title, else substring); no match lists open windows |
 | `computer_key` | `keys` chord like `"ctrl+s"`, `"super"`, `"Return"` (case-insensitive, xdotool-style names), `repeat?` |
 | `computer_wait` | `seconds` |
 
-Every tool returns a screenshot (actions wait 300ms first) plus a line stating the coordinate contract:
+Every tool except `computer_type` returns a screenshot (actions wait 300ms first) plus a line stating the coordinate
+contract:
 `Screenshot 1430x804 of the primary display (native 2560x1440, scale 0.5585). All computer_* coordinates are pixels in
 this 1430x804 image.` The helper maps screenshot pixels to capture pixels, then to the OS input space (points on
 macOS, physical pixels on Windows), using the most recent full screenshot.
+
+`computer_type` returns `Typed N characters into <Role> "<name>".` instead, naming the element that had keyboard focus
+(read through UI Automation / AX in both modes), so typing into the wrong field shows up without an image.
+`computer_focus` taps Alt before `SetForegroundWindow` on Windows (Windows only lets a background process take the
+foreground right after an Alt press) and reports an error when focus was still refused; on macOS it raises the window
+via AX and makes its app frontmost.
 
 ## Build the helper (Windows / WSL)
 
@@ -102,7 +110,7 @@ flattened, and output stops at 400 elements. Limits:
   first UI Automation client connects, so the first tree of a browser can be slow or thin. Large pages take 1–2s.
   Chrome, Edge and Electron apps (Discord, VS Code) take a few seconds after that first access; until then their
   content areas are empty panes, and the tree ends with a note that a later `computer_tree` may show more.
-- The foreground window is often the terminal running OpenCode; the model switches with alt+Tab / Start / Spotlight.
+- The foreground window is often the terminal running OpenCode; the model switches with `computer_focus`.
 - macOS reads each attribute with a cross-process call and stops after 3000 elements, so very large web views are cut
   short.
 
@@ -151,6 +159,10 @@ Consider gating the tools with `"permission": { "computer_*": "ask" }`.
    the click must land (zoom must not shift coordinates).
 7. Set Windows display scaling to 125% or 150%, restart OpenCode, and repeat a small-target click.
 8. Double-click and right-click a desktop item.
+9. `computer_focus` a window behind the terminal by part of its title, then a minimized one: both come to the front.
+   A title that matches nothing returns the list of open windows.
+10. Click into a text field and `computer_type` into it: the result names that field (e.g. `Edit "Search"`); then do
+    the same with focus somewhere unexpected and confirm the result shows where the text actually went.
 
 ## Manual test checklist (tree mode)
 

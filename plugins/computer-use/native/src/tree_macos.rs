@@ -4,7 +4,9 @@ use accessibility_sys::{
     kAXFocusedApplicationAttribute, kAXFocusedAttribute, kAXFocusedUIElementAttribute, kAXFocusedWindowAttribute,
     kAXParentAttribute, kAXPositionAttribute, kAXRoleAttribute, kAXSelectedAttribute, kAXSizeAttribute,
     kAXSubroleAttribute, kAXTitleAttribute, kAXValueAttribute, kAXValueTypeCGPoint, kAXValueTypeCGSize,
-    AXUIElementCopyAttributeValue, AXUIElementCreateSystemWide, AXUIElementRef, AXValueGetValue, AXValueRef, AXValueType,
+    kAXFrontmostAttribute, kAXMinimizedAttribute, kAXRaiseAction, kAXWindowsAttribute, AXUIElementCopyAttributeValue,
+    AXUIElementCreateApplication, AXUIElementCreateSystemWide, AXUIElementPerformAction, AXUIElementRef,
+    AXUIElementSetAttributeValue, AXValueGetValue, AXValueRef, AXValueType,
 };
 use core_foundation::array::CFArray;
 use core_foundation::base::{CFType, CFTypeRef, TCFType};
@@ -63,6 +65,43 @@ impl Backend {
         }
         Ok(parts.join("\n"))
     }
+
+    /// Role and name of the element with keyboard focus.
+    pub fn focused(&self) -> Option<(String, String)> {
+        let element = attribute(&self.system, kAXFocusedUIElementAttribute)?;
+        let title = string(&element, kAXTitleAttribute);
+        let name = if title.is_empty() { string(&element, kAXDescriptionAttribute) } else { title };
+        Some((string(&element, kAXRoleAttribute).trim_start_matches("AX").to_string(), name))
+    }
+
+    /// Unminimize and raise the window, and make its app frontmost. xcap's window list and the app's AXWindows are
+    /// matched by title.
+    pub fn raise(&self, window: &xcap::Window) -> Result<(), Box<dyn Error>> {
+        let app = unsafe { CFType::wrap_under_create_rule(AXUIElementCreateApplication(window.pid()? as _) as CFTypeRef) };
+        let title = window.title()?;
+        let windows = attribute(&app, kAXWindowsAttribute).and_then(|v| v.downcast::<CFArray>()).ok_or("the app lists no windows")?;
+        let target = windows
+            .iter()
+            .map(|w| unsafe { CFType::wrap_under_get_rule(*w as CFTypeRef) })
+            .find(|w| string(w, kAXTitleAttribute) == title)
+            .ok_or("the window was not found in its app's accessibility windows")?;
+        set(&target, kAXMinimizedAttribute, CFBoolean::false_value());
+        unsafe {
+            AXUIElementPerformAction(target.as_CFTypeRef() as AXUIElementRef, CFString::new(kAXRaiseAction).as_concrete_TypeRef())
+        };
+        set(&app, kAXFrontmostAttribute, CFBoolean::true_value());
+        Ok(())
+    }
+}
+
+fn set(element: &CFType, name: &str, value: CFBoolean) {
+    unsafe {
+        AXUIElementSetAttributeValue(
+            element.as_CFTypeRef() as AXUIElementRef,
+            CFString::new(name).as_concrete_TypeRef(),
+            value.as_CFTypeRef(),
+        )
+    };
 }
 
 /// `clip` is the root's rect: elements outside it are scrolled out of view.

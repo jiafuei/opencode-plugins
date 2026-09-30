@@ -11,7 +11,7 @@ type Response =
       height?: number;
       /** Tree mode. */
       tree?: string;
-      /** computer_read. */
+      /** computer_read and computer_type. */
       text?: string;
       screenshot: [number, number];
       native: [number, number];
@@ -116,7 +116,7 @@ export default Plugin.define({
           name: "computer_tree",
           options: { codemode: false },
           description:
-            'Read the accessibility tree of the foreground window: one element per line as [id] role "name" value="…" @(x,y wxh) states, indented by nesting. An open menu or popup outside the window follows it, then the other open windows. Use element IDs with computer_click, computer_move, computer_scroll and computer_drag, and computer_read for the full text of an element. Apps that draw their own UI (games, some custom-rendered apps) expose little or nothing; use keyboard tools or x/y there. The foreground window may be the terminal running OpenCode: switch with computer_key (alt+Tab, or the Start menu / Spotlight).',
+            'Read the accessibility tree of the foreground window: one element per line as [id] role "name" value="…" @(x,y wxh) states, indented by nesting. An open menu or popup outside the window follows it, then the other open windows. Use element IDs with computer_click, computer_move, computer_scroll and computer_drag, and computer_read for the full text of an element. Apps that draw their own UI (games, some custom-rendered apps) expose little or nothing; use keyboard tools or x/y there. The foreground window may be the terminal running OpenCode: switch with computer_focus using a title from the window list.',
           input: Schema.Record(Schema.String, Schema.Unknown),
           execute: (_, context) => call({ action: "tree" }, context.signal),
         });
@@ -197,9 +197,16 @@ export default Plugin.define({
       tools.add({
         name: "computer_type",
         options: { codemode: false },
-        description: `Type text at the current keyboard focus. Any Unicode text works regardless of keyboard layout. Use computer_key for Enter, Tab, and shortcuts. ${RESULT}`,
+        description: `Type text at the current keyboard focus. Any Unicode text works regardless of keyboard layout. Use computer_key for Enter, Tab, and shortcuts. Returns no ${TREE ? "tree" : "screenshot"}, only which element had keyboard focus; the next action's result shows the outcome, or call ${TREE ? "computer_tree" : "computer_screenshot"} to check.${TREE ? " Element IDs stay valid." : ""}`,
         input: input({ text: Schema.String }),
         execute: ({ text }, context) => call({ action: "type", text }, context.signal),
+      });
+      tools.add({
+        name: "computer_focus",
+        options: { codemode: false },
+        description: `Bring a top-level window to the front (restoring it if minimized), by title: case-insensitive, an exact title first, else the first window whose title contains the text. If nothing matches, the error lists the open windows' titles${TREE ? "" : ", which is how to find window titles in screenshot mode"}. ${RESULT}`,
+        input: input({ title: Schema.String.annotate({ description: "Window title or part of it" }) }),
+        execute: ({ title }, context) => call({ action: "focus", title }, context.signal),
       });
       tools.add({
         name: "computer_key",

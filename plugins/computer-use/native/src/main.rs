@@ -67,8 +67,13 @@ enum Action {
         direction: ScrollDirection,
         amount: i32,
     },
+    /// Types without a screenshot or tree: the outcome is predictable and the next action shows it.
     Type {
         text: String,
+    },
+    /// Bring a top-level window to the front by title.
+    Focus {
+        title: String,
     },
     Key {
         keys: String,
@@ -119,8 +124,10 @@ struct Display {
 struct State {
     enigo: Enigo,
     display: Display,
-    /// Tree mode: the accessibility backend and the elements of the latest tree (ID = index + 1).
-    tree: Option<(platform::Backend, Vec<platform::Element>)>,
+    /// Accessibility backend: trees in tree mode, and the focused element after typing in both modes.
+    backend: platform::Backend,
+    /// Tree mode: the elements of the latest tree (ID = index + 1).
+    tree: Option<Vec<platform::Element>>,
 }
 
 fn fit_scale(w: f64, h: f64) -> f64 {
@@ -152,19 +159,18 @@ fn to_input(display: &Display, [x, y]: [f64; 2]) -> (i32, i32) {
     ((display.x + x * factor).round() as i32, (display.y + y * factor).round() as i32)
 }
 
-fn lookup(state: &State, id: usize) -> Result<(&platform::Backend, &platform::Element), Box<dyn Error>> {
-    let (backend, elements) = state.tree.as_ref().ok_or("element IDs are only available in tree mode")?;
-    let element = elements.get(id.wrapping_sub(1)).ok_or(format!("unknown element {id}; call computer_tree for current IDs"))?;
-    Ok((backend, element))
+fn lookup(state: &State, id: usize) -> Result<&platform::Element, Box<dyn Error>> {
+    let elements = state.tree.as_ref().ok_or("element IDs are only available in tree mode")?;
+    Ok(elements.get(id.wrapping_sub(1)).ok_or(format!("unknown element {id}; call computer_tree for current IDs"))?)
 }
 
 /// Input-space point for an element ID from the latest tree (its live center), or screenshot-space x/y.
 fn target(state: &State, element: Option<usize>, x: Option<f64>, y: Option<f64>) -> Result<(i32, i32), Box<dyn Error>> {
     let (x, y) = match (element, x, y) {
         (Some(id), _, _) => {
-            let (backend, element) = lookup(state, id)?;
-            let [x, y, w, h] = backend
-                .bounds(element)
+            let [x, y, w, h] = state
+                .backend
+                .bounds(lookup(state, id)?)
                 .map_err(|_| format!("element {id} is no longer available; call computer_tree for current IDs"))?;
             return Ok(((x + w / 2.0).round() as i32, (y + h / 2.0).round() as i32));
         }
@@ -225,16 +231,16 @@ fn parse_key(name: &str) -> Result<Key, Box<dyn Error>> {
     })
 }
 
-/// Perform the action. Zoom and read answer directly; everything else is followed by a fresh observation.
+/// Perform the action. Zoom, read and type answer directly; everything else is followed by a fresh observation.
 fn act(state: &mut State, action: Action) -> Result<Option<serde_json::Value>, Box<dyn Error>> {
     let settle = !matches!(action, Action::Screenshot | Action::Tree);
     match action {
         Action::Screenshot | Action::Tree => {}
         Action::Zoom { region } => return zoom(&state.display, region).map(Some),
         Action::Read { element, offset } => {
-            let (backend, found) = lookup(state, element)?;
-            let text = backend
-                .text(found)
+            let text = state
+                .backend
+                .text(lookup(state, element)?)
                 .map_err(|_| format!("element {element} is no longer available; call computer_tree for current IDs"))?;
             // Terminal buffers pad every line and end in blank lines.
             let text = text.lines().map(str::trim_end).collect::<Vec<_>>().join("\n");
@@ -291,7 +297,40 @@ fn act(state: &mut State, action: Action) -> Result<Option<serde_json::Value>, B
             };
             state.enigo.scroll(length, axis)?;
         }
-        Action::Type { text } => state.enigo.text(&text)?,
+        Action::Type { text } => {
+            state.enigo.text(&text)?;
+            // Name the field that received the text, so typing into the wrong place shows up without a screenshot.
+            let count = text.chars().count();
+            let typed = match state.backend.focused() {
+                Some((role, name)) if name.is_empty() => format!("Typed {count} characters into {role}."),
+                Some((role, name)) => format!("Typed {count} characters into {role} \"{name}\"."),
+                None => format!("Typed {count} characters."),
+            };
+            return Ok(Some(serde_json::json!({ "text": typed })));
+        }
+        Action::Focus { title } => {
+            let windows: Vec<(xcap::Window, String)> = xcap::Window::all()?
+                .into_iter()
+                .map(|window| {
+                    let title = window.title().unwrap_or_default();
+                    (window, title)
+                })
+                .filter(|(_, title)| !title.is_empty())
+                .collect();
+            let wanted = title.to_lowercase();
+            let found = windows
+                .iter()
+                .find(|(_, title)| title.to_lowercase() == wanted)
+                .or_else(|| windows.iter().find(|(_, title)| !wanted.is_empty() && title.to_lowercase().contains(&wanted)));
+            let Some((window, _)) = found else {
+                let titles: Vec<String> = windows.iter().take(20).map(|(_, title)| format!("- {title}")).collect();
+                return Err(format!("no window title matches \"{title}\". Open windows:\n{}", titles.join("\n")).into());
+            };
+            // Windows only lets a background process take the foreground right after an Alt key press.
+            #[cfg(windows)]
+            state.enigo.key(Key::Alt, Direction::Click)?;
+            state.backend.raise(window)?;
+        }
         Action::Key { keys, repeat } => {
             // Parse the whole chord before pressing anything.
             let keys = keys.split('+').map(parse_key).collect::<Result<Vec<_>, _>>()?;
@@ -319,8 +358,8 @@ fn observe(state: &mut State) -> Result<serde_json::Value, Box<dyn Error>> {
     let (display, image) = capture()?;
     state.display = display;
     match &mut state.tree {
-        Some((backend, elements)) => {
-            let (text, fresh) = tree::render(&backend.snapshot()?, &state.display);
+        Some(elements) => {
+            let (text, fresh) = tree::render(&state.backend.snapshot()?, &state.display);
             *elements = fresh;
             Ok(serde_json::json!({ "tree": format!("{text}{}", tree::windows(&state.display)?) }))
         }
@@ -357,8 +396,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     }
     // UI Automation initializes COM, so the backend is created before anything else touches it.
-    let tree = if std::env::args().any(|arg| arg == "--tree") { Some((platform::Backend::new()?, Vec::new())) } else { None };
-    let mut state = State { enigo: enigo?, display: capture()?.0, tree };
+    let backend = platform::Backend::new()?;
+    let tree = std::env::args().any(|arg| arg == "--tree").then(Vec::new);
+    let mut state = State { enigo: enigo?, display: capture()?.0, backend, tree };
     let mut stdout = std::io::stdout().lock();
     for line in std::io::stdin().lock().lines() {
         let request: Request = serde_json::from_str(&line?)?;

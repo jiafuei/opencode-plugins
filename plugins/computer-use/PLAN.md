@@ -152,8 +152,19 @@ models, token cost, and element-precise targeting. Decisions:
   the Text-pattern document when available (terminals, editors, browser documents), else name + value; macOS reads
   AXValue/AXTitle/AXDescription (no text-range APIs). Right-trimmed lines, 50,000-character pages with a next-offset note.
 
+### Post-action observation
+
+Every action returns a fresh screenshot (or tree) except `computer_type`. Typing has a predictable outcome and in
+practice is almost always followed by `computer_key` (Return, Tab) or a click, whose result shows the outcome anyway.
+Instead it returns the role and name of the element with keyboard focus, which catches typing into the wrong field.
+Move, key, scroll, drag, click, wait and focus keep their observation: each changes the screen in ways the model has to
+see (hover menus, dialogs opened by shortcuts, new scroll content). In tree mode typing keeps the current IDs.
+
+`computer_focus({ title })` brings a window to the front in both modes (Alt tap + `SetForegroundWindow` on Windows,
+AXRaise + AXFrontmost on macOS); with no match, the error lists open windows, which is how screenshot mode discovers
+titles.
+
 ## Open questions
 
 - Helper delivery mechanism (phase 3).
 - JPEG quality (80 now): check small-text legibility in phase 1; `zoom` is the fallback.
-- Whether a per-action screenshot is too token-heavy for long sessions; option to skip it for `move`/`key`.
