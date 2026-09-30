@@ -211,7 +211,7 @@ export default Plugin.define({
       tools.add({
         name: "computer_key",
         options: { codemode: false },
-        description: `Press a key or key chord, e.g. "Return", "Escape", "Tab", "super" (Windows key), "ctrl+s", "alt+Tab", "Down"; on macOS use cmd for shortcuts, e.g. "cmd+space" (Spotlight), "cmd+c", "cmd+tab". Names are case-insensitive: ctrl, alt/option, shift, super/win/cmd (Windows key on Windows, Command on macOS), Return/Enter, Escape/Esc, Tab, BackSpace, Delete, Home, End, Page_Up, Page_Down, Up, Down, Left, Right, Space, Insert, F1-F12, or a single character. ${RESULT}`,
+        description: `Press a key or key chord, e.g. "Return", "Escape", "Tab", "super" (Windows key), "ctrl+s", "alt+Tab", "Down"; on macOS use cmd for shortcuts, e.g. "cmd+space" (Spotlight), "cmd+c", "cmd+tab". Names are case-insensitive: ctrl, alt/option, shift, super/win/cmd (Windows key on Windows, Command on macOS), Return/Enter, Escape/Esc, Tab, BackSpace, Delete, Home, End, Page_Up, Page_Down, Up, Down, Left, Right, Space, ${process.platform === "darwin" ? "" : "Insert, "}F1-F12, or a single character. ${RESULT}`,
         input: input({
           keys: Schema.String.annotate({ description: 'Keys joined with "+", modifiers first' }),
           repeat: Schema.optional(Schema.Number.annotate({ description: "Press the chord this many times (default 1)" })),

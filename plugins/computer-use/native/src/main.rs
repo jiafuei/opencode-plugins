@@ -222,7 +222,10 @@ fn parse_key(name: &str) -> Result<Key, Box<dyn Error>> {
         "left" => Key::LeftArrow,
         "right" => Key::RightArrow,
         "space" => Key::Space,
+        #[cfg(not(target_os = "macos"))]
         "insert" => Key::Insert,
+        #[cfg(target_os = "macos")]
+        "insert" => return Err("Insert is not supported on macOS".into()),
         _ => match (lower.strip_prefix('f').and_then(|n| n.parse::<usize>().ok()), lower.chars().count()) {
             (Some(n @ 1..=12), _) => F[n - 1],
             (_, 1) => Key::Unicode(lower.chars().next().unwrap()),
