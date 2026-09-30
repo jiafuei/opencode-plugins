@@ -32,7 +32,7 @@ describe("SSE tool-name restoration", () => {
     const payload = events.map((event, i) => event + (i % 3 === 1 ? "\r\n\r\n" : "\n\n")).join("");
     const expected = payload.replace('"name":"_get_weather"', '"name":"get_weather"').replace('"name":"__secret"', '"name":"_secret"');
     for (const sizes of [[1], [3], [7, 1, 13], [64], [new TextEncoder().encode(payload).length]]) {
-      const output = await new Response(fragmentedStream(payload, sizes).pipeThrough(createSseToolNameTransform())).text();
+      const output = await new Response(fragmentedStream(payload, sizes).pipeThrough(createSseToolNameTransform("_"))).text();
       expect(output).toBe(expected);
     }
   });
@@ -40,7 +40,7 @@ describe("SSE tool-name restoration", () => {
   test("joins multiple data lines before JSON parsing and rewrites as one", async () => {
     const payload = 'data: {"type":"content_block_start","index":9,\n' +
       'data: "content_block":{"type":"tool_use","id":"toolu_09","name":"_split_name","input":{}}}\n\n';
-    const output = await new Response(fragmentedStream(payload, [13]).pipeThrough(createSseToolNameTransform())).text();
+    const output = await new Response(fragmentedStream(payload, [13]).pipeThrough(createSseToolNameTransform("_"))).text();
     const dataLines = output.split("\n").filter((line) => line.startsWith("data:"));
     expect(dataLines).toHaveLength(1);
     expect(JSON.parse(dataLines[0]!.slice("data: ".length))).toEqual({
@@ -53,7 +53,7 @@ describe("SSE tool-name restoration", () => {
     const payload = 'event: message_start\n' +
       'data: {"type":"message_start","message":{"id":"msg_ms","role":"assistant","content":[' +
       '{"type":"text","text":"hi"},{"type":"tool_use","id":"toolu_10","name":"_prefixed","input":{}}]}}\r\n\r\n';
-    const output = await new Response(fragmentedStream(payload, [17]).pipeThrough(createSseToolNameTransform())).text();
+    const output = await new Response(fragmentedStream(payload, [17]).pipeThrough(createSseToolNameTransform("_"))).text();
     expect(output).toBe(payload.replace('"name":"_prefixed"', '"name":"prefixed"'));
   });
 });

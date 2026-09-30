@@ -2,7 +2,7 @@
 
 Claude Pro/Max subscription login for OpenCode. Adds an OAuth connection method
 to the built-in `anthropic` integration and rewrites requests using selectable Agent SDK
-CLI (default), interactive CLI, or Cowork desktop-agent wire profiles. Profiles pin
+CLI (default) or interactive CLI wire profiles. Profiles pin
 their own headers, beta list, billing/system fingerprint, and tool-name
 transport.
 
@@ -18,7 +18,7 @@ transport.
 
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
-| `spoofingProfile` | `"cli" \| "cowork" \| "sdk-cli"` | `"sdk-cli"` | Selects the complete client wire profile. |
+| `spoofingProfile` | `"cli" \| "sdk-cli"` | `"sdk-cli"` | Selects the complete client wire profile. |
 | `attributionHeader` | `boolean` | `true` | Controls the billing header and `cch`. Profile identity remains enabled when false. |
 
 ### Spoofing profiles
@@ -28,24 +28,21 @@ Each value selects one coherent wire identity:
 | Value | Reference | Version / entrypoint | CCH |
 | --- | --- | --- | --- |
 | `"cli"` | September 29–30 interactive CLI captures | `2.1.284` / `cli` | Native global byte-marker normalization |
-| `"cowork"` | oh-my-pi Cowork | `2.1.246` / `claude-desktop` | Raw serialized-body attestation |
 | `"sdk-cli"` | September 29 genuine SDK CLI capture | `2.1.284` / `sdk-cli` | Native global byte-marker normalization |
 
 ```json
 {
   "plugins": [
-    { "package": "@jiafuei/opencode-claude-oauth", "options": { "spoofingProfile": "cowork" } }
+    { "package": "@jiafuei/opencode-claude-oauth", "options": { "spoofingProfile": "cli" } }
   ]
 }
 ```
 
-The CLI, Cowork, and SDK CLI profiles derive device identity from this plugin's stable
+Both profiles derive device identity from this plugin's stable
 install ID and the OAuth account. No profile reads `~/.claude.json` or
 `CLAUDE_CONFIG_DIR`. Both `cli` and `sdk-cli` emit billing request-chain fields
 (`cc_prev_req` / `cc_prompt_id`).
 
-`cowork` replaces the request headers with the profile's complete header set
-and uses OpenCode's HTTP client.
 `cli` and `sdk-cli` share a local relay to control upstream header order and casing.
 
 ### Interactive and SDK CLI
@@ -147,8 +144,7 @@ that follow it. The phrase with only a working-directory line passed, so the
 check appears to score content rather than match one exact string. Neither CLI
 profile's `cch`, billing suffix, header order, betas, tool names, nor global
 preamble triggered it. Both CLI profiles rewrite the preamble to Claude Code's
-wording, "You have been invoked in the following environment:". `cowork` does
-not rewrite it.
+wording, "You have been invoked in the following environment:".
 
 When this error returns, capture the failing request (see the relay's
 `HTTPS_PROXY` support) and bisect the same way. Content in the system blocks is
@@ -189,39 +185,18 @@ the plugin's session `model.request`, `http.request`, and `http.response`
 hooks apply the selected wire transform to `/v1/messages` calls. OpenCode
 itself sends the `Authorization: Bearer …` token and the `?beta=true` query.
 
-- Cowork and both CLI profiles emit the selected profile's exact `User-Agent`, `x-app: cli`,
+- Both profiles emit the selected profile's exact `User-Agent`, `x-app: cli`,
   a per-invocation `x-client-request-id` (stable across HTTP retries), the
-  Stainless header set, and a stable per-session `X-Claude-Code-Session-Id`
-  UUID. Cowork derives it deterministically from the install and OpenCode
-  session so it survives restarts; both CLI profiles keep process-local mappings.
-  OpenCode's session-routing, project, and client headers are dropped.
-- Cowork and both CLI profiles use a beta profile chosen per request shape (utility vs
-  agent profile). Other caller betas are preserved and deduplicated after the
+  Stainless header set, and a per-session `X-Claude-Code-Session-Id` UUID kept
+  in a process-local mapping. OpenCode's session-routing, project, and client
+  headers are dropped.
+- Both profiles use a beta profile chosen per request class (utility vs
+  agent requests). Other caller betas are preserved and deduplicated after the
   profile's list, except `fine-grained-tool-streaming-2025-05-14` (absent from
   the profile), the SDK's obsolete `structured-outputs-2025-11-13` tool beta,
   and `context-1m-2025-08-07` (hard-429'd for subscription credentials).
-- Cowork body rewrite (see above for the two CLI profiles):
-  - `system[0]` = `x-anthropic-billing-header` with the selected version and
-    entrypoint, fingerprinting the first user text like OMP. `system[1]`
-    carries the Agent SDK identity. Cowork sanitizes OpenCode-identifying caller-system
-    lines and uses a generic coding-agent opening. Cowork skips both fingerprint
-    blocks for claude-3-5-haiku.
-  - `metadata.user_id` uses `{device_id, session_id, account_uuid}` order. Device
-    IDs derive deterministically from this plugin's install ID and the OAuth
-    account, and existing valid CC attribution is preserved verbatim.
-  - `max_tokens` clamped to ≤ 64000. Incoming `stream` is preserved as-is.
-  - Cowork recursively normalizes tool schemas to Anthropic's accepted subset,
-    selectively enables strict schemas for OMP's supported tool set, adds short
-    prompt-cache breakpoints to the last two real messages, and applies
-    model-aware thinking, sampling, forced-tool, and context-management rules.
-  - The redundant default `tool_choice:{type:"auto"}` is omitted.
-- Cowork and both CLI profiles use the selected `cch` algorithm from the profile table, patched over the
+- Both profiles use the native `cch` algorithm from the profile table, patched over the
   `cch=00000` placeholder as five lowercase hex characters.
-- Cowork custom tool names are cloaked with one `_` prefix on the way out
-  (definitions, `tool_choice`, historical
-  `tool_use` blocks) and the exact prefix is stripped on the way in from the
-  streaming SSE response (`content_block_start`), so OpenCode's logical tool
-  names remain unchanged.
 - Anthropic model costs are reported as zero while the OAuth connection is
   active (subscription-billed); models reload when the credential switches.
 
@@ -229,9 +204,8 @@ itself sends the `Authorization: Bearer …` token and the `?beta=true` query.
 
 Token exchanges and refreshes use Claude Code's OAuth token endpoint and
 Axios-style headers. Refresh scope excludes `org:create_api_key`; login retains
-it. Missing Cowork identity is recovered best-effort from the Claude CLI
-bootstrap endpoint; other profiles use the OAuth profile and Claude CLI roles
-endpoints. Token-endpoint errors are reduced to the HTTP status and the
+it. Missing identity is recovered best-effort from the OAuth profile and
+Claude CLI roles endpoints. Token-endpoint errors are reduced to the HTTP status and the
 structured `error`/`error_description` fields; raw bodies and credentials
 never appear in thrown errors. The OAuth grant typically stays valid for
 around 30 days (an observed lifetime); an `invalid_grant` refresh failure asks

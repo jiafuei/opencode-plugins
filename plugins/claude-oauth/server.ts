@@ -1,16 +1,7 @@
 import { Integration, Plugin, type Credential } from "@opencode/plugin";
 import { randomBytes, randomUUID } from "node:crypto";
-import {
-  buildBetas,
-  buildEnforcedHeaders,
-  createSseToolNameTransform,
-  resolveSpoofingProfile,
-  rewriteBody,
-  uncloakedResponseHeaders,
-} from "./wire_format.ts";
-import type { SpoofingProfile } from "./wire_format.ts";
-import { deriveCoworkSessionId } from "./local_storage.ts";
-import { cliHeaders, rewriteCliBody, type CliAttribution } from "./cli_wire.ts";
+import { createSseToolNameTransform, resolveSpoofingProfile, uncloakedResponseHeaders } from "./wire_format.ts";
+import { cliHeaders, rewriteCliBody, type CliAttribution, type CliProfile } from "./cli_wire.ts";
 import { createCliRelay } from "./cli_transport.ts";
 
 // Configure in `opencode.json` like:
@@ -32,7 +23,6 @@ const AUTHORIZE_URL = rot13("uggcf://pynhqr.pbz/pnv/bnhgu/nhgubevmr");
 const TOKEN_URL = rot13("uggcf://cyngsbez.pynhqr.pbz/i1/bnhgu/gbxra");
 const PROFILE_URL = rot13("uggcf://ncv.naguebcvp.pbz/ncv/bnhgu/cebsvyr");
 const ROLES_URL = rot13("uggcf://ncv.naguebcvp.pbz/ncv/bnhgu/pynhqr_pyv/ebyrf");
-const BOOTSTRAP_URL = rot13("uggcf://ncv.naguebcvp.pbz/ncv/pynhqr_pyv/obbgfgenc");
 const REDIRECT_URI = rot13("uggcf://cyngsbez.pynhqr.pbz/bnhgu/pbqr/pnyyonpx");
 const SCOPES =
   rot13("bet:perngr_ncv_xrl hfre:cebsvyr hfre:vasrerapr hfre:frffvbaf:pynhqr_pbqr hfre:zpc_freiref hfre:svyr_hcybnq");
@@ -40,7 +30,6 @@ const REFRESH_SCOPES = rot13("hfre:cebsvyr hfre:vasrerapr hfre:frffvbaf:pynhqr_p
 
 const AXIOS_USER_AGENT = "axios/1.15.2";
 const AXIOS_ACCEPT = "application/json, text/plain, */*";
-const SESSION_ID_HEADER = "X-Claude-Code-Session-Id";
 const REQUEST_ID_HEADER = "x-client-request-id";
 const METHOD_ID = Integration.MethodID.make("claude-pro-max");
 const FLOW_TIMEOUT_MS = 5 * 60 * 1000;
@@ -55,7 +44,7 @@ interface TokenResponse {
 
 /**
  * Account + organization identity resolved from the token response and/or
- * the OAuth profile, Claude CLI roles, or Cowork bootstrap endpoints. Stored
+ * the OAuth profile and Claude CLI roles endpoints. Stored
  * as the credential's metadata.
  */
 interface OAuthIdentity {
@@ -128,41 +117,13 @@ async function fetchOAuthIdentity(accessToken: string): Promise<OAuthIdentity> {
   };
 }
 
-async function fetchCoworkBootstrapIdentity(accessToken: string, profile: SpoofingProfile): Promise<OAuthIdentity> {
-  const response = await fetch(`${BOOTSTRAP_URL}?entrypoint=cli&model=claude-opus-4-8`, {
-    headers: {
-      Accept: AXIOS_ACCEPT,
-      Authorization: `Bearer ${accessToken}`,
-      "Content-Type": "application/json",
-      "User-Agent": `claude-code/${profile.version}`,
-      "anthropic-beta": "oauth-2025-04-20",
-    },
-    signal: AbortSignal.timeout(30_000),
-  });
-  if (!response.ok) throw new Error(`Anthropic bootstrap request failed: ${response.status}`);
-  const { oauth_account: account } = (await response.json()) as {
-    oauth_account?: {
-      account_uuid?: string;
-      account_email?: string;
-      organization_uuid?: string;
-      organization_name?: string;
-    };
-  };
-  return {
-    accountId: account?.account_uuid,
-    email: account?.account_email,
-    orgId: account?.organization_uuid,
-    orgName: account?.organization_name,
-  };
-}
-
 /**
  * Resolve the login identity, merging the token response over profile
  * recovery. Identity is captured once at login and kept across refreshes.
  * Recovery failures are swallowed so they never invalidate an otherwise
  * successful token exchange.
  */
-export async function resolveIdentity(data: TokenResponse, profile?: SpoofingProfile): Promise<OAuthIdentity> {
+export async function resolveIdentity(data: TokenResponse): Promise<OAuthIdentity> {
   const identity: OAuthIdentity = {
     accountId: data.account?.uuid,
     email: data.account?.email_address,
@@ -170,10 +131,7 @@ export async function resolveIdentity(data: TokenResponse, profile?: SpoofingPro
     orgName: data.organization?.name,
   };
   if (identity.accountId && identity.email && identity.orgId) return identity;
-  const recovered: OAuthIdentity = await (profile?.id === "cowork"
-    ? fetchCoworkBootstrapIdentity(data.access_token, profile)
-    : fetchOAuthIdentity(data.access_token)
-  ).catch(() => ({}));
+  const recovered: OAuthIdentity = await fetchOAuthIdentity(data.access_token).catch(() => ({}));
   return {
     accountId: identity.accountId ?? recovered.accountId,
     email: identity.email ?? recovered.email,
@@ -201,9 +159,9 @@ interface ClaudeOAuthOptions {
   attributionHeader?: boolean;
   /**
    * Client identity spoofed on the Anthropic wire: "sdk-cli" (default),
-   * "cli" (interactive), or "cowork".
+   * or "cli" (interactive).
    */
-  spoofingProfile?: SpoofingProfile["id"];
+  spoofingProfile?: CliProfile["id"];
 }
 
 export default Plugin.define({
@@ -320,7 +278,7 @@ export default Plugin.define({
                 access: tokens.access_token,
                 refresh: tokens.refresh_token!,
                 expires: Date.now() + tokens.expires_in * 1000,
-                metadata: { ...(await resolveIdentity(tokens, profile)) },
+                metadata: { ...(await resolveIdentity(tokens)) },
               };
             },
           };
@@ -345,25 +303,23 @@ export default Plugin.define({
 
     await load();
 
-    if (profile.wireFormat === "cli") {
-      await ctx.session.hook("context", async (event) => {
-        if (!oauth) return;
-        const state = await cliState(event.sessionID);
-        const user = event.messages.findLast((message) => message.role === "user");
-        if (!user || state.agentId) return;
-        const turn = user.id ?? new Bun.CryptoHasher("sha256").update(JSON.stringify(user.content)).digest("hex");
-        if (turn !== state.turn) {
-          state.turn = turn;
-          state.promptId = randomUUID();
-          // Core retains metadata (even an empty object) on human messages;
-          // synthetic task notifications are lowered without it.
-          state.turnOrigin = profile.id === "sdk-cli" ? "sdk" : user.metadata !== undefined ? "human" : "task_notification";
-          // Every turn advances the turn index; task notifications are not prompts.
-          state.turnIndex = (state.turnIndex ?? 0) + 1;
-          state.promptIndex = (state.promptIndex ?? 0) + (state.turnOrigin === "task_notification" ? 0 : 1);
-        }
-      }, { providerID: "anthropic" });
-    }
+    await ctx.session.hook("context", async (event) => {
+      if (!oauth) return;
+      const state = await cliState(event.sessionID);
+      const user = event.messages.findLast((message) => message.role === "user");
+      if (!user || state.agentId) return;
+      const turn = user.id ?? new Bun.CryptoHasher("sha256").update(JSON.stringify(user.content)).digest("hex");
+      if (turn !== state.turn) {
+        state.turn = turn;
+        state.promptId = randomUUID();
+        // Core retains metadata (even an empty object) on human messages;
+        // synthetic task notifications are lowered without it.
+        state.turnOrigin = profile.id === "sdk-cli" ? "sdk" : user.metadata !== undefined ? "human" : "task_notification";
+        // Every turn advances the turn index; task notifications are not prompts.
+        state.turnIndex = (state.turnIndex ?? 0) + 1;
+        state.promptIndex = (state.promptIndex ?? 0) + (state.turnOrigin === "task_notification" ? 0 : 1);
+      }
+    }, { providerID: "anthropic" });
 
     // Subscription-billed: zero out costs so usage tracking doesn't report
     // API spend for Pro/Max requests.
@@ -380,35 +336,28 @@ export default Plugin.define({
       "model.request",
       async (event) => {
         if (!oauth) return;
-        if (profile.wireFormat === "cli") {
-          const state = await cliState(event.sessionID);
-          const id = randomUUID();
-          const timer = setTimeout(() => cliCalls.delete(id), 60 * 60 * 1000);
-          timer.unref();
-          cliCalls.set(id, {
-            id, rawSessionId: event.sessionID, state, sequence: ++state.sequence, kind: event.kind, attempts: 0, timer,
-            attribution: {
-              sessionId: state.wireId,
-              accountId: oauth.metadata?.accountId as string | undefined,
-              agentId: state.agentId,
-              agentType: state.agentId ? event.agent : undefined,
-              requestClass: event.kind === "primary" ? state.agentId ? "subagent" : "main"
-                : event.kind === "compaction" ? "compaction" : "auxiliary",
-              // CC's compaction billing line carries only the previous request.
-              ...(event.kind !== "title" && event.kind !== "compaction" ? { promptId: state.promptId, turnOrigin: state.turnOrigin } : {}),
-              ...(event.kind === "primary" ? { promptIndex: state.promptIndex, turnIndex: state.turnIndex } : {}),
-              ...(event.kind !== "title" ? {
-                previousRequestId: state.previousRequestId, previousMessageId: state.previousMessageId,
-              } : {}),
-            },
-          });
-          event.headers[REQUEST_ID_HEADER] = id;
-          return;
-        }
-        event.headers[SESSION_ID_HEADER] = deriveCoworkSessionId(event.sessionID);
-        // Fresh UUID per logical invocation; HTTP retries of the prepared
-        // request reuse it.
-        event.headers[REQUEST_ID_HEADER] = randomUUID();
+        const state = await cliState(event.sessionID);
+        const id = randomUUID();
+        const timer = setTimeout(() => cliCalls.delete(id), 60 * 60 * 1000);
+        timer.unref();
+        cliCalls.set(id, {
+          id, rawSessionId: event.sessionID, state, sequence: ++state.sequence, kind: event.kind, attempts: 0, timer,
+          attribution: {
+            sessionId: state.wireId,
+            accountId: oauth.metadata?.accountId as string | undefined,
+            agentId: state.agentId,
+            agentType: state.agentId ? event.agent : undefined,
+            requestClass: event.kind === "primary" ? state.agentId ? "subagent" : "main"
+              : event.kind === "compaction" ? "compaction" : "auxiliary",
+            // CC's compaction billing line carries only the previous request.
+            ...(event.kind !== "title" && event.kind !== "compaction" ? { promptId: state.promptId, turnOrigin: state.turnOrigin } : {}),
+            ...(event.kind === "primary" ? { promptIndex: state.promptIndex, turnIndex: state.turnIndex } : {}),
+            ...(event.kind !== "title" ? {
+              previousRequestId: state.previousRequestId, previousMessageId: state.previousMessageId,
+            } : {}),
+          },
+        });
+        event.headers[REQUEST_ID_HEADER] = id;
       },
       { providerID: "anthropic" },
     );
@@ -420,35 +369,14 @@ export default Plugin.define({
         const url = new URL(request.url);
         if (!oauth || url.pathname !== "/v1/messages") return;
         const body = await request.text();
-        if (profile.wireFormat === "cli") {
-          const id = request.headers.get(REQUEST_ID_HEADER)!;
-          const call = cliCalls.get(id);
-          if (!call || cliStates.get(event.sessionID) !== call.state) throw new Error("Claude CLI request belongs to an inactive session");
-          const rewritten = rewriteCliBody(body, call.attribution, attributionHeader, profile);
-          const headers = cliHeaders(request.headers, call.attribution, rewritten, id, call.attempts++, profile);
-          relay ??= createCliRelay();
-          event.request = relay.forward(url, headers, rewritten.json, request.signal);
-          cliResponses.set(event.request, call);
-          return;
-        }
-        const rewritten = rewriteBody(body, {
-          sessionId: request.headers.get(SESSION_ID_HEADER) ?? undefined,
-          accountId: oauth.metadata?.accountId as string | undefined,
-          attributionHeader,
-          profile,
-        });
-        event.request = new Request(url, {
-          method: request.method,
-          // The session header always matches the body's metadata user_id
-          // session, which rewriteBody may have preserved from the body.
-          headers: buildEnforcedHeaders(profile, {
-            sessionId: rewritten.sessionId,
-            betas: buildBetas(rewritten.thinking, rewritten.hasTools, request.headers.get("anthropic-beta"), profile),
-            authorization: request.headers.get("authorization")!,
-            clientRequestId: request.headers.get(REQUEST_ID_HEADER) ?? randomUUID(),
-          }),
-          body: rewritten.json,
-        });
+        const id = request.headers.get(REQUEST_ID_HEADER)!;
+        const call = cliCalls.get(id);
+        if (!call || cliStates.get(event.sessionID) !== call.state) throw new Error("Claude CLI request belongs to an inactive session");
+        const rewritten = rewriteCliBody(body, call.attribution, attributionHeader, profile);
+        const headers = cliHeaders(request.headers, call.attribution, rewritten, id, call.attempts++, profile);
+        relay ??= createCliRelay();
+        event.request = relay.forward(url, headers, rewritten.json, request.signal);
+        cliResponses.set(event.request, call);
       },
       { providerID: "anthropic" },
     );
@@ -461,50 +389,41 @@ export default Plugin.define({
       async (event) => {
         const response = event.response;
         const contentType = response.headers.get("content-type") ?? "";
-        if (profile.wireFormat === "cli") {
-          const call = cliResponses.get(event.request);
-          if (!call || !response.ok) return;
-          const requestId = response.headers.get("request-id");
-          const complete = (messageId: string) => {
-            if (requestId && cliStates.get(call.rawSessionId) === call.state && call.sequence >= call.state.committed && call.kind === "primary") {
-              call.state.previousRequestId = requestId;
-              call.state.previousMessageId = messageId;
-              call.state.committed = call.sequence;
-            }
-            clearTimeout(call.timer);
-            cliCalls.delete(call.id);
-          };
-          if (contentType.includes("text/event-stream")) {
-            let messageId = "";
-            let stopped = false;
-            let failed = false;
-            const transform = createSseToolNameTransform(profile.toolPrefix, {
-              event(value) {
-                if (stopped || value.type === "error") failed = true;
-                if (value.type === "message_start") messageId = value.message.id;
-                if (value.type === "message_stop") stopped = true;
-              },
-              end() { if (stopped && !failed) complete(messageId); },
-            });
-            event.response = new Response(response.body!.pipeThrough(transform), {
-              status: response.status, headers: uncloakedResponseHeaders(response),
-            });
-          } else if (contentType.includes("application/json")) {
-            const message = await response.json() as Record<string, any>;
-            complete(message.id);
-            for (const block of message.content) {
-              if (block.type === "tool_use" && block.name.startsWith(profile.toolPrefix)) block.name = block.name.slice(profile.toolPrefix.length);
-            }
-            event.response = Response.json(message, { status: response.status, headers: uncloakedResponseHeaders(response) });
+        const call = cliResponses.get(event.request);
+        if (!call || !response.ok) return;
+        const requestId = response.headers.get("request-id");
+        const complete = (messageId: string) => {
+          if (requestId && cliStates.get(call.rawSessionId) === call.state && call.sequence >= call.state.committed && call.kind === "primary") {
+            call.state.previousRequestId = requestId;
+            call.state.previousMessageId = messageId;
+            call.state.committed = call.sequence;
           }
-          return;
+          clearTimeout(call.timer);
+          cliCalls.delete(call.id);
+        };
+        if (contentType.includes("text/event-stream")) {
+          let messageId = "";
+          let stopped = false;
+          let failed = false;
+          const transform = createSseToolNameTransform(profile.toolPrefix, {
+            event(value) {
+              if (stopped || value.type === "error") failed = true;
+              if (value.type === "message_start") messageId = value.message.id;
+              if (value.type === "message_stop") stopped = true;
+            },
+            end() { if (stopped && !failed) complete(messageId); },
+          });
+          event.response = new Response(response.body!.pipeThrough(transform), {
+            status: response.status, headers: uncloakedResponseHeaders(response),
+          });
+        } else if (contentType.includes("application/json")) {
+          const message = await response.json() as Record<string, any>;
+          complete(message.id);
+          for (const block of message.content) {
+            if (block.type === "tool_use" && block.name.startsWith(profile.toolPrefix)) block.name = block.name.slice(profile.toolPrefix.length);
+          }
+          event.response = Response.json(message, { status: response.status, headers: uncloakedResponseHeaders(response) });
         }
-        if (!oauth || new URL(event.request.url).pathname !== "/v1/messages" || !contentType.includes("text/event-stream")) return;
-        event.response = new Response(response.body!.pipeThrough(createSseToolNameTransform(profile.toolPrefix)), {
-          status: response.status,
-          statusText: response.statusText,
-          headers: uncloakedResponseHeaders(response),
-        });
       },
       { providerID: "anthropic" },
     );

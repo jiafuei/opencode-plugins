@@ -3,7 +3,6 @@ import { deriveDeviceId } from "./local_storage.ts";
 
 export const CLI_PROFILE = {
   id: "cli",
-  wireFormat: "cli",
   version: "2.1.284",
   userAgent: "claude-cli/2.1.284 (external, cli)",
   billingEntrypoint: "cli",
