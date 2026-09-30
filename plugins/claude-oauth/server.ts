@@ -10,7 +10,6 @@ import {
 } from "./wire_format.ts";
 import type { SpoofingProfile } from "./wire_format.ts";
 import { deriveCoworkSessionId } from "./local_storage.ts";
-import { buildExMachinaHeaders, rewriteExMachinaBody, unprefixExMachinaName } from "./ex_machina_wire.ts";
 import { cliHeaders, rewriteCliBody, type CliAttribution } from "./cli_wire.ts";
 import { createCliRelay } from "./cli_transport.ts";
 
@@ -202,7 +201,7 @@ interface ClaudeOAuthOptions {
   attributionHeader?: boolean;
   /**
    * Client identity spoofed on the Anthropic wire: "sdk-cli" (default),
-   * "cli" (interactive), "cowork", or the source-derived "ex-machina" profile.
+   * "cli" (interactive), or "cowork".
    */
   spoofingProfile?: SpoofingProfile["id"];
 }
@@ -375,7 +374,7 @@ export default Plugin.define({
     await ctx.session.hook(
       "model.request",
       async (event) => {
-        if (!oauth || profile.wireFormat === "ex-machina") return;
+        if (!oauth) return;
         if (profile.wireFormat === "cli") {
           const state = await cliState(event.sessionID);
           const id = randomUUID();
@@ -426,14 +425,6 @@ export default Plugin.define({
           cliResponses.set(event.request, call);
           return;
         }
-        if (profile.wireFormat === "ex-machina") {
-          event.request = new Request(url, {
-            method: request.method,
-            headers: buildExMachinaHeaders(request.headers),
-            body: rewriteExMachinaBody(body, attributionHeader),
-          });
-          return;
-        }
         const rewritten = rewriteBody(body, {
           sessionId: request.headers.get(SESSION_ID_HEADER) ?? undefined,
           accountId: oauth.metadata?.accountId as string | undefined,
@@ -481,7 +472,7 @@ export default Plugin.define({
             let messageId = "";
             let stopped = false;
             let failed = false;
-            const transform = createSseToolNameTransform(profile.toolPrefix, undefined, {
+            const transform = createSseToolNameTransform(profile.toolPrefix, {
               event(value) {
                 if (stopped || value.type === "error") failed = true;
                 if (value.type === "message_start") messageId = value.message.id;
@@ -503,11 +494,7 @@ export default Plugin.define({
           return;
         }
         if (!oauth || new URL(event.request.url).pathname !== "/v1/messages" || !contentType.includes("text/event-stream")) return;
-        const transform =
-          profile.wireFormat === "ex-machina"
-            ? createSseToolNameTransform("mcp_", unprefixExMachinaName)
-            : createSseToolNameTransform(profile.toolPrefix);
-        event.response = new Response(response.body!.pipeThrough(transform), {
+        event.response = new Response(response.body!.pipeThrough(createSseToolNameTransform(profile.toolPrefix)), {
           status: response.status,
           statusText: response.statusText,
           headers: uncloakedResponseHeaders(response),

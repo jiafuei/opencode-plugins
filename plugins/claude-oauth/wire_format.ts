@@ -1,7 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
 import { deriveDeviceId } from "./local_storage.ts";
-import { EX_MACHINA_PROFILE } from "./ex_machina_wire.ts";
-import type { ExMachinaProfile } from "./ex_machina_wire.ts";
 import { CLI_PROFILE, SDK_CLI_PROFILE, type CliProfile } from "./cli_wire.ts";
 export { SDK_CLI_PROFILE } from "./cli_wire.ts";
 import {
@@ -50,7 +48,7 @@ export interface ClaudeCodeSpoofingProfile {
   agentBetas: readonly string[];
 }
 
-export type SpoofingProfile = ClaudeCodeSpoofingProfile | ExMachinaProfile | CliProfile;
+export type SpoofingProfile = ClaudeCodeSpoofingProfile | CliProfile;
 
 export const COWORK_PROFILE: ClaudeCodeSpoofingProfile = {
   id: "cowork",
@@ -87,7 +85,6 @@ const SPOOFING_PROFILES: Record<string, SpoofingProfile> = {
   cli: CLI_PROFILE,
   cowork: COWORK_PROFILE,
   "sdk-cli": SDK_CLI_PROFILE,
-  "ex-machina": EX_MACHINA_PROFILE,
 };
 
 /** Resolve the plugin's spoofingProfile option once at the boundary. Undefined selects SDK CLI. */
@@ -95,7 +92,7 @@ export function resolveSpoofingProfile(value: string | undefined): SpoofingProfi
   const profile = SPOOFING_PROFILES[value ?? "sdk-cli"];
   if (!profile) {
     throw new Error(
-      `claude-oauth: unsupported spoofingProfile "${value}" — expected "cli", "cowork", "sdk-cli", or "ex-machina"`,
+      `claude-oauth: unsupported spoofingProfile "${value}" — expected "cli", "cowork", or "sdk-cli"`,
     );
   }
   return profile;
@@ -216,7 +213,6 @@ function prefixRequestToolNames(params: Record<string, any>, prefix: string): vo
  */
 export function createSseToolNameTransform(
   prefix: string = COWORK_PROFILE.toolPrefix,
-  transformName?: (name: string) => string,
   completion?: { event(value: any): void; end(): void },
 ): TransformStream<Uint8Array, Uint8Array> {
   const decoder = new TextDecoder();
@@ -229,25 +225,6 @@ export function createSseToolNameTransform(
   let eventLines: Array<{ text: string; eol: string }> = [];
 
   function uncloak(event: any): any | undefined {
-    if (transformName) {
-      let changed = false;
-      const visit = (value: unknown): void => {
-        if (!value || typeof value !== "object") return;
-        for (const [key, item] of Object.entries(value)) {
-          if (key === "name" && typeof item === "string") {
-            const next = transformName(item);
-            if (next !== item) {
-              (value as Record<string, unknown>)[key] = next;
-              changed = true;
-            }
-          } else {
-            visit(item);
-          }
-        }
-      };
-      visit(event);
-      return changed ? event : undefined;
-    }
     if (event.type === "content_block_start" && event.content_block.type === "tool_use") {
       return { ...event, content_block: { ...event.content_block, name: strip(event.content_block.name) } };
     }
