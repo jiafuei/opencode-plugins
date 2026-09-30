@@ -31,8 +31,9 @@ const REFRESH_SCOPES = rot13("hfre:cebsvyr hfre:vasrerapr hfre:frffvbaf:pynhqr_p
 const AXIOS_USER_AGENT = "axios/1.15.2";
 const AXIOS_ACCEPT = "application/json, text/plain, */*";
 const REQUEST_ID_HEADER = "x-client-request-id";
-// Session metadata key holding the main thread's turn attribution, so it survives plugin reloads.
-const TURN_METADATA_KEY = "claude-oauth.turn";
+// Session metadata key holding a root session's Claude Code state. A resumed Claude Code session keeps its
+// session UUID, request chain, and turn indexes, so this state survives plugin reloads and restarts.
+const SESSION_METADATA_KEY = "claude-oauth.session";
 const METHOD_ID = Integration.MethodID.make("claude-pro-max");
 const FLOW_TIMEOUT_MS = 5 * 60 * 1000;
 
@@ -203,7 +204,10 @@ export default Plugin.define({
       attempts: number;
       timer: ReturnType<typeof setTimeout>;
     };
-    type SavedTurn = Pick<CliState, "turn" | "promptId" | "promptIndex" | "turnIndex">;
+    type SavedSession = Pick<
+      CliState,
+      "wireId" | "turn" | "promptId" | "promptIndex" | "turnIndex" | "previousRequestId" | "previousMessageId"
+    > & { accountId?: string };
     const cliStates = new Map<string, CliState>();
     const cliCalls = new Map<string, CliCall>();
     const cliResponses = new WeakMap<Request, CliCall>();
@@ -214,18 +218,28 @@ export default Plugin.define({
       const session = await ctx.session.get({ sessionID });
       const parent = session.parentID ? await cliState(session.parentID) : undefined;
       if (generation !== cliGeneration) throw new Error("Claude CLI session changed while preparing the request");
+      // Children inherit the parent's metadata but not its state; another account starts a fresh session.
+      const saved = parent ? undefined : session.metadata?.[SESSION_METADATA_KEY] as SavedSession | undefined;
+      const { accountId: _, ...resumed } = saved && saved.accountId === oauth?.metadata?.accountId ? saved : {};
       const created: CliState = {
         parentId: session.parentID,
         wireId: parent?.wireId ?? randomUUID(),
-        // Children inherit the parent's metadata but not its turn attribution.
-        ...(parent
-          ? { agentId: `a${randomBytes(8).toString("hex")}`, promptId: parent.promptId }
-          : session.metadata?.[TURN_METADATA_KEY] as SavedTurn | undefined),
+        ...(parent ? { agentId: `a${randomBytes(8).toString("hex")}`, promptId: parent.promptId } : resumed),
         sequence: 0, committed: 0,
       };
       const winner = cliStates.get(sessionID) ?? created;
       cliStates.set(sessionID, winner);
       return winner;
+    };
+
+    const persist = async (sessionID: Parameters<typeof ctx.session.get>[0]["sessionID"], state: CliState) => {
+      if (state.parentId) return;
+      const { wireId, turn, promptId, promptIndex, turnIndex, previousRequestId, previousMessageId } = state;
+      const saved = Object.fromEntries(Object.entries({
+        accountId: oauth?.metadata?.accountId, wireId, turn, promptId, promptIndex, turnIndex, previousRequestId, previousMessageId,
+      }).filter(([, value]) => value !== undefined));
+      const { metadata } = await ctx.session.get({ sessionID });
+      await ctx.session.update({ sessionID, metadata: { ...metadata, [SESSION_METADATA_KEY]: saved } });
     };
 
     const load = async () => {
@@ -324,9 +338,7 @@ export default Plugin.define({
         // Every turn advances the turn index; task notifications are not prompts.
         state.turnIndex = (state.turnIndex ?? 0) + 1;
         state.promptIndex = (state.promptIndex ?? 0) + (state.turnOrigin === "task_notification" ? 0 : 1);
-        const saved: SavedTurn = { turn, promptId: state.promptId, promptIndex: state.promptIndex, turnIndex: state.turnIndex };
-        const { metadata } = await ctx.session.get({ sessionID: event.sessionID });
-        await ctx.session.update({ sessionID: event.sessionID, metadata: { ...metadata, [TURN_METADATA_KEY]: saved } });
+        await persist(event.sessionID, state);
       }
     }, { providerID: "anthropic" });
 
@@ -406,6 +418,7 @@ export default Plugin.define({
             call.state.previousRequestId = requestId;
             call.state.previousMessageId = messageId;
             call.state.committed = call.sequence;
+            void persist(call.rawSessionId, call.state);
           }
           clearTimeout(call.timer);
           cliCalls.delete(call.id);
@@ -457,9 +470,9 @@ export default Plugin.define({
           if (state) {
             // A new chain owner fences old completions without changing the
             // session UUID shared by the root and its running child agents.
-            cliStates.set(event.data.sessionID, {
-              ...state, previousRequestId: undefined, previousMessageId: undefined, sequence: 0, committed: 0,
-            });
+            const reset = { ...state, previousRequestId: undefined, previousMessageId: undefined, sequence: 0, committed: 0 };
+            cliStates.set(event.data.sessionID, reset);
+            void persist(event.data.sessionID, reset);
           }
         }
         if (

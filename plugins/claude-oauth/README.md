@@ -95,14 +95,16 @@ They share the following behavior:
   successful complete JSON message or an SSE stream ending with a parsed
   `message_stop` and no error event. Retries reuse logical IDs and increment
   `X-Stainless-Retry-Count`. Late completions cannot replace newer chains or
-  restore deleted, compacted, or credential-switched state.
+  restore deleted, compacted, or account-switched state.
 - Main requests carry `x-claude-code-prompt-id` and billing `cc_prompt_index` /
   `cc_turn_index`: every turn advances the turn index, and task notifications do not
   count as prompts. Subagents carry the prompt ID header but no indexes.
-- The main thread's turn attribution (prompt ID and prompt/turn indexes) is saved in
-  the session's metadata under `claude-oauth.turn`, so it survives plugin reloads and
-  restarts. The wire session UUID and the `cc_prev_req` chain are process-local and
-  reset when the plugin reloads. Device identity remains stable across reloads.
+- A root session's Claude Code state (wire session UUID, `cc_prev_req` /
+  `previous_message_id` chain, prompt ID, and prompt/turn indexes) is saved in the
+  session's metadata under `claude-oauth.session` and restored after plugin reloads and
+  restarts, as a Claude Code `--resume` keeps all of it (September 30 capture). State
+  saved under another account is not restored. Device identity remains stable across
+  reloads.
 - CCH uses the native serialized-byte algorithm, including nested `model`
   values and `max_tokens`/fallback exclusions. It reproduces all 61 2.1.280 and
   176 2.1.284 message checksums in the September 29–30 captures.

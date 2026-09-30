@@ -3,7 +3,7 @@ import net from "node:net";
 import { gzipSync } from "node:zlib";
 import { CLI_PROFILE, SDK_CLI_PROFILE, cliHeaders, patchCliCch, rewriteCliBody } from "./cli_wire.ts";
 import { createCliRelay } from "./cli_transport.ts";
-import { setupPlugin } from "./test_harness.ts";
+import { OAUTH_CREDENTIAL, setupPlugin } from "./test_harness.ts";
 
 const BODY = {
   model: "claude-opus-5-5",
@@ -235,7 +235,7 @@ test("retries retain logical IDs and failed/truncated streams do not advance att
   } finally { f.close(); }
 });
 
-test("late completions cannot overwrite a newer chain or revive deleted/credential-switched state", async () => {
+test("late completions cannot overwrite a newer chain or revive deleted/account-switched state", async () => {
   const f = await fixture({});
   try {
     const old = await f.send(await f.prepare(), false);
@@ -243,29 +243,36 @@ test("late completions cannot overwrite a newer chain or revive deleted/credenti
     await old.response.text();
     expect((await f.send()).capture.body.diagnostics.previous_message_id).toBe("msg_2");
     const deleted = await f.send(await f.prepare(), false);
+    // Deleting a session also deletes its metadata.
+    delete f.plugin.state.sessions.ses_root;
     await f.plugin.emit({ type: "session.deleted", data: { sessionID: "ses_root" } });
     await deleted.response.text();
     const revived = await f.send();
     expect(revived.capture.body.diagnostics.previous_message_id).toBeNull();
     expect(revived.capture.headers.get("x-claude-code-session-id")).not.toBe(deleted.capture.headers.get("x-claude-code-session-id"));
     const switched = await f.send(await f.prepare(), false);
+    f.plugin.state.credential = { ...OAUTH_CREDENTIAL, metadata: { accountId: "acct-other" } };
     await f.plugin.emit({ type: "credential.switched", data: { integrationID: "anthropic", credentialID: "cred_2" } });
     await switched.response.text();
     expect((await f.send()).capture.body.diagnostics.previous_message_id).toBeNull();
   } finally { f.close(); }
 });
 
-test("turn attribution survives a plugin reload through session metadata", async () => {
+test("session state survives a plugin reload through session metadata, like a Claude Code resume", async () => {
   const before = await fixture();
   const after = await fixture();
   try {
     before.plugin.state.sessions.ses_root = { metadata: { other: "kept" } };
     const first = await before.send();
     const promptId = first.capture.headers.get("x-claude-code-prompt-id");
+    await Bun.sleep(0);
     // A fresh plugin instance sees only the persisted session metadata.
     after.plugin.state.sessions = before.plugin.state.sessions;
     const sameTurn = await after.send();
     expect(sameTurn.capture.headers.get("x-claude-code-prompt-id")).toBe(promptId);
+    expect(sameTurn.capture.headers.get("x-claude-code-session-id")).toBe(first.capture.headers.get("x-claude-code-session-id"));
+    expect(sameTurn.capture.body.diagnostics.previous_message_id).toBe("msg_1");
+    expect(sameTurn.capture.body.system[0].text).toContain("cc_prev_req=req_1;");
     expect(sameTurn.capture.body.system[0].text).toContain("cc_turn_origin=human; cc_prompt_index=1; cc_turn_index=1;");
     const nextTurn = await after.send(await after.prepare("ses_root", "primary", "msg_user2"));
     expect(nextTurn.capture.body.system[0].text).toContain("cc_prompt_index=2; cc_turn_index=2;");
