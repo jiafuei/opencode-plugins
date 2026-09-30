@@ -14,12 +14,15 @@ type Response =
     }
   | { id: number; ok: false; error: string };
 
-const HELPER = process.env.COMPUTER_USE_HELPER ?? `${import.meta.dir}/bin/computer-use-helper.exe`;
+// Under WSL the helper is a Windows exe run through interop; on macOS it is a native binary.
+const HELPER =
+  process.env.COMPUTER_USE_HELPER ??
+  `${import.meta.dir}/bin/computer-use-helper${process.platform === "darwin" ? "" : ".exe"}`;
 
 const COORDINATES =
   "Coordinates are pixels in the most recent computer_screenshot image of the primary display, not native display pixels.";
 const RESULT =
-  "Returns a screenshot taken 300ms after the action. If the UI was still animating (Start menu, menus or dialogs opening), call computer_wait before clicking positions taken from it.";
+  "Returns a screenshot taken 300ms after the action. If the UI was still animating (Start menu, Spotlight, menus or dialogs opening), call computer_wait before clicking positions taken from it.";
 
 // Separate x/y instead of an [x, y] tuple: tuple-form array schemas are rejected by some providers.
 // Plain Number, not Int: schema checks fail inside opencode's effect copy even on integer input; the helper rounds.
@@ -156,7 +159,7 @@ export default Plugin.define({
       tools.add({
         name: "computer_key",
         options: { codemode: false },
-        description: `Press a key or key chord, e.g. "Return", "Escape", "Tab", "super" (Windows key), "ctrl+s", "alt+Tab", "ctrl+shift+Escape", "Down". Names are case-insensitive: ctrl, alt, shift, super/win/cmd, Return/Enter, Escape/Esc, Tab, BackSpace, Delete, Home, End, Page_Up, Page_Down, Up, Down, Left, Right, Space, Insert, F1-F12, or a single character. ${RESULT}`,
+        description: `Press a key or key chord, e.g. "Return", "Escape", "Tab", "super" (Windows key), "ctrl+s", "alt+Tab", "Down"; on macOS use cmd for shortcuts, e.g. "cmd+space" (Spotlight), "cmd+c", "cmd+tab". Names are case-insensitive: ctrl, alt/option, shift, super/win/cmd (Windows key on Windows, Command on macOS), Return/Enter, Escape/Esc, Tab, BackSpace, Delete, Home, End, Page_Up, Page_Down, Up, Down, Left, Right, Space, Insert, F1-F12, or a single character. ${RESULT}`,
         input: input({
           keys: Schema.String.annotate({ description: 'Keys joined with "+", modifiers first' }),
           repeat: Schema.optional(Schema.Number.annotate({ description: "Press the chord this many times (default 1)" })),
@@ -167,7 +170,7 @@ export default Plugin.define({
       tools.add({
         name: "computer_wait",
         options: { codemode: false },
-        description: `Wait, then take a screenshot. Use after actions that start animations or loading (Start menu, menus, dialogs, app launch) before clicking positions from the previous screenshot. ${COORDINATES}`,
+        description: `Wait, then take a screenshot. Use after actions that start animations or loading (Start menu, Spotlight, menus, dialogs, app launch) before clicking positions from the previous screenshot. ${COORDINATES}`,
         input: input({ seconds: Schema.Number.annotate({ description: "Seconds to wait, e.g. 1" }) }),
         execute: ({ seconds }, context) => call({ action: "wait", seconds: Math.max(0, seconds) }, context.signal),
       });

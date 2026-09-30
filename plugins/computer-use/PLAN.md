@@ -113,15 +113,20 @@ Decided during phase 1: fixed 300ms post-action settle with no per-call override
 animations (the Start menu was captured mid-animation in testing). Coordinates are `Schema.Number` (plugin-side `Int`
 checks fail inside opencode's effect copy); the helper rounds. Every result states the coordinate contract.
 
-### 2. macOS backend
+### 2. macOS backend — implemented, awaiting build and manual checklist on a Mac
 
-Same helper, macOS build. Screen Recording + Accessibility permission flow (helper reports a clear error when not
-granted), Retina scaling, code signing so permission grants survive helper updates.
+Same helper, macOS build. Coordinate mapping now derives the input-units-per-capture-pixel ratio from xcap's monitor
+geometry (points on macOS, physical pixels on DPI-aware Windows) against the captured image, and maps through the most
+recent full screenshot. Screen Recording is checked with `CGPreflightScreenCaptureAccess` (prompt via
+`CGRequestScreenCaptureAccess`); Accessibility via enigo, which prompts and fails with `NoPermission`. When either is
+missing the helper answers every request with an error naming it. Permissions attach to the terminal app that launched
+OpenCode; code signing and a stable helper identity are deferred to phase 3.
 
 ### 3. Distribution
 
 Decide how the plugin obtains the helper: per-platform npm packages vs. download from GitHub releases on first use.
-Build Windows and macOS binaries in CI.
+Build Windows and macOS binaries in CI. Sign the macOS helper if permissions should attach to it rather than the
+terminal.
 
 ## Open questions
 

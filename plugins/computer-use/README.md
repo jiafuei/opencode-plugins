@@ -3,7 +3,7 @@
 Screenshot-driven desktop control for OpenCode. The plugin registers ordinary tools; a small Rust helper
 (`native/`) captures the screen and drives mouse and keyboard. See [PLAN.md](PLAN.md) for the design.
 
-Current target: Windows host with the OpenCode server in WSL2 (primary display only).
+Targets: Windows host with the OpenCode server in WSL2, and macOS with OpenCode running natively. Primary display only.
 
 | Tool | Input |
 |---|---|
@@ -19,9 +19,10 @@ Current target: Windows host with the OpenCode server in WSL2 (primary display o
 
 Every tool returns a screenshot (actions wait 300ms first) plus a line stating the coordinate contract:
 `Screenshot 1430x804 of the primary display (native 2560x1440, scale 0.5585). All computer_* coordinates are pixels in
-this 1430x804 image.` The helper maps screenshot pixels to native pixels.
+this 1430x804 image.` The helper maps screenshot pixels to capture pixels, then to the OS input space (points on
+macOS, physical pixels on Windows), using the most recent full screenshot.
 
-## Build the helper
+## Build the helper (Windows / WSL)
 
 From WSL, with the Windows Rust toolchain (MSVC target):
 
@@ -47,7 +48,29 @@ echo '{"id":1,"action":"screenshot"}' | bin/computer-use-helper.exe
 Actions: `screenshot`, `zoom` (`region`), `click` (`coordinate`, `button?`, `count?`), `move` (`coordinate`), `drag`
 (`start`, `end`), `scroll` (`coordinate`, `direction`, `amount`), `type` (`text`), `key` (`keys`, `repeat?`), `wait`
 (`seconds`). Coordinates are in screenshot pixel space; the helper scales them to the primary monitor. Responses also
-carry `screenshot` (full-screenshot size), `native`, `scale`, and `cursor` (native).
+carry `screenshot` (full-screenshot size), `native` (capture pixels), `scale`, and `cursor` (OS input units).
+
+## Build the helper (macOS)
+
+On the Mac, with a Rust toolchain:
+
+```sh
+cd plugins/computer-use/native
+cargo build --release
+mkdir -p ../bin && cp target/release/computer-use-helper ../bin/
+```
+
+The plugin runs `bin/computer-use-helper` on macOS.
+
+### Permissions
+
+The helper needs **Screen Recording** and **Accessibility**. macOS grants both to the app that launched OpenCode (your
+terminal, e.g. Terminal, iTerm2, Ghostty), not to the helper itself. On the first tool call the helper triggers the
+system prompts and every call returns an error naming the missing permission. To grant them:
+
+1. System Settings → Privacy & Security → Screen Recording: enable your terminal app.
+2. System Settings → Privacy & Security → Accessibility: enable your terminal app.
+3. Quit and reopen the terminal app, then start OpenCode again.
 
 ## Load in OpenCode
 
@@ -59,7 +82,7 @@ Add the plugin directory by absolute path to the `plugins` array in `opencode.js
 
 Consider gating the tools with `"permission": { "computer_*": "ask" }`.
 
-## Manual test checklist
+## Manual test checklist (Windows)
 
 1. Ask the model to take a screenshot and describe what is on screen. The description must match the actual desktop
    (proves the image reached the model). Repeat with the claude-oauth provider and one non-Anthropic provider.
@@ -72,3 +95,14 @@ Consider gating the tools with `"permission": { "computer_*": "ask" }`.
    the click must land (zoom must not shift coordinates).
 7. Set Windows display scaling to 125% or 150%, restart OpenCode, and repeat a small-target click.
 8. Double-click and right-click a desktop item.
+
+## Manual test checklist (macOS)
+
+1. First tool call without permissions: the error names the missing permission(s) and the system prompts appear. Grant
+   them, restart the terminal and OpenCode, then take a screenshot and confirm the description matches the screen.
+2. Spotlight: `computer_key "cmd+space"` → `computer_type "TextEdit"` → `computer_key "Return"`, then type text
+   including CJK (e.g. `こんにちは`) and confirm it appears correctly.
+3. On a Retina display, click a small target (a menu bar item or a toolbar button); it must land exactly.
+4. Scroll a long page or list.
+5. Drag a window by its title bar to a new position.
+6. Zoom on small text (e.g. the menu bar clock), then click something found there.

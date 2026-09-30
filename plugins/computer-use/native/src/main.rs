@@ -74,12 +74,18 @@ enum ScrollDirection {
     Right,
 }
 
+/// Geometry of the most recent full capture; model coordinates refer to the screenshot made from it.
 struct Display {
     monitor: Monitor,
-    x: i32,
-    y: i32,
+    /// Monitor origin in input units.
+    x: f64,
+    y: f64,
+    /// Capture size in physical pixels.
     width: u32,
     height: u32,
+    /// Input units per capture pixel: 0.5 on a Retina Mac (points), 1 on DPI-aware Windows.
+    input_per_pixel: f64,
+    /// Screenshot pixels per capture pixel.
     scale: f64,
 }
 
@@ -93,24 +99,29 @@ fn fit_scale(w: f64, h: f64) -> f64 {
     1f64.min(MAX_EDGE / w.max(h)).min((MAX_PIXELS / (w * h)).sqrt())
 }
 
-fn primary() -> Result<Display, Box<dyn Error>> {
+fn capture() -> Result<(Display, RgbaImage), Box<dyn Error>> {
     let monitor = Monitor::all()?
         .into_iter()
         .find(|m| m.is_primary().unwrap_or(false))
         .ok_or("no primary monitor")?;
-    let (width, height) = (monitor.width()?, monitor.height()?);
-    Ok(Display {
-        x: monitor.x()?,
-        y: monitor.y()?,
+    let image = monitor.capture_image()?;
+    let (width, height) = image.dimensions();
+    let display = Display {
+        x: monitor.x()? as f64,
+        y: monitor.y()? as f64,
         width,
         height,
+        // xcap reports monitor geometry in input units (points on macOS), but captures physical pixels.
+        input_per_pixel: monitor.width()? as f64 / width as f64,
         scale: fit_scale(width as f64, height as f64),
         monitor,
-    })
+    };
+    Ok((display, image))
 }
 
-fn to_screen(display: &Display, [x, y]: [f64; 2]) -> (i32, i32) {
-    (display.x + (x / display.scale).round() as i32, display.y + (y / display.scale).round() as i32)
+fn to_input(display: &Display, [x, y]: [f64; 2]) -> (i32, i32) {
+    let factor = display.input_per_pixel / display.scale;
+    ((display.x + x * factor).round() as i32, (display.y + y * factor).round() as i32)
 }
 
 /// Downscale to the model's image limits and JPEG-encode.
@@ -164,16 +175,17 @@ fn parse_key(name: &str) -> Result<Key, Box<dyn Error>> {
     })
 }
 
-fn run(enigo: &mut Enigo, display: &Display, action: Action) -> Result<Shot, Box<dyn Error>> {
+fn run(enigo: &mut Enigo, display: &mut Display, action: Action) -> Result<Shot, Box<dyn Error>> {
+    let settle = !matches!(action, Action::Screenshot);
     match action {
-        Action::Screenshot => return encode(&display.monitor.capture_image()?),
+        Action::Screenshot => {}
         Action::Zoom { region } => return zoom(display, region),
         Action::Move { coordinate } => {
-            let (x, y) = to_screen(display, coordinate);
+            let (x, y) = to_input(display, coordinate);
             enigo.move_mouse(x, y, Coordinate::Abs)?;
         }
         Action::Click { coordinate, button, count } => {
-            let (x, y) = to_screen(display, coordinate);
+            let (x, y) = to_input(display, coordinate);
             enigo.move_mouse(x, y, Coordinate::Abs)?;
             let button = match button {
                 None | Some(ClickButton::Left) => Button::Left,
@@ -185,8 +197,8 @@ fn run(enigo: &mut Enigo, display: &Display, action: Action) -> Result<Shot, Box
             }
         }
         Action::Drag { start, end } => {
-            let (sx, sy) = to_screen(display, start);
-            let (ex, ey) = to_screen(display, end);
+            let (sx, sy) = to_input(display, start);
+            let (ex, ey) = to_input(display, end);
             enigo.move_mouse(sx, sy, Coordinate::Abs)?;
             enigo.button(Button::Left, Direction::Press)?;
             // Intermediate moves so apps see a real drag rather than a jump.
@@ -197,7 +209,7 @@ fn run(enigo: &mut Enigo, display: &Display, action: Action) -> Result<Shot, Box
             enigo.button(Button::Left, Direction::Release)?;
         }
         Action::Scroll { coordinate, direction, amount } => {
-            let (x, y) = to_screen(display, coordinate);
+            let (x, y) = to_input(display, coordinate);
             enigo.move_mouse(x, y, Coordinate::Abs)?;
             // enigo: positive scrolls down / right.
             let (length, axis) = match direction {
@@ -225,8 +237,12 @@ fn run(enigo: &mut Enigo, display: &Display, action: Action) -> Result<Shot, Box
         }
         Action::Wait { seconds } => thread::sleep(Duration::from_secs_f64(seconds)),
     }
-    thread::sleep(SETTLE);
-    encode(&display.monitor.capture_image()?)
+    if settle {
+        thread::sleep(SETTLE);
+    }
+    let (fresh, image) = capture()?;
+    *display = fresh;
+    encode(&image)
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -237,13 +253,34 @@ fn main() -> Result<(), Box<dyn Error>> {
         use windows::Win32::UI::HiDpi::{SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)?;
     }
-    let mut enigo = Enigo::new(&Settings::default())?;
+    let enigo = Enigo::new(&Settings::default());
+    // macOS grants Screen Recording and Accessibility to the app that launched OpenCode (the terminal). Missing
+    // grants are requested here (the system shows its prompt) and only take effect after that app restarts.
+    #[cfg(target_os = "macos")]
+    {
+        let mut missing = Vec::new();
+        if !macos::screen_recording() {
+            missing.push("Screen Recording");
+        }
+        // Enigo checks Accessibility itself and opens the system prompt when it is missing.
+        if matches!(enigo, Err(enigo::NewConError::NoPermission)) {
+            missing.push("Accessibility");
+        }
+        if !missing.is_empty() {
+            return refuse(&format!(
+                "macOS {} permission missing. Grant it to the terminal app that runs OpenCode in System Settings > Privacy & Security, then quit and reopen that app and OpenCode.",
+                missing.join(" and ")
+            ));
+        }
+    }
+    let mut enigo = enigo?;
+    let (mut display, _) = capture()?;
     let mut stdout = std::io::stdout().lock();
     for line in std::io::stdin().lock().lines() {
         let request: Request = serde_json::from_str(&line?)?;
-        let result = primary().and_then(|display| Ok((run(&mut enigo, &display, request.action)?, display)));
+        let result = run(&mut enigo, &mut display, request.action);
         let response = match result {
-            Ok((shot, display)) => {
+            Ok(shot) => {
                 serde_json::json!({
                     "id": request.id,
                     "ok": true,
@@ -262,4 +299,30 @@ fn main() -> Result<(), Box<dyn Error>> {
         stdout.flush()?;
     }
     Ok(())
+}
+
+/// Answer every request with the same error, for when the helper cannot work at all.
+#[cfg(target_os = "macos")]
+fn refuse(error: &str) -> Result<(), Box<dyn Error>> {
+    let mut stdout = std::io::stdout().lock();
+    for line in std::io::stdin().lock().lines() {
+        let request: serde_json::Value = serde_json::from_str(&line?)?;
+        writeln!(stdout, "{}", serde_json::json!({ "id": request["id"], "ok": false, "error": error }))?;
+        stdout.flush()?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+mod macos {
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        fn CGPreflightScreenCaptureAccess() -> bool;
+        fn CGRequestScreenCaptureAccess() -> bool;
+    }
+
+    /// Whether Screen Recording is granted; opens the system prompt when it is not.
+    pub fn screen_recording() -> bool {
+        unsafe { CGPreflightScreenCaptureAccess() || CGRequestScreenCaptureAccess() }
+    }
 }
