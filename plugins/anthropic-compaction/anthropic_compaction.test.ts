@@ -29,32 +29,38 @@ function compaction(content: unknown[]) {
   return { event, sent };
 }
 
+const block = { type: "compaction", provider: "anthropic", text: "Summary." };
+
 describe("native compaction", () => {
-  test("registers only for opted-in providers", async () => {
+  test("registers per provider, with the AWS body rewrite only where asked", async () => {
     expect(await load({})).toEqual([]);
-    const hooks = await load({ providers: ["anthropic", "my-proxy"] });
-    expect(hooks.map((hook) => [hook.name, hook.options])).toEqual([
-      ["experimental.compaction.native", { providerID: "anthropic" }],
-      ["experimental.compaction.native", { providerID: "my-proxy" }],
+    const hooks = await load({
+      providers: { anthropic: { mechanism: "on-demand" }, "my-proxy": { mechanism: "threshold", aws: true } },
+    });
+    expect(hooks.map((hook) => [hook.name, hook.options.providerID])).toEqual([
+      ["experimental.compaction.native", "anthropic"],
+      ["experimental.compaction.native", "my-proxy"],
+      ["http.request", "my-proxy"],
     ]);
+    await expect(load({ providers: { anthropic: {} } })).rejects.toThrow('"on-demand" or "threshold"');
   });
 
-  test("installs Anthropic's compaction block after a synthetic user message", async () => {
-    const [hook] = await load({ providers: ["anthropic"], instructions: "Keep file paths." });
-    const block = { type: "compaction", provider: "anthropic", text: "Summary." };
+  test("on-demand installs the signed block first in the conversation", async () => {
+    const [hook] = await load({ providers: { anthropic: { mechanism: "on-demand" } }, instructions: "Keep paths." });
+    const { event, sent } = compaction([block]);
+    await hook!.callback(event);
+    expect(sent).toEqual([{ compaction: { type: "summarize", instructions: "Keep paths." } }]);
+    expect(event.result?.replacement).toEqual([{ role: "assistant", content: [block] }]);
+  });
+
+  test("threshold installs the block after a synthetic user message", async () => {
+    const [hook] = await load({ providers: { anthropic: { mechanism: "threshold" } } });
     const { event, sent } = compaction([block]);
     await hook!.callback(event);
     expect(sent).toEqual([
       {
         contextManagement: {
-          edits: [
-            {
-              type: "compact_20260112",
-              trigger: { type: "input_tokens", value: 50_000 },
-              pauseAfterCompaction: true,
-              instructions: "Keep file paths.",
-            },
-          ],
+          edits: [{ type: "compact_20260112", trigger: { type: "input_tokens", value: 50_000 }, pauseAfterCompaction: true }],
         },
       },
     ]);
@@ -69,8 +75,29 @@ describe("native compaction", () => {
     ]);
   });
 
-  test("fails when Anthropic returns no compaction block", async () => {
-    const [hook] = await load({ providers: ["anthropic"] });
+  test("fails instead of installing a missing or null summary", async () => {
+    const [hook] = await load({ providers: { anthropic: { mechanism: "threshold" } } });
     await expect(hook!.callback(compaction([{ type: "text", text: "Hi" }]).event)).rejects.toThrow("50000 tokens");
+    const { event } = compaction([{ ...block, text: null }]);
+    await expect(hook!.callback(event)).rejects.toThrow("failed to produce");
+    expect(event.result).toBeUndefined();
+  });
+
+  test("AWS providers carry the beta header into the body", async () => {
+    const hooks = await load({ providers: { proxy: { mechanism: "on-demand", aws: true } } });
+    const http = hooks.find((hook) => hook.name === "http.request")!;
+    const event = {
+      request: new Request("https://proxy.example/v1/messages", {
+        method: "POST",
+        headers: { "anthropic-beta": "interleaved-thinking-2025-05-14,compact-2026-09-04" },
+        body: JSON.stringify({ messages: [], anthropic_beta: ["existing"] }),
+      }),
+    };
+    await http.callback(event);
+    expect(await event.request.json()).toEqual({
+      messages: [],
+      anthropic_version: "bedrock-2023-05-31",
+      anthropic_beta: ["existing", "interleaved-thinking-2025-05-14", "compact-2026-09-04"],
+    });
   });
 });
