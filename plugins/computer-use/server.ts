@@ -9,6 +9,8 @@ type Response =
       image?: string;
       width?: number;
       height?: number;
+      /** computer_screenshot: keyboard focus and open windows. */
+      context?: string;
       /** computer_tree. */
       tree?: string;
       /** computer_read and computer_type. */
@@ -84,7 +86,9 @@ export default Plugin.define({
       const text =
         request.action === "zoom"
           ? `Zoom of screenshot region ${JSON.stringify(request.region)}, shown at ${response.width}x${response.height}. Coordinates stay in full-screenshot space: ${contract}`
-          : contract;
+          : response.context === undefined
+            ? contract
+            : `${contract}\n\n${response.context}`;
       return {
         content: [
           { type: "text" as const, text },
@@ -107,7 +111,7 @@ export default Plugin.define({
       tools.add({
         name: "computer_screenshot",
         options: { codemode: false },
-        description: `Capture the primary display. ${COORDINATES}`,
+        description: `Capture the primary display, with the element that has keyboard focus and the open windows front to back (exact titles for computer_focus, including minimized and covered ones). Screenshots returned after actions omit that list. ${COORDINATES}`,
         input: Schema.Record(Schema.String, Schema.Unknown),
         execute: (_, context) => call({ action: "screenshot" }, context.signal),
       });
@@ -127,7 +131,7 @@ export default Plugin.define({
         name: "computer_tree",
         options: { codemode: false },
         description:
-          'Read the accessibility tree of the foreground window as text: one element per line as [id] role "name" value="…" @(x,y wxh) states, indented by nesting; bounds are in screenshot pixels and only on elements without listed children. An open menu or popup outside the window follows it, then the other open windows. Use it to target small or crowded controls exactly by element ID with computer_click, computer_move, computer_scroll and computer_drag, or to read text with computer_read. Pass find with text you can see on screen (a button label, a link, a field name) to list only the elements that contain it; prefer that over the full tree when you know what to target. Apps that draw their own UI (games, canvas apps) expose little or nothing; use the screenshot there.',
+          'Read the accessibility tree of the foreground window as text: one element per line as [id] role "name" value="…" @(x,y wxh) states, indented by nesting; bounds are in screenshot pixels and only on elements without listed children. An open menu or popup outside the window follows it. Use it to target small or crowded controls exactly by element ID with computer_click, computer_move, computer_scroll and computer_drag, or to read text with computer_read. Pass find with text you can see on screen (a button label, a link, a field name) to list only the elements that contain it; prefer that over the full tree when you know what to target. Apps that draw their own UI (games, canvas apps) expose little or nothing; use the screenshot there.',
         input: input({
           find: Schema.optional(
             Schema.String.annotate({ description: "Only list elements whose name or value contains this text (case-insensitive), each with its parent's name" }),
@@ -204,7 +208,7 @@ export default Plugin.define({
       tools.add({
         name: "computer_focus",
         options: { codemode: false },
-        description: `Bring a top-level window to the front (restoring it if minimized), by title: case-insensitive, an exact title first, else the first window whose title contains the text. If nothing matches, the error lists the open windows' titles; computer_tree lists them too. ${RESULT}`,
+        description: `Bring a top-level window to the front (restoring it if minimized), by title: case-insensitive, an exact title first, else the first window whose title contains the text. If nothing matches, the error lists the open windows' titles; computer_screenshot lists them too. ${RESULT}`,
         input: input({ title: Schema.String.annotate({ description: "Window title or part of it" }) }),
         execute: ({ title }, context) => call({ action: "focus", title }, context.signal),
       });

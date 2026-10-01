@@ -138,13 +138,13 @@ fn emit(node: &Node, depth: usize, parent: &str, find: Option<&str>, display: &D
     complete
 }
 
-/// Other visible top-level windows, so the model knows what it can switch to.
+/// Visible top-level windows, front to back, so the model knows what it can switch to and the exact titles to use.
 pub fn windows(display: &Display) -> Result<String, Box<dyn Error>> {
     let factor = display.scale / display.input_per_pixel;
-    let mut out = String::from("Other windows:\n");
+    let mut out = String::from("Open windows (front to back):\n");
     for window in xcap::Window::all()? {
         let title = window.title().unwrap_or_default();
-        if title.is_empty() || window.is_focused()? {
+        if title.is_empty() {
             continue;
         }
         // app_name fails for elevated processes; the title alone is still useful.
@@ -154,11 +154,12 @@ pub fn windows(display: &Display) -> Result<String, Box<dyn Error>> {
         } else {
             let _ = writeln!(
                 out,
-                " @({},{} {}x{})",
+                " @({},{} {}x{}){}",
                 ((window.x()? as f64 - display.x) * factor).round(),
                 ((window.y()? as f64 - display.y) * factor).round(),
                 (window.width()? as f64 * factor).round(),
-                (window.height()? as f64 * factor).round()
+                (window.height()? as f64 * factor).round(),
+                if window.is_focused()? { " foreground" } else { "" }
             );
         }
         if out.lines().count() > MAX_WINDOWS {

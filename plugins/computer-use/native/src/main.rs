@@ -34,8 +34,9 @@ struct Request {
 #[derive(Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 enum Action {
+    /// Also reports keyboard focus and the open windows; screenshots after actions don't.
     Screenshot,
-    /// `find` lists only elements whose name or value contains it, and skips the window list.
+    /// `find` lists only elements whose name or value contains it.
     Tree {
         find: Option<String>,
     },
@@ -236,17 +237,23 @@ fn parse_key(name: &str) -> Result<Key, Box<dyn Error>> {
     })
 }
 
-/// Perform the action. Tree, zoom, read and type answer directly; everything else is followed by a fresh screenshot.
+/// Perform the action. Screenshot, tree, zoom, read and type answer directly; everything else is followed by a fresh
+/// screenshot.
 fn act(state: &mut State, action: Action) -> Result<Option<serde_json::Value>, Box<dyn Error>> {
-    let settle = !matches!(action, Action::Screenshot);
     match action {
-        Action::Screenshot => {}
+        Action::Screenshot => {
+            let mut screenshot = observe(state)?;
+            let focus = match state.backend.focused() {
+                Some((role, name)) if name.is_empty() => role,
+                Some((role, name)) => format!("{role} \"{name}\""),
+                None => "unknown".to_string(),
+            };
+            screenshot["context"] = format!("Keyboard focus: {focus}\n{}", tree::windows(&state.display)?).into();
+            return Ok(Some(screenshot));
+        }
         Action::Tree { find } => {
-            let (mut text, elements) = tree::render(&state.backend.snapshot()?, &state.display, find.as_deref());
+            let (text, elements) = tree::render(&state.backend.snapshot()?, &state.display, find.as_deref());
             state.tree = elements;
-            if find.is_none() {
-                text.push_str(&tree::windows(&state.display)?);
-            }
             return Ok(Some(serde_json::json!({ "tree": text })));
         }
         Action::Zoom { region } => return zoom(&state.display, region).map(Some),
@@ -360,9 +367,7 @@ fn act(state: &mut State, action: Action) -> Result<Option<serde_json::Value>, B
         }
         Action::Wait { seconds } => thread::sleep(Duration::from_secs_f64(seconds)),
     }
-    if settle {
-        thread::sleep(SETTLE);
-    }
+    thread::sleep(SETTLE);
     Ok(None)
 }
 

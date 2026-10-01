@@ -141,12 +141,12 @@ Decisions:
   elements still land and vanished ones error. Pointer tools take `element` (`start_element`/`end_element` for drag) or
   x/y.
 - **Scope**: foreground window, plus the top-level window or AXMenu holding keyboard focus when it lies outside (open
-  menus), then a list of other windows (xcap's window list: title, app, bounds, minimized).
+  menus).
 - **Pruning**: skip offscreen and zero-size elements; flatten unnamed pane/group containers; drop unnamed
   image/text/separator leaves, leaves repeating the nearest rendered ancestor's name, and scroll bar children; cap at 400
   rendered elements. Bounds only on elements without listed children; URL values cut at 60 characters.
 - **`find`**: `computer_tree({ find })` lists only elements whose name or value contains the text, flat, with the
-  parent's name, and no window list. With screenshots as the observation, the tree is mostly for targeting something
+  parent's name. With screenshots as the observation, the tree is mostly for targeting something
   already seen, so a filtered lookup beats sending the whole tree (about 20x smaller on a browser window).
 - **Windows**: `uiautomation` crate, one cached Subtree request with the rendered properties. The cached subtree stops
   at browser documents (separate providers), so an empty Document gets a second cached request rooted at itself.
@@ -168,8 +168,13 @@ Instead it returns the role and name of the element with keyboard focus, which c
 Move, key, scroll, drag, click, wait and focus keep their observation: each changes the screen in ways the model has to
 see (hover menus, dialogs opened by shortcuts, new scroll content).
 
+An explicit `computer_screenshot` adds keyboard focus and the open-window list (front to back, minimized and covered
+windows included): the orientation a screenshot can't give, at ~100–300 tokens, and only when the model asks to look
+rather than after every action. The full tree used to carry the window list; it moved here so a lookup by `find` or a
+tree read doesn't pay for it.
+
 `computer_focus({ title })` brings a window to the front (Alt tap + `SetForegroundWindow` on Windows,
-AXRaise + AXFrontmost on macOS); with no match, the error lists open windows (as does `computer_tree`).
+AXRaise + AXFrontmost on macOS); with no match, the error lists open windows (as does `computer_screenshot`).
 
 ## Open questions
 

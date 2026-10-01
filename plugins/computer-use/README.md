@@ -7,7 +7,7 @@ Targets: Windows host with the OpenCode server in WSL2, and macOS with OpenCode 
 
 | Tool | Input |
 |---|---|
-| `computer_screenshot` | — |
+| `computer_screenshot` | — also lists keyboard focus and the open windows |
 | `computer_zoom` | `x0`, `y0`, `x1`, `y1` — region shown at native resolution; coordinates stay in full-screenshot space |
 | `computer_tree` | `find?` — foreground window's accessibility tree as text, with element IDs; `find` lists only matching elements |
 | `computer_read` | `element`, `offset?` — full text of one tree element, paged |
@@ -20,11 +20,23 @@ Targets: Windows host with the OpenCode server in WSL2, and macOS with OpenCode 
 | `computer_key` | `keys` chord like `"ctrl+s"`, `"super"`, `"Return"` (case-insensitive, xdotool-style names), `repeat?` |
 | `computer_wait` | `seconds` |
 
-Every tool except `computer_type`, `computer_tree` and `computer_read` returns a screenshot (actions wait 300ms first) plus a line stating the coordinate
-contract:
+Every tool except `computer_type`, `computer_tree` and `computer_read` returns a screenshot (actions wait 300ms first)
+plus a line stating the coordinate contract:
 `Screenshot 1430x804 of the primary display (native 2560x1440, scale 0.5585). All computer_* coordinates are pixels in
 this 1430x804 image.` The helper maps screenshot pixels to capture pixels, then to the OS input space (points on
 macOS, physical pixels on Windows), using the most recent full screenshot.
+
+An explicit `computer_screenshot` also lists what a screenshot can't show: where typing would go, and every open window
+front to back, including minimized and covered ones, with the exact titles `computer_focus` takes. Screenshots after
+actions leave this out to keep each step small.
+
+```
+Keyboard focus: Edit "Search"
+Open windows (front to back):
+- "Example article — Mozilla Firefox" (Firefox) @(0,0 1430x783) foreground
+- "#general | … - Discord" (Discord) @(8,12 1417x747)
+- "Inbox - … - Mozilla Thunderbird" (Thunderbird) minimized
+```
 
 `computer_type` returns `Typed N characters into <Role> "<name>".` instead, naming the element that had keyboard focus
 (read through UI Automation / AX), so typing into the wrong field shows up without an image.
@@ -74,7 +86,7 @@ the default observation; the tree is for targeting small or crowded controls exa
   exists returns an error asking for `computer_tree`; after larger UI changes the model should re-read the tree, since
   an ID can still resolve to an element whose content changed.
 - `computer_tree({ find })` lists only the elements whose name or value contains the text (case-insensitive), flat,
-  each followed by `in "<parent name>"`, and skips the window list. The model sees a label in the screenshot and asks
+  each followed by `in "<parent name>"`. The model sees a label in the screenshot and asks
   for just that element, which costs a few lines instead of the whole tree.
 - `computer_read({ element, offset? })` returns the full text of one element without acting or resetting IDs: the
   Text-pattern document on Windows when the element has the `text` state (terminal and editor buffers, browser
@@ -98,13 +110,9 @@ Foreground window:
   [27] ComboBox "Search with Google or enter address" value="…" @(218,17 867x18) collapsed
   [75] Document "Example article" value="https://example.com/article" focused
     [79] Hyperlink "Home" value="https://x.com/home" @(365,85 145x33)
-Other windows:
-- "#general | … - Discord" (Discord) @(8,12 1417x747)
-- "Inbox - … - Mozilla Thunderbird" (Thunderbird) minimized
 ```
 
-The tree covers the foreground window, plus an open menu or popup that holds keyboard focus outside it, followed by the
-other top-level windows. Offscreen (scrolled-out or collapsed) elements are skipped. Unnamed layout containers are
+The tree covers the foreground window, plus an open menu or popup that holds keyboard focus outside it. Offscreen (scrolled-out or collapsed) elements are skipped. Unnamed layout containers are
 flattened. Unnamed images, text and separators, text that repeats its parent's name (a link and its text), and scroll bar
 parts are dropped. Bounds appear only on elements without listed children; containers are targeted by ID. URL values
 are cut at 60 characters. Output stops at 400 elements. Limits:
