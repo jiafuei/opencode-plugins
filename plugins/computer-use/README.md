@@ -9,7 +9,7 @@ Targets: Windows host with the OpenCode server in WSL2, and macOS with OpenCode 
 |---|---|
 | `computer_screenshot` | — |
 | `computer_zoom` | `x0`, `y0`, `x1`, `y1` — region shown at native resolution; coordinates stay in full-screenshot space |
-| `computer_tree` | — foreground window's accessibility tree as text, with element IDs |
+| `computer_tree` | `find?` — foreground window's accessibility tree as text, with element IDs; `find` lists only matching elements |
 | `computer_read` | `element`, `offset?` — full text of one tree element, paged |
 | `computer_click` | `element` or `x`, `y`; `button?` (`left`/`right`/`middle`), `count?` (1–3) |
 | `computer_move` | `element` or `x`, `y` — hover |
@@ -55,7 +55,7 @@ echo '{"id":1,"action":"screenshot"}' | bin/computer-use-helper.exe
 # {"id":1,"ok":true,"image":"<base64 jpeg>","width":1430,"height":804,"cursor":[779,981]}
 ```
 
-Actions: `screenshot`, `tree`, `zoom` (`region`), `click` (`element?` or `x`, `y`; `button?`, `count?`), `move`
+Actions: `screenshot`, `tree` (`find?`), `zoom` (`region`), `click` (`element?` or `x`, `y`; `button?`, `count?`), `move`
 (`element?` or `x`, `y`), `drag` (`start_element?` or `start_x`, `start_y`; `end_element?` or `end_x`, `end_y`), `scroll`
 (`element?` or `x`, `y`; `direction`, `amount`), `type` (`text`), `key` (`keys`, `repeat?`), `wait` (`seconds`),
 `read` (`element`, `offset?`; answers with `text`).
@@ -73,6 +73,9 @@ the default observation; the tree is for targeting small or crowded controls exa
 - IDs come from the latest `computer_tree` and stay valid across actions until the next one. An element that no longer
   exists returns an error asking for `computer_tree`; after larger UI changes the model should re-read the tree, since
   an ID can still resolve to an element whose content changed.
+- `computer_tree({ find })` lists only the elements whose name or value contains the text (case-insensitive), flat,
+  each followed by `in "<parent name>"`, and skips the window list. The model sees a label in the screenshot and asks
+  for just that element, which costs a few lines instead of the whole tree.
 - `computer_read({ element, offset? })` returns the full text of one element without acting or resetting IDs: the
   Text-pattern document on Windows when the element has the `text` state (terminal and editor buffers, browser
   documents), otherwise its name and value (AXValue/AXTitle/AXDescription on macOS). Lines are right-trimmed and
@@ -86,23 +89,25 @@ Example (trimmed):
 Accessibility tree. @(x,y wxh) bounds are in the 1430x804 screenshot space of the primary display (native 2560x1440, scale 0.5585). Element IDs stay valid until the next computer_tree call; after the UI changes substantially (navigation, a new dialog), call computer_tree again before using them.
 
 Foreground window:
-[1] Window "Example article — Mozilla Firefox" @(0,0 1430x783)
-  [2] ToolBar "Menu Bar" @(0,0 1430x15)
-    [3] MenuBar "Application" @(0,0 194x12)
+[1] Window "Example article — Mozilla Firefox"
+  [2] ToolBar "Menu Bar"
+    [3] MenuBar "Application"
       [4] MenuItem "File" @(0,0 17x12) collapsed
   [17] Button "Back" @(22,15 21x23) collapsed
   [18] Button "Forward" @(42,15 21x23) disabled collapsed
   [27] ComboBox "Search with Google or enter address" value="…" @(218,17 867x18) collapsed
-  [75] Document "Example article" value="https://example.com/article" @(7,53 1424x729) focused
+  [75] Document "Example article" value="https://example.com/article" focused
     [79] Hyperlink "Home" value="https://x.com/home" @(365,85 145x33)
 Other windows:
-- "#ramen-street | … - Discord" (Discord) @(8,12 1417x747)
+- "#general | … - Discord" (Discord) @(8,12 1417x747)
 - "Inbox - … - Mozilla Thunderbird" (Thunderbird) minimized
 ```
 
 The tree covers the foreground window, plus an open menu or popup that holds keyboard focus outside it, followed by the
 other top-level windows. Offscreen (scrolled-out or collapsed) elements are skipped. Unnamed layout containers are
-flattened, and output stops at 400 elements. Limits:
+flattened. Unnamed images, text and separators, text that repeats its parent's name (a link and its text), and scroll bar
+parts are dropped. Bounds appear only on elements without listed children; containers are targeted by ID. URL values
+are cut at 60 characters. Output stops at 400 elements. Limits:
 
 - Apps that draw their own UI (games, canvas apps, some custom toolkits) expose little or nothing. Use the screenshot
   and x/y there.

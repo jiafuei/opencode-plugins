@@ -35,7 +35,10 @@ struct Request {
 #[serde(tag = "action", rename_all = "snake_case")]
 enum Action {
     Screenshot,
-    Tree,
+    /// `find` lists only elements whose name or value contains it, and skips the window list.
+    Tree {
+        find: Option<String>,
+    },
     /// `[x0, y0, x1, y1]` in screenshot space.
     Zoom {
         region: [f64; 4],
@@ -238,10 +241,13 @@ fn act(state: &mut State, action: Action) -> Result<Option<serde_json::Value>, B
     let settle = !matches!(action, Action::Screenshot);
     match action {
         Action::Screenshot => {}
-        Action::Tree => {
-            let (text, elements) = tree::render(&state.backend.snapshot()?, &state.display);
+        Action::Tree { find } => {
+            let (mut text, elements) = tree::render(&state.backend.snapshot()?, &state.display, find.as_deref());
             state.tree = elements;
-            return Ok(Some(serde_json::json!({ "tree": format!("{text}{}", tree::windows(&state.display)?) })));
+            if find.is_none() {
+                text.push_str(&tree::windows(&state.display)?);
+            }
+            return Ok(Some(serde_json::json!({ "tree": text })));
         }
         Action::Zoom { region } => return zoom(&state.display, region).map(Some),
         Action::Read { element, offset } => {

@@ -142,7 +142,12 @@ Decisions:
   x/y.
 - **Scope**: foreground window, plus the top-level window or AXMenu holding keyboard focus when it lies outside (open
   menus), then a list of other windows (xcap's window list: title, app, bounds, minimized).
-- **Pruning**: skip offscreen and zero-size elements; flatten unnamed pane/group containers; cap at 400 rendered elements.
+- **Pruning**: skip offscreen and zero-size elements; flatten unnamed pane/group containers; drop unnamed
+  image/text/separator leaves, leaves repeating the nearest rendered ancestor's name, and scroll bar children; cap at 400
+  rendered elements. Bounds only on elements without listed children; URL values cut at 60 characters.
+- **`find`**: `computer_tree({ find })` lists only elements whose name or value contains the text, flat, with the
+  parent's name, and no window list. With screenshots as the observation, the tree is mostly for targeting something
+  already seen, so a filtered lookup beats sending the whole tree (about 20x smaller on a browser window).
 - **Windows**: `uiautomation` crate, one cached Subtree request with the rendered properties. The cached subtree stops
   at browser documents (separate providers), so an empty Document gets a second cached request rooted at itself.
   Toggle/expand/selection states are only read when the pattern is available (otherwise UIA returns a sentinel).

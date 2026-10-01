@@ -127,9 +127,13 @@ export default Plugin.define({
         name: "computer_tree",
         options: { codemode: false },
         description:
-          'Read the accessibility tree of the foreground window as text: one element per line as [id] role "name" value="…" @(x,y wxh) states, indented by nesting, bounds in screenshot pixels. An open menu or popup outside the window follows it, then the other open windows. Use it to target small or crowded controls exactly by element ID with computer_click, computer_move, computer_scroll and computer_drag, or to read text with computer_read. Apps that draw their own UI (games, canvas apps) expose little or nothing; use the screenshot there.',
-        input: Schema.Record(Schema.String, Schema.Unknown),
-        execute: (_, context) => call({ action: "tree" }, context.signal),
+          'Read the accessibility tree of the foreground window as text: one element per line as [id] role "name" value="…" @(x,y wxh) states, indented by nesting; bounds are in screenshot pixels and only on elements without listed children. An open menu or popup outside the window follows it, then the other open windows. Use it to target small or crowded controls exactly by element ID with computer_click, computer_move, computer_scroll and computer_drag, or to read text with computer_read. Pass find with text you can see on screen (a button label, a link, a field name) to list only the elements that contain it; prefer that over the full tree when you know what to target. Apps that draw their own UI (games, canvas apps) expose little or nothing; use the screenshot there.',
+        input: input({
+          find: Schema.optional(
+            Schema.String.annotate({ description: "Only list elements whose name or value contains this text (case-insensitive), each with its parent's name" }),
+          ),
+        }),
+        execute: ({ find }, context) => call({ action: "tree", find }, context.signal),
       });
       tools.add({
         name: "computer_read",
