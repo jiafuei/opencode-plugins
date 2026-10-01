@@ -5,11 +5,11 @@ type Response =
   | {
       id: number;
       ok: true;
-      /** Screenshot mode and zoom. */
+      /** Screenshots, actions and zoom. */
       image?: string;
       width?: number;
       height?: number;
-      /** Tree mode. */
+      /** computer_tree. */
       tree?: string;
       /** computer_read and computer_type. */
       text?: string;
@@ -24,31 +24,24 @@ const HELPER =
   process.env.COMPUTER_USE_HELPER ??
   `${import.meta.dir}/bin/computer-use-helper${process.platform === "darwin" ? "" : ".exe"}`;
 
-// Tree mode observes through the accessibility tree instead of screenshots: text only, and pointer tools also accept
-// element IDs from the latest tree.
-const TREE = process.env.COMPUTER_USE_MODE === "tree";
-
-const COORDINATES = TREE
-  ? "Target an element by its [id] from the latest accessibility tree; IDs stay valid until the next computer_tree call or action, which always returns a fresh tree (computer_read does not reset them). x/y (the tree's @(x,y) coordinate space) are a fallback for things the tree does not list."
-  : "Coordinates are pixels in the most recent computer_screenshot image of the primary display, not native display pixels.";
-const RESULT = TREE
-  ? "Returns the foreground window's accessibility tree 300ms after the action. If the UI was still changing (Start menu, Spotlight, menus, dialogs, app launch), call computer_wait for a fresh tree before using its IDs."
-  : "Returns a screenshot taken 300ms after the action. If the UI was still animating (Start menu, Spotlight, menus or dialogs opening), call computer_wait before clicking positions taken from it.";
+const COORDINATES =
+  "Coordinates are pixels in the most recent computer_screenshot image of the primary display, not native display pixels.";
+const TARGET = "Target an element by its [id] from the latest computer_tree, or pass x/y.";
+const RESULT =
+  "Returns a screenshot taken 300ms after the action. If the UI was still animating (Start menu, Spotlight, menus or dialogs opening), call computer_wait before clicking positions taken from it.";
 
 // Separate x/y instead of an [x, y] tuple: tuple-form array schemas are rejected by some providers.
 // Plain Number, not Int: schema checks fail inside opencode's effect copy even on integer input; the helper rounds.
-// In tree mode x/y are optional because an element ID can replace them.
+// x/y are optional because an element ID can replace them.
 const coordinate = (name: string) =>
-  TREE
-    ? Schema.optional(Schema.Number.annotate({ description: `${name} in tree coordinates; use instead of an element ID` }))
-    : Schema.Number.annotate({ description: `${name} in screenshot pixels` });
+  Schema.optional(Schema.Number.annotate({ description: `${name} in screenshot pixels; omit when passing an element ID` }));
 const id = (description: string) => Schema.optional(Schema.Number.annotate({ description }));
 
-const input = <Fields extends Schema.Struct.Fields>(fields: Fields) =>
+const input = <Fields extends Record<string, Schema.Top & { readonly DecodingServices: never }>>(fields: Fields) =>
   Schema.toStandardJSONSchemaV1(Schema.toStandardSchemaV1(Schema.Struct(fields)));
 
 function startHelper() {
-  const proc = Bun.spawn([HELPER, ...(TREE ? ["--tree"] : [])], { stdin: "pipe", stdout: "pipe", stderr: "inherit" });
+  const proc = Bun.spawn([HELPER], { stdin: "pipe", stdout: "pipe", stderr: "inherit" });
   const reader = proc.stdout.pipeThrough(new TextDecoderStream()).getReader();
   let buffered = "";
   return {
@@ -85,7 +78,7 @@ export default Plugin.define({
       const space = `native ${response.native[0]}x${response.native[1]}, scale ${response.scale.toFixed(4)}`;
       if (response.tree !== undefined)
         return {
-          content: `Accessibility tree. @(x,y wxh) bounds and all computer_* x/y are in a ${width}x${height} space covering the primary display (${space}). Element IDs stay valid until the next computer_tree call or action; computer_read does not reset them.\n\n${response.tree}`,
+          content: `Accessibility tree. @(x,y wxh) bounds are in the ${width}x${height} screenshot space of the primary display (${space}). Element IDs stay valid until the next computer_tree call; after the UI changes substantially (navigation, a new dialog), call computer_tree again before using them.\n\n${response.tree}`,
         };
       const contract = `Screenshot ${width}x${height} of the primary display (${space}). All computer_* coordinates are pixels in this ${width}x${height} image.`;
       const text =
@@ -111,49 +104,51 @@ export default Plugin.define({
     }
 
     await ctx.tool.transform((tools) => {
-      if (TREE) {
-        tools.add({
-          name: "computer_tree",
-          options: { codemode: false },
-          description:
-            'Read the accessibility tree of the foreground window: one element per line as [id] role "name" value="…" @(x,y wxh) states, indented by nesting. An open menu or popup outside the window follows it, then the other open windows. Use element IDs with computer_click, computer_move, computer_scroll and computer_drag, and computer_read for the full text of an element. Apps that draw their own UI (games, some custom-rendered apps) expose little or nothing; use keyboard tools or x/y there. The foreground window may be the terminal running OpenCode: switch with computer_focus using a title from the window list.',
-          input: Schema.Record(Schema.String, Schema.Unknown),
-          execute: (_, context) => call({ action: "tree" }, context.signal),
-        });
-        tools.add({
-          name: "computer_read",
-          options: { codemode: false },
-          description:
-            'Read the full text of one element from the latest accessibility tree: the whole page text of a browser Document, the buffer of a terminal or editor (elements with the "text" state), or the complete text of an item cut off with "…(truncated; computer_read [id])". Long text is paged: the result ends with the offset to pass for the next page. Does not act, and keeps the current tree and its IDs valid.',
-          input: input({
-            element: Schema.Number.annotate({ description: "Element ID from the latest tree" }),
-            offset: Schema.optional(Schema.Number.annotate({ description: "Character offset to start from (default 0)" })),
-          }),
-          execute: ({ element, offset }, context) =>
-            call({ action: "read", element: Math.round(element), offset: offset === undefined ? undefined : Math.max(0, Math.round(offset)) }, context.signal),
-        });
-      } else {
-        tools.add({
-          name: "computer_screenshot",
-          options: { codemode: false },
-          description: `Capture the primary display. ${COORDINATES}`,
-          input: Schema.Record(Schema.String, Schema.Unknown),
-          execute: (_, context) => call({ action: "screenshot" }, context.signal),
-        });
-        tools.add({
-          name: "computer_zoom",
-          options: { codemode: false },
-          description: `Show a region of the screen at higher detail, e.g. to read small text. The region and all later coordinates stay in full-screenshot space; zooming does not change what coordinates mean. ${COORDINATES}`,
-          input: input({ x0: coordinate("left"), y0: coordinate("top"), x1: coordinate("right"), y1: coordinate("bottom") }),
-          execute: ({ x0, y0, x1, y1 }, context) => call({ action: "zoom", region: [x0, y0, x1, y1] }, context.signal),
-        });
-      }
+      tools.add({
+        name: "computer_screenshot",
+        options: { codemode: false },
+        description: `Capture the primary display. ${COORDINATES}`,
+        input: Schema.Record(Schema.String, Schema.Unknown),
+        execute: (_, context) => call({ action: "screenshot" }, context.signal),
+      });
+      tools.add({
+        name: "computer_zoom",
+        options: { codemode: false },
+        description: `Show a region of the screen at higher detail, e.g. to read small text. The region and all later coordinates stay in full-screenshot space; zooming does not change what coordinates mean. ${COORDINATES}`,
+        input: input({
+          x0: Schema.Number.annotate({ description: "left in screenshot pixels" }),
+          y0: Schema.Number.annotate({ description: "top in screenshot pixels" }),
+          x1: Schema.Number.annotate({ description: "right in screenshot pixels" }),
+          y1: Schema.Number.annotate({ description: "bottom in screenshot pixels" }),
+        }),
+        execute: ({ x0, y0, x1, y1 }, context) => call({ action: "zoom", region: [x0, y0, x1, y1] }, context.signal),
+      });
+      tools.add({
+        name: "computer_tree",
+        options: { codemode: false },
+        description:
+          'Read the accessibility tree of the foreground window as text: one element per line as [id] role "name" value="…" @(x,y wxh) states, indented by nesting, bounds in screenshot pixels. An open menu or popup outside the window follows it, then the other open windows. Use it to target small or crowded controls exactly by element ID with computer_click, computer_move, computer_scroll and computer_drag, or to read text with computer_read. Apps that draw their own UI (games, canvas apps) expose little or nothing; use the screenshot there.',
+        input: Schema.Record(Schema.String, Schema.Unknown),
+        execute: (_, context) => call({ action: "tree" }, context.signal),
+      });
+      tools.add({
+        name: "computer_read",
+        options: { codemode: false },
+        description:
+          'Read the full text of one element from the latest computer_tree: the whole page text of a browser Document, the buffer of a terminal or editor (elements with the "text" state), or the complete text of an item cut off with "…(truncated; computer_read [id])". Long text is paged: the result ends with the offset to pass for the next page. Does not act, and keeps the tree\'s IDs valid.',
+        input: input({
+          element: Schema.Number.annotate({ description: "Element ID from the latest tree" }),
+          offset: Schema.optional(Schema.Number.annotate({ description: "Character offset to start from (default 0)" })),
+        }),
+        execute: ({ element, offset }, context) =>
+          call({ action: "read", element: Math.round(element), offset: offset === undefined ? undefined : Math.max(0, Math.round(offset)) }, context.signal),
+      });
       tools.add({
         name: "computer_click",
         options: { codemode: false },
-        description: `Move the pointer to ${TREE ? "an element or a coordinate" : "a coordinate"} and click. ${COORDINATES} ${RESULT}`,
+        description: `Move the pointer to an element or a coordinate and click. ${TARGET} ${COORDINATES} ${RESULT}`,
         input: input({
-          ...(TREE ? { element: id("Element ID to click at its center") } : {}),
+          element: id("Element ID to click at its center"),
           x: coordinate("x"),
           y: coordinate("y"),
           button: Schema.optional(Schema.Literals(["left", "right", "middle"])),
@@ -164,18 +159,19 @@ export default Plugin.define({
       tools.add({
         name: "computer_move",
         options: { codemode: false },
-        description: `Move the pointer without clicking, e.g. to hover and open tooltips or hover menus. ${COORDINATES} ${RESULT}`,
-        input: input({ ...(TREE ? { element: id("Element ID to hover at its center") } : {}), x: coordinate("x"), y: coordinate("y") }),
+        description: `Move the pointer without clicking, e.g. to hover and open tooltips or hover menus. ${TARGET} ${COORDINATES} ${RESULT}`,
+        input: input({ element: id("Element ID to hover at its center"), x: coordinate("x"), y: coordinate("y") }),
         execute: (args, context) => call({ action: "move", ...args }, context.signal),
       });
       tools.add({
         name: "computer_drag",
         options: { codemode: false },
-        description: `Press the left button at the start point, drag to the end point, and release. Use for moving or resizing windows, selecting text, drag and drop. ${COORDINATES} ${RESULT}`,
+        description: `Press the left button at the start point, drag to the end point, and release. Use for moving or resizing windows, selecting text, drag and drop. Each end is an element [id] from the latest computer_tree or x/y. ${COORDINATES} ${RESULT}`,
         input: input({
-          ...(TREE ? { start_element: id("Element ID to start the drag at"), end_element: id("Element ID to drop on") } : {}),
+          start_element: id("Element ID to start the drag at"),
           start_x: coordinate("start x"),
           start_y: coordinate("start y"),
+          end_element: id("Element ID to drop on"),
           end_x: coordinate("end x"),
           end_y: coordinate("end y"),
         }),
@@ -184,9 +180,9 @@ export default Plugin.define({
       tools.add({
         name: "computer_scroll",
         options: { codemode: false },
-        description: `Scroll the mouse wheel over ${TREE ? "an element or a point" : "a point"}. ${COORDINATES} ${RESULT}`,
+        description: `Scroll the mouse wheel over an element or a point. ${TARGET} ${COORDINATES} ${RESULT}`,
         input: input({
-          ...(TREE ? { element: id("Element ID to scroll over") } : {}),
+          element: id("Element ID to scroll over"),
           x: coordinate("x"),
           y: coordinate("y"),
           direction: Schema.Literals(["up", "down", "left", "right"]),
@@ -197,14 +193,14 @@ export default Plugin.define({
       tools.add({
         name: "computer_type",
         options: { codemode: false },
-        description: `Type text at the current keyboard focus. Any Unicode text works regardless of keyboard layout. Use computer_key for Enter, Tab, and shortcuts. Returns no ${TREE ? "tree" : "screenshot"}, only which element had keyboard focus; the next action's result shows the outcome, or call ${TREE ? "computer_tree" : "computer_screenshot"} to check.${TREE ? " Element IDs stay valid." : ""}`,
+        description: `Type text at the current keyboard focus. Any Unicode text works regardless of keyboard layout. Use computer_key for Enter, Tab, and shortcuts. Returns no screenshot, only which element had keyboard focus; the next action's result shows the outcome, or call computer_screenshot to check.`,
         input: input({ text: Schema.String }),
         execute: ({ text }, context) => call({ action: "type", text }, context.signal),
       });
       tools.add({
         name: "computer_focus",
         options: { codemode: false },
-        description: `Bring a top-level window to the front (restoring it if minimized), by title: case-insensitive, an exact title first, else the first window whose title contains the text. If nothing matches, the error lists the open windows' titles${TREE ? "" : ", which is how to find window titles in screenshot mode"}. ${RESULT}`,
+        description: `Bring a top-level window to the front (restoring it if minimized), by title: case-insensitive, an exact title first, else the first window whose title contains the text. If nothing matches, the error lists the open windows' titles; computer_tree lists them too. ${RESULT}`,
         input: input({ title: Schema.String.annotate({ description: "Window title or part of it" }) }),
         execute: ({ title }, context) => call({ action: "focus", title }, context.signal),
       });
@@ -222,9 +218,7 @@ export default Plugin.define({
       tools.add({
         name: "computer_wait",
         options: { codemode: false },
-        description: TREE
-          ? `Wait, then return a fresh accessibility tree. Use after actions that start animations or loading (Start menu, Spotlight, menus, dialogs, app launch) before using IDs from the previous tree. ${COORDINATES}`
-          : `Wait, then take a screenshot. Use after actions that start animations or loading (Start menu, Spotlight, menus, dialogs, app launch) before clicking positions from the previous screenshot. ${COORDINATES}`,
+        description: `Wait, then take a screenshot. Use after actions that start animations or loading (Start menu, Spotlight, menus, dialogs, app launch) before clicking positions from the previous screenshot. ${COORDINATES}`,
         input: input({ seconds: Schema.Number.annotate({ description: "Seconds to wait, e.g. 1" }) }),
         execute: ({ seconds }, context) => call({ action: "wait", seconds: Math.max(0, seconds) }, context.signal),
       });

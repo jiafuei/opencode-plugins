@@ -128,14 +128,18 @@ Decide how the plugin obtains the helper: per-platform npm packages vs. download
 Build Windows and macOS binaries in CI. Sign the macOS helper if permissions should attach to it rather than the
 terminal.
 
-### Tree mode — implemented; Windows verified by helper-level checks, macOS unbuilt
+### Accessibility tree — implemented; Windows verified by helper-level checks, macOS unbuilt
 
-`COMPUTER_USE_MODE=tree` swaps screenshots for the foreground window's accessibility tree (text only), for text-only
-models, token cost, and element-precise targeting. Decisions:
+`computer_tree` and `computer_read` sit alongside the screenshot tools, for element-precise targeting and full-text
+reads. This was first a separate `COMPUTER_USE_MODE=tree` that replaced screenshots, for text-only models and token
+cost. It was merged because current models all take images, a full tree (up to 400 elements) usually costs more tokens
+than a ~1.5k-token screenshot, and the mode hid the tree from vision models and the screenshot from apps without one.
+Decisions:
 
 - **Element IDs**: sequential per tree. The helper keeps id → native element (UIA element / AXUIElement) from the latest
-  tree only, re-reads the element's live bounds on use, and acts at the center. Pointer tools take `element`
-  (`start_element`/`end_element` for drag); x/y stay as a fallback and are optional in tree mode.
+  `computer_tree` only; actions keep them. It re-reads the element's live bounds on use and acts at the center, so moved
+  elements still land and vanished ones error. Pointer tools take `element` (`start_element`/`end_element` for drag) or
+  x/y.
 - **Scope**: foreground window, plus the top-level window or AXMenu holding keyboard focus when it lies outside (open
   menus), then a list of other windows (xcap's window list: title, app, bounds, minimized).
 - **Pruning**: skip offscreen and zero-size elements; flatten unnamed pane/group containers; cap at 400 rendered elements.
@@ -144,8 +148,7 @@ models, token cost, and element-precise targeting. Decisions:
   Toggle/expand/selection states are only read when the pattern is available (otherwise UIA returns a sentinel).
 - **macOS**: `accessibility-sys` + `core-foundation`: AXFocusedApplication → AXFocusedWindow → AXChildren recursion,
   bounded at 3000 visited elements; elements outside the window rect count as offscreen.
-- Coordinates stay in the screenshot space (the helper still captures once per observation to keep the mapping fresh),
-  so x/y and tree bounds agree across modes.
+- Tree bounds are in the screenshot space of the most recent capture, so x/y and tree bounds agree.
 - **Text limits**: labels of elements with children are cut at 80 characters (web containers repeat their children), leaf
   text at 2,000; a cut leaf points at `computer_read`. No per-call length argument: the element cap bounds output.
 - **`computer_read({ element, offset? })`**: full text of one element without acting or resetting IDs. Windows reads
@@ -154,15 +157,14 @@ models, token cost, and element-precise targeting. Decisions:
 
 ### Post-action observation
 
-Every action returns a fresh screenshot (or tree) except `computer_type`. Typing has a predictable outcome and in
+Every action returns a fresh screenshot except `computer_type`. Typing has a predictable outcome and in
 practice is almost always followed by `computer_key` (Return, Tab) or a click, whose result shows the outcome anyway.
 Instead it returns the role and name of the element with keyboard focus, which catches typing into the wrong field.
 Move, key, scroll, drag, click, wait and focus keep their observation: each changes the screen in ways the model has to
-see (hover menus, dialogs opened by shortcuts, new scroll content). In tree mode typing keeps the current IDs.
+see (hover menus, dialogs opened by shortcuts, new scroll content).
 
-`computer_focus({ title })` brings a window to the front in both modes (Alt tap + `SetForegroundWindow` on Windows,
-AXRaise + AXFrontmost on macOS); with no match, the error lists open windows, which is how screenshot mode discovers
-titles.
+`computer_focus({ title })` brings a window to the front (Alt tap + `SetForegroundWindow` on Windows,
+AXRaise + AXFrontmost on macOS); with no match, the error lists open windows (as does `computer_tree`).
 
 ## Open questions
 

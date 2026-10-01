@@ -9,23 +9,25 @@ Targets: Windows host with the OpenCode server in WSL2, and macOS with OpenCode 
 |---|---|
 | `computer_screenshot` | — |
 | `computer_zoom` | `x0`, `y0`, `x1`, `y1` — region shown at native resolution; coordinates stay in full-screenshot space |
-| `computer_click` | `x`, `y`, `button?` (`left`/`right`/`middle`), `count?` (1–3) |
-| `computer_move` | `x`, `y` — hover |
-| `computer_drag` | `start_x`, `start_y`, `end_x`, `end_y` — left-button drag |
-| `computer_scroll` | `x`, `y`, `direction` (`up`/`down`/`left`/`right`), `amount` (wheel clicks) |
+| `computer_tree` | — foreground window's accessibility tree as text, with element IDs |
+| `computer_read` | `element`, `offset?` — full text of one tree element, paged |
+| `computer_click` | `element` or `x`, `y`; `button?` (`left`/`right`/`middle`), `count?` (1–3) |
+| `computer_move` | `element` or `x`, `y` — hover |
+| `computer_drag` | `start_element` or `start_x`, `start_y`; `end_element` or `end_x`, `end_y` — left-button drag |
+| `computer_scroll` | `element` or `x`, `y`; `direction` (`up`/`down`/`left`/`right`), `amount` (wheel clicks) |
 | `computer_type` | `text` — Unicode, layout-independent; returns only the focused element, no screenshot |
 | `computer_focus` | `title` — bring a window to the front (exact title, else substring); no match lists open windows |
 | `computer_key` | `keys` chord like `"ctrl+s"`, `"super"`, `"Return"` (case-insensitive, xdotool-style names), `repeat?` |
 | `computer_wait` | `seconds` |
 
-Every tool except `computer_type` returns a screenshot (actions wait 300ms first) plus a line stating the coordinate
+Every tool except `computer_type`, `computer_tree` and `computer_read` returns a screenshot (actions wait 300ms first) plus a line stating the coordinate
 contract:
 `Screenshot 1430x804 of the primary display (native 2560x1440, scale 0.5585). All computer_* coordinates are pixels in
 this 1430x804 image.` The helper maps screenshot pixels to capture pixels, then to the OS input space (points on
 macOS, physical pixels on Windows), using the most recent full screenshot.
 
 `computer_type` returns `Typed N characters into <Role> "<name>".` instead, naming the element that had keyboard focus
-(read through UI Automation / AX in both modes), so typing into the wrong field shows up without an image.
+(read through UI Automation / AX), so typing into the wrong field shows up without an image.
 `computer_focus` taps Alt before `SetForegroundWindow` on Windows (Windows only lets a background process take the
 foreground right after an Alt press) and reports an error when focus was still refused; on macOS it raises the window
 via AX and makes its app frontmost.
@@ -56,23 +58,21 @@ echo '{"id":1,"action":"screenshot"}' | bin/computer-use-helper.exe
 Actions: `screenshot`, `tree`, `zoom` (`region`), `click` (`element?` or `x`, `y`; `button?`, `count?`), `move`
 (`element?` or `x`, `y`), `drag` (`start_element?` or `start_x`, `start_y`; `end_element?` or `end_x`, `end_y`), `scroll`
 (`element?` or `x`, `y`; `direction`, `amount`), `type` (`text`), `key` (`keys`, `repeat?`), `wait` (`seconds`),
-`read` (`element`, `offset?`; tree mode, answers with `text` and keeps the current IDs).
+`read` (`element`, `offset?`; answers with `text`).
 Coordinates are in screenshot pixel space; the helper scales them to the primary monitor. Responses carry `image`
-(screenshot mode) or `tree` (tree mode, helper started with `--tree`), plus `screenshot` (full-screenshot size), `native`
-(capture pixels), `scale`, and `cursor` (OS input units).
+(screenshot, zoom and actions), `tree` (`tree`) or `text` (`read`, `type`), plus `screenshot` (full-screenshot size),
+`native` (capture pixels), `scale`, and `cursor` (OS input units).
 
-## Tree mode
+## Accessibility tree
 
-Set `COMPUTER_USE_MODE=tree` in OpenCode's environment to observe through the accessibility tree instead of
-screenshots (UI Automation on Windows, the AX API on macOS). This works with text-only models and costs fewer tokens on
-form-heavy apps. It is also more precise, because actions can target elements instead of pixels. In tree mode:
+`computer_tree` reads the foreground window through UI Automation on Windows and the AX API on macOS. Screenshots stay
+the default observation; the tree is for targeting small or crowded controls exactly and for reading text:
 
-- `computer_tree` replaces `computer_screenshot` and `computer_zoom`, and every result is text only.
 - `computer_click`, `computer_move` and `computer_scroll` take an `element` ID, and `computer_drag` takes
-  `start_element`/`end_element`. The helper acts at the element's current center. x/y still work as a fallback in the
-  same coordinate space the tree's bounds use.
-- IDs come from the latest tree; every action returns a fresh tree, and an ID that no longer resolves returns an
-  error asking for `computer_tree`.
+  `start_element`/`end_element`. The helper acts at the element's current center. Tree bounds are in screenshot pixels.
+- IDs come from the latest `computer_tree` and stay valid across actions until the next one. An element that no longer
+  exists returns an error asking for `computer_tree`; after larger UI changes the model should re-read the tree, since
+  an ID can still resolve to an element whose content changed.
 - `computer_read({ element, offset? })` returns the full text of one element without acting or resetting IDs: the
   Text-pattern document on Windows when the element has the `text` state (terminal and editor buffers, browser
   documents), otherwise its name and value (AXValue/AXTitle/AXDescription on macOS). Lines are right-trimmed and
@@ -83,7 +83,7 @@ form-heavy apps. It is also more precise, because actions can target elements in
 Example (trimmed):
 
 ```
-Accessibility tree. @(x,y wxh) bounds and all computer_* x/y are in a 1430x804 space covering the primary display (native 2560x1440, scale 0.5585). Element IDs stay valid until the next computer_tree call or action; computer_read does not reset them.
+Accessibility tree. @(x,y wxh) bounds are in the 1430x804 screenshot space of the primary display (native 2560x1440, scale 0.5585). Element IDs stay valid until the next computer_tree call; after the UI changes substantially (navigation, a new dialog), call computer_tree again before using them.
 
 Foreground window:
 [1] Window "Example article — Mozilla Firefox" @(0,0 1430x783)
@@ -104,8 +104,8 @@ The tree covers the foreground window, plus an open menu or popup that holds key
 other top-level windows. Offscreen (scrolled-out or collapsed) elements are skipped. Unnamed layout containers are
 flattened, and output stops at 400 elements. Limits:
 
-- Apps that draw their own UI (games, canvas apps, some custom toolkits) expose little or nothing. Use keyboard tools
-  or x/y there, or switch back to screenshot mode.
+- Apps that draw their own UI (games, canvas apps, some custom toolkits) expose little or nothing. Use the screenshot
+  and x/y there.
 - Browsers expose page content only after their accessibility engine starts. Firefox and Chromium start it when the
   first UI Automation client connects, so the first tree of a browser can be slow or thin. Large pages take 1–2s.
   Chrome, Edge and Electron apps (Discord, VS Code) take a few seconds after that first access; until then their
@@ -164,9 +164,7 @@ Consider gating the tools with `"permission": { "computer_*": "ask" }`.
 10. Click into a text field and `computer_type` into it: the result names that field (e.g. `Edit "Search"`); then do
     the same with focus somewhere unexpected and confirm the result shows where the text actually went.
 
-## Manual test checklist (tree mode)
-
-Run with `COMPUTER_USE_MODE=tree` (restart OpenCode after changing it), ideally once with a text-only model.
+## Manual test checklist (accessibility tree)
 
 1. `computer_tree` with a normal app in front (Notepad / TextEdit, Explorer / Finder): the tree lists its controls
    with sensible roles, names and bounds.
@@ -174,7 +172,8 @@ Run with `COMPUTER_USE_MODE=tree` (restart OpenCode after changing it), ideally 
 3. Open a menu (e.g. File) and confirm the open menu appears as a focused popup, then click an item in it by ID.
 4. In a browser, read a page and click a link by ID; scroll the page with `computer_scroll` on the document element.
 5. Check a checkbox in a settings dialog and confirm its state flips between `unchecked` and `checked`.
-6. Call a stale ID after the UI changed: the error asks for `computer_tree`.
+6. Close a dialog, then use an ID from inside it: the error asks for `computer_tree`. Click by ID, then click
+   another ID from the same tree: both land (actions keep the IDs).
 7. In Firefox, open an article and `computer_read` its `Document` element: the article text comes back (or only the
    title and URL if the document has no `text` state), paged if long.
 8. With the terminal in front, `computer_read` its `text` element: the scrollback comes back without padding.

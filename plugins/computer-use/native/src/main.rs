@@ -67,7 +67,7 @@ enum Action {
         direction: ScrollDirection,
         amount: i32,
     },
-    /// Types without a screenshot or tree: the outcome is predictable and the next action shows it.
+    /// Types without a screenshot: the outcome is predictable and the next action shows it.
     Type {
         text: String,
     },
@@ -124,10 +124,10 @@ struct Display {
 struct State {
     enigo: Enigo,
     display: Display,
-    /// Accessibility backend: trees in tree mode, and the focused element after typing in both modes.
+    /// Accessibility backend: trees, element text, and the focused element after typing.
     backend: platform::Backend,
-    /// Tree mode: the elements of the latest tree (ID = index + 1).
-    tree: Option<Vec<platform::Element>>,
+    /// Elements of the latest tree (ID = index + 1). Actions keep them; only the next tree replaces them.
+    tree: Vec<platform::Element>,
 }
 
 fn fit_scale(w: f64, h: f64) -> f64 {
@@ -160,8 +160,7 @@ fn to_input(display: &Display, [x, y]: [f64; 2]) -> (i32, i32) {
 }
 
 fn lookup(state: &State, id: usize) -> Result<&platform::Element, Box<dyn Error>> {
-    let elements = state.tree.as_ref().ok_or("element IDs are only available in tree mode")?;
-    Ok(elements.get(id.wrapping_sub(1)).ok_or(format!("unknown element {id}; call computer_tree for current IDs"))?)
+    Ok(state.tree.get(id.wrapping_sub(1)).ok_or(format!("unknown element {id}; call computer_tree for current IDs"))?)
 }
 
 /// Input-space point for an element ID from the latest tree (its live center), or screenshot-space x/y.
@@ -234,11 +233,16 @@ fn parse_key(name: &str) -> Result<Key, Box<dyn Error>> {
     })
 }
 
-/// Perform the action. Zoom, read and type answer directly; everything else is followed by a fresh observation.
+/// Perform the action. Tree, zoom, read and type answer directly; everything else is followed by a fresh screenshot.
 fn act(state: &mut State, action: Action) -> Result<Option<serde_json::Value>, Box<dyn Error>> {
-    let settle = !matches!(action, Action::Screenshot | Action::Tree);
+    let settle = !matches!(action, Action::Screenshot);
     match action {
-        Action::Screenshot | Action::Tree => {}
+        Action::Screenshot => {}
+        Action::Tree => {
+            let (text, elements) = tree::render(&state.backend.snapshot()?, &state.display);
+            state.tree = elements;
+            return Ok(Some(serde_json::json!({ "tree": format!("{text}{}", tree::windows(&state.display)?) })));
+        }
         Action::Zoom { region } => return zoom(&state.display, region).map(Some),
         Action::Read { element, offset } => {
             let text = state
@@ -356,18 +360,11 @@ fn act(state: &mut State, action: Action) -> Result<Option<serde_json::Value>, B
     Ok(None)
 }
 
-/// Refresh the display mapping and describe the screen: a screenshot, or in tree mode the foreground window's tree.
+/// Refresh the display mapping and take a screenshot.
 fn observe(state: &mut State) -> Result<serde_json::Value, Box<dyn Error>> {
     let (display, image) = capture()?;
     state.display = display;
-    match &mut state.tree {
-        Some(elements) => {
-            let (text, fresh) = tree::render(&state.backend.snapshot()?, &state.display);
-            *elements = fresh;
-            Ok(serde_json::json!({ "tree": format!("{text}{}", tree::windows(&state.display)?) }))
-        }
-        None => encode(&image),
-    }
+    encode(&image)
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -400,13 +397,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     // UI Automation initializes COM, so the backend is created before anything else touches it.
     let backend = platform::Backend::new()?;
-    let tree = std::env::args().any(|arg| arg == "--tree").then(Vec::new);
-    let mut state = State { enigo: enigo?, display: capture()?.0, backend, tree };
+    let mut state = State { enigo: enigo?, display: capture()?.0, backend, tree: Vec::new() };
     let mut stdout = std::io::stdout().lock();
     for line in std::io::stdin().lock().lines() {
         let request: Request = serde_json::from_str(&line?)?;
-        let result = act(&mut state, request.action).and_then(|zoomed| match zoomed {
-            Some(zoomed) => Ok(zoomed),
+        let result = act(&mut state, request.action).and_then(|answer| match answer {
+            Some(answer) => Ok(answer),
             None => observe(&mut state),
         });
         let response = match result {
