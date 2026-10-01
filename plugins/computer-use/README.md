@@ -7,23 +7,25 @@ Targets: Windows host with the OpenCode server in WSL2, and macOS with OpenCode 
 
 | Tool | Input |
 |---|---|
-| `computer_screenshot` | — also lists keyboard focus and the open windows |
+| `computer_screenshot` | — also lists the frontmost window, keyboard focus and the open windows |
 | `computer_zoom` | `x0`, `y0`, `x1`, `y1` — region shown at native resolution; coordinates stay in full-screenshot space |
-| `computer_tree` | `find?` — foreground window's accessibility tree as text, with element IDs; `find` lists only matching elements |
+| `computer_tree` | `find?`, `window?` — accessibility tree of the foreground window, or of any window by title, as text with element IDs; `find` lists only matching elements |
 | `computer_read` | `element`, `offset?` — full text of one tree element, paged |
 | `computer_click` | `element` or `x`, `y`; `button?` (`left`/`right`/`middle`), `count?` (1–3) |
 | `computer_move` | `element` or `x`, `y` — hover |
 | `computer_drag` | `start_element` or `start_x`, `start_y`; `end_element` or `end_x`, `end_y` — left-button drag |
 | `computer_scroll` | `element` or `x`, `y`; `direction` (`up`/`down`/`left`/`right`), `amount` (wheel clicks) |
-| `computer_type` | `text` — Unicode, layout-independent; returns only the focused element, no screenshot |
-| `computer_focus` | `title` — bring a window to the front (exact title, else substring); no match lists open windows |
-| `computer_key` | `keys` chord like `"ctrl+s"`, `"super"`, `"Return"` (case-insensitive, xdotool-style names), `repeat?` |
+| `computer_type` | `text`, `element?`, `window?` — Unicode, layout-independent; focuses `element` / raises `window` first; returns only the frontmost window and focused element, no screenshot |
+| `computer_focus` | `title` — bring a window to the front (exact title, else substring), verified; no match lists open windows |
+| `computer_key` | `keys` chord like `"ctrl+s"`, `"super"`, `"Return"` (case-insensitive, xdotool-style names), `repeat?`, `window?` |
 | `computer_wait` | `seconds` |
 
 Every tool except `computer_type`, `computer_tree` and `computer_read` returns a screenshot (actions wait 300ms first)
 plus a line stating the coordinate contract:
 `Screenshot 1430x804 of the primary display (native 2560x1440, scale 0.5585). All computer_* coordinates are pixels in
-this 1430x804 image.` The helper maps screenshot pixels to capture pixels, then to the OS input space (points on
+this 1430x804 image.` Actions add where input goes now, so keys or clicks that landed in the wrong app show up at once:
+`Frontmost window: "general - Slack" (Slack). Keyboard focus: TextArea "Message #general".` When the frontmost app
+exposes no focused element, that line is a warning that keys and typed text may be dropped. The helper maps screenshot pixels to capture pixels, then to the OS input space (points on
 macOS, physical pixels on Windows), using the most recent full screenshot.
 
 An explicit `computer_screenshot` also lists what a screenshot can't show: where typing would go, and every open window
@@ -31,18 +33,43 @@ front to back, including minimized and covered ones, with the exact titles `comp
 actions leave this out to keep each step small.
 
 ```
-Keyboard focus: Edit "Search"
+Frontmost window: "Example article — Mozilla Firefox" (Firefox). Keyboard focus: Edit "Search".
 Open windows (front to back):
 - "Example article — Mozilla Firefox" (Firefox) @(0,0 1430x783) foreground
 - "#general | … - Discord" (Discord) @(8,12 1417x747)
 - "Inbox - … - Mozilla Thunderbird" (Thunderbird) minimized
 ```
 
-`computer_type` returns `Typed N characters into <Role> "<name>".` instead, naming the element that had keyboard focus
-(read through UI Automation / AX), so typing into the wrong field shows up without an image.
-`computer_focus` taps Alt before `SetForegroundWindow` on Windows (Windows only lets a background process take the
-foreground right after an Alt press) and reports an error when focus was still refused; on macOS it raises the window
-via AX and makes its app frontmost.
+`computer_type` returns `Typed N characters.` plus that frontmost/focus line instead, read through UI Automation / AX, so
+typing into the wrong field shows up without an image.
+
+Synthetic keys always go to the frontmost app. `computer_key` and `computer_type` take `window` to bring a window to the
+front first, and `computer_type` takes `element` to focus a field from the latest tree first (AXFocused / UIA
+`SetFocus`, which keeps the caret where the app puts it, unlike a click in the middle of existing text).
+
+`computer_focus` (and `window` on the other tools) fails instead of reporting success when another app stays in front.
+On Windows it taps Alt before `SetForegroundWindow` (Windows only lets a background process take the foreground right
+after an Alt press; skipped when the window is already in front) and checks its result. On macOS it unminimizes the
+window, raises it via AX and sets its app frontmost, then waits up to 1s for that app to become frontmost. macOS 14+ can
+ignore activation from a background process, so it then tries LaunchServices (`open` on the app bundle) and waits again.
+
+## Overlay
+
+While OpenCode drives the computer, the primary display gets a glowing orange border and a banner at the top saying
+what it is doing, e.g. `OpenCode is using your computer · Typing in Slack`. The overlay appears with the first
+`computer_*` action and disappears when every session that used the computer stops running (done, failed or
+interrupted); the next action shows it again. Typed text is never shown.
+
+The overlay is click-through and never takes focus. On macOS it is left out of screen captures; on Windows the model's
+screenshots show it, and the `computer_screenshot` description tells the model it is OpenCode's own overlay. It runs as a separate process, the helper started with `--overlay`, which reads one banner text per line on
+stdin (an empty line hides it) and exits with the helper.
+
+- Windows: a layered, topmost `WS_EX_NOACTIVATE | WS_EX_TRANSPARENT` window drawn per pixel with `UpdateLayeredWindow`.
+  Windows refuses `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)` for such windows (it fails with a misleading
+  "not enough memory" error), and GDI captures include layered windows under DWM, so screenshots show the overlay. A
+  colour-keyed window would accept the affinity but can't draw the glow.
+- macOS: a non-activating `NSPanel` at screen-saver level on every Space, ignoring mouse events, from an accessory-policy
+  app (no Dock icon). `NSWindowSharingNone` keeps it out of `CGWindowListCreateImage`, which xcap captures with.
 
 ## Build the helper (Windows / WSL)
 
@@ -67,9 +94,10 @@ echo '{"id":1,"action":"screenshot"}' | bin/computer-use-helper.exe
 # {"id":1,"ok":true,"image":"<base64 jpeg>","width":1430,"height":804,"cursor":[779,981]}
 ```
 
-Actions: `screenshot`, `tree` (`find?`), `zoom` (`region`), `click` (`element?` or `x`, `y`; `button?`, `count?`), `move`
+Actions: `screenshot`, `tree` (`find?`, `window?`), `zoom` (`region`), `click` (`element?` or `x`, `y`; `button?`, `count?`), `move`
 (`element?` or `x`, `y`), `drag` (`start_element?` or `start_x`, `start_y`; `end_element?` or `end_x`, `end_y`), `scroll`
-(`element?` or `x`, `y`; `direction`, `amount`), `type` (`text`), `key` (`keys`, `repeat?`), `wait` (`seconds`),
+(`element?` or `x`, `y`; `direction`, `amount`), `type` (`text`, `element?`, `window?`), `focus` (`title`), `key` (`keys`,
+`repeat?`, `window?`), `wait` (`seconds`), `hide` (hide the overlay; answers without an image),
 `read` (`element`, `offset?`; answers with `text`).
 Coordinates are in screenshot pixel space; the helper scales them to the primary monitor. Responses carry `image`
 (screenshot, zoom and actions), `tree` (`tree`) or `text` (`read`, `type`), plus `screenshot` (full-screenshot size),
@@ -82,6 +110,8 @@ the default observation; the tree is for targeting small or crowded controls exa
 
 - `computer_click`, `computer_move` and `computer_scroll` take an `element` ID, and `computer_drag` takes
   `start_element`/`end_element`. The helper acts at the element's current center. Tree bounds are in screenshot pixels.
+- `computer_tree({ window })` reads any window by title (matched like `computer_focus`), also one behind others. Actions
+  on its elements bring that window to the front first, verified, so a click by ID cannot land in the covering window.
 - IDs come from the latest `computer_tree` and stay valid across actions until the next one. An element that no longer
   exists returns an error asking for `computer_tree`; after larger UI changes the model should re-read the tree, since
   an ID can still resolve to an element whose content changed.
@@ -112,7 +142,7 @@ Foreground window:
     [79] Hyperlink "Home" value="https://x.com/home" @(365,85 145x33)
 ```
 
-The tree covers the foreground window, plus an open menu or popup that holds keyboard focus outside it. Offscreen (scrolled-out or collapsed) elements are skipped. Unnamed layout containers are
+Without `window`, the tree covers the foreground window, plus an open menu or popup that holds keyboard focus outside it. Offscreen (scrolled-out or collapsed) elements are skipped. Unnamed layout containers are
 flattened. Unnamed images, text and separators, text that repeats its parent's name (a link and its text), and scroll bar
 parts are dropped. Bounds appear only on elements without listed children; containers are targeted by ID. URL values
 are cut at 60 characters. Output stops at 400 elements. Limits:
@@ -126,6 +156,10 @@ are cut at 60 characters. Output stops at 400 elements. Limits:
 - The foreground window is often the terminal running OpenCode; the model switches with `computer_focus`.
 - macOS reads each attribute with a cross-process call and stops after 3000 elements, so very large web views are cut
   short.
+- On macOS, Electron and Chromium apps (Slack, VS Code, Chrome) only build their tree for clients that set
+  `AXManualAccessibility` on the app; the helper sets it before reading a tree or the focused element.
+- macOS lists only on-screen windows: minimized windows and windows on other Spaces are not in the window list, so
+  `computer_focus` and `window` can't reach them.
 
 ## Build the helper (macOS)
 
@@ -201,3 +235,21 @@ Consider gating the tools with `"permission": { "computer_*": "ask" }`.
 4. Scroll a long page or list.
 5. Drag a window by its title bar to a new position.
 6. Zoom on small text (e.g. the menu bar clock), then click something found there.
+7. With the terminal in front, `computer_focus` a window of another app: it comes to the front, or the call fails. It
+   must never report success while the terminal stays frontmost. Every action result names the frontmost window.
+8. With Slack (or another Electron app) in the background, `computer_tree({ window: "Slack", find: "Message" })`: the
+   message box is listed. `computer_type({ element, text })` with its ID brings Slack to the front, focuses the box, and
+   the result names it as the keyboard focus.
+9. With the terminal in front, `computer_key({ keys: "cmd+a", window: "TextEdit" })`: the TextEdit document is
+   selected, not the terminal.
+
+## Manual test checklist (overlay)
+
+1. The first action shows the border and the banner; the banner follows each action ("Clicking", "Typing in …").
+2. macOS: the returned screenshot shows neither the border nor the banner. Windows: it shows both.
+3. Clicks and drags under the border and the banner land on the windows below; the frontmost window in the results never
+   names the overlay, and the app being controlled keeps keyboard focus (type right after the overlay first appears).
+4. The overlay stays up between actions while the model thinks, and disappears when the session finishes, fails, or is
+   interrupted with Esc.
+5. With display scaling at 150% (Windows) or on a Retina display (macOS), the border hugs the screen edges and the banner
+   text is sharp.

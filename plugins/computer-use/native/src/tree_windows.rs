@@ -41,9 +41,13 @@ impl Backend {
         Ok(Self { automation, request })
     }
 
-    /// The foreground window, plus the top-level window holding keyboard focus when that is a separate popup such as
-    /// an open menu.
-    pub fn snapshot(&self) -> Result<Vec<Node>, Box<dyn Error>> {
+    /// The window, or else the foreground window plus the top-level window holding keyboard focus when that is a
+    /// separate popup such as an open menu.
+    pub fn snapshot(&self, window: Option<&xcap::Window>) -> Result<Vec<Node>, Box<dyn Error>> {
+        if let Some(window) = window {
+            let element = self.automation.element_from_handle_build_cache(Handle::from(hwnd(window)?), &self.request)?;
+            return Ok(vec![node(&element, &self.request)]);
+        }
         let handle = Handle::from(unsafe { GetForegroundWindow() });
         let foreground = self.automation.element_from_handle_build_cache(handle, &self.request)?;
         let mut roots = vec![node(&foreground, &self.request)];
@@ -80,17 +84,22 @@ impl Backend {
         Ok([name, value].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join("\n"))
     }
 
-    /// Control type and name of the element with keyboard focus.
-    pub fn focused(&self) -> Option<(String, String)> {
+    /// Control type and name of the element with keyboard focus. UI Automation tracks it system-wide, so the front
+    /// window isn't needed.
+    pub fn focused(&self, _front: Option<&xcap::Window>) -> Option<(String, String)> {
         let element = self.automation.get_focused_element().ok()?;
         Some((format!("{:?}", element.get_control_type().ok()?), element.get_name().unwrap_or_default()))
+    }
+
+    /// Give the element keyboard focus.
+    pub fn focus(&self, element: &Element) -> Result<(), Box<dyn Error>> {
+        Ok(element.set_focus()?)
     }
 
     /// Restore the window if minimized and make it the foreground window. The caller has just tapped Alt, which lifts
     /// Windows' foreground lock for this process.
     pub fn raise(&self, window: &xcap::Window) -> Result<(), Box<dyn Error>> {
-        // xcap's window id is the HWND.
-        let hwnd = HWND(window.id()? as usize as *mut std::ffi::c_void);
+        let hwnd = hwnd(window)?;
         unsafe {
             if IsIconic(hwnd).as_bool() {
                 let _ = ShowWindow(hwnd, SW_RESTORE);
@@ -102,6 +111,11 @@ impl Backend {
         }
         Ok(())
     }
+}
+
+/// xcap's window id is the HWND.
+fn hwnd(window: &xcap::Window) -> Result<HWND, Box<dyn Error>> {
+    Ok(HWND(window.id()? as usize as *mut std::ffi::c_void))
 }
 
 fn node(element: &UIElement, request: &UICacheRequest) -> Node {

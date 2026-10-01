@@ -9,7 +9,7 @@ type Response =
       image?: string;
       width?: number;
       height?: number;
-      /** computer_screenshot: keyboard focus and open windows. */
+      /** Frontmost window and keyboard focus after actions; computer_screenshot adds the open windows. */
       context?: string;
       /** computer_tree. */
       tree?: string;
@@ -28,9 +28,17 @@ const HELPER =
 
 const COORDINATES =
   "Coordinates are pixels in the most recent computer_screenshot image of the primary display, not native display pixels.";
-const TARGET = "Target an element by its [id] from the latest computer_tree, or pass x/y.";
+// macOS keeps the overlay out of screenshots; Windows can't for a per-pixel transparent window.
+const OVERLAY =
+  process.platform === "darwin"
+    ? ""
+    : " The orange glow along the screen edges and the dark banner at the top center are OpenCode's own overlay, not part of any app; clicks pass through them to what is underneath.";
+const TARGET =
+  "Target an element by its [id] from the latest computer_tree, or pass x/y. Elements from a tree read with window bring that window to the front first.";
 const RESULT =
-  "Returns a screenshot taken 300ms after the action. If the UI was still animating (Start menu, Spotlight, menus or dialogs opening), call computer_wait before clicking positions taken from it.";
+  "Returns a screenshot taken 300ms after the action, with the frontmost window and the element that has keyboard focus. If the UI was still animating (Start menu, Spotlight, menus or dialogs opening), call computer_wait before clicking positions taken from it.";
+const WINDOW =
+  "Window title or part of it, matched like computer_focus: bring it to the front first (verified) so the input cannot land in another app";
 
 // Separate x/y instead of an [x, y] tuple: tuple-form array schemas are rejected by some providers.
 // Plain Number, not Int: schema checks fail inside opencode's effect copy even on integer input; the helper rounds.
@@ -68,13 +76,20 @@ export default Plugin.define({
     let helper: ReturnType<typeof startHelper> | undefined;
     let queue: Promise<unknown> = Promise.resolve();
     let nextID = 0;
+    // Sessions that used the computer and are still running. The helper's overlay stays up until all of them stop.
+    const using = new Set<string>();
 
-    async function send(request: Record<string, unknown>) {
+    async function exchange(request: Record<string, unknown>) {
       if (!helper || helper.proc.exitCode !== null) helper = startHelper();
       helper.proc.stdin.write(`${JSON.stringify({ id: ++nextID, ...request })}\n`);
       helper.proc.stdin.flush();
       const response = JSON.parse(await helper.readLine()) as Response;
       if (!response.ok) throw new Error(response.error);
+      return response;
+    }
+
+    async function send(request: Record<string, unknown>) {
+      const response = await exchange(request);
       if (response.text !== undefined) return { content: response.text };
       const [width, height] = response.screenshot;
       const space = `native ${response.native[0]}x${response.native[1]}, scale ${response.scale.toFixed(4)}`;
@@ -97,23 +112,47 @@ export default Plugin.define({
       };
     }
 
-    // One desktop, one pointer: actions run strictly one after another, even when the model issues parallel calls.
-    function call(request: Record<string, unknown>, signal: AbortSignal) {
-      const result = queue.then(() => {
-        signal.throwIfAborted();
-        return send(request);
-      });
+    // One desktop, one pointer: helper requests run strictly one after another, even when the model issues parallel
+    // calls.
+    function enqueue<T>(work: () => Promise<T>) {
+      const result = queue.then(work);
       queue = result.catch(() => {});
       return result;
     }
+
+    function call(request: Record<string, unknown>, context: { sessionID: string; signal: AbortSignal }) {
+      using.add(context.sessionID);
+      return enqueue(() => {
+        context.signal.throwIfAborted();
+        return send(request);
+      });
+    }
+
+    const subscription = new AbortController();
+    void (async () => {
+      for await (const event of ctx.event.subscribe({ signal: subscription.signal })) {
+        if (
+          event.type !== "session.execution.succeeded" &&
+          event.type !== "session.execution.interrupted" &&
+          event.type !== "session.execution.failed"
+        )
+          continue;
+        if (!using.delete(event.data.sessionID) || using.size > 0) continue;
+        enqueue(async () => {
+          if (helper?.proc.exitCode === null) await exchange({ action: "hide" });
+        }).catch((error) => console.error("computer-use: hiding the overlay failed:", error));
+      }
+    })().catch((error) => {
+      if (!subscription.signal.aborted) console.error("computer-use: watching sessions failed:", error);
+    });
 
     await ctx.tool.transform((tools) => {
       tools.add({
         name: "computer_screenshot",
         options: { codemode: false },
-        description: `Capture the primary display, with the element that has keyboard focus and the open windows front to back (exact titles for computer_focus, including minimized and covered ones). Screenshots returned after actions omit that list. ${COORDINATES}`,
+        description: `Capture the primary display, with the frontmost window, the element that has keyboard focus, and the open windows front to back (exact titles for computer_focus, including minimized and covered ones). Screenshots returned after actions omit that list.${OVERLAY} ${COORDINATES}`,
         input: Schema.Record(Schema.String, Schema.Unknown),
-        execute: (_, context) => call({ action: "screenshot" }, context.signal),
+        execute: (_, context) => call({ action: "screenshot" }, context),
       });
       tools.add({
         name: "computer_zoom",
@@ -125,19 +164,22 @@ export default Plugin.define({
           x1: Schema.Number.annotate({ description: "right in screenshot pixels" }),
           y1: Schema.Number.annotate({ description: "bottom in screenshot pixels" }),
         }),
-        execute: ({ x0, y0, x1, y1 }, context) => call({ action: "zoom", region: [x0, y0, x1, y1] }, context.signal),
+        execute: ({ x0, y0, x1, y1 }, context) => call({ action: "zoom", region: [x0, y0, x1, y1] }, context),
       });
       tools.add({
         name: "computer_tree",
         options: { codemode: false },
         description:
-          'Read the accessibility tree of the foreground window as text: one element per line as [id] role "name" value="…" @(x,y wxh) states, indented by nesting; bounds are in screenshot pixels and only on elements without listed children. An open menu or popup outside the window follows it. Use it to target small or crowded controls exactly by element ID with computer_click, computer_move, computer_scroll and computer_drag, or to read text with computer_read. Pass find with text you can see on screen (a button label, a link, a field name) to list only the elements that contain it; prefer that over the full tree when you know what to target. Apps that draw their own UI (games, canvas apps) expose little or nothing; use the screenshot there.',
+          'Read the accessibility tree of the foreground window, or of any window by title (also one in the background), as text: one element per line as [id] role "name" value="…" @(x,y wxh) states, indented by nesting; bounds are in screenshot pixels and only on elements without listed children. For the foreground window, an open menu or popup outside it follows. Actions on elements of a window read by title bring that window to the front first. Use it to target small or crowded controls exactly by element ID with computer_click, computer_move, computer_scroll and computer_drag, or to read text with computer_read. Pass find with text you can see on screen (a button label, a link, a field name) to list only the elements that contain it; prefer that over the full tree when you know what to target. Apps that draw their own UI (games, canvas apps) expose little or nothing; use the screenshot there.',
         input: input({
           find: Schema.optional(
             Schema.String.annotate({ description: "Only list elements whose name or value contains this text (case-insensitive), each with its parent's name" }),
           ),
+          window: Schema.optional(
+            Schema.String.annotate({ description: "Window title or part of it, matched like computer_focus; omit for the foreground window" }),
+          ),
         }),
-        execute: ({ find }, context) => call({ action: "tree", find }, context.signal),
+        execute: (args, context) => call({ action: "tree", ...args }, context),
       });
       tools.add({
         name: "computer_read",
@@ -149,7 +191,7 @@ export default Plugin.define({
           offset: Schema.optional(Schema.Number.annotate({ description: "Character offset to start from (default 0)" })),
         }),
         execute: ({ element, offset }, context) =>
-          call({ action: "read", element: Math.round(element), offset: offset === undefined ? undefined : Math.max(0, Math.round(offset)) }, context.signal),
+          call({ action: "read", element: Math.round(element), offset: offset === undefined ? undefined : Math.max(0, Math.round(offset)) }, context),
       });
       tools.add({
         name: "computer_click",
@@ -162,14 +204,14 @@ export default Plugin.define({
           button: Schema.optional(Schema.Literals(["left", "right", "middle"])),
           count: Schema.optional(Schema.Literals([1, 2, 3]).annotate({ description: "1 = click, 2 = double, 3 = triple" })),
         }),
-        execute: (args, context) => call({ action: "click", ...args }, context.signal),
+        execute: (args, context) => call({ action: "click", ...args }, context),
       });
       tools.add({
         name: "computer_move",
         options: { codemode: false },
         description: `Move the pointer without clicking, e.g. to hover and open tooltips or hover menus. ${TARGET} ${COORDINATES} ${RESULT}`,
         input: input({ element: id("Element ID to hover at its center"), x: coordinate("x"), y: coordinate("y") }),
-        execute: (args, context) => call({ action: "move", ...args }, context.signal),
+        execute: (args, context) => call({ action: "move", ...args }, context),
       });
       tools.add({
         name: "computer_drag",
@@ -183,7 +225,7 @@ export default Plugin.define({
           end_x: coordinate("end x"),
           end_y: coordinate("end y"),
         }),
-        execute: (args, context) => call({ action: "drag", ...args }, context.signal),
+        execute: (args, context) => call({ action: "drag", ...args }, context),
       });
       tools.add({
         name: "computer_scroll",
@@ -196,43 +238,49 @@ export default Plugin.define({
           direction: Schema.Literals(["up", "down", "left", "right"]),
           amount: Schema.Number.annotate({ description: "Wheel clicks, usually 3 lines each; 5 is a good default" }),
         }),
-        execute: (args, context) => call({ action: "scroll", ...args, amount: Math.round(args.amount) }, context.signal),
+        execute: (args, context) => call({ action: "scroll", ...args, amount: Math.round(args.amount) }, context),
       });
       tools.add({
         name: "computer_type",
         options: { codemode: false },
-        description: `Type text at the current keyboard focus. Any Unicode text works regardless of keyboard layout. Use computer_key for Enter, Tab, and shortcuts. Returns no screenshot, only which element had keyboard focus; the next action's result shows the outcome, or call computer_screenshot to check.`,
-        input: input({ text: Schema.String }),
-        execute: ({ text }, context) => call({ action: "type", text }, context.signal),
+        description: `Type text at the keyboard focus. Pass element (an [id] from the latest computer_tree) to focus that field first, and window to bring a window to the front first; without them the text goes to whatever app is frontmost. Any Unicode text works regardless of keyboard layout. Use computer_key for Enter, Tab, and shortcuts. Returns no screenshot, only the frontmost window and the element that had keyboard focus; the next action's result shows the outcome, or call computer_screenshot to check.`,
+        input: input({
+          text: Schema.String,
+          element: id("Element ID of the field to focus before typing"),
+          window: Schema.optional(Schema.String.annotate({ description: WINDOW })),
+        }),
+        execute: (args, context) => call({ action: "type", ...args }, context),
       });
       tools.add({
         name: "computer_focus",
         options: { codemode: false },
-        description: `Bring a top-level window to the front (restoring it if minimized), by title: case-insensitive, an exact title first, else the first window whose title contains the text. If nothing matches, the error lists the open windows' titles; computer_screenshot lists them too. ${RESULT}`,
+        description: `Bring a top-level window to the front (restoring it if minimized), by title: case-insensitive, an exact title first, else the first window whose title contains the text. If nothing matches, the error lists the open windows' titles; computer_screenshot lists them too. Errors when the OS keeps another app in front. ${RESULT}`,
         input: input({ title: Schema.String.annotate({ description: "Window title or part of it" }) }),
-        execute: ({ title }, context) => call({ action: "focus", title }, context.signal),
+        execute: ({ title }, context) => call({ action: "focus", title }, context),
       });
       tools.add({
         name: "computer_key",
         options: { codemode: false },
-        description: `Press a key or key chord, e.g. "Return", "Escape", "Tab", "super" (Windows key), "ctrl+s", "alt+Tab", "Down"; on macOS use cmd for shortcuts, e.g. "cmd+space" (Spotlight), "cmd+c", "cmd+tab". Names are case-insensitive: ctrl, alt/option, shift, super/win/cmd (Windows key on Windows, Command on macOS), Return/Enter, Escape/Esc, Tab, BackSpace, Delete, Home, End, Page_Up, Page_Down, Up, Down, Left, Right, Space, ${process.platform === "darwin" ? "" : "Insert, "}F1-F12, or a single character. ${RESULT}`,
+        description: `Press a key or key chord, e.g. "Return", "Escape", "Tab", "super" (Windows key), "ctrl+s", "alt+Tab", "Down"; on macOS use cmd for shortcuts, e.g. "cmd+space" (Spotlight), "cmd+c", "cmd+tab". Names are case-insensitive: ctrl, alt/option, shift, super/win/cmd (Windows key on Windows, Command on macOS), Return/Enter, Escape/Esc, Tab, BackSpace, Delete, Home, End, Page_Up, Page_Down, Up, Down, Left, Right, Space, ${process.platform === "darwin" ? "" : "Insert, "}F1-F12, or a single character. Keys go to the frontmost app; pass window to bring a window to the front first. ${RESULT}`,
         input: input({
           keys: Schema.String.annotate({ description: 'Keys joined with "+", modifiers first' }),
           repeat: Schema.optional(Schema.Number.annotate({ description: "Press the chord this many times (default 1)" })),
+          window: Schema.optional(Schema.String.annotate({ description: WINDOW })),
         }),
-        execute: ({ keys, repeat }, context) =>
-          call({ action: "key", keys, repeat: Math.max(1, Math.round(repeat ?? 1)) }, context.signal),
+        execute: ({ repeat, ...args }, context) =>
+          call({ action: "key", ...args, repeat: Math.max(1, Math.round(repeat ?? 1)) }, context),
       });
       tools.add({
         name: "computer_wait",
         options: { codemode: false },
         description: `Wait, then take a screenshot. Use after actions that start animations or loading (Start menu, Spotlight, menus, dialogs, app launch) before clicking positions from the previous screenshot. ${COORDINATES}`,
         input: input({ seconds: Schema.Number.annotate({ description: "Seconds to wait, e.g. 1" }) }),
-        execute: ({ seconds }, context) => call({ action: "wait", seconds: Math.max(0, seconds) }, context.signal),
+        execute: ({ seconds }, context) => call({ action: "wait", seconds: Math.max(0, seconds) }, context),
       });
     });
 
     return async () => {
+      subscription.abort();
       helper?.proc.kill();
     };
   },

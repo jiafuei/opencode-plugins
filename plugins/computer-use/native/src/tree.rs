@@ -28,14 +28,18 @@ pub struct Node {
 
 /// Render the roots as indented `[id] role "name" value="…" @(x,y wxh) states` lines in screenshot space, with bounds
 /// only on elements without listed children. With `find`, only elements whose name or value contains it
-/// (case-insensitive) are listed, flat, each with its parent's name. Returns the text and the elements in ID order
-/// (ID = index + 1).
-pub fn render(roots: &[Node], display: &Display, find: Option<&str>) -> (String, Vec<Element>) {
+/// (case-insensitive) are listed, flat, each with its parent's name. `header` names the first root. Returns the text and
+/// the elements in ID order (ID = index + 1).
+pub fn render(roots: &[Node], header: &str, display: &Display, find: Option<&str>) -> (String, Vec<Element>) {
     let mut out = String::new();
     let mut elements = Vec::new();
     let find = find.map(str::to_lowercase);
     for (index, root) in roots.iter().enumerate() {
-        out.push_str(if index == 0 { "Foreground window:\n" } else { "Focused popup outside that window (e.g. an open menu):\n" });
+        if index == 0 {
+            let _ = writeln!(out, "{header}:");
+        } else {
+            out.push_str("Focused popup outside that window (e.g. an open menu):\n");
+        }
         if !emit(root, 0, "", find.as_deref(), display, &mut out, &mut elements) {
             let _ = writeln!(out, "(truncated at {MAX_ELEMENTS} elements)");
             break;

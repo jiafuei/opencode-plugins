@@ -6,6 +6,7 @@ use std::io::{BufRead, Write};
 use std::{error::Error, thread, time::Duration};
 use xcap::Monitor;
 
+mod overlay;
 mod tree;
 #[cfg(target_os = "macos")]
 #[path = "tree_macos.rs"]
@@ -18,6 +19,8 @@ mod platform;
 const MAX_EDGE: f64 = 1568.0;
 const MAX_PIXELS: f64 = 1_150_000.0;
 const SETTLE: Duration = Duration::from_millis(300);
+/// After raising a window or focusing an element: activation and focus changes land asynchronously.
+const FOCUS_SETTLE: Duration = Duration::from_millis(100);
 const JPEG_QUALITY: u8 = 80;
 const DRAG_STEPS: i32 = 10;
 /// Characters per computer_read page.
@@ -34,11 +37,13 @@ struct Request {
 #[derive(Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 enum Action {
-    /// Also reports keyboard focus and the open windows; screenshots after actions don't.
+    /// Also lists the open windows; screenshots after actions only report the frontmost window and keyboard focus.
     Screenshot,
-    /// `find` lists only elements whose name or value contains it.
+    /// `find` lists only elements whose name or value contains it. `window` reads that window instead of the
+    /// foreground one, which is then raised before actions on its elements.
     Tree {
         find: Option<String>,
+        window: Option<String>,
     },
     /// `[x0, y0, x1, y1]` in screenshot space.
     Zoom {
@@ -71,21 +76,28 @@ enum Action {
         direction: ScrollDirection,
         amount: i32,
     },
-    /// Types without a screenshot: the outcome is predictable and the next action shows it.
+    /// Types without a screenshot: the outcome is predictable and the next action shows it. `window` is raised and
+    /// `element` focused first.
     Type {
         text: String,
+        window: Option<String>,
+        element: Option<usize>,
     },
     /// Bring a top-level window to the front by title.
     Focus {
         title: String,
     },
+    /// `window` is raised first.
     Key {
         keys: String,
         repeat: Option<u32>,
+        window: Option<String>,
     },
     Wait {
         seconds: f64,
     },
+    /// Hide the overlay: OpenCode's session stopped using the computer. The next action shows it again.
+    Hide,
     /// Full text of a tree element, paged by character offset. Keeps the current tree and its IDs.
     Read {
         element: usize,
@@ -132,6 +144,10 @@ struct State {
     backend: platform::Backend,
     /// Elements of the latest tree (ID = index + 1). Actions keep them; only the next tree replaces them.
     tree: Vec<platform::Element>,
+    /// The window a tree was read from by title; raised before actions on its elements.
+    tree_window: Option<xcap::Window>,
+    /// Glowing border and banner that tell the user OpenCode is driving the computer, and what it is doing.
+    overlay: overlay::Overlay,
 }
 
 fn fit_scale(w: f64, h: f64) -> f64 {
@@ -167,13 +183,23 @@ fn lookup(state: &State, id: usize) -> Result<&platform::Element, Box<dyn Error>
     Ok(state.tree.get(id.wrapping_sub(1)).ok_or(format!("unknown element {id}; call computer_tree for current IDs"))?)
 }
 
+/// An element to act on. When its tree was read from a window by title, that window is raised first.
+fn element(state: &mut State, id: usize) -> Result<platform::Element, Box<dyn Error>> {
+    let element = lookup(state, id)?.clone();
+    if let Some(window) = state.tree_window.clone() {
+        raise(state, &window)?;
+    }
+    Ok(element)
+}
+
 /// Input-space point for an element ID from the latest tree (its live center), or screenshot-space x/y.
-fn target(state: &State, element: Option<usize>, x: Option<f64>, y: Option<f64>) -> Result<(i32, i32), Box<dyn Error>> {
-    let (x, y) = match (element, x, y) {
+fn target(state: &mut State, element_id: Option<usize>, x: Option<f64>, y: Option<f64>) -> Result<(i32, i32), Box<dyn Error>> {
+    let (x, y) = match (element_id, x, y) {
         (Some(id), _, _) => {
+            let element = element(state, id)?;
             let [x, y, w, h] = state
                 .backend
-                .bounds(lookup(state, id)?)
+                .bounds(&element)
                 .map_err(|_| format!("element {id} is no longer available; call computer_tree for current IDs"))?;
             return Ok(((x + w / 2.0).round() as i32, (y + h / 2.0).round() as i32));
         }
@@ -181,6 +207,73 @@ fn target(state: &State, element: Option<usize>, x: Option<f64>, y: Option<f64>)
         _ => return Err("pass an element ID, or both x and y".into()),
     };
     Ok(to_input(&state.display, [x, y]))
+}
+
+/// Top-level window by title: case-insensitive, an exact title first, else the first title containing it. No match lists
+/// the open windows.
+fn find_window(title: &str) -> Result<xcap::Window, Box<dyn Error>> {
+    let mut windows: Vec<(xcap::Window, String)> = xcap::Window::all()?
+        .into_iter()
+        .map(|window| {
+            let title = window.title().unwrap_or_default();
+            (window, title)
+        })
+        .filter(|(_, title)| !title.is_empty())
+        .collect();
+    let wanted = title.to_lowercase();
+    let index = windows
+        .iter()
+        .position(|(_, title)| title.to_lowercase() == wanted)
+        .or_else(|| windows.iter().position(|(_, title)| !wanted.is_empty() && title.to_lowercase().contains(&wanted)));
+    let Some(index) = index else {
+        let titles: Vec<String> = windows.iter().take(20).map(|(_, title)| format!("- {title}")).collect();
+        return Err(format!("no window title matches \"{title}\". Open windows:\n{}", titles.join("\n")).into());
+    };
+    Ok(windows.swap_remove(index).0)
+}
+
+/// Bring the window to the front; the backend errors when the OS refuses. On macOS this always raises: even a window of
+/// the frontmost app can sit behind another of its windows.
+fn raise(state: &mut State, window: &xcap::Window) -> Result<(), Box<dyn Error>> {
+    // Windows only lets a background process take the foreground right after an Alt press. A window already in front
+    // is left alone.
+    #[cfg(windows)]
+    {
+        if window.is_focused()? {
+            return Ok(());
+        }
+        state.enigo.key(Key::Alt, Direction::Click)?;
+    }
+    state.backend.raise(window)?;
+    thread::sleep(FOCUS_SETTLE);
+    Ok(())
+}
+
+/// The window in front (on macOS: the first window of the frontmost app), or None when no app owns the foreground.
+fn front_window() -> Result<Option<xcap::Window>, Box<dyn Error>> {
+    Ok(xcap::Window::all()?.into_iter().find(|window| window.is_focused().unwrap_or(false)))
+}
+
+/// Where input goes now: the frontmost window and the element with keyboard focus. Reported after every action, so
+/// input that lands in the wrong app shows up immediately.
+fn input_target(state: &State) -> Result<String, Box<dyn Error>> {
+    let front = front_window()?;
+    let app = front.as_ref().map(|window| window.app_name().unwrap_or_default()).unwrap_or_default();
+    let title = front.as_ref().map(|window| window.title().unwrap_or_default()).unwrap_or_default();
+    let window = match (&front, title.is_empty()) {
+        (None, _) => "unknown".to_string(),
+        (Some(_), true) => app.clone(),
+        (Some(_), false) => format!("\"{title}\" ({app})"),
+    };
+    Ok(match state.backend.focused(front.as_ref()) {
+        Some((role, name)) if name.is_empty() => format!("Frontmost window: {window}. Keyboard focus: {role}."),
+        Some((role, name)) => format!("Frontmost window: {window}. Keyboard focus: {role} \"{name}\"."),
+        None => format!(
+            "Frontmost window: {window}. WARNING: keyboard focus unknown: {} exposes no focused element, so keys and typed \
+             text may be dropped. Pass element to computer_type, or click the target field and check this line again.",
+            if app.is_empty() { "the frontmost app" } else { &app }
+        ),
+    })
 }
 
 /// Downscale to the model's image limits and JPEG-encode.
@@ -237,23 +330,51 @@ fn parse_key(name: &str) -> Result<Key, Box<dyn Error>> {
     })
 }
 
-/// Perform the action. Screenshot, tree, zoom, read and type answer directly; everything else is followed by a fresh
-/// screenshot.
+/// Banner text for the overlay while the action runs; empty hides the overlay.
+fn describe(action: &Action) -> String {
+    let doing = match action {
+        Action::Hide => return String::new(),
+        Action::Screenshot | Action::Zoom { .. } => "Looking at the screen".to_string(),
+        Action::Tree { window: Some(title), .. } => format!("Reading {title}"),
+        Action::Tree { .. } | Action::Read { .. } => "Reading the screen".to_string(),
+        Action::Click { .. } => "Clicking".to_string(),
+        Action::Move { .. } => "Moving the pointer".to_string(),
+        Action::Drag { .. } => "Dragging".to_string(),
+        Action::Scroll { .. } => "Scrolling".to_string(),
+        Action::Type { window: Some(title), .. } => format!("Typing in {title}"),
+        Action::Type { .. } => "Typing".to_string(),
+        Action::Key { keys, window: Some(title), .. } => format!("Pressing {keys} in {title}"),
+        Action::Key { keys, .. } => format!("Pressing {keys}"),
+        Action::Focus { title } => format!("Switching to {title}"),
+        Action::Wait { .. } => "Waiting".to_string(),
+    };
+    format!("OpenCode is using your computer · {doing}")
+}
+
+/// Perform the action. Screenshot, tree, zoom, read, type and hide answer directly; everything else is followed by a
+/// fresh screenshot.
 fn act(state: &mut State, action: Action) -> Result<Option<serde_json::Value>, Box<dyn Error>> {
+    state.overlay.set(&describe(&action))?;
     match action {
+        Action::Hide => return Ok(Some(serde_json::json!({}))),
         Action::Screenshot => {
             let mut screenshot = observe(state)?;
-            let focus = match state.backend.focused() {
-                Some((role, name)) if name.is_empty() => role,
-                Some((role, name)) => format!("{role} \"{name}\""),
-                None => "unknown".to_string(),
-            };
-            screenshot["context"] = format!("Keyboard focus: {focus}\n{}", tree::windows(&state.display)?).into();
+            screenshot["context"] = format!("{}\n{}", input_target(state)?, tree::windows(&state.display)?).into();
             return Ok(Some(screenshot));
         }
-        Action::Tree { find } => {
-            let (text, elements) = tree::render(&state.backend.snapshot()?, &state.display, find.as_deref());
+        Action::Tree { find, window } => {
+            let window = window.map(|title| find_window(&title)).transpose()?;
+            let header = match &window {
+                Some(window) => format!(
+                    "Window \"{}\" ({}); actions on its elements bring it to the front first",
+                    window.title()?,
+                    window.app_name().unwrap_or_default()
+                ),
+                None => "Foreground window".to_string(),
+            };
+            let (text, elements) = tree::render(&state.backend.snapshot(window.as_ref())?, &header, &state.display, find.as_deref());
             state.tree = elements;
+            state.tree_window = window;
             return Ok(Some(serde_json::json!({ "tree": text })));
         }
         Action::Zoom { region } => return zoom(&state.display, region).map(Some),
@@ -317,44 +438,30 @@ fn act(state: &mut State, action: Action) -> Result<Option<serde_json::Value>, B
             };
             state.enigo.scroll(length, axis)?;
         }
-        Action::Type { text } => {
+        Action::Type { text, window, element: id } => {
+            if let Some(title) = window {
+                raise(state, &find_window(&title)?)?;
+            }
+            if let Some(id) = id {
+                let element = element(state, id)?;
+                state.backend.focus(&element).map_err(|error| format!("could not focus element {id}: {error}"))?;
+                thread::sleep(FOCUS_SETTLE);
+            }
             state.enigo.text(&text)?;
-            // Name the field that received the text, so typing into the wrong place shows up without a screenshot.
-            let count = text.chars().count();
-            let typed = match state.backend.focused() {
-                Some((role, name)) if name.is_empty() => format!("Typed {count} characters into {role}."),
-                Some((role, name)) => format!("Typed {count} characters into {role} \"{name}\"."),
-                None => format!("Typed {count} characters."),
-            };
+            // Name where the text went, so typing into the wrong place shows up without a screenshot.
+            let typed = format!("Typed {} characters. {}", text.chars().count(), input_target(state)?);
             return Ok(Some(serde_json::json!({ "text": typed })));
         }
         Action::Focus { title } => {
-            let windows: Vec<(xcap::Window, String)> = xcap::Window::all()?
-                .into_iter()
-                .map(|window| {
-                    let title = window.title().unwrap_or_default();
-                    (window, title)
-                })
-                .filter(|(_, title)| !title.is_empty())
-                .collect();
-            let wanted = title.to_lowercase();
-            let found = windows
-                .iter()
-                .find(|(_, title)| title.to_lowercase() == wanted)
-                .or_else(|| windows.iter().find(|(_, title)| !wanted.is_empty() && title.to_lowercase().contains(&wanted)));
-            let Some((window, _)) = found else {
-                let titles: Vec<String> = windows.iter().take(20).map(|(_, title)| format!("- {title}")).collect();
-                return Err(format!("no window title matches \"{title}\". Open windows:\n{}", titles.join("\n")).into());
-            };
-            // Windows only lets a background process take the foreground right after an Alt key press.
-            #[cfg(windows)]
-            state.enigo.key(Key::Alt, Direction::Click)?;
-            state.backend.raise(window)?;
+            raise(state, &find_window(&title)?)?;
         }
-        Action::Key { keys, repeat } => {
+        Action::Key { keys, repeat, window } => {
             // Parse the whole chord before pressing anything.
             let keys = keys.split('+').map(parse_key).collect::<Result<Vec<_>, _>>()?;
             let (last, modifiers) = keys.split_last().ok_or("empty key chord")?;
+            if let Some(title) = window {
+                raise(state, &find_window(&title)?)?;
+            }
             for _ in 0..repeat.unwrap_or(1) {
                 for key in modifiers {
                     state.enigo.key(*key, Direction::Press)?;
@@ -386,6 +493,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         use windows::Win32::UI::HiDpi::{SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)?;
     }
+    if std::env::args().nth(1).as_deref() == Some("--overlay") {
+        return overlay::run();
+    }
     let enigo = Enigo::new(&Settings::default());
     // macOS grants Screen Recording and Accessibility to the app that launched OpenCode (the terminal). Missing
     // grants are requested here (the system shows its prompt) and only take effect after that app restarts.
@@ -408,13 +518,16 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     // UI Automation initializes COM, so the backend is created before anything else touches it.
     let backend = platform::Backend::new()?;
-    let mut state = State { enigo: enigo?, display: capture()?.0, backend, tree: Vec::new() };
+    let mut state = State { enigo: enigo?, display: capture()?.0, backend, tree: Vec::new(), tree_window: None, overlay: Default::default() };
     let mut stdout = std::io::stdout().lock();
     for line in std::io::stdin().lock().lines() {
         let request: Request = serde_json::from_str(&line?)?;
         let result = act(&mut state, request.action).and_then(|answer| match answer {
             Some(answer) => Ok(answer),
-            None => observe(&mut state),
+            None => observe(&mut state).and_then(|mut screenshot| {
+                screenshot["context"] = input_target(&state)?.into();
+                Ok(screenshot)
+            }),
         });
         let response = match result {
             Ok(mut response) => {
