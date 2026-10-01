@@ -95,8 +95,8 @@ impl Backend {
             if IsIconic(hwnd).as_bool() {
                 let _ = ShowWindow(hwnd, SW_RESTORE);
             }
-            let _ = SetForegroundWindow(hwnd);
-            if GetForegroundWindow() != hwnd {
+            // The return value, not GetForegroundWindow: that is briefly NULL while activation switches over.
+            if !SetForegroundWindow(hwnd).as_bool() {
                 return Err("Windows refused to bring the window to the front; click it or its taskbar button instead".into());
             }
         }
