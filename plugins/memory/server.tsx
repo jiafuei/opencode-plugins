@@ -154,9 +154,9 @@ const DreamOutputSchema = Schema.Struct({
   content: Schema.String,
 });
 
-export type DreamRuntimeState = { additions: number; since: number; failAt?: number };
+type DreamRuntimeState = { additions: number; since: number; failAt?: number };
 
-export function validateDreamOptions(source: Pick<MemoryOptions, "dream_interval_hours" | "dream_min_additions">) {
+function validateDreamOptions(source: Pick<MemoryOptions, "dream_interval_hours" | "dream_min_additions">) {
   const intervalHours = source.dream_interval_hours ?? DEFAULT_DREAM_INTERVAL_HOURS;
   if (typeof intervalHours !== "number" || !Number.isFinite(intervalHours) || intervalHours <= 0) {
     throw new Error("Memory dream_interval_hours must be a finite number greater than 0");
@@ -535,6 +535,8 @@ const setup = async (ctx: Plugin.Context) => {
         return state;
       })();
       loading.set(sessionID, load);
+      // A failed load is not cached, so the next hook retries it.
+      load.catch(() => loading.delete(sessionID));
     }
     return load;
   };
@@ -628,7 +630,7 @@ const setup = async (ctx: Plugin.Context) => {
       return { entry, index };
     });
     recordSaved(sessionID, entry.file, entry);
-    await rpc.events.emit("saved", { sessionID, title: entry.title });
+    await rpc.events.emit("saved", { sessionID, title: entry.title }).catch(() => {});
     if (index.length > topicLimit || Buffer.byteLength(index.map(indexLine).join("\n")) > indexBytes) {
       startDream({ trigger: "auto", sessionID });
     }
@@ -1049,6 +1051,16 @@ const setup = async (ctx: Plugin.Context) => {
       await executeDream({ trigger: input.trigger, requestID: input.requestID ?? null, runID, sessionID: input.sessionID });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
+      // Status first, so failed bookkeeping below cannot leave the TUI on "Dreaming...".
+      await writeDreamStatus({
+        requestID: input.requestID ?? null,
+        runID,
+        state: "failed",
+        sessionID: input.sessionID,
+        startedAt,
+        finishedAt: new Date().toISOString(),
+        message,
+      }).catch(() => {});
       await serializeWrite(async () => {
         const state = await readDreamState();
         await writeDreamState({ ...state, additions: state?.additions ?? 0, since: state?.since ?? Date.now(), failAt: Date.now() });
@@ -1066,15 +1078,6 @@ const setup = async (ctx: Plugin.Context) => {
           actions: [],
         }).catch(() => {});
       }
-      await writeDreamStatus({
-        requestID: input.requestID ?? null,
-        runID,
-        state: "failed",
-        sessionID: input.sessionID,
-        startedAt,
-        finishedAt: new Date().toISOString(),
-        message,
-      }).catch(() => {});
     }
   };
 
@@ -1121,7 +1124,7 @@ const setup = async (ctx: Plugin.Context) => {
       const cursor = messages.at(-1)!.id;
       const transcript = renderTranscript(messages);
       if (transcript && await enabled()) {
-        await rpc.events.emit("review", { sessionID });
+        await rpc.events.emit("review", { sessionID }).catch(() => {});
         const saved = state.saved.map((item) => `- ${item.title} (${item.file})`).join("\n");
         const { memories } = await runWorker(
           reflectModel,
@@ -1226,7 +1229,11 @@ const setup = async (ctx: Plugin.Context) => {
     if (restricted) {
       const topics: string[] = [];
       for (const entry of entries) {
-        if (entry.type === "preference" || entry.type === "instruction") topics.push(`${indexLine(entry)}\n${await readTopic(entry.file)}`);
+        if (entry.type !== "preference" && entry.type !== "instruction") continue;
+        const content = await readTopic(entry.file).catch((error) => {
+          if (error.code !== "ENOENT") throw error;
+        });
+        if (content !== undefined) topics.push(`${indexLine(entry)}\n${content}`);
       }
       return topics.length > 0
         ? `<memory>\nProject preferences and instructions stated by the user: follow them unless the current conversation says otherwise.\n\n${topics.join("\n\n")}\n</memory>`

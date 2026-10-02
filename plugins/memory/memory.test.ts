@@ -32,6 +32,7 @@ async function fixture(
     idle_delay_ms?: number;
     dream_interval_hours?: number;
     dream_min_additions?: number;
+    dream_topic_limit?: number;
   } = {},
   storage = new Map<string, unknown>(),
 ) {
@@ -213,7 +214,6 @@ describe("memory persistence", () => {
     const project = memory(storage, directory);
     project.set("index", [entry]);
     project.set("topic/typed-a1b2c3d4", { content: "Run the focused suite first.", type: "instruction", scope: "testing", revision: "abc", updatedAt: "2026-08-02" });
-    project.set("settings", { dream_auto: true });
     const app = await fixture(directory, noMemories, {}, storage);
     const next = await app.message("ses_migrated", "Next.");
     const request = await app.context("ses_migrated", [userMessage("msg_existing"), userMessage(next)]);
@@ -309,34 +309,24 @@ These index changes supersede matching entries in the <memory> index; the same g
     }
   });
 
-  test.serial("uses the dream engine to synthesize complete sources above the size threshold", async () => {
+  test.serial("starts a dream when a save grows the index past the configured topic limit", async () => {
     const directory = "/tmp/memory-consolidation-project";
     const storage = new Map<string, unknown>();
-    const project = store(storage, directory, Array.from({ length: 201 }, (_, index) => ({
-      file: `topic-${index}.md`,
-      content: `COMPLETE_START_${index}\n${"x".repeat(80)}\nCOMPLETE_END_${index}`,
-    })));
-    let consolidationPrompt = "";
+    const project = store(storage, directory, [{ file: "a.md" }, { file: "b.md" }]);
     let selections = 0;
     const app = await fixture(directory, (call) => {
       if (isDreamSelector(call)) return ++selections === 1
-        ? { action: "synthesize", files: ["topic-0.md", "topic-1.md"], reason: "related topics" }
+        ? { action: "synthesize", files: ["a.md", "b.md"], reason: "related topics" }
         : { action: "none" };
-      if (isDreamCurator(call)) {
-        consolidationPrompt = call.prompt;
-        return memoryExtraction({ title: "Consolidated topic" });
-      }
+      if (isDreamCurator(call)) return memoryExtraction({ title: "Consolidated topic" });
       return noMemories();
-    }, {}, storage);
+    }, { dream_topic_limit: 2 }, storage);
     await app.save("ses_maintenance_writer", memoryExtraction({ title: "Threshold crossing" }));
     await until(() => app.statuses().some((status) => status.state === "changed"));
     await app.dispose();
 
-    expect(consolidationPrompt).toContain("COMPLETE_END_0");
-    expect(consolidationPrompt).toContain("COMPLETE_END_1");
-    const output = project.index().find((entry) => entry.file.startsWith("consolidated-topic-"))!;
-    expect(project.topic("topic-0.md")).toBeUndefined();
-    expect(project.topic("topic-1.md")).toBeUndefined();
+    expect(project.topic("a.md")).toBeUndefined();
+    expect(project.topic("b.md")).toBeUndefined();
     expect(app.statuses().at(-1)!.counts).toEqual({ synthesize: 1, prune: 0 });
   });
 
@@ -347,7 +337,10 @@ These index changes supersede matching entries in the <memory> index; the same g
       { file: "first.md", title: "First", summary: "First summary", content: "FIRST_BODY" },
       { file: "second.md", title: "Second", summary: "Second summary", content: "SECOND_BODY", type: "instruction" },
       { file: "third.md", title: "Typed", summary: "Typed reference summary", content: "THIRD_BODY", type: "reference" },
+      { file: "gone.md", title: "Gone", type: "instruction" },
     ]);
+    // A hand-deleted topic file must not drop the other user-stated topics.
+    await rm(join(dataHome, "opencode", "memory", memoryProjectKey(directory), "gone.md"));
     const app = await fixture(directory, noMemories, {}, storage);
 
     const output = await app.context("ses_index");
@@ -359,6 +352,7 @@ These index changes supersede matching entries in the <memory> index; the same g
     for (const restricted of [await app.context("ses_sub"), await app.context("ses_worker_1")]) {
       expect(restricted.system[0]!.text).toContain("[Second](second.md)");
       expect(restricted.system[0]!.text).toContain("SECOND_BODY");
+      expect(restricted.system[0]!.text).not.toContain("(gone.md)");
       expect(restricted.system[0]!.text).not.toContain("(first.md)");
       expect(restricted.system[0]!.text).not.toContain("(third.md)");
       expect(restricted.tools.memory).toBeUndefined();
@@ -545,7 +539,6 @@ describe("memory auto dreaming", () => {
       { file: "two.md", title: "Two" },
       { file: "three.md", title: "Three" },
     ]);
-    project.set("settings", { dream_auto: true });
     const app = await fixture(directory, () => noMemories(), {}, storage);
     await app.message("ses_auto_init", "Use memory.");
     await until(() => project.get("dream") !== undefined);
@@ -562,7 +555,6 @@ describe("memory auto dreaming", () => {
       { file: "one.md", title: "One" },
       { file: "two.md", title: "Two" },
     ]);
-    project.set("settings", { dream_auto: true });
     project.set("dream", { auto: true, additions: 7, since: Date.now() - 37 * 3_600_000 });
     const app = await fixture(directory, (call) => (isDreamSelector(call) ? { action: "none" } : noMemories()), {}, storage);
     await app.message("ses_gate", "Use memory.");
