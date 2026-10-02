@@ -985,13 +985,7 @@ const setup = async (ctx: Plugin.Context) => {
     const changed = counts.synthesize + counts.prune > 0;
 
     if (abortReason) {
-      // Failed or stale runs keep their progress counters; a simple fixed
-      // backoff prevents hot retries. The manifest preserves any actions that
-      // were already applied.
-      await serializeWrite(async () => {
-        const state = await readDreamState();
-        await writeDreamState({ ...state, additions: state?.additions ?? 0, since: state?.since ?? Date.now(), failAt: Date.now() });
-      });
+      // The manifest preserves any actions that were already applied.
       await writeDreamManifest(input.runID, {
         trigger: input.trigger,
         ...dreamModelFields(model),
@@ -1014,18 +1008,15 @@ const setup = async (ctx: Plugin.Context) => {
         counts,
         message: changed ? `${abortReason}; changes were applied` : abortReason,
       });
+      // Failed or stale runs keep their progress counters; a simple fixed
+      // backoff prevents hot retries.
+      await serializeWrite(async () => {
+        const state = await readDreamState();
+        await writeDreamState({ ...state, additions: state?.additions ?? 0, since: state?.since ?? Date.now(), failAt: Date.now() });
+      }).catch((error) => console.error("Memory dream bookkeeping failed:", error));
       return;
     }
 
-    await serializeWrite(async () => {
-      const state = await readDreamState();
-      await writeDreamState({
-        ...(state?.auto === true ? { auto: true } : {}),
-        additions: Math.max(0, (state?.additions ?? 0) - baselineAdditions),
-        since: Date.now(),
-        lastRunAt: Date.now(),
-      });
-    });
     await writeDreamManifest(input.runID, {
       trigger: input.trigger,
       ...dreamModelFields(model),
@@ -1037,8 +1028,26 @@ const setup = async (ctx: Plugin.Context) => {
       orphans,
       actions,
     });
-    // Quarantine from older successful runs is purged; failed runs keep theirs.
+    await writeDreamStatus({
+      requestID: input.requestID,
+      runID: input.runID,
+      state: changed ? "changed" : "noop",
+      sessionID: input.sessionID,
+      startedAt,
+      finishedAt,
+      counts,
+    });
+    // Bookkeeping after the run is recorded: a failure here must not report
+    // the run as failed. Quarantine from older successful runs is purged;
+    // failed runs keep theirs.
     await serializeWrite(async () => {
+      const state = await readDreamState();
+      await writeDreamState({
+        ...(state?.auto === true ? { auto: true } : {}),
+        additions: Math.max(0, (state?.additions ?? 0) - baselineAdditions),
+        since: Date.now(),
+        lastRunAt: Date.now(),
+      });
       const trashPrefix = `${prefix}/trash/`;
       let after: string | undefined;
       do {
@@ -1051,16 +1060,7 @@ const setup = async (ctx: Plugin.Context) => {
         }
         after = page.next;
       } while (after);
-    });
-    await writeDreamStatus({
-      requestID: input.requestID,
-      runID: input.runID,
-      state: changed ? "changed" : "noop",
-      sessionID: input.sessionID,
-      startedAt,
-      finishedAt,
-      counts,
-    });
+    }).catch((error) => console.error("Memory dream bookkeeping failed:", error));
   };
 
   const runDream = async (input: { trigger: "auto" | "manual"; sessionID?: string; requestID?: string; consumeRequest?: boolean }) => {
