@@ -100,6 +100,7 @@ type SessionMessages = Awaited<ReturnType<Plugin.Context["session"]["context"]>>
 const CONSOLIDATION_BATCH = 8;
 const MAX_REFLECTIONS = 3;
 const TOOL_TEXT_LIMIT = 2_000;
+const WORKER_TIMEOUT_MS = 5 * 60_000;
 
 const DEFAULT_DREAM_INTERVAL_HOURS = 36;
 const DEFAULT_DREAM_MIN_ADDITIONS = 7;
@@ -572,11 +573,19 @@ const setup = async (ctx: Plugin.Context) => {
 
   // Workers are one-shot text generations without tools; the prompt demands
   // JSON matching the schema and the reply is decoded strictly.
+  // generate.text takes no abort signal, so a stalled request is abandoned
+  // rather than cancelled; otherwise it would hold its reflection or dream forever.
   const runWorker = async <S extends Schema.Top>(model: WorkerModel | undefined, schema: S, system: string, prompt: string): Promise<S["Type"]> => {
-    const { text } = await ctx.generate.text({
-      prompt: `${system}\n\n${prompt}\n\nRespond with only one JSON value matching this JSON Schema, without code fences or commentary:\n${JSON.stringify(Schema.toJsonSchemaDocument(schema).schema)}`,
-      model: model && { providerID: model.providerID, id: model.modelID, variant: model.variant },
-    });
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const { text } = await Promise.race([
+      ctx.generate.text({
+        prompt: `${system}\n\n${prompt}\n\nRespond with only one JSON value matching this JSON Schema, without code fences or commentary:\n${JSON.stringify(Schema.toJsonSchemaDocument(schema).schema)}`,
+        model: model && { providerID: model.providerID, id: model.modelID, variant: model.variant },
+      }),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`Memory worker timed out after ${WORKER_TIMEOUT_MS / 60_000} minutes`)), WORKER_TIMEOUT_MS);
+      }),
+    ]).finally(() => clearTimeout(timer));
     return Schema.decodeUnknownSync(Schema.fromJsonString(schema))(text.trim().replace(/^```(?:json)?\s*|\s*```$/g, ""));
   };
 
@@ -673,7 +682,8 @@ const setup = async (ctx: Plugin.Context) => {
   };
 
   // Status updates drive the TUI's dream indicator and completion toasts.
-  const writeDreamStatus = (fields: DreamStatus) => rpc.events.emit("dream", fields);
+  // Status is a TUI notification; a failed emit must not affect the run.
+  const writeDreamStatus = (fields: DreamStatus) => rpc.events.emit("dream", fields).catch(() => {});
 
   // Decision-only manifest keyed by run ID under `dreams/`. Records what was
   // decided and applied; never source topic content.
@@ -751,17 +761,23 @@ const setup = async (ctx: Plugin.Context) => {
     const baselineAdditions = Math.max(0, (await readDreamState())?.additions ?? 0);
 
     // Immutable snapshot evidence: index entries plus complete topic contents,
-    // captured in one queued read. Workers receive selected full topics from
-    // this snapshot.
+    // captured in one queued step. Workers receive selected full topics from
+    // this snapshot. Entries whose topic file is gone are dropped from the index.
+    const orphans: string[] = [];
     const snapshot = await serializeWrite(async () => {
       const files = new Map<string, DreamSource>();
-      for (const entry of await readIndex()) {
+      const index = await readIndex();
+      for (const entry of index) {
         try {
           files.set(entry.file, { entry, content: await readTopic(entry.file) });
         } catch (error) {
           if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-          console.warn(`Memory dream skipped missing topic: ${entry.file}`);
+          orphans.push(entry.file);
         }
+      }
+      if (orphans.length > 0) {
+        await writeIndex(index.filter((entry) => files.has(entry.file)));
+        console.warn(`Memory dream dropped index entries without topic files: ${orphans.join(", ")}`);
       }
       return files;
     });
@@ -775,7 +791,7 @@ const setup = async (ctx: Plugin.Context) => {
     let abortReason: string | undefined;
     let indexedCount = snapshot.size;
 
-    for (let iteration = 0; iteration < DREAM_MAX_ACTIONS && !abortReason; iteration++) {
+    for (let iteration = 0; iteration < DREAM_MAX_ACTIONS && !abortReason && !disposed; iteration++) {
       if (candidates.size === 0) break;
       if (candidates.size === 1 && generated.has(candidates.keys().next().value!)) break;
 
@@ -851,9 +867,14 @@ const setup = async (ctx: Plugin.Context) => {
               await ctx.storage.set(`${prefix}/trash/${input.runID}/${source.entry.file}`, { ...source.entry, content: source.content });
             }
             await writeIndex(currentIndex.filter((entry) => !removals.has(entry.file)));
-            for (const source of removalSources) await rm(join(root, source.entry.file), { force: true });
+            // The index is published; an unindexed leftover file is harmless.
+            for (const source of removalSources) await rm(join(root, source.entry.file), { force: true }).catch((error) => console.warn("Memory dream left a removed topic file:", error));
             return { kind: "applied" };
-          });
+          }).catch((error: Error) => ({ kind: "failed" as const, message: error.message }));
+          if (committed.kind === "failed") {
+            abortReason = committed.message;
+            break;
+          }
           if (committed.kind === "stale") {
             abortReason = "Memory topics changed during the dream";
             break;
@@ -921,9 +942,13 @@ const setup = async (ctx: Plugin.Context) => {
           await rm(join(root, file), { force: true });
           throw error;
         }
-        for (const name of chosen.files) await rm(join(root, name), { force: true });
+        for (const name of chosen.files) await rm(join(root, name), { force: true }).catch((error) => console.warn("Memory dream left a source topic file:", error));
         return { kind: "applied", entry };
-      });
+      }).catch((error: Error) => ({ kind: "failed" as const, message: error.message }));
+      if (committed.kind === "failed") {
+        abortReason = committed.message;
+        break;
+      }
       if (committed.kind === "stale") {
         abortReason = "Memory topics changed during the dream";
         break;
@@ -976,6 +1001,7 @@ const setup = async (ctx: Plugin.Context) => {
         state: "failed",
         changed,
         error: abortReason,
+        orphans,
         actions,
       });
       await writeDreamStatus({
@@ -1008,6 +1034,7 @@ const setup = async (ctx: Plugin.Context) => {
       finishedAt,
       state: changed ? "changed" : "noop",
       changed,
+      orphans,
       actions,
     });
     // Quarantine from older successful runs is purged; failed runs keep theirs.
@@ -1060,7 +1087,7 @@ const setup = async (ctx: Plugin.Context) => {
         startedAt,
         finishedAt: new Date().toISOString(),
         message,
-      }).catch(() => {});
+      });
       await serializeWrite(async () => {
         const state = await readDreamState();
         await writeDreamState({ ...state, additions: state?.additions ?? 0, since: state?.since ?? Date.now(), failAt: Date.now() });

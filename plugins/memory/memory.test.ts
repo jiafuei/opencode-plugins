@@ -595,7 +595,25 @@ describe("memory manual dreaming", () => {
     await app.dispose();
   });
 
-  test.serial("continues dreaming with available topics when an indexed file is missing", async () => {
+  test.serial("fails a dream whose worker never answers", async () => {
+    const directory = "/tmp/memory-dream-timeout-project";
+    const storage = new Map<string, unknown>();
+    store(storage, directory, [{ file: "a.md" }, { file: "b.md" }]);
+    const app = await fixture(directory, (call) => isDreamSelector(call) ? new Promise(() => {}) : noMemories(), {}, storage);
+    try {
+      jest.useFakeTimers();
+      await app.dream("req-timeout");
+      await until(() => app.calls.some(isDreamSelector));
+      jest.advanceTimersByTime(5 * 60_000);
+      await until(() => app.statuses().some((status) => status.state !== "running"));
+      expect(app.statuses().at(-1)).toMatchObject({ state: "failed", message: expect.stringContaining("timed out") });
+    } finally {
+      jest.useRealTimers();
+      await app.dispose();
+    }
+  });
+
+  test.serial("drops index entries without topic files and dreams over the rest", async () => {
     const directory = "/tmp/memory-dream-missing-project";
     const storage = new Map<string, unknown>();
     const project = store(storage, directory, [
@@ -615,7 +633,10 @@ describe("memory manual dreaming", () => {
     try {
       await app.dream("req-missing");
       await until(() => app.statuses().some((status) => status.state !== "running"));
-      expect(app.statuses().at(-1)).toMatchObject({ state: "changed", counts: { synthesize: 1, prune: 0 } });
+      const status = app.statuses().at(-1)!;
+      expect(status).toMatchObject({ state: "changed", counts: { synthesize: 1, prune: 0 } });
+      expect(project.index().map((entry) => entry.file)).not.toContain("missing.md");
+      expect(project.get(`dreams/${status.runID}`).orphans).toEqual(["missing.md"]);
       const output = project.index().find((entry) => entry.file.startsWith("merged-"))!;
       expect(project.topic(output.file)).toBe("Combined facts");
       expect(project.topic("a.md")).toBeUndefined();
