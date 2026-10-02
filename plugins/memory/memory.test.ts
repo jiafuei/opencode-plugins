@@ -192,50 +192,12 @@ async function settle() {
 describe("memory index lines", () => {
   test("renders and parses typed entries", () => {
     const entry = { title: "Typed", file: "typed.md", summary: "Be concise", type: "preference" as const, updated: "2026-08-01" };
-    const legacy = "- [Legacy](legacy.md) - [recap|editor|2026-08-02] Old scope";
     expect(indexLine(entry)).toBe("- [Typed](typed.md) - [preference|2026-08-01] Be concise");
-    expect(parseIndex(`# Notes\n${indexLine(entry)}\n${legacy}\n- [Loose](loose.md) - No prefix\n`)).toEqual([
-      entry,
-      { title: "Legacy", file: "legacy.md", summary: "Old scope", type: "recap", updated: "2026-08-02" },
-    ]);
+    expect(parseIndex(`# Notes\n${indexLine(entry)}\n- [Loose](loose.md) - No prefix\n`)).toEqual([entry]);
   });
 });
 
 describe("memory persistence", () => {
-  test.serial("exports the plugin-storage store to markdown files once", async () => {
-    const directory = "/tmp/memory-export-project";
-    const unrelated = { system: "<memory>other project</memory>", pending: [], frozen: [], saved: [] };
-    const entry = { title: "Typed", file: "typed-a1b2c3d4", summary: "Run focused tests", type: "instruction", updated: "2026-08-02" };
-    const cached = "<memory>cached index</memory>";
-    const storage = new Map<string, unknown>([
-      ["session/ses_other_project", unrelated],
-      ["session/ses_migrated", { system: cached, pending: [], frozen: [["msg_existing", [[entry.file, entry]]]], saved: [] }],
-    ]);
-    const project = memory(storage, directory);
-    project.set("index", [entry]);
-    project.set("topic/typed-a1b2c3d4", { content: "Run the focused suite first.", type: "instruction", scope: "testing", revision: "abc", updatedAt: "2026-08-02" });
-    const app = await fixture(directory, noMemories, {}, storage);
-    const next = await app.message("ses_migrated", "Next.");
-    const request = await app.context("ses_migrated", [userMessage("msg_existing"), userMessage(next)]);
-    expect(request.system).toEqual([{ type: "text", text: cached }]);
-    expect(request.messages[0]!.content[1]!.text).toBe(`<memory_update>
-These index changes supersede matching entries in the <memory> index; the same guidance applies.
-
-- [Typed](typed-a1b2c3d4) - [instruction|2026-08-02] Run focused tests
-</memory_update>`);
-    expect(request.messages[1]!.content).toHaveLength(1);
-    expect((await app.read("ses_migrated", entry.file)).content).toContain("Run the focused suite first.");
-    await app.dispose();
-
-    expect(project.index()).toEqual([
-      { title: "Typed", file: "typed-a1b2c3d4.md", summary: "Run focused tests", type: "instruction", updated: "2026-08-02" },
-    ]);
-    expect(project.topic("typed-a1b2c3d4.md")).toBe("Run the focused suite first.");
-    expect(project.get("index")).toBeUndefined();
-    expect(project.get(`topic/${entry.file}`)).toBeUndefined();
-    expect(storage.get("session/ses_other_project")).toEqual(unrelated);
-  });
-
   test.serial("memory tool saves a topic and queues its delta only for other sessions", async () => {
     const directory = "/tmp/memory-tool-project";
     const storage = new Map<string, unknown>();
@@ -458,18 +420,18 @@ These index changes supersede matching entries in the <memory> index; the same g
     const directory = "/tmp/memory-reflect-project";
     const storage = new Map<string, unknown>();
     const app = await fixture(directory, (call) => isReflection(call)
-      ? { memories: [{ ...memoryExtraction({ title: "Redis fixture diagnosis" }) }] }
+      ? { memories: [{ ...memoryExtraction({ title: "Focused tests first", type: "instruction" }) }] }
       : noMemories(), { idle_delay_ms: 1000, reflect_model: "test/small#low" }, storage);
-    const assistant = (id: string, text: string, output: string) => ({
+    const assistant = (id: string, text: string) => ({
       id, type: "assistant", content: [
         { type: "text", text },
-        { type: "tool", name: "bash", state: { status: "completed", input: { command: "bun test" }, content: [{ type: "text", text: output }] } },
+        { type: "tool", name: "bash", state: { status: "completed", input: { command: "bun test" }, content: [{ type: "text", text: "TOOL_OUTPUT" }] } },
       ],
     });
     await app.context("ses_reflect");
     app.history("ses_reflect", [
       { id: "msg_1", type: "user", text: "Why is the login test flaky?" },
-      assistant("msg_2", "The shared Redis fixture leaks state.", `START${"x".repeat(5000)}END`),
+      assistant("msg_2", "The shared Redis fixture leaks state."),
     ]);
 
     try {
@@ -482,13 +444,12 @@ These index changes supersede matching entries in the <memory> index; the same g
       expect(app.calls[0]!.model).toEqual({ providerID: "test", id: "small", variant: "low" });
       expect(app.calls[0]!.prompt).toContain("Why is the login test flaky?");
       expect(app.calls[0]!.prompt).toContain("The shared Redis fixture leaks state.");
-      expect(app.calls[0]!.prompt).toContain("START");
-      expect(app.calls[0]!.prompt).not.toContain("END");
+      expect(app.calls[0]!.prompt).not.toContain("TOOL_OUTPUT");
 
       // Only messages after the cursor are reviewed; the earlier save is listed.
       app.history("ses_reflect", [
         { id: "msg_1", type: "user", text: "Why is the login test flaky?" },
-        assistant("msg_2", "The shared Redis fixture leaks state.", "ok"),
+        assistant("msg_2", "The shared Redis fixture leaks state."),
         { id: "msg_3", type: "user", text: "Thanks, now rename the helper." },
       ]);
       await app.emit("session.execution.succeeded", "ses_reflect");
@@ -497,11 +458,11 @@ These index changes supersede matching entries in the <memory> index; the same g
       await settle();
       expect(app.calls[1]!.prompt).toContain("Thanks, now rename the helper.");
       expect(app.calls[1]!.prompt).not.toContain("Why is the login test flaky?");
-      expect(app.calls[1]!.prompt).toContain("- Redis fixture diagnosis (redis-fixture-diagnosis-");
+      expect(app.calls[1]!.prompt).toContain("- Focused tests first (focused-tests-first-");
     } finally {
       jest.useRealTimers();
     }
-    expect(memory(storage, directory).index()[0]!.title).toBe("Redis fixture diagnosis");
+    expect(memory(storage, directory).index()[0]!.title).toBe("Focused tests first");
     await app.dispose();
   });
 

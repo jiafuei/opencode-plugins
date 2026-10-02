@@ -50,15 +50,13 @@ type IndexEntry = {
   updated: string;
 };
 
-type Delta = [file: string, entry: IndexEntry | null];
-
 // Persisted in plugin storage as `session/<sessionID>` so a restart or plugin reload
 // re-renders the identical system block and historical delta parts.
 type PersistedSession = {
   system?: string;
   restricted?: boolean;
-  knownIndex?: IndexEntry[];
-  frozen: Array<[messageID: string, update: string | Delta[]]>;
+  knownIndex: IndexEntry[];
+  frozen: Array<[messageID: string, update: string]>;
   cursor?: string;
   saved: Array<{ file: string; title: string }>;
 };
@@ -99,7 +97,6 @@ type SessionMessages = Awaited<ReturnType<Plugin.Context["session"]["context"]>>
 
 const CONSOLIDATION_BATCH = 8;
 const MAX_REFLECTIONS = 3;
-const TOOL_TEXT_LIMIT = 2_000;
 const WORKER_TIMEOUT_MS = 5 * 60_000;
 
 const DEFAULT_DREAM_INTERVAL_HOURS = 36;
@@ -116,8 +113,8 @@ const ReflectionSchema = Schema.Struct({
     title: Schema.String,
     summary: Schema.String,
     content: Schema.String,
-    type: Schema.Literals(MEMORY_TYPES),
-  })).check(Schema.isMaxLength(MAX_REFLECTIONS)),
+    type: Schema.Literals(["preference", "instruction"]),
+  })),
 });
 
 const DreamSelectorSchema = Schema.Union([
@@ -157,18 +154,6 @@ const DreamOutputSchema = Schema.Struct({
 
 type DreamRuntimeState = { additions: number; since: number; failAt?: number };
 
-function validateDreamOptions(source: Pick<MemoryOptions, "dream_interval_hours" | "dream_min_additions">) {
-  const intervalHours = source.dream_interval_hours ?? DEFAULT_DREAM_INTERVAL_HOURS;
-  if (typeof intervalHours !== "number" || !Number.isFinite(intervalHours) || intervalHours <= 0) {
-    throw new Error("Memory dream_interval_hours must be a finite number greater than 0");
-  }
-  const minAdditions = source.dream_min_additions ?? DEFAULT_DREAM_MIN_ADDITIONS;
-  if (!Number.isInteger(minAdditions) || minAdditions <= 0) {
-    throw new Error("Memory dream_min_additions must be a positive integer");
-  }
-  return { intervalHours, minAdditions };
-}
-
 // Auto dreaming is due only when BOTH the interval window has elapsed and
 // enough ordinary additions accumulated since the last successful run.
 export function dreamDue(now: number, state: DreamRuntimeState, options: { intervalHours: number; minAdditions: number }): boolean {
@@ -187,14 +172,11 @@ function parseModel(value: string | undefined): WorkerModel | undefined {
   return { providerID: model!.slice(0, separator), modelID: model!.slice(separator + 1), variant: variant || undefined };
 }
 
-// Cached snapshots from the storage-backed version use extensionless ids.
-// Accept those too, without rewriting the cached text.
 export function parseIndex(text: string): IndexEntry[] {
   return text.split(/\r?\n/).flatMap((line) => {
-    const match = line.match(/^- \[([^\]]+)]\(([^)/]+)\) - \[([a-z]+)\|(?:[^|\]]+\|)?(\d{4}-\d{2}-\d{2})\] (.*)$/);
+    const match = line.match(/^- \[([^\]]+)]\(([^)/]+)\) - \[([a-z]+)\|(\d{4}-\d{2}-\d{2})\] (.*)$/);
     if (!match) return [];
-    const file = match[2]!.endsWith(".md") ? match[2]! : `${match[2]}.md`;
-    return [{ title: match[1]!, file, type: match[3] as StoredType, updated: match[4]!, summary: match[5]! }];
+    return [{ title: match[1]!, file: match[2]!, type: match[3] as StoredType, updated: match[4]!, summary: match[5]! }];
   });
 }
 
@@ -313,24 +295,15 @@ function renderDelta(deltas: Iterable<[string, IndexEntry | null]>): string {
   return `<memory_update>\nThese index changes supersede matching entries in the <memory> index; the same guidance applies.\n\n${sections}\n</memory_update>`;
 }
 
-// User text, assistant text, and tool calls with truncated input and output.
-// Reasoning and bookkeeping messages are left out.
+// User and assistant text only; tool calls, reasoning, and bookkeeping
+// messages are left out.
 function renderTranscript(messages: SessionMessages): string {
-  const clip = (text: string) => text.length > TOOL_TEXT_LIMIT ? `${text.slice(0, TOOL_TEXT_LIMIT)}\n[truncated]` : text;
   const blocks: string[] = [];
   for (const message of messages) {
     if (message.type === "user") blocks.push(`<user>\n${message.text}\n</user>`);
     if (message.type !== "assistant") continue;
     for (const part of message.content) {
       if (part.type === "text" && part.text.trim()) blocks.push(`<assistant>\n${part.text}\n</assistant>`);
-      if (part.type !== "tool") continue;
-      const state = part.state;
-      const output = state.status === "completed" || state.status === "error"
-        ? (state.content ?? []).map((item) => item.type === "text" ? item.text : `[file ${item.name ?? item.uri}]`).join("\n")
-          || (state.status === "error" ? state.error.message : "")
-        : "";
-      const input = typeof state.input === "string" ? state.input : JSON.stringify(state.input);
-      blocks.push(`<tool name="${part.name}" status="${state.status}">\n<input>${clip(input)}</input>\n<output>${clip(output)}</output>\n</tool>`);
     }
   }
   return blocks.join("\n");
@@ -338,16 +311,14 @@ function renderTranscript(messages: SessionMessages): string {
 
 const REFLECT_SYSTEM = "You are a project-memory reviewer. Return only the requested JSON result.";
 
-const REFLECT_PROMPT = `Review this stretch of a coding conversation and catch durable project memories the agent missed saving with its memory tool. Most stretches need none: return an empty memories array unless something clearly qualifies. Return at most ${MAX_REFLECTIONS}.
+const REFLECT_PROMPT = `Review this stretch of a coding conversation and catch lasting preferences or instructions the user stated that the agent missed saving with its memory tool. Most stretches need none: return an empty memories array unless something clearly qualifies. Return at most ${MAX_REFLECTIONS}.
 
 Types:
 - preference: a lasting general preference the user stated or confirmed.
 - instruction: a scoped rule for future work the user stated or confirmed.
-- recap: the settled conclusion of a question the transcript resolved (a confirmed root cause, a decided approach, a rejected alternative, or its rationale) that would be expensive to re-derive; it may come from the agent's own work. Record the conclusion, not the path to it.
-- reference: lasting external material worth returning to, such as a spec or dashboard URL.
-Use assistant turns to interpret what the user meant (for example what "yes, always do that" refers to), but preference and instruction must come from the user.
+Both must come from the user. Use assistant turns only to interpret what the user meant (for example what "yes, always do that" refers to).
 
-Skip anything already covered by <session_saves> or the index, current task state, plans, unresolved investigations and their hypotheses, routine receipts (commits, edits, passing tests), anything recoverable from code or git, and secrets. Tool input and output are truncated.
+Skip anything already covered by <session_saves> or the index, one-off requests that only apply to the current task, and secrets.
 
 One subject per memory. Each memory becomes a new topic; when an indexed topic already covers the subject, skip it. The summary is a one-line hook under about 100 characters describing what the topic covers; name the area first when it applies to only part of the project (for example "Testing: run the focused suite first"). The content is a few short sentences without frontmatter: the fact first, then why it matters or when it applies.`;
 
@@ -406,32 +377,18 @@ export function memoryProjectKey(directory: string): string {
   return `${resolvedDirectory.toLowerCase().replace(/[^a-z._-]/g, "-")}-${Bun.hash.wyhash(resolvedDirectory).toString(16).padStart(8, "0").slice(0, 8)}`;
 }
 
-// One-time export of the plugin-storage store (index and topics) back to
-// markdown files. Cached session blocks and updates remain unchanged; the
-// memory tool also accepts their old extensionless topic ids.
-async function exportStoredMemory(storage: Plugin.Context["storage"], projectKey: string, root: string) {
-  const prefix = `memory/${projectKey}`;
-  const index = await storage.get(`${prefix}/index`) as IndexEntry[] | undefined;
-  if (index === undefined) return;
-  for (const entry of index) {
-    const topic = await storage.get(`${prefix}/topic/${entry.file}`) as { content: string };
-    await Bun.write(join(root, `${entry.file}.md`), `${topic.content.trim()}\n`);
-  }
-  await Bun.write(join(root, "index.md"), index.map((entry) => `${indexLine({ ...entry, file: `${entry.file}.md` })}\n`).join(""));
-  for (const entry of index) await storage.remove(`${prefix}/topic/${entry.file}`);
-  await storage.remove(`${prefix}/index`);
-}
-
 const setup = async (ctx: Plugin.Context) => {
   const directory = ctx.location.directory;
   const source = ctx.options as MemoryOptions;
   const reflectModel = parseModel(source.reflect_model);
   const dreamModel = parseModel(source.dream_model) ?? reflectModel;
   const idleDelay = source.idle_delay_ms ?? 300_000;
-  const dreamOptions = validateDreamOptions(source);
+  const dreamOptions = {
+    intervalHours: source.dream_interval_hours ?? DEFAULT_DREAM_INTERVAL_HOURS,
+    minAdditions: source.dream_min_additions ?? DEFAULT_DREAM_MIN_ADDITIONS,
+  };
   const indexBytes = source.dream_index_bytes ?? 8 * 1024;
   const topicLimit = source.dream_topic_limit ?? 200;
-  if (!Number.isInteger(idleDelay) || idleDelay < 1_000) throw new Error("Memory idle_delay_ms must be at least 1000");
 
   const projectKey = memoryProjectKey(directory);
   // The index and topics are markdown files so they stay easy to edit by
@@ -440,7 +397,6 @@ const setup = async (ctx: Plugin.Context) => {
   // project key.
   const root = join(process.env.XDG_DATA_HOME ?? join(homedir(), ".local", "share"), "opencode", "memory", projectKey);
   const indexPath = join(root, "index.md");
-  await exportStoredMemory(ctx.storage, projectKey, root);
   const prefix = `memory/${projectKey}`;
   const settingsKey = `${prefix}/settings`;
   const dreamStateKey = `${prefix}/dream`;
@@ -507,25 +463,13 @@ const setup = async (ctx: Plugin.Context) => {
     let load = loading.get(sessionID);
     if (!load) {
       load = (async () => {
-        const saved = (await ctx.storage.get(`session/${sessionID}`) ?? { frozen: [], saved: [] }) as PersistedSession;
-        const knownIndex = new Map((saved.knownIndex ?? parseIndex(saved.system ?? "")).map((entry) => [entry.file, entry]));
-        // Older sessions stored frozen entry sets, not text or a known index.
-        if (saved.knownIndex === undefined) {
-          for (const [, deltas] of saved.frozen) {
-            if (typeof deltas === "string") continue;
-            for (const [id, entry] of deltas) {
-              const file = id.endsWith(".md") ? id : `${id}.md`;
-              if (entry) knownIndex.set(file, { ...entry, file });
-              else knownIndex.delete(file);
-            }
-          }
-        }
+        const saved = (await ctx.storage.get(`session/${sessionID}`) ?? { knownIndex: [], frozen: [], saved: [] }) as PersistedSession;
         const state: SessionState = {
           system: saved.system,
           restricted: saved.restricted,
           prompts: new Set(),
-          knownIndex,
-          frozen: new Map(saved.frozen.map(([messageID, update]) => [messageID, typeof update === "string" ? update : renderDelta(update)])),
+          knownIndex: new Map(saved.knownIndex.map((entry) => [entry.file, entry])),
+          frozen: new Map(saved.frozen),
           cursor: saved.cursor,
           saved: saved.saved,
           reflecting: false,
@@ -758,7 +702,7 @@ const setup = async (ctx: Plugin.Context) => {
     }
     // Concurrent ordinary saves during this long run must survive completion:
     // only the counter captured here is subtracted at the end.
-    const baselineAdditions = Math.max(0, (await readDreamState())?.additions ?? 0);
+    const baselineAdditions = (await readDreamState())?.additions ?? 0;
 
     // Immutable snapshot evidence: index entries plus complete topic contents,
     // captured in one queued step. Workers receive selected full topics from
@@ -850,16 +794,14 @@ const setup = async (ctx: Plugin.Context) => {
 
         if (removals.size > 0) {
           const removalSources = [...removals].map(([file]) => snapshot.get(file)!);
-          const committed = await serializeWrite(async (): Promise<{ kind: "applied" } | { kind: "stale" } | { kind: "disabled" }> => {
-            if (!(await enabled())) return { kind: "disabled" };
+          await serializeWrite(async () => {
+            if (!(await enabled())) throw new Error("memory was disabled mid-run");
             const currentIndex = await readIndex();
             for (const source of removalSources) {
               const current = currentIndex.find((entry) => entry.file === source.entry.file);
-              if (!current || indexLine(current) !== indexLine(source.entry)) return { kind: "stale" };
-              const content = await readTopic(source.entry.file).catch((error) => {
-                if (error.code !== "ENOENT") throw error;
-              });
-              if (content !== source.content) return { kind: "stale" };
+              if (!current || indexLine(current) !== indexLine(source.entry) || await readTopic(source.entry.file) !== source.content) {
+                throw new Error("Memory topics changed during the dream");
+              }
             }
             // Quarantine copies first, then publish the index, then drop the
             // topics; a failure leaves the topics indexed.
@@ -869,20 +811,10 @@ const setup = async (ctx: Plugin.Context) => {
             await writeIndex(currentIndex.filter((entry) => !removals.has(entry.file)));
             // The index is published; an unindexed leftover file is harmless.
             for (const source of removalSources) await rm(join(root, source.entry.file), { force: true }).catch((error) => console.warn("Memory dream left a removed topic file:", error));
-            return { kind: "applied" };
-          }).catch((error: Error) => ({ kind: "failed" as const, message: error.message }));
-          if (committed.kind === "failed") {
-            abortReason = committed.message;
-            break;
-          }
-          if (committed.kind === "stale") {
-            abortReason = "Memory topics changed during the dream";
-            break;
-          }
-          if (committed.kind === "disabled") {
-            abortReason = "memory was disabled mid-run";
-            break;
-          }
+          }).catch((error: Error) => {
+            abortReason = error.message;
+          });
+          if (abortReason) break;
           for (const verdict of removals.values()) verdict.quarantinePath = `trash/${input.runID}/${verdict.file}`;
           for (const [file] of removals) {
             candidates.delete(file);
@@ -915,20 +847,16 @@ const setup = async (ctx: Plugin.Context) => {
       const extracted = produced;
 
       const slug = extracted.title.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 48) || "memory";
-      const committed = await serializeWrite(async (): Promise<
-        { kind: "applied"; entry: IndexEntry } | { kind: "stale" } | { kind: "disabled" }
-      > => {
-        if (!(await enabled())) return { kind: "disabled" };
+      const committed = await serializeWrite(async () => {
+        if (!(await enabled())) throw new Error("memory was disabled mid-run");
         // Recheck metadata and source contents against the
         // immutable snapshot evidence before every commit.
         const currentIndex = await readIndex();
         for (const source of sources) {
           const current = currentIndex.find((entry) => entry.file === source.entry.file);
-          if (!current || indexLine(current) !== indexLine(source.entry)) return { kind: "stale" };
-          const content = await readTopic(source.entry.file).catch((error) => {
-            if (error.code !== "ENOENT") throw error;
-          });
-          if (content !== source.content) return { kind: "stale" };
+          if (!current || indexLine(current) !== indexLine(source.entry) || await readTopic(source.entry.file) !== source.content) {
+            throw new Error("Memory topics changed during the dream");
+          }
         }
 
         const file = `${slug}-${crypto.randomUUID().replaceAll("-", "").slice(0, 8)}.md`;
@@ -943,25 +871,16 @@ const setup = async (ctx: Plugin.Context) => {
           throw error;
         }
         for (const name of chosen.files) await rm(join(root, name), { force: true }).catch((error) => console.warn("Memory dream left a source topic file:", error));
-        return { kind: "applied", entry };
-      }).catch((error: Error) => ({ kind: "failed" as const, message: error.message }));
-      if (committed.kind === "failed") {
-        abortReason = committed.message;
-        break;
-      }
-      if (committed.kind === "stale") {
-        abortReason = "Memory topics changed during the dream";
-        break;
-      }
-      if (committed.kind === "disabled") {
-        abortReason = "memory was disabled mid-run";
-        break;
-      }
+        return entry;
+      }).catch((error: Error) => {
+        abortReason = error.message;
+      });
+      if (!committed) break;
 
       actions.push({
         action: chosen.action,
         reason: chosen.reason,
-        output: { file: committed.entry.file, title: extracted.title, type: extracted.type },
+        output: { file: committed.file, title: extracted.title, type: extracted.type },
       });
 
       // Keep the candidate view current so later iterations cannot repeat a
@@ -970,10 +889,10 @@ const setup = async (ctx: Plugin.Context) => {
         candidates.delete(source.entry.file);
         snapshot.delete(source.entry.file);
       }
-      snapshot.set(committed.entry.file, { entry: committed.entry, content: extracted.content.trim() });
-      generated.add(committed.entry.file);
+      snapshot.set(committed.file, { entry: committed, content: extracted.content.trim() });
+      generated.add(committed.file);
       indexedCount -= sources.length - 1;
-      candidates.set(committed.entry.file, snapshot.get(committed.entry.file)!);
+      candidates.set(committed.file, snapshot.get(committed.file)!);
     }
 
     const finishedAt = new Date().toISOString();
@@ -1221,7 +1140,6 @@ const setup = async (ctx: Plugin.Context) => {
       },
       execute: async (args, context) => {
         const input = { ...(args as { action: "save" | "read" | "delete" } & Partial<MemoryInput>) };
-        if (input.target && !input.target.endsWith(".md")) input.target += ".md";
         if (input.action === "read") {
           if (!input.target) throw new Error("read requires target");
           if (!(await enabled())) throw new Error("Project memory is disabled");
@@ -1391,7 +1309,7 @@ const setup = async (ctx: Plugin.Context) => {
   const dreamTimer = setInterval(() => {
     void dreamTick();
   }, DREAM_TICK_MS);
-  dreamTimer.unref?.();
+  dreamTimer.unref();
 
   return async () => {
     disposed = true;

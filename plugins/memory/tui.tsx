@@ -15,7 +15,7 @@ export function dreamCountsMessage(counts: Record<string, unknown> | undefined):
   const labels = [["synthesize", "synthesized"], ["prune", "pruned"]] as const;
   for (const [key, label] of labels) {
     const count = counts?.[key];
-    if (typeof count === "number" && count > 0) parts.push(`${count} ${label}`);
+    if (count) parts.push(`${count} ${label}`);
   }
   return parts.join(", ");
 }
