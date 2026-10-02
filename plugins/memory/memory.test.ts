@@ -21,7 +21,7 @@ type DreamStatus = { requestID: string | null; runID: string; state: string; ses
 type Hook = (event: never) => Promise<void> | void;
 type MemoryTool = { execute: (input: unknown, context: { sessionID: string; agent: string }) => Promise<{ content: string }> };
 type Handlers = Record<string, (input: never) => Promise<unknown>>;
-type Entry = { title: string; file: string; summary: string; type: string; scope: string; updated: string };
+type Entry = { title: string; file: string; summary: string; type: string; updated: string };
 
 async function fixture(
   directory: string,
@@ -151,7 +151,6 @@ function store(
     file: entry.file,
     summary: entry.summary ?? "Stored topic",
     type: entry.type ?? "recap",
-    scope: "project",
     updated: "2026-08-01",
   })));
   for (const entry of entries) project.setTopic(entry.file, entry.content ?? `${entry.file} body`);
@@ -162,7 +161,6 @@ type Extraction = {
   title: string;
   summary: string;
   type: string;
-  scope: string;
   content: string;
 };
 
@@ -170,7 +168,6 @@ const memoryExtraction = (overrides: Partial<Extraction> = {}): Extraction => ({
   title: "Stored progress",
   summary: "A durable project outcome.",
   type: "recap",
-  scope: "project",
   content: "The parser migration shipped and the focused suite passes.",
   ...overrides,
 });
@@ -193,9 +190,13 @@ async function settle() {
 
 describe("memory index lines", () => {
   test("renders and parses typed entries", () => {
-    const entry = { title: "Typed", file: "typed.md", summary: "Be concise", type: "preference" as const, scope: "editor", updated: "2026-08-01" };
-    expect(indexLine(entry)).toBe("- [Typed](typed.md) - [preference|editor|2026-08-01] Be concise");
-    expect(parseIndex(`# Notes\n${indexLine(entry)}\n- [Loose](loose.md) - No prefix\n`)).toEqual([entry]);
+    const entry = { title: "Typed", file: "typed.md", summary: "Be concise", type: "preference" as const, updated: "2026-08-01" };
+    const legacy = "- [Legacy](legacy.md) - [recap|editor|2026-08-02] Old scope";
+    expect(indexLine(entry)).toBe("- [Typed](typed.md) - [preference|2026-08-01] Be concise");
+    expect(parseIndex(`# Notes\n${indexLine(entry)}\n${legacy}\n- [Loose](loose.md) - No prefix\n`)).toEqual([
+      entry,
+      { title: "Legacy", file: "legacy.md", summary: "Old scope", type: "recap", updated: "2026-08-02" },
+    ]);
   });
 });
 
@@ -203,7 +204,7 @@ describe("memory persistence", () => {
   test.serial("exports the plugin-storage store to markdown files once", async () => {
     const directory = "/tmp/memory-export-project";
     const unrelated = { system: "<memory>other project</memory>", pending: [], frozen: [], saved: [] };
-    const entry = { title: "Typed", file: "typed-a1b2c3d4", summary: "Run focused tests", type: "instruction", scope: "testing", updated: "2026-08-02" };
+    const entry = { title: "Typed", file: "typed-a1b2c3d4", summary: "Run focused tests", type: "instruction", updated: "2026-08-02" };
     const cached = "<memory>cached index</memory>";
     const storage = new Map<string, unknown>([
       ["session/ses_other_project", unrelated],
@@ -220,14 +221,14 @@ describe("memory persistence", () => {
     expect(request.messages[0]!.content[1]!.text).toBe(`<memory_update>
 These index changes supersede matching entries in the <memory> index; the same guidance applies.
 
-- [Typed](typed-a1b2c3d4) - [instruction|testing|2026-08-02] Run focused tests
+- [Typed](typed-a1b2c3d4) - [instruction|2026-08-02] Run focused tests
 </memory_update>`);
     expect(request.messages[1]!.content).toHaveLength(1);
     expect((await app.read("ses_migrated", entry.file)).content).toContain("Run the focused suite first.");
     await app.dispose();
 
     expect(project.index()).toEqual([
-      { title: "Typed", file: "typed-a1b2c3d4.md", summary: "Run focused tests", type: "instruction", scope: "testing", updated: "2026-08-02" },
+      { title: "Typed", file: "typed-a1b2c3d4.md", summary: "Run focused tests", type: "instruction", updated: "2026-08-02" },
     ]);
     expect(project.topic("typed-a1b2c3d4.md")).toBe("Run the focused suite first.");
     expect(project.get("index")).toBeUndefined();
@@ -249,11 +250,10 @@ These index changes supersede matching entries in the <memory> index; the same g
       summary: "Run the focused Bun test before the full suite.",
       content: "Run the affected plugin's focused Bun test before the full suite.",
       type: "instruction",
-      scope: "testing",
     });
     const file = result.content.replace("Saved ", "");
     expect(project.topic(file)).toBe("Run the affected plugin's focused Bun test before the full suite.");
-    expect(indexLine(project.index()[0]!)).toStartWith(`- [Focused tests first](${file}) - [instruction|testing|`);
+    expect(indexLine(project.index()[0]!)).toStartWith(`- [Focused tests first](${file}) - [instruction|`);
     expect(app.saved()).toEqual([{ sessionID: "ses_origin", title: "Focused tests first" }]);
 
     const other = await app.message("ses_other", "Next.");
@@ -273,7 +273,7 @@ These index changes supersede matching entries in the <memory> index; the same g
     store(storage, directory, [{ file: "rule.md", title: "Rule", content: "Always run the focused suite.", type: "instruction" }]);
     const app = await fixture(directory, noMemories, {}, storage);
     expect((await app.read("ses_read", "rule.md")).content)
-      .toBe("Rule\ntype: instruction | scope: project | updated: 2026-08-01\n\nAlways run the focused suite.");
+      .toBe("Rule\ntype: instruction | updated: 2026-08-01\n\nAlways run the focused suite.");
     await app.dispose();
   });
 
@@ -351,8 +351,8 @@ These index changes supersede matching entries in the <memory> index; the same g
     const app = await fixture(directory, noMemories, {}, storage);
 
     const output = await app.context("ses_index");
-    expect(output.system[0]!.text).toContain("[First](first.md) - [recap|project|2026-08-01] First summary");
-    expect(output.system[0]!.text).toContain("[Typed](third.md) - [reference|project|2026-08-01] Typed reference summary");
+    expect(output.system[0]!.text).toContain("[First](first.md) - [recap|2026-08-01] First summary");
+    expect(output.system[0]!.text).toContain("[Typed](third.md) - [reference|2026-08-01] Typed reference summary");
     expect(output.system[0]!.text).not.toContain("FIRST_BODY");
     expect(output.tools.memory).toBeDefined();
 
@@ -364,7 +364,7 @@ These index changes supersede matching entries in the <memory> index; the same g
       expect(restricted.tools.memory).toBeUndefined();
     }
 
-    project.setIndex([{ title: "Third", file: "third.md", summary: "Third summary", type: "recap", scope: "project", updated: "2026-08-01" }]);
+    project.setIndex([{ title: "Third", file: "third.md", summary: "Third summary", type: "recap", updated: "2026-08-01" }]);
     expect((await app.context("ses_index")).system).toEqual(output.system);
     expect((await app.context("ses_new")).system[0]!.text).toContain("Third summary");
 
@@ -447,7 +447,7 @@ These index changes supersede matching entries in the <memory> index; the same g
     await app.dispose();
 
     // The index file changes; the restored session still renders its snapshot.
-    project.setIndex([{ title: "Changed", file: "changed.md", summary: "Changed summary", type: "recap", scope: "project", updated: "2026-08-01" }]);
+    project.setIndex([{ title: "Changed", file: "changed.md", summary: "Changed summary", type: "recap", updated: "2026-08-01" }]);
     app = await fixture(directory, noMemories, {}, storage);
     const restored = await app.context("ses_restore", history());
     expect(restored.system).toEqual(initial.system);
@@ -518,7 +518,7 @@ These index changes supersede matching entries in the <memory> index; the same g
     project.set("settings", { enabled: false, custom: "keep" });
     const app = await fixture(directory, noMemories, {}, storage);
     await app.rpc.toggle!({ key: "dream_auto" } as never);
-    expect(project.get("settings")).toEqual({ enabled: false, custom: "keep", dream_auto: true });
+    expect(project.get("settings")).toEqual({ enabled: false, custom: "keep", dream_auto: false });
     await app.dispose();
   });
 });
@@ -601,6 +601,36 @@ describe("memory manual dreaming", () => {
     expect(dreamCall[0]!.model).toEqual({ providerID: "test", id: "deep-model", variant: "deep" });
 
     await app.dispose();
+  });
+
+  test.serial("continues dreaming with available topics when an indexed file is missing", async () => {
+    const directory = "/tmp/memory-dream-missing-project";
+    const storage = new Map<string, unknown>();
+    const project = store(storage, directory, [
+      { file: "missing.md", title: "Missing" },
+      { file: "a.md", title: "Alpha" },
+      { file: "b.md", title: "Beta" },
+    ]);
+    await rm(join(dataHome, "opencode", "memory", memoryProjectKey(directory), "missing.md"));
+    const app = await fixture(directory, (call) => {
+      if (isDreamSelector(call)) {
+        expect(call.prompt).not.toContain("missing.md");
+        return { action: "synthesize", files: ["a.md", "b.md"], reason: "shared pattern" };
+      }
+      return memoryExtraction({ title: "Merged", content: "Combined facts" });
+    }, {}, storage);
+
+    try {
+      await app.dream("req-missing");
+      await until(() => app.statuses().some((status) => status.state !== "running"));
+      expect(app.statuses().at(-1)).toMatchObject({ state: "changed", counts: { synthesize: 1, prune: 0 } });
+      const output = project.index().find((entry) => entry.file.startsWith("merged-"))!;
+      expect(project.topic(output.file)).toBe("Combined facts");
+      expect(project.topic("a.md")).toBeUndefined();
+      expect(project.topic("b.md")).toBeUndefined();
+    } finally {
+      await app.dispose();
+    }
   });
 
   test.serial("synthesizes complete replacements across iterations without source history", async () => {

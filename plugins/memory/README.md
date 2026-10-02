@@ -10,7 +10,7 @@ Project-scoped memory with a Claude Code-like `/memory` browser. Memory is a com
 - **Updates.** On the first request of each genuine user turn, the current index is compared with the index that session already knows. Changed entries and removal notices are appended to that user message inside `<system>` tags (never to synthetic or compaction messages). The exact update text is frozen, so later requests replay it identically without rewriting the cached snapshot or earlier messages. This also catches changes made while a session was unloaded and hand edits to the index. The originating session acknowledges its own saves and deletions without receiving redundant updates.
 - **Restarts and compaction.** Each session's snapshot, known index, frozen update text, reflection cursor, and saved-topic list persist in plugin storage (`ctx.storage`, key `session/<sessionID>`), so a restart or plugin reload renders byte-identical context. After a compaction the next request takes a fresh snapshot (which includes every committed update) and drops old updates. The entry is removed when the session is deleted.
 - **Subagents and workflow workers.** Child sessions (with a `parentID`) and workflow workers (metadata `workflowWorkerID`) get a compact block with the full content of `preference` and `instruction` topics inline, no `memory` tool, no deltas, and no reflection.
-- **Dreaming.** A save that grows the index past 32 KiB or 200 topics starts a dream. Dreams run from `/dream`, `Dream now` in `/memory`, or the opt-in automatic gate (`dream_interval_hours` elapsed and `dream_min_additions` creates/replacements since the last successful run). A run performs at most eight actions: `synthesize` replaces 2–8 related topics with one self-contained topic (mixed-type groups become non-authoritative `insight`s), and `prune` asks a tool-free curator for an independent keep/remove verdict per nominated topic; removals need evidence where the category requires it and move to quarantine under `trash/<run-id>/`, which a later successful run purges. Every run writes a decision-only manifest under `dreams/`; one server process runs at most one dream at a time. The sidebar shows `Dreaming...` while a run is active, and manual failures show a warning toast.
+- **Dreaming.** A save that grows the index past `dream_index_bytes` (default 8 KiB) or `dream_topic_limit` (default 200) topics starts a dream. Dreams also run from `/dream`, `Dream now` in `/memory`, or the automatic gate (`dream_interval_hours` elapsed and `dream_min_additions` creates/replacements since the last successful run), which is on by default and can be turned off in `/memory`. A run performs at most eight actions: `synthesize` replaces 2–8 related topics with one self-contained topic (mixed-type groups become non-authoritative `insight`s), and `prune` asks a tool-free curator for an independent keep/remove verdict per nominated topic; removals need evidence where the category requires it and move to quarantine under `trash/<run-id>/`, which a later successful run purges. Every run writes a decision-only manifest under `dreams/`; one server process runs at most one dream at a time. The sidebar shows `Dreaming...` while a run is active, and manual failures show a warning toast.
 - **Disabling.** `/memory` toggles memory per project. Disabled memory adds no context, including historical updates, hides the tool, skips reflection, and refuses reads and new writes; a write already in progress finishes. Toggling can invalidate the provider's prompt cache. Cached snapshots and frozen updates remain stored for re-enabling; unseen index changes arrive on the next enabled user turn.
 
 Workers (reflection and dreaming) are one-shot text generations with no session and no tools; replies must decode as JSON matching the worker's schema.
@@ -28,10 +28,10 @@ ${XDG_DATA_HOME:-~/.local/share}/opencode/memory/-home-alice-project-a1b2c3d4/
 `index.md` has one line per topic, and the prompt renders the same lines. The link target is the topic id:
 
 ```markdown
-- [Short title](short-title-a1b2c3d4.md) - [preference|editor|2026-08-23] One-line summary
+- [Short title](short-title-a1b2c3d4.md) - [preference|2026-08-23] One-line summary
 ```
 
-Topic files are the body alone, with no frontmatter. Title, summary, type, scope, and the plugin-owned write date live only in the index line. Files are read fresh on every access: body edits apply on the next read, and index edits arrive on the next genuine user turn without changing existing snapshots. Index lines not in the format above are ignored and dropped the next time the plugin writes the index; legacy extensionless topic ids are also accepted.
+Topic files are the body alone, with no frontmatter. Title, summary, type, and the plugin-owned write date live only in the index line. Files are read fresh on every access: body edits apply on the next read, and index edits arrive on the next genuine user turn without changing existing snapshots. Index lines not in the format above are ignored and dropped the next time the plugin writes the index; legacy extensionless topic ids and lines with a `[type|scope|date]` prefix are also accepted, and the scope is dropped on the next write.
 
 Settings, dream bookkeeping, and per-session state live in the server plugin's key-value storage (`ctx.storage`), keyed by the same project key:
 
@@ -72,7 +72,9 @@ The package exposes server, TUI, and RPC entrypoints, so the one `plugins` entry
         "dream_model": "anthropic/claude-sonnet-4-6#high",
         "idle_delay_ms": 300000,
         "dream_interval_hours": 36,
-        "dream_min_additions": 7
+        "dream_min_additions": 7,
+        "dream_index_bytes": 8192,
+        "dream_topic_limit": 200
       }
     }
   ]
@@ -88,6 +90,8 @@ Options:
 | `idle_delay_ms` | `300000` | Idle time after an execution before reflection; minimum `1000` |
 | `dream_interval_hours` | `36` | Minimum hours between automatic dreams; greater than `0` |
 | `dream_min_additions` | `7` | Minimum creates or replacements before automatic dreaming; positive integer |
+| `dream_index_bytes` | `8192` | Index size in bytes that starts a dream after a save |
+| `dream_topic_limit` | `200` | Topic count that starts a dream after a save |
 
 Models use `provider/model` or `provider/model#variant`.
 
