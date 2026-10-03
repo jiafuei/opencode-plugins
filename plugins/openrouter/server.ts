@@ -45,18 +45,16 @@ export default Plugin.define({
     }
 
     await ctx.session.hook("http.request", async (event) => {
-      const request = event.request;
-      if (request.method !== "POST" || !request.headers.get("content-type")?.includes("application/json")) return;
       const info = await context(event.sessionID);
       const applied = await layers(info, event.model.id);
       if (!applied.some((layer) => Object.keys(layer.patch).length)) return;
-      const body = await request.json();
+      const body = await event.request.json();
       const { provider } = resolveSettings(body.provider ?? {}, applied);
       if (Object.keys(provider).length) body.provider = provider;
       else delete body.provider;
-      const headers = new Headers(request.headers);
+      const headers = new Headers(event.request.headers);
       headers.delete("content-length");
-      event.request = new Request(request, { headers, body: JSON.stringify(body) });
+      event.request = new Request(event.request, { headers, body: JSON.stringify(body) });
     }, { providerID: "openrouter" });
 
     // Start the local UI only when it is opened from the TUI.
@@ -71,56 +69,51 @@ export default Plugin.define({
               if (!url.pathname.startsWith("/api/")) {
                 const assets: Record<string, string> = { "/": "index.html", "/app.js": "app.js", "/style.css": "style.css" };
                 const asset = assets[url.pathname];
-                if (!asset || request.method !== "GET") return new Response("Not found", { status: 404 });
-                return new Response(Bun.file(new URL(`./web/${asset}`, import.meta.url)), { headers: {
-                  "Content-Security-Policy": "default-src 'self'; style-src 'self'; script-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'",
-                  "Referrer-Policy": "no-referrer",
-                } });
+                if (!asset) return new Response("Not found", { status: 404 });
+                return new Response(Bun.file(new URL(`./web/${asset}`, import.meta.url)));
               }
-              if (request.headers.get("authorization") !== `Bearer ${token}`) return new Response("Unauthorized", { status: 401 });
-              try {
-                if (url.pathname === "/api/context" && request.method === "GET") {
-                  const info = await context(url.searchParams.get("sessionID") ?? undefined);
-                  const models = (await ctx.model.list()).filter((model) => model.providerID === "openrouter");
-                  return Response.json({
-                    directory: info.directory,
-                    session: info.session ? { id: info.session.id, title: info.session.title, model: info.session.model } : null,
-                    models: models.map((model) => ({ id: model.id, name: model.name, variants: model.variants.map((variant) => variant.id) })),
-                    fields,
-                  }, { headers: { "Cache-Control": "no-store" } });
-                }
-                if ((url.pathname === "/api/settings" || url.pathname === "/api/preview") && request.method === "POST") {
-                  const input = selectionSchema.parse(await request.json());
-                  const info = await context(input.sessionID);
-                  if (input.scope === "session" && !info.session) return Response.json({ error: "Open settings from a session to edit its overrides." }, { status: 400 });
-                  const scope = input.scope === "folder" ? `folder/${encodeURIComponent(info.directory)}`
-                    : input.scope === "session" ? `session/${info.session!.id}` : "global";
-                  const key = settingsKey(scope, input.modelID);
-                  if (url.pathname === "/api/settings" && input.patch) await ctx.storage.set(key, input.patch);
-                  const patch = input.patch ?? (await ctx.storage.get(key) as Patch | undefined) ?? {};
-                  const applied = await layers(info, input.previewModelID);
-                  if (input.patch) {
-                    const edited = applied.find((layer) => layer.key === key);
-                    if (edited) edited.patch = input.patch;
-                  }
-                  const models = await ctx.model.list();
-                  const model = models.find((model) => model.providerID === "openrouter" && model.id === input.previewModelID);
-                  const variant = model?.variants.find((variant) => variant.id === input.variant);
-                  // Model registry values already include provider defaults. Body overlays win over semantic settings.
-                  const base: Record<string, unknown> = {};
-                  for (const overlay of [model?.settings?.provider, variant?.settings?.provider, model?.body?.provider, variant?.body?.provider]) {
-                    for (const [key, value] of Object.entries(overlay ?? {})) {
-                      base[key] = value && typeof value === "object" && !Array.isArray(value)
-                        ? { ...(typeof base[key] === "object" ? base[key] : {}), ...value }
-                        : value;
-                    }
-                  }
-                  return Response.json({ patch, ...resolveSettings(base, applied) }, { headers: { "Cache-Control": "no-store" } });
-                }
-                return new Response("Not found", { status: 404 });
-              } catch (error) {
-                return Response.json({ error: error instanceof Error ? error.message : String(error) }, { status: error instanceof z.ZodError ? 400 : 500 });
+              if (request.headers.get("authorization") !== `Bearer ${token}`) return Response.json({ error: "Unauthorized" }, { status: 401 });
+              if (url.pathname === "/api/context" && request.method === "GET") {
+                const info = await context(url.searchParams.get("sessionID") ?? undefined);
+                const models = (await ctx.model.list()).filter((model) => model.providerID === "openrouter");
+                return Response.json({
+                  directory: info.directory,
+                  session: info.session ? { id: info.session.id, title: info.session.title, model: info.session.model } : null,
+                  models: models.map((model) => ({ id: model.id, name: model.name, variants: model.variants.map((variant) => variant.id) })),
+                  fields,
+                }, { headers: { "Cache-Control": "no-store" } });
               }
+              if ((url.pathname === "/api/settings" || url.pathname === "/api/preview") && request.method === "POST") {
+                const input = selectionSchema.parse(await request.json());
+                const info = await context(input.sessionID);
+                const scope = input.scope === "folder" ? `folder/${encodeURIComponent(info.directory)}`
+                  : input.scope === "session" ? `session/${info.session!.id}` : "global";
+                const key = settingsKey(scope, input.modelID);
+                if (url.pathname === "/api/settings" && input.patch) await ctx.storage.set(key, input.patch);
+                const patch = input.patch ?? (await ctx.storage.get(key) as Patch | undefined) ?? {};
+                const applied = await layers(info, input.previewModelID);
+                if (input.patch) {
+                  const edited = applied.find((layer) => layer.key === key);
+                  if (edited) edited.patch = input.patch;
+                }
+                const models = await ctx.model.list();
+                const model = models.find((model) => model.providerID === "openrouter" && model.id === input.previewModelID);
+                const variant = model?.variants.find((variant) => variant.id === input.variant);
+                // Model registry values already include provider defaults. Body overlays win over semantic settings.
+                const base: Record<string, unknown> = {};
+                for (const overlay of [model?.settings?.provider, variant?.settings?.provider, model?.body?.provider, variant?.body?.provider]) {
+                  for (const [key, value] of Object.entries(overlay ?? {})) {
+                    base[key] = value && typeof value === "object" && !Array.isArray(value)
+                      ? { ...(typeof base[key] === "object" ? base[key] : {}), ...value }
+                      : value;
+                  }
+                }
+                return Response.json({ patch, ...resolveSettings(base, applied) }, { headers: { "Cache-Control": "no-store" } });
+              }
+              return Response.json({ error: "Not found" }, { status: 404 });
+            },
+            error(error) {
+              return Response.json({ error: error.message }, { status: error instanceof z.ZodError ? 400 : 500 });
             },
           });
         }

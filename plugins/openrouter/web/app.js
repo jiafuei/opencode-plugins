@@ -13,16 +13,12 @@ const controls = new Map();
 async function api(path, body) {
   const response = await fetch(`/api/${path}`, {
     method: body ? "POST" : "GET",
-    headers: { authorization: `Bearer ${token}`, ...(body ? { "content-type": "application/json" } : {}) },
-    ...(body ? { body: JSON.stringify(body) } : {}),
+    headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+    body: body && JSON.stringify(body),
   });
-  if (!response.ok) {
-    const text = await response.text();
-    let message = text;
-    try { message = JSON.parse(text).error; } catch {}
-    throw new Error(message);
-  }
-  return response.json();
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.error);
+  return data;
 }
 
 function showError(error) {
@@ -31,7 +27,7 @@ function showError(error) {
 }
 
 function inputData(patch) {
-  return { ...selection, sessionID, previewModelID: $("preview-model").value.trim(), variant: $("variant").value, ...(patch ? { patch } : {}) };
+  return { ...selection, sessionID, previewModelID: $("preview-model").value.trim(), variant: $("variant").value, patch };
 }
 
 function collect() {
@@ -191,22 +187,21 @@ $("settings").addEventListener("submit", async (event) => {
   event.preventDefault();
   clearTimeout(timer);
   ++sequence;
+  // Keep the selected layer stable while its save is in flight.
+  const inputs = document.querySelectorAll("input, select, textarea, button");
   try {
     const patch = collect();
-    // Keep the selected layer stable while its save is in flight.
-    const inputs = document.querySelectorAll("input, select, textarea, button");
     inputs.forEach((input) => { input.disabled = true; });
-    try {
-      const state = await api("settings", inputData(patch));
-      dirty = false;
-      renderPreview(state);
-      $("status").textContent = "Saved · applies on the next request";
-      showError(null);
-    } finally {
-      inputs.forEach((input) => { input.disabled = false; });
-      $("save").disabled = !dirty;
-    }
+    const state = await api("settings", inputData(patch));
+    dirty = false;
+    renderPreview(state);
+    $("status").textContent = "Saved · applies on the next request";
+    showError(null);
   } catch (error) { showError(error); }
+  finally {
+    inputs.forEach((input) => { input.disabled = false; });
+    $("save").disabled = !dirty;
+  }
 });
 $("copy").addEventListener("click", async () => {
   try { await navigator.clipboard.writeText($("effective").textContent); $("copy").textContent = "Copied"; setTimeout(() => { $("copy").textContent = "Copy"; }, 1200); }

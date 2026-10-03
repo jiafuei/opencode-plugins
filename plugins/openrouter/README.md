@@ -43,7 +43,7 @@ Supports every field in OpenRouter's [provider-selection guide](https://openrout
 
 Lists accept one slug per line or comma-separated values, including specific endpoint slugs. Sorting, price caps, and performance thresholds use JSON inputs to support their complete object forms. Price caps support `prompt`, `completion`, `request`, `image`, and `audio`.
 
-The native HTTP request hook is scoped to OpenCode provider ID `openrouter`. It transforms JSON POST requests for all session request kinds: main agent/tool continuations, subagents, titles, compaction, and transient session generation. It preserves authentication, messages, and other request fields. Standalone `ctx.generate.text` calls outside sessions do not expose session HTTP hooks.
+The native HTTP request hook is scoped to OpenCode provider ID `openrouter`. It transforms requests for all session request kinds: main agent/tool continuations, subagents, titles, compaction, and transient session generation. It preserves authentication, messages, and other request fields. Standalone `ctx.generate.text` calls outside sessions do not expose session HTTP hooks.
 
 The preview includes configured OpenCode model/variant defaults and unsaved edits, with field provenance. Other plugins' live request changes cannot be predicted by a configuration preview. OpenRouter account policies still apply. No requests, responses, or upstream-provider history are recorded.
 
