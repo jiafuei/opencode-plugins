@@ -941,10 +941,36 @@ export function normalizeSchemaForCCA(value: unknown): unknown {
   }
 }
 
-/** Function-declaration parameters must be object-rooted even when a scalar schema is otherwise valid. */
+/**
+ * Function-declaration parameters must be object-rooted even when a scalar
+ * schema is otherwise valid. The result is in the native client's protojson
+ * shape.
+ */
 export function normalizeToolSchemaForCCA(value: unknown): unknown {
   const normalized = normalizeSchemaForCCA(value);
-  return isPlainObject(normalized) && normalized.type === "object"
-    ? normalized
-    : { ...CCA_FALLBACK_SCHEMA };
+  return toNativeSchema(
+    isPlainObject(normalized) && normalized.type === "object" ? normalized : { ...CCA_FALLBACK_SCHEMA },
+  );
+}
+
+/**
+ * The native schema converter's output: enum-name types, fields in Schema
+ * proto order, sorted property maps, and no `title`/`propertyOrdering`
+ * (the converter never sets them).
+ */
+function toNativeSchema(node: JsonObject): JsonObject {
+  const result: JsonObject = {};
+  if (typeof node.type === "string") result.type = node.type.toUpperCase();
+  if (node.description !== undefined) result.description = node.description;
+  if (node.default !== undefined) result.default = node.default;
+  if (isPlainObject(node.items)) result.items = toNativeSchema(node.items);
+  if (node.enum !== undefined) result.enum = node.enum;
+  if (isPlainObject(node.properties)) {
+    const properties = node.properties;
+    result.properties = Object.fromEntries(
+      Object.keys(properties).sort().map((name) => [name, toNativeSchema(properties[name] as JsonObject)]),
+    );
+  }
+  if (node.required !== undefined) result.required = node.required;
+  return result;
 }

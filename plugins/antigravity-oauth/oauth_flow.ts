@@ -1,7 +1,8 @@
 /**
  * Antigravity OAuth: Google installed-app authorization-code flow plus Cloud
- * Code Assist project discovery/provisioning. Mirrors oh-my-pi's dedicated
- * Antigravity flow (`google-antigravity.ts` + `google-oauth-shared.ts`).
+ * Code Assist project discovery/provisioning. Login and provisioning mirror
+ * the IDE's Electron (Node) client; token refresh mirrors the language
+ * server's Go client, which refreshes for inference.
  *
  * All network functions take an injectable `fetcher` so tests stay fully
  * mocked. Errors carry status/message only — never credential material.
@@ -9,7 +10,8 @@
 
 import {
   ANTIGRAVITY_DAILY_ENDPOINT,
-  getAntigravityUserAgent,
+  getAntigravityNodeUserAgent,
+  getAntigravityVersion,
 } from "./wire.ts";
 
 // Native Antigravity installed-app client (base64 exactly as upstream ships it).
@@ -18,13 +20,12 @@ const CLIENT_ID = atob(
 );
 const CLIENT_SECRET = atob("R09DU1BYLUs1OEZXUjQ4NkxkTEoxbUxCOHNYQzR6NnFEQWY=");
 
-export const CALLBACK_PORT = 51121;
+/** Native redirects go to `http://localhost:<ephemeral port>/oauth-callback`. */
 export const CALLBACK_PATH = "/oauth-callback";
-export const REDIRECT_URI = `http://127.0.0.1:${CALLBACK_PORT}${CALLBACK_PATH}`;
 
 const AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
 const TOKEN_URL = "https://oauth2.googleapis.com/token";
-const USERINFO_URL = "https://www.googleapis.com/oauth2/v1/userinfo?alt=json";
+const USERINFO_URL = "https://www.googleapis.com/oauth2/v2/userinfo";
 
 /** Per-request timeout for provisioning-phase HTTP calls (OMP OAUTH_REQUEST_TIMEOUT_MS). */
 export const OAUTH_REQUEST_TIMEOUT_MS = 30_000;
@@ -44,8 +45,13 @@ export const SCOPES = [
   "https://www.googleapis.com/auth/experimentsandconfigs",
 ];
 
-/** Cloud Code Assist metadata sent by native Antigravity control-plane requests. */
-export const ANTIGRAVITY_LOAD_CODE_ASSIST_METADATA = Object.freeze({ ideType: "ANTIGRAVITY" });
+/** google-api-nodejs-client identification sent by the IDE's Node side. */
+const NODE_API_CLIENT = "gl-node/22.21.1";
+
+/** Client metadata the IDE's Node side sends with loadCodeAssist and onboardUser. */
+export function nodeIdeMetadata(): Record<string, string> {
+  return { ide_type: "ANTIGRAVITY", ide_version: getAntigravityVersion(), ide_name: "antigravity" };
+}
 
 export interface OAuthCredentials {
   refresh: string;
@@ -71,7 +77,7 @@ export function newOAuthState(): string {
  * with consent prompt; state is the CSRF token. No PKCE: the current native
  * Antigravity flow does not use a code challenge.
  */
-export function buildAuthUrl(state: string, redirectUri = REDIRECT_URI): string {
+export function buildAuthUrl(state: string, redirectUri: string): string {
   const params = new URLSearchParams({
     client_id: CLIENT_ID,
     response_type: "code",
@@ -124,10 +130,14 @@ function nonEmpty(value: unknown): string | undefined {
   return typeof value === "string" && value.length > 0 ? value : undefined;
 }
 
-async function postToken(body: Record<string, string>, fetcher: typeof fetch): Promise<TokenResponse> {
+async function postToken(
+  body: Record<string, string>,
+  headers: Record<string, string>,
+  fetcher: typeof fetch,
+): Promise<TokenResponse> {
   const response = await fetcher(TOKEN_URL, {
     method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    headers,
     body: new URLSearchParams(body),
     signal: AbortSignal.timeout(OAUTH_REQUEST_TIMEOUT_MS),
   });
@@ -148,13 +158,20 @@ export async function exchangeToken(
   redirectUri: string,
   fetcher: typeof fetch = fetch,
 ): Promise<OAuthCredentials> {
+  // google-auth-library's getToken form order and headers.
   const data = await postToken(
     {
       client_id: CLIENT_ID,
-      client_secret: CLIENT_SECRET,
       code,
       grant_type: "authorization_code",
       redirect_uri: redirectUri,
+      client_secret: CLIENT_SECRET,
+    },
+    {
+      "Accept-Encoding": "gzip, deflate, br",
+      "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+      "User-Agent": "google-api-nodejs-client/10.3.0",
+      "x-goog-api-client": NODE_API_CLIENT,
     },
     fetcher,
   );
@@ -169,12 +186,18 @@ export async function refreshToken(
   storedRefreshToken: string,
   fetcher: typeof fetch = fetch,
 ): Promise<Pick<OAuthCredentials, "refresh" | "access" | "expires">> {
+  // golang.org/x/oauth2 over HTTP/1.1: sorted form keys, Go's default user agent.
   const data = await postToken(
     {
       client_id: CLIENT_ID,
       client_secret: CLIENT_SECRET,
-      refresh_token: storedRefreshToken,
       grant_type: "refresh_token",
+      refresh_token: storedRefreshToken,
+    },
+    {
+      "User-Agent": "Go-http-client/1.1",
+      "Content-Type": "application/x-www-form-urlencoded",
+      "Accept-Encoding": "gzip",
     },
     fetcher,
   );
@@ -205,8 +228,9 @@ async function finalizeCredentials(
 /** Best-effort user email; failures are ignored (it is optional metadata). */
 export async function fetchUserEmail(accessToken: string, fetcher: typeof fetch = fetch): Promise<string | undefined> {
   try {
+    const { "Content-Type": _json, ...headers } = nodeHeaders(accessToken);
     const response = await fetcher(USERINFO_URL, {
-      headers: { Authorization: `Bearer ${accessToken}` },
+      headers,
       signal: AbortSignal.timeout(OAUTH_REQUEST_TIMEOUT_MS),
     });
     if (response.ok) {
@@ -227,7 +251,6 @@ interface UserTier {
 
 interface LoadCodeAssistResponse {
   currentTier?: UserTier | null;
-  paidTier?: UserTier | null;
   allowedTiers?: UserTier[];
   ineligibleTiers?: Array<{ tierId?: string; reasonMessage?: string; validationUrl?: string }>;
   cloudaicompanionProject?: string;
@@ -246,12 +269,14 @@ export interface ProvisionTiming {
   sleep?: (ms: number) => Promise<void>;
 }
 
-/** Shared Cloud Code Assist control-plane headers (native fingerprint). */
-function ccaHeaders(accessToken: string): Record<string, string> {
+/** Header set of the IDE's Node client (google-api-nodejs-client via gaxios). */
+function nodeHeaders(accessToken: string): Record<string, string> {
   return {
+    "Accept-Encoding": "gzip, deflate, br",
     Authorization: `Bearer ${accessToken}`,
     "Content-Type": "application/json",
-    "User-Agent": getAntigravityUserAgent(),
+    "User-Agent": getAntigravityNodeUserAgent(),
+    "x-goog-api-client": NODE_API_CLIENT,
   };
 }
 
@@ -276,7 +301,7 @@ export function accountVerificationMessage(payload: any, nextAction: string): st
 async function cloudCodeAssistRequest(request: CloudCodeRequest, fetcher: typeof fetch): Promise<unknown> {
   const init: RequestInit = {
     method: request.method,
-    headers: ccaHeaders(request.accessToken),
+    headers: nodeHeaders(request.accessToken),
     signal: AbortSignal.timeout(request.timeoutMs),
   };
   if (request.method === "POST") init.body = JSON.stringify(request.body ?? {});
@@ -290,38 +315,18 @@ async function cloudCodeAssistRequest(request: CloudCodeRequest, fetcher: typeof
   return response.json();
 }
 
-async function loadCodeAssist(
-  accessToken: string,
-  body: Record<string, unknown>,
-  fetcher: typeof fetch,
-  timeoutMs = OAUTH_REQUEST_TIMEOUT_MS,
-): Promise<LoadCodeAssistResponse> {
+async function loadCodeAssist(accessToken: string, fetcher: typeof fetch): Promise<LoadCodeAssistResponse> {
   return (await cloudCodeAssistRequest(
-    { label: "loadCodeAssist", url: `${ANTIGRAVITY_DAILY_ENDPOINT}/v1internal:loadCodeAssist`, method: "POST", accessToken, body, timeoutMs },
+    {
+      label: "loadCodeAssist",
+      url: `${ANTIGRAVITY_DAILY_ENDPOINT}/v1internal:loadCodeAssist`,
+      method: "POST",
+      accessToken,
+      body: { metadata: nodeIdeMetadata() },
+      timeoutMs: OAUTH_REQUEST_TIMEOUT_MS,
+    },
     fetcher,
   )) as LoadCodeAssistResponse;
-}
-
-async function loadAccountState(accessToken: string, fetcher: typeof fetch): Promise<LoadCodeAssistResponse> {
-  let payload = await loadCodeAssist(
-    accessToken,
-    { metadata: ANTIGRAVITY_LOAD_CODE_ASSIST_METADATA },
-    fetcher,
-  );
-  const projectId = extractProjectId(payload);
-  if (payload.paidTier == null && projectId) {
-    payload = await loadCodeAssist(
-      accessToken,
-      { cloudaicompanionProject: projectId, metadata: ANTIGRAVITY_LOAD_CODE_ASSIST_METADATA },
-      fetcher,
-    );
-  }
-  return payload;
-}
-
-function extractProjectId(payload: LoadCodeAssistResponse): string | undefined {
-  const projectId = payload.cloudaicompanionProject;
-  return projectId && projectId.length > 0 ? projectId : undefined;
 }
 
 function assertFreeTierEligible(payload: LoadCodeAssistResponse): void {
@@ -354,7 +359,11 @@ async function onboardUser(
       url: `${ANTIGRAVITY_DAILY_ENDPOINT}/v1internal:onboardUser`,
       method: "POST",
       accessToken,
-      body: { tierId: FREE_TIER_ID, metadata: ANTIGRAVITY_LOAD_CODE_ASSIST_METADATA },
+      // Captured native body (snake_case, with the IDE version and name).
+      body: {
+        tier_id: FREE_TIER_ID,
+        metadata: nodeIdeMetadata(),
+      },
       timeoutMs: remaining(),
     },
     fetcher,
@@ -399,17 +408,17 @@ export async function discoverProject(
   timing: ProvisionTiming = {},
 ): Promise<string> {
   onProgress?.("Checking Cloud Code Assist account status...");
-  const payload = await loadAccountState(accessToken, fetcher);
+  let payload = await loadCodeAssist(accessToken, fetcher);
 
   assertFreeTierEligible(payload);
   if (payload.currentTier == null) {
     onProgress?.("Provisioning the Antigravity free tier...");
     await onboardUser(accessToken, fetcher, timing);
+    onProgress?.("Refreshing Cloud Code Assist project...");
+    payload = await loadCodeAssist(accessToken, fetcher);
   }
 
-  onProgress?.("Refreshing Cloud Code Assist project...");
-  const refreshed = await loadAccountState(accessToken, fetcher);
-  const projectId = extractProjectId(refreshed);
+  const projectId = payload.cloudaicompanionProject;
   if (!projectId) {
     throw new Error("loadCodeAssist did not return a cloudaicompanionProject");
   }

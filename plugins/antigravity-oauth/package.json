@@ -1,7 +1,7 @@
 {
   "name": "@jiafuei/opencode-antigravity-oauth",
   "version": "0.1.0",
-  "description": "Google Antigravity OAuth for OpenCode: Gemini, Claude, and GPT-OSS through Cloud Code Assist with the native antigravity/hub wire fingerprint",
+  "description": "Google Antigravity OAuth for OpenCode: Gemini, Claude, and GPT-OSS through Cloud Code Assist with the native Antigravity IDE wire fingerprint",
   "type": "module",
   "exports": {
     "./server": "./server.ts"

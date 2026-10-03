@@ -1,8 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import {
-  ANTIGRAVITY_LOAD_CODE_ASSIST_METADATA,
-  discoverProject,
-} from "./oauth_flow.ts";
+import { discoverProject, nodeIdeMetadata } from "./oauth_flow.ts";
+import { getAntigravityVersion } from "./wire.ts";
 
 interface RecordedCall {
   url: string;
@@ -45,40 +43,20 @@ describe("project discovery", () => {
     );
   });
 
-  test("existing accounts resolve the project with native metadata", async () => {
+  test("existing accounts resolve the project with a single native load", async () => {
     const { fetcher, calls } = scriptedFetcher([
-      // Initial load: current tier already present (with paidTier, so no
-      // follow-up project-scoped load is needed).
-      () => jsonResponse({ currentTier: { id: "free-tier" }, paidTier: { id: "free-tier" }, cloudaicompanionProject: "proj-1" }),
-      // Final refresh load after resolving account state.
-      () => jsonResponse({ currentTier: { id: "free-tier" }, paidTier: { id: "free-tier" }, cloudaicompanionProject: "proj-1" }),
-    ]);
-    const progress: string[] = [];
-    const project = await discoverProject("tok", fetcher, (message) => progress.push(message), immediateTiming);
-    expect(project).toBe("proj-1");
-    expect(calls).toHaveLength(2);
-
-    const firstBody = JSON.parse(String(calls[0]!.init.body));
-    expect(firstBody).toEqual({ metadata: ANTIGRAVITY_LOAD_CODE_ASSIST_METADATA });
-    expect(calls[0]!.url).toBe("https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist");
-    // Native fingerprint on control-plane requests too.
-    expect((calls[0]!.init.headers as Record<string, string>)["User-Agent"]).toContain("antigravity/hub/");
-  });
-
-  test("missing paidTier triggers a follow-up load carrying the companion project", async () => {
-    const { fetcher, calls } = scriptedFetcher([
-      () => jsonResponse({ cloudaicompanionProject: "proj-x" }), // no tiers yet
-      () => jsonResponse({ currentTier: { id: "free-tier" }, paidTier: { id: "free-tier" } }), // repeat with project
-      () =>
-        jsonResponse({
-          currentTier: { id: "free-tier" },
-          paidTier: { id: "free-tier" },
-          cloudaicompanionProject: "proj-y",
-        }),
+      () => jsonResponse({ currentTier: { id: "free-tier" }, cloudaicompanionProject: "proj-1" }),
     ]);
     const project = await discoverProject("tok", fetcher, undefined, immediateTiming);
-    expect(project).toBe("proj-y");
-    expect(JSON.parse(String(calls[1]!.init.body)).cloudaicompanionProject).toBe("proj-x");
+    expect(project).toBe("proj-1");
+    expect(calls).toHaveLength(1);
+    expect(JSON.parse(String(calls[0]!.init.body))).toEqual({ metadata: nodeIdeMetadata() });
+    expect(calls[0]!.url).toBe("https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist");
+    // Login-time provisioning runs on the IDE's Node side.
+    expect(calls[0]!.init.headers).toMatchObject({
+      "User-Agent": "antigravity/2.5.5 windows/amd64 google-api-nodejs-client/10.3.0",
+      "x-goog-api-client": "gl-node/22.21.1",
+    });
   });
 
   test("fresh accounts onboard the free tier and poll the LRO", async () => {
@@ -93,7 +71,7 @@ describe("project discovery", () => {
         return jsonResponse({ name: "operations/abc", done: true, response: { cloudaicompanionProject: "p" } });
       },
       // final load
-      () => jsonResponse({ currentTier: { id: "free-tier" }, paidTier: { id: "free-tier" }, cloudaicompanionProject: "proj-new" }),
+      () => jsonResponse({ currentTier: { id: "free-tier" }, cloudaicompanionProject: "proj-new" }),
     ]);
     const sleeps: number[] = [];
     const timing = { pollIntervalMs: 1000, timeoutMs: 30_000, sleep: async (ms: number) => void sleeps.push(ms) };
@@ -105,15 +83,15 @@ describe("project discovery", () => {
     const onboardCall = calls[1]!;
     expect(onboardCall.url).toBe("https://daily-cloudcode-pa.googleapis.com/v1internal:onboardUser");
     expect(JSON.parse(String(onboardCall.init.body))).toEqual({
-      tierId: "free-tier",
-      metadata: ANTIGRAVITY_LOAD_CODE_ASSIST_METADATA,
+      tier_id: "free-tier",
+      metadata: { ide_type: "ANTIGRAVITY", ide_version: getAntigravityVersion(), ide_name: "antigravity" },
     });
     // LRO polls carry the shared native context, Content-Type included.
     const pollCall = calls[2]!;
     expect(pollCall.url).toBe("https://daily-cloudcode-pa.googleapis.com/v1internal/operations/abc");
     const pollHeaders = pollCall.init.headers as Record<string, string>;
     expect(pollHeaders["Content-Type"]).toBe("application/json");
-    expect(pollHeaders["User-Agent"]).toContain("antigravity/hub/");
+    expect(pollHeaders["User-Agent"]).toStartWith("antigravity/2.5.5 ");
   });
 
   test("failed operations surface their error", async () => {
@@ -147,7 +125,6 @@ describe("project discovery", () => {
             },
           ],
         }),
-      () => jsonResponse({}),
     ]);
     try {
       await discoverProject("t", fetcher, undefined, immediateTiming);

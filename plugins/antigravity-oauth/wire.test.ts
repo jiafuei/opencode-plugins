@@ -1,140 +1,100 @@
 import { describe, expect, test } from "bun:test";
 import {
-  ANTIGRAVITY_MODEL_WIRE_PROFILES,
-  DEFAULT_EFFORT_BUDGETS,
-  MODEL_SPECS,
+  SNAPSHOT_CATALOG,
+  WIRE_MODEL_HEADER,
   advanceEnvelope,
   createCcaSseUnwrap,
   createSessionState,
   getAntigravityUserAgent,
-  getAntigravityVersion,
   normalizeSchemaForCCA,
   providerModels,
-  readRequestedEffort,
-  resolveWireModelId,
   rewriteBodyForAntigravity,
 } from "./wire.ts";
 
 // ---------------------------------------------------------------------------
-// User agent / version discovery
+// User agent
 // ---------------------------------------------------------------------------
 
 describe("antigravity user agent", () => {
-  test("matches the native hub fingerprint format", () => {
+  test("matches the native IDE language server fingerprint", () => {
+    const version = process.env.OPENCODE_ANTIGRAVITY_VERSION;
     delete process.env.OPENCODE_ANTIGRAVITY_VERSION;
+    expect(getAntigravityUserAgent()).toBe("antigravity/ide/2.5.5 (aidev_client; os_type=windows; arch=amd64)");
     process.env.OPENCODE_ANTIGRAVITY_VERSION = "9.9.9";
-    expect(getAntigravityUserAgent()).toBe(
-      "antigravity/hub/9.9.9 (aidev_client; os_type=darwin; arch=arm64; cl=963137146)",
-    );
-    process.env.OPENCODE_ANTIGRAVITY_CL = "123";
-    process.env.OPENCODE_ANTIGRAVITY_OS = "linux";
-    process.env.OPENCODE_ANTIGRAVITY_ARCH = "x64";
-    expect(getAntigravityVersion()).toBe("9.9.9");
-    expect(getAntigravityUserAgent()).toBe(
-      "antigravity/hub/9.9.9 (aidev_client; os_type=linux; arch=x64; cl=123)",
-    );
-    delete process.env.OPENCODE_ANTIGRAVITY_CL;
+    process.env.OPENCODE_ANTIGRAVITY_OS = "darwin";
+    process.env.OPENCODE_ANTIGRAVITY_ARCH = "arm64";
+    expect(getAntigravityUserAgent()).toBe("antigravity/ide/9.9.9 (aidev_client; os_type=darwin; arch=arm64)");
     delete process.env.OPENCODE_ANTIGRAVITY_OS;
     delete process.env.OPENCODE_ANTIGRAVITY_ARCH;
-    // Other suites instantiate the plugin in this process; keep discovery off.
-    process.env.OPENCODE_ANTIGRAVITY_VERSION = "2.8.0";
+    if (version === undefined) delete process.env.OPENCODE_ANTIGRAVITY_VERSION;
+    else process.env.OPENCODE_ANTIGRAVITY_VERSION = version;
   });
-
 });
 
 // ---------------------------------------------------------------------------
 // Session state & request envelope
 // ---------------------------------------------------------------------------
 
-describe("session state", () => {
-  test("envelope advances monotonically per conversation", () => {
-    const state = createSessionState();
-    const first = advanceEnvelope(state, "gemini-3.1-pro-low", undefined, false);
-    const second = advanceEnvelope(state, "gemini-3.1-pro-low", undefined, false);
-    expect(first.step).toBe(2);
-    expect(second.step).toBe(3);
-    for (const env of [first, second]) {
-      expect(env.requestId).toMatch(new RegExp(`^agent/${state.agentId}/\\d+/${state.trajectoryId}/\\d+$`));
-      expect(env.labels["trajectory_id"]).toBe(state.trajectoryId);
-      expect(env.labels["last_step_index"]).toBe(String(env.step - 1));
-      expect(env.labels["used_claude"]).toBe("false");
-      // Wire profile enum rides along for known ids.
-    }
-    expect(first.labels["model_enum"]).toBe(ANTIGRAVITY_MODEL_WIRE_PROFILES["gemini-3.1-pro-low"]!.modelEnum);
-  });
-
+const user = (text: string) => ({ role: "user", parts: [{ text }] });
+const reply = (text: string) => ({ role: "model", parts: [{ text }] });
+const call = (name: string) => ({ role: "model", parts: [{ functionCall: { id: name, name, args: {} } }] });
+const results = (...names: string[]) => ({
+  role: "user",
+  parts: names.map((name) => ({ functionResponse: { id: name, name, response: { name, content: "ok" } } })),
 });
 
-// ---------------------------------------------------------------------------
-// Effort routing
-// ---------------------------------------------------------------------------
+describe("session envelope", () => {
+  test("step index and execution ids follow the native trajectory", () => {
+    const state = createSessionState();
+    const model = SNAPSHOT_CATALOG["gemini-3.8-flash-low"]!;
+    const stepOf = (requestId: string) => Number(requestId.split("/").at(-1));
 
-function effortOf(specKey: string, thinkingConfig?: Record<string, unknown>) {
-  return readRequestedEffort(MODEL_SPECS[specKey]!, thinkingConfig);
-}
-
-describe("wire model routing", () => {
-  test("budget family tiers route to captured wire ids", () => {
-    expect(resolveWireModelId(MODEL_SPECS["gemini-3.1-pro"]!, { effort: "off", requested: true }, "gemini-3.1-pro")).toBe("gemini-3.1-pro-low");
-    expect(resolveWireModelId(MODEL_SPECS["gemini-3.1-pro"]!, { effort: "low", requested: true }, "gemini-3.1-pro")).toBe("gemini-3.1-pro-low");
-    expect(resolveWireModelId(MODEL_SPECS["gemini-3.1-pro"]!, { effort: "high", requested: true }, "gemini-3.1-pro")).toBe("gemini-pro-agent");
-    expect(resolveWireModelId(MODEL_SPECS["gemini-3-flash"]!, { effort: "medium", requested: true }, "gemini-3-flash")).toBe("gemini-3.5-flash-low");
-    expect(resolveWireModelId(MODEL_SPECS["gemini-3-flash"]!, { effort: "high", requested: true }, "gemini-3-flash")).toBe("gemini-3-flash-agent");
-  });
-
-  test("thinking pairs route off to the bare id and efforts to -thinking", () => {
-    const spec = MODEL_SPECS["claude-opus-4-5"]!;
-    expect(resolveWireModelId(spec, { effort: "off", requested: true }, "claude-opus-4-5")).toBe("claude-opus-4-5");
-    expect(resolveWireModelId(spec, { effort: "minimal", requested: true }, "claude-opus-4-5")).toBe("claude-opus-4-5-thinking");
-    expect(resolveWireModelId(spec, { effort: "high", requested: true }, "claude-opus-4-5")).toBe("claude-opus-4-5-thinking");
-  });
-
-  test("asymmetric and constant wire ids fall back correctly", () => {
-    expect(resolveWireModelId(MODEL_SPECS["claude-sonnet-4-6"]!, { effort: "low", requested: true }, "claude-sonnet-4-6")).toBe("claude-sonnet-4-6");
-    expect(resolveWireModelId(MODEL_SPECS["gpt-oss-120b"]!, { effort: "medium", requested: true }, "gpt-oss-120b")).toBe("gpt-oss-120b-medium");
-    expect(resolveWireModelId(MODEL_SPECS["gemini-2.5-pro"]!, { effort: "off", requested: true }, "gemini-2.5-pro")).toBe("gemini-2.5-pro");
-  });
-
-  test("mandatory-reasoning families clamp off to the lowest supported effort", () => {
-    expect(resolveWireModelId(MODEL_SPECS["gemini-3.6-flash"]!, { effort: "off", requested: true }, "gemini-3.6-flash")).toBe("gemini-3.6-flash-low");
-    expect(resolveWireModelId(MODEL_SPECS["gemini-3.7-flash"]!, { effort: "high", requested: true }, "gemini-3.7-flash")).toBe("gemini-3.7-flash-high");
-    expect(resolveWireModelId(MODEL_SPECS["gemini-3.8-flash"]!, { effort: "medium", requested: true }, "gemini-3.8-flash")).toBe("gemini-3.8-flash-medium");
-    expect(resolveWireModelId(MODEL_SPECS["gemini-3-pro"]!, { effort: "minimal", requested: true }, "gemini-3-pro")).toBe("gemini-3-pro-low");
-  });
-
-  test("effort detection from thinkingConfig", () => {
-    expect(effortOf("gemini-3.1-pro", undefined)).toEqual({ effort: "off", requested: false });
-    expect(effortOf("gemini-3.6-flash", { includeThoughts: true, thinkingLevel: "HIGH" })).toEqual({ effort: "high", requested: true });
-    expect(effortOf("gemini-3.5-flash", { includeThoughts: true, thinkingBudget: 4000 })).toEqual({ effort: "medium", requested: true });
-    // Unmatched custom budgets keep thinking alive but cannot pick a tier.
-    expect(effortOf("claude-sonnet-4-6", { includeThoughts: true, thinkingBudget: 777 })).toEqual({
-      effort: "off",
-      requested: true,
-      unmatched: true,
+    // Captured sequence: first prompt is step 2, the checkpoint after the
+    // first reply adds a step, tool calls and results add one step each.
+    const first = advanceEnvelope(state, [user("a")], model);
+    expect(first.requestId).toMatch(new RegExp(`^agent/${state.agentId}/\\d+/${state.trajectoryId}/2$`));
+    expect(first.labels).toEqual({
+      last_step_index: "1",
+      model_enum: "MODEL_PLACEHOLDER_M320",
+      trajectory_id: state.trajectoryId,
+      used_claude: "false",
+      used_claude_conservative: "false",
+      used_non_gemini_model: "false",
     });
-    // Default budgets apply where families have none baked.
-    expect(effortOf("gpt-oss-120b", { includeThoughts: true, thinkingBudget: DEFAULT_EFFORT_BUDGETS.medium })).toEqual({
-      effort: "medium",
-      requested: true,
-    });
+
+    const second = advanceEnvelope(state, [user("a"), reply("b"), user("c")], model);
+    expect(stepOf(second.requestId)).toBe(5);
+    const execution = second.labels["last_execution_id"];
+    expect(execution).toMatch(/^[0-9a-f-]{36}$/);
+
+    // A tool continuation stays in the same execution.
+    const toolTurn = [user("a"), reply("b"), user("c"), call("x"), results("x")];
+    const third = advanceEnvelope(state, toolTurn, model);
+    expect(stepOf(third.requestId)).toBe(7);
+    expect(third.labels["last_execution_id"]).toBe(execution);
+
+    // Retries of the same history reproduce the identity.
+    expect(advanceEnvelope(state, toolTurn, model).labels).toEqual(third.labels);
+
+    // Four batched results are four steps; the next user turn moves the execution on.
+    const batched = advanceEnvelope(state, [...toolTurn, call("y"), results("y1", "y2", "y3", "y4"), user("d")], model);
+    expect(stepOf(batched.requestId)).toBe(13);
+    expect(batched.labels["last_execution_id"]).not.toBe(execution);
+
+    // Compacted history never moves the step backwards.
+    const compacted = advanceEnvelope(state, [user("summary"), user("e")], model);
+    expect(stepOf(compacted.requestId)).toBe(13);
   });
 
-  test("budget families accept OpenCode-style levels; level families ignore budgets", () => {
-    // OpenCode derives thinkingLevel variants for Gemini 3 ids regardless of
-    // transport; budget families map them onto the family's tiers.
-    expect(effortOf("gemini-3.1-pro", { includeThoughts: true, thinkingLevel: "low" })).toEqual({ effort: "low", requested: true });
-    expect(effortOf("gemini-3.5-flash", { includeThoughts: true, thinkingLevel: "medium" })).toEqual({ effort: "medium", requested: true });
-    // Level families never invent a tier from a bare budget value.
-    expect(effortOf("gemini-3.6-flash", { includeThoughts: true, thinkingBudget: 4096 })).toEqual({
-      effort: "off",
-      requested: true,
-      unmatched: true,
-    });
-    // Bare includeThoughts defaults to the family's high control.
-    expect(effortOf("gemini-3.1-pro", { includeThoughts: true })).toEqual({ effort: "high", requested: true });
-    expect(effortOf("claude-opus-4-6", { includeThoughts: true })).toEqual({ effort: "high", requested: true });
-    // Explicit off (no controls at all).
-    expect(effortOf("claude-sonnet-4-6", { includeThoughts: false })).toEqual({ effort: "off", requested: true });
+  test("model family flags stay set once a non-Gemini model is used", () => {
+    const state = createSessionState();
+    const flags = (wireId: string) => {
+      const { labels } = advanceEnvelope(state, [user("a")], SNAPSHOT_CATALOG[wireId]!);
+      return [labels["used_claude"], labels["used_claude_conservative"], labels["used_non_gemini_model"]];
+    };
+    expect(flags("gpt-oss-120b-medium")).toEqual(["false", "false", "true"]);
+    expect(flags("claude-opus-5-5-low")).toEqual(["true", "true", "true"]);
+    expect(flags("gemini-3.8-flash-high")).toEqual(["true", "true", "true"]);
   });
 });
 
@@ -150,173 +110,114 @@ function baseArgs(): Record<string, any> {
   };
 }
 
-function withThinking(thinkingConfig: Record<string, unknown>): Record<string, any> {
-  const args = baseArgs();
-  args.generationConfig.thinkingConfig = thinkingConfig;
-  return args;
+function rewrite(args: Record<string, any>, wireModelId: string, state = createSessionState()): Record<string, any> {
+  return rewriteBodyForAntigravity({
+    args: { tools: [], ...args },
+    logicalModelId: wireModelId.replace(/-(low|medium|high)$/, ""),
+    wireModelId,
+    model: SNAPSHOT_CATALOG[wireModelId]!,
+    projectId: "proj-1",
+    state,
+  });
 }
 
 describe("body rewrite", () => {
   test("produces the Cloud Code Assist envelope", () => {
-    const state = createSessionState();
     const args = baseArgs();
-    args.generationConfig.thinkingConfig = { includeThoughts: true, thinkingLevel: "high" };
+    args.systemInstruction = { parts: [{ text: "system" }, { text: "prompt" }] };
+    args.generationConfig = { temperature: 0.5, topK: 3, maxOutputTokens: 100, thinkingConfig: { includeThoughts: true, thinkingLevel: "high" } };
     args.tools = [{ functionDeclarations: [{ name: "t", parameters: { type: "object", properties: {} } }] }];
-    const result = rewriteBodyForAntigravity({
-      args,
-      logicalModelId: "gemini-3.1-pro",
-      projectId: "proj-1",
-      state,
-      invocationId: undefined,
-    });
-    expect(result.wireModelId).toBe("gemini-pro-agent");
-    const body = JSON.parse(result.body);
+    const body = rewrite(args, "gemini-3.8-flash-low");
     expect(body.project).toBe("proj-1");
-    expect(body.model).toBe("gemini-pro-agent");
+    expect(body.model).toBe("gemini-3.8-flash-low");
     expect(body.userAgent).toBe("antigravity");
     expect(body.requestType).toBe("agent");
     expect(body.requestId).toMatch(/^agent\//);
-    expect(body.request.systemInstruction).toEqual({ role: "user", parts: [{ text: "system prompt" }] });
+    expect(Object.keys(body)).toEqual(["project", "requestId", "request", "model", "userAgent", "requestType"]);
+    expect(Object.keys(body.request)).toEqual([
+      "contents",
+      "systemInstruction",
+      "tools",
+      "toolConfig",
+      "labels",
+      "generationConfig",
+      "sessionId",
+    ]);
+    // The native system prompt is a single part.
+    expect(body.request.systemInstruction).toEqual({ role: "user", parts: [{ text: "system\nprompt" }] });
     expect(body.request.sessionId).toMatch(/^-\d+$/);
-    expect(body.request.generationConfig.maxOutputTokens).toBe(65535);
-    // Budget transport: the level input is normalized to the captured budget.
-    expect(body.request.generationConfig.thinkingConfig).toEqual({ includeThoughts: true, thinkingBudget: 10001 });
+    // Only the catalog's output cap and thinking budget; OpenCode's sampling settings are dropped.
+    expect(body.request.generationConfig).toEqual({
+      maxOutputTokens: 65536,
+      thinkingConfig: { includeThoughts: true, thinkingBudget: 1000 },
+    });
     expect(body.request.toolConfig.functionCallingConfig.mode).toBe("VALIDATED");
-    expect(body.request.labels.model_enum).toBe("MODEL_PLACEHOLDER_M16");
+    expect(body.request.labels.model_enum).toBe("MODEL_PLACEHOLDER_M320");
   });
 
-  test("forces VALIDATED for Claude even with no tools", () => {
+  test("sends each family's captured thinking transport", () => {
+    expect(rewrite(baseArgs(), "gemini-3.8-flash-high").request.generationConfig).toEqual({
+      maxOutputTokens: 65536,
+      thinkingConfig: { includeThoughts: true, thinkingBudget: -1 },
+    });
+    expect(rewrite(baseArgs(), "claude-opus-5-5-medium").request.generationConfig).toEqual({
+      maxOutputTokens: 128000,
+      thinkingConfig: { includeThoughts: true, thinkingBudget: 0, thinkingLevel: "MEDIUM" },
+    });
+  });
+
+  test("tool-less requests become checkpoint calls that leave the trajectory untouched", () => {
     const state = createSessionState();
-    const result = rewriteBodyForAntigravity({
-      args: { contents: [], generationConfig: {} },
-      logicalModelId: "claude-sonnet-4-6",
-      projectId: "p",
+    const body = rewriteBodyForAntigravity({
+      args: { ...baseArgs(), generationConfig: { temperature: 0.5 } },
+      logicalModelId: "claude-opus-5-5",
+      wireModelId: "claude-opus-5-5-high",
+      model: SNAPSHOT_CATALOG["claude-opus-5-5-high"]!,
+      projectId: "proj-1",
       state,
     });
-    const body = JSON.parse(result.body);
-    expect(result.wireModelId).toBe("claude-sonnet-4-6");
+    expect(body).toEqual({
+      project: "proj-1",
+      requestId: expect.stringMatching(/^checkpoint\/[0-9a-f-]{36}$/),
+      request: {
+        contents: [{ role: "user", parts: [{ text: "hi" }] }],
+        systemInstruction: { role: "user", parts: [{ text: "system prompt" }] },
+        generationConfig: { maxOutputTokens: 16384, thinkingConfig: { includeThoughts: false, thinkingBudget: 0 } },
+        sessionId: state.sessionId,
+      },
+      model: "gemini-3.1-flash-lite",
+      userAgent: "antigravity",
+      requestType: "checkpoint",
+    });
+    expect(state.historySteps).toBe(0);
+    expect(state.usedClaude).toBe(false);
+  });
+
+  test("forces VALIDATED for Claude", () => {
+    const body = rewrite({ contents: [], toolConfig: { functionCallingConfig: { mode: "ANY" } } }, "claude-opus-5-5-high");
     expect(body.request.toolConfig.functionCallingConfig.mode).toBe("VALIDATED");
-    expect(body.request.tools).toBeUndefined();
     expect(body.request.labels.used_claude).toBe("true");
   });
 
   test("keeps explicit non-AUTO SDK tool choices and defaults plain tools to VALIDATED", () => {
-    const state = createSessionState();
     const forced = baseArgs();
     forced.tools = [{ functionDeclarations: [{ name: "t", parameters: { type: "object", properties: {} } }] }];
     forced.toolConfig = { functionCallingConfig: { mode: "ANY", allowedFunctionNames: ["t"] } };
-    const forcedBody = JSON.parse(
-      rewriteBodyForAntigravity({ args: forced, logicalModelId: "gemini-3-flash", projectId: "p", state }).body,
-    );
-    expect(forcedBody.request.toolConfig.functionCallingConfig.mode).toBe("ANY");
+    expect(rewrite(forced, "gemini-3.8-flash-low").request.toolConfig.functionCallingConfig.mode).toBe("ANY");
 
     const plain = baseArgs();
     plain.tools = [{ functionDeclarations: [{ name: "t", parameters: { type: "object", properties: {} } }] }];
-    const plainBody = JSON.parse(
-      rewriteBodyForAntigravity({ args: plain, logicalModelId: "gemini-3-flash", projectId: "p", state }).body,
-    );
-    expect(plainBody.request.toolConfig.functionCallingConfig.mode).toBe("VALIDATED");
+    expect(rewrite(plain, "gemini-3.8-flash-low").request.toolConfig.functionCallingConfig.mode).toBe("VALIDATED");
   });
 
-  test("suppresses server-side thinking when off is required", () => {
-    const state = createSessionState();
-    const budgetBody = JSON.parse(
-      rewriteBodyForAntigravity({ args: baseArgs(), logicalModelId: "gemini-3.5-flash", projectId: "p", state }).body,
-    );
-    expect(budgetBody.request.generationConfig.thinkingConfig).toEqual({ includeThoughts: false, thinkingBudget: 0 });
-
-    const levelBody = JSON.parse(
-      rewriteBodyForAntigravity({ args: baseArgs(), logicalModelId: "gemini-3-pro", projectId: "p", state }).body,
-    );
-    expect(levelBody.request.generationConfig.thinkingConfig).toEqual({ includeThoughts: false, thinkingLevel: "MINIMAL" });
-  });
-
-  test("unmatched custom thinking budgets are forwarded untouched", () => {
-    const state = createSessionState();
-    const args = baseArgs();
-    args.generationConfig.thinkingConfig = { includeThoughts: true, thinkingBudget: 777 };
-    const body = JSON.parse(
-      rewriteBodyForAntigravity({ args, logicalModelId: "gemini-3.5-flash", projectId: "p", state }).body,
-    );
-    expect(body.request.generationConfig.thinkingConfig).toEqual({ includeThoughts: true, thinkingBudget: 777 });
-  });
-
-  test("normalizes thinking to exactly the family transport at the wire boundary", () => {
-    const state = createSessionState();
-
-    // Default high on a budget model (bare includeThoughts).
-    const defaultPro = JSON.parse(
-      rewriteBodyForAntigravity({
-        args: withThinking({ includeThoughts: true }),
-        logicalModelId: "gemini-3.1-pro",
-        projectId: "p",
-        state,
-      }).body,
-    );
-    expect(defaultPro.model).toBe("gemini-pro-agent");
-    expect(defaultPro.request.generationConfig.thinkingConfig).toEqual({ includeThoughts: true, thinkingBudget: 10001 });
-
-    // Claude default high uses the shared default budget.
-    const claude = JSON.parse(
-      rewriteBodyForAntigravity({
-        args: withThinking({ includeThoughts: true }),
-        logicalModelId: "claude-sonnet-4-6",
-        projectId: "p",
-        state,
-      }).body,
-    );
-    expect(claude.request.generationConfig.thinkingConfig).toEqual({ includeThoughts: true, thinkingBudget: DEFAULT_EFFORT_BUDGETS.high });
-
-    // Merged level+budget input collapses to the single native control.
-    const merged = JSON.parse(
-      rewriteBodyForAntigravity({
-        args: withThinking({ includeThoughts: true, thinkingLevel: "medium", thinkingBudget: 999_999 }),
-        logicalModelId: "gemini-3-flash",
-        projectId: "p",
-        state,
-      }).body,
-    );
-    expect(merged.request.generationConfig.thinkingConfig).toEqual({ includeThoughts: true, thinkingBudget: 4000 });
-
-    // Level families emit uppercase levels only, dropping stray budgets.
-    const levelCleanup = JSON.parse(
-      rewriteBodyForAntigravity({
-        args: withThinking({ includeThoughts: true, thinkingLevel: "low", thinkingBudget: 12_345 }),
-        logicalModelId: "gemini-3.6-flash",
-        projectId: "p",
-        state,
-      }).body,
-    );
-    expect(levelCleanup.request.generationConfig.thinkingConfig).toEqual({ includeThoughts: true, thinkingLevel: "LOW" });
-
-    // Explicit off still suppresses where required.
-    const explicitOff = JSON.parse(
-      rewriteBodyForAntigravity({
-        args: withThinking({ includeThoughts: false }),
-        logicalModelId: "gemini-3.5-flash",
-        projectId: "p",
-        state,
-      }).body,
-    );
-    expect(explicitOff.request.generationConfig.thinkingConfig).toEqual({ includeThoughts: false, thinkingBudget: 0 });
-  });
-
-  test("emits LOW when minimal routes to a Flash low SKU", () => {
-    for (const model of ["gemini-3.6-flash", "gemini-3.7-flash", "gemini-3.8-flash"]) {
-      const body = JSON.parse(
-        rewriteBodyForAntigravity({
-          args: withThinking({ includeThoughts: true, thinkingLevel: "minimal" }),
-          logicalModelId: model,
-          projectId: "p",
-          state: createSessionState(),
-        }).body,
-      );
-      expect(body.model).toBe(`${model}-low`);
-      expect(body.request.generationConfig.thinkingConfig).toEqual({
-        includeThoughts: true,
-        thinkingLevel: "LOW",
-      });
-    }
+  test("tool results carry output text in the provider's native role", () => {
+    const args = { contents: [user("a"), call("x"), results("x")] };
+    const nativeResult = (role: string) => ({
+      role,
+      parts: [{ functionResponse: { id: "x", name: "x", response: { output: "ok" } } }],
+    });
+    expect(rewrite(args, "gemini-3.8-flash-low").request.contents[2]).toEqual(nativeResult("model"));
+    expect(rewrite(args, "claude-opus-5-5-low").request.contents[2]).toEqual(nativeResult("user"));
   });
 
   test("normalizes Gemini 3 function-call signatures per model turn", () => {
@@ -328,17 +229,10 @@ describe("body rewrite", () => {
           { functionCall: { name: "second", args: {} }, thoughtSignature: "skip_thought_signature_validator" },
         ],
       },
-      { role: "user", parts: [{ functionResponse: { name: "first", response: {} } }] },
+      { role: "user", parts: [{ functionResponse: { name: "first", response: { content: "" } } }] },
       { role: "model", parts: [{ functionCall: { name: "unsigned", args: {} } }] },
     ];
-    const body = JSON.parse(
-      rewriteBodyForAntigravity({
-        args: { contents },
-        logicalModelId: "gemini-3.8-flash",
-        projectId: "p",
-        state: createSessionState(),
-      }).body,
-    );
+    const body = rewrite({ contents }, "gemini-3.8-flash-low");
 
     expect(body.request.contents[0].parts[0].thoughtSignature).toBe("signed");
     expect(body.request.contents[0].parts[1].thoughtSignature).toBeUndefined();
@@ -346,39 +240,70 @@ describe("body rewrite", () => {
   });
 
   test("drops unsigned Claude thinking while preserving signed thinking", () => {
-    const body = JSON.parse(
-      rewriteBodyForAntigravity({
-        args: {
-          contents: [
-            {
-              role: "model",
-              parts: [
-                { text: "unsigned", thought: true },
-                { text: "signed", thought: true, thoughtSignature: "opaque" },
-                { functionCall: { name: "tool", args: {} } },
-              ],
-            },
-          ],
-        },
-        logicalModelId: "claude-sonnet-4-6",
-        projectId: "p",
-        state: createSessionState(),
-      }).body,
+    const body = rewrite(
+      {
+        contents: [
+          {
+            role: "model",
+            parts: [
+              { text: "unsigned", thought: true },
+              { text: "signed", thought: true, thoughtSignature: "opaque" },
+              { functionCall: { name: "tool", args: {} } },
+            ],
+          },
+        ],
+      },
+      "claude-opus-5-5-high",
     );
 
+    // The signature moves to the first non-thought part, as the native client replays it.
     expect(body.request.contents).toEqual([
       {
         role: "model",
         parts: [
-          { text: "signed", thought: true, thoughtSignature: "opaque" },
-          { functionCall: { name: "tool", args: {} } },
+          { text: "signed", thought: true },
+          { functionCall: { name: "tool", args: {} }, thoughtSignature: "opaque" },
         ],
       },
     ]);
   });
 
+  test("replays assistant parts in native order: joined thoughts, joined text, then calls", () => {
+    const body = rewrite(
+      {
+        contents: [
+          {
+            role: "model",
+            parts: [
+              { text: "a", thought: true },
+              { text: "b", thought: true },
+              { functionCall: { name: "first", args: {} }, thoughtSignature: "call-sig" },
+              { text: "x", thoughtSignature: "text-sig" },
+              { text: "y" },
+              { functionCall: { name: "second", args: {} } },
+            ],
+          },
+          { role: "model", parts: [{ text: " \n" }, { functionCall: { name: "third", args: {} }, thoughtSignature: "s3" }] },
+        ],
+      },
+      "gemini-3.8-flash-low",
+    );
+    expect(body.request.contents).toEqual([
+      {
+        role: "model",
+        parts: [
+          { text: "ab", thought: true },
+          { text: "xy", thoughtSignature: "text-sig" },
+          { functionCall: { name: "first", args: {} }, thoughtSignature: "call-sig" },
+          { functionCall: { name: "second", args: {} } },
+        ],
+      },
+      // Whitespace-only text is omitted.
+      { role: "model", parts: [{ functionCall: { name: "third", args: {} }, thoughtSignature: "s3" }] },
+    ]);
+  });
+
   test("converts @ai-sdk/google parametersJsonSchema declarations like OMP", () => {
-    const state = createSessionState();
     const args = baseArgs();
     args.tools = [
       {
@@ -389,7 +314,7 @@ describe("body rewrite", () => {
             // Actual @ai-sdk/google 3.x shape (OpenAPI-style schema).
             parametersJsonSchema: {
               type: "object",
-              properties: { path: { type: "string", pattern: "^/" }, extra: true },
+              properties: { path: { type: "string", title: "Path", pattern: "^/" }, extra: true },
               required: ["path"],
               additionalProperties: false,
             },
@@ -399,15 +324,17 @@ describe("body rewrite", () => {
         ],
       },
     ];
-    const body = JSON.parse(rewriteBodyForAntigravity({ args, logicalModelId: "claude-opus-4-6", projectId: "p", state }).body);
+    const body = rewrite(args, "claude-opus-5-5-high");
     const declarations = body.request.tools[0].functionDeclarations;
     expect(declarations[0].parametersJsonSchema).toBeUndefined();
+    // Native protojson shape: enum-name types and sorted property maps.
     expect(declarations[0].parameters).toEqual({
-      type: "object",
-      properties: { path: { type: "string" }, extra: {} },
+      type: "OBJECT",
+      properties: { extra: {}, path: { type: "STRING" } },
       required: ["path"],
     });
-    expect(declarations[1]).toEqual({ name: "legacy", description: "", parameters: { type: "object", properties: {} } });
+    expect(Object.keys(declarations[0].parameters.properties)).toEqual(["extra", "path"]);
+    expect(declarations[1]).toEqual({ name: "legacy", description: "", parameters: { type: "OBJECT", properties: {} } });
   });
 
   test("normalizes tool schemas for CCA", () => {
@@ -455,7 +382,6 @@ describe("body rewrite", () => {
   });
 
   test("encodes numeric enums at the request-rewrite boundary", () => {
-    const state = createSessionState();
     const args = baseArgs();
     args.tools = [
       {
@@ -471,11 +397,10 @@ describe("body rewrite", () => {
         ],
       },
     ];
-    const result = rewriteBodyForAntigravity({ args, logicalModelId: "claude-opus-4-6", projectId: "p", state });
-    const declaration = JSON.parse(result.body).request.tools[0].functionDeclarations[0];
+    const declaration = rewrite(args, "claude-opus-5-5-high").request.tools[0].functionDeclarations[0];
     expect(declaration.parameters).toEqual({
-      type: "object",
-      properties: { depth: { type: "integer", enum: ["1", "2"] } },
+      type: "OBJECT",
+      properties: { depth: { type: "INTEGER", enum: ["1", "2"] } },
       required: ["depth"],
     });
   });
@@ -537,6 +462,7 @@ function assertNoForbiddenConstructs(schema: unknown): void {
   };
   walk(schema);
 }
+
 
 describe("CCA tool schema normalization", () => {
   test("collapses nullable unions by dropping the null branch", () => {
@@ -881,48 +807,41 @@ describe("CCA tool schema normalization", () => {
   });
 });
 
+
 // ---------------------------------------------------------------------------
 // Provider model registration
 // ---------------------------------------------------------------------------
 
 describe("provider model registration", () => {
-  test("registers all usable families with zero cost", () => {
+  test("groups the agent catalog into tier families defaulting to the highest tier", () => {
     const models = Object.fromEntries(providerModels().map((model) => [model.id, model]));
-    for (const model of Object.values(models)) {
-      expect(model.providerID).toBe("google-antigravity");
-      expect(model.cost).toEqual([]);
-      expect(model.variants.length).toBeGreaterThan(0);
-    }
-    // Effort variants map onto the captured budget tiers.
-    const variant = (id: string, effort: string) =>
-      models[id]!.variants.find((candidate) => candidate.id === effort)!.settings!.thinkingConfig;
-    expect(variant("gemini-3.1-pro", "high").thinkingBudget).toBe(10001);
-    expect(variant("gemini-3.7-flash", "low").thinkingLevel).toBe("low");
-  });
-
-  test("never registers invented thinking budgets", () => {
-    for (const model of providerModels()) {
-      for (const variant of model.variants) {
-        expect(["minimal", "low", "medium", "high"]).toContain(variant.id);
-        expect(variant.settings?.thinkingConfig).toBeDefined();
-      }
-    }
-  });
-
-  test("live discovery keeps supported routes and drops unavailable variants", () => {
-    const models = Object.fromEntries(
-      providerModels({
-        "gemini-3.1-pro-low": { maxTokens: 800_000, maxOutputTokens: 65_535, supportsImages: true },
-        "claude-opus-4-6-thinking": { maxTokens: 250_000 },
-        "claude-sonnet-4-6": {},
-        "gemini-3.7-flash-low": { isInternal: true },
-        "gemini-2.5-pro": {},
-        "unmapped-model": {},
-      }).map((model) => [model.id, model]),
-    );
-    expect(Object.keys(models).sort()).toEqual(["claude-opus-4-6", "claude-sonnet-4-6", "gemini-3.1-pro"]);
-    expect(models["gemini-3.1-pro"]!.limit.context).toBe(800_000);
-    expect(models["gemini-3.1-pro"]!.variants.map((variant) => variant.id)).toEqual(["minimal", "low", "medium"]);
+    expect(Object.keys(models)).toEqual([
+      "gemini-3.8-flash",
+      "gemini-3.7-flash",
+      "gemini-3.6-flash",
+      "gemini-3.1-pro",
+      "claude-opus-5-5",
+      "claude-sonnet-5-5",
+      "gpt-oss-120b",
+    ]);
+    const opus = models["claude-opus-5-5"]!;
+    expect(opus).toMatchObject({
+      providerID: "google-antigravity",
+      name: "Claude Opus 5.5",
+      headers: { [WIRE_MODEL_HEADER]: "claude-opus-5-5-high" },
+      cost: [],
+      limit: { context: 1_000_000, output: 128_000 },
+    });
+    expect(opus.variants).toEqual([
+      { id: "low", headers: { [WIRE_MODEL_HEADER]: "claude-opus-5-5-low" } },
+      { id: "medium", headers: { [WIRE_MODEL_HEADER]: "claude-opus-5-5-medium" } },
+      { id: "high", headers: { [WIRE_MODEL_HEADER]: "claude-opus-5-5-high" } },
+    ] as any);
+    // Asymmetric wire ids still group by display name.
+    expect(models["gemini-3.1-pro"]!.headers).toEqual({ [WIRE_MODEL_HEADER]: "gemini-pro-agent" });
+    // A single tier needs no variants.
+    expect(models["gpt-oss-120b"]!.variants).toEqual([]);
+    expect(models["gpt-oss-120b"]!.capabilities.input).toEqual(["text"]);
   });
 });
 
@@ -950,12 +869,11 @@ describe("response unwrapping", () => {
   }
 
   test("unwraps response-wrapped SSE chunks incrementally, preserving framing", async () => {
-    let completed: string | undefined;
-    const transformer = createCcaSseUnwrap({ onComplete: (id) => (completed = id) });
-    const chunkA = JSON.stringify({ response: { candidates: [], usageMetadata: {}, responseId: "r-1" } });
+    const chunkA = JSON.stringify({ response: { candidates: [], usageMetadata: {}, responseId: "r-1" }, traceId: "t-1" });
     const chunkB = JSON.stringify({ response: { candidates: [{ finishReason: "STOP" }], responseId: "r-1" } });
+    const completions: unknown[] = [];
     // Split mid-line across writes to prove incremental processing.
-    const output = await collect(transformer, [
+    const output = await collect(createCcaSseUnwrap(undefined, (completion) => completions.push(completion)), [
       `data: ${chunkA.slice(0, 20)}`,
       chunkA.slice(20),
       "\n\n",
@@ -965,14 +883,13 @@ describe("response unwrapping", () => {
     expect(dataLines).toHaveLength(2);
     expect(JSON.parse(dataLines[0]!.slice(6))).toEqual(JSON.parse(chunkA).response);
     expect(JSON.parse(dataLines[1]!.slice(6))).toEqual(JSON.parse(chunkB).response);
-    expect(completed).toBe("r-1");
+    // A call-only or empty turn has no first-message time.
+    expect(completions).toEqual([{ traceId: "t-1" }]);
   });
 
   test("[DONE] and non-data lines pass through", async () => {
-    const transformer = createCcaSseUnwrap({});
-    const output = await collect(transformer, ["event: x\ndata: [DONE]\n\n"]);
+    const output = await collect(createCcaSseUnwrap(), ["event: x\ndata: [DONE]\n\n"]);
     expect(output).toContain("event: x\n");
     expect(output).toContain("data: [DONE]\n\n");
   });
-
 });

@@ -1,11 +1,10 @@
 /**
  * Antigravity wire-format helpers.
  *
- * Everything in this file mirrors the behavior of the native
- * `antigravity/hub` client and oh-my-pi's Google Antigravity implementation
- * against the Cloud Code Assist (`daily-cloudcode-pa`) endpoints: request
- * envelope construction, per-session identity state, effort-tier wire-id
- * routing, tool schema normalization, and SSE response unwrapping.
+ * Everything in this file mirrors the native Antigravity IDE language server
+ * against the Cloud Code Assist (`daily-cloudcode-pa`) endpoints: user agent,
+ * agent model catalog, per-session request identity, request envelope
+ * construction, tool schema normalization, and SSE response unwrapping.
  */
 
 import { Model, Provider } from "@opencode/plugin";
@@ -14,433 +13,148 @@ import { normalizeSchemaForCCA, normalizeToolSchemaForCCA } from "./schema.ts";
 export const PROVIDER_ID = Provider.ID.make("google-antigravity");
 
 // ---------------------------------------------------------------------------
-// Endpoints & captured constants
+// Endpoints & client identity
 // ---------------------------------------------------------------------------
 
 export const ANTIGRAVITY_DAILY_ENDPOINT = "https://daily-cloudcode-pa.googleapis.com";
 export const ANTIGRAVITY_SANDBOX_ENDPOINT = "https://daily-cloudcode-pa.sandbox.googleapis.com";
 export const ANTIGRAVITY_ENDPOINTS = [ANTIGRAVITY_DAILY_ENDPOINT, ANTIGRAVITY_SANDBOX_ENDPOINT] as const;
 
-const DEFAULT_ANTIGRAVITY_VERSION = "2.8.0";
-
-const ANTIGRAVITY_VERSION_MANIFEST_URL =
-  "https://antigravity-hub-auto-updater-974169037036.us-central1.run.app/manifest/latest-arm64-mac.yml";
-const ANTIGRAVITY_VERSION_FETCH_TIMEOUT_MS = 5_000;
-
-let discoveredAntigravityVersion: string | null = null;
-let antigravityVersionFetch: Promise<void> | null = null;
-
-/** Current Antigravity client version: env override → manifest-discovered → pinned fallback. */
+/** Native IDE client version; override with OPENCODE_ANTIGRAVITY_VERSION. */
 export function getAntigravityVersion(): string {
-  return process.env.OPENCODE_ANTIGRAVITY_VERSION || discoveredAntigravityVersion || DEFAULT_ANTIGRAVITY_VERSION;
-}
-
-/** Extracts the client version from an electron-builder update manifest. */
-export function parseAntigravityManifestVersion(yamlText: string): string | null {
-  for (const line of yamlText.split(/\r?\n/)) {
-    const match = /^\s*version\s*:\s*(?:"([^"]*)"|'([^']*)'|([^\s#]+))\s*(?:#.*)?$/.exec(line);
-    if (!match) continue;
-    const version = (match[1] ?? match[2] ?? match[3] ?? "").trim();
-    return /^\d+\.\d+\.\d+$/.test(version) ? version : null;
-  }
-  return null;
+  return process.env.OPENCODE_ANTIGRAVITY_VERSION || "2.5.5";
 }
 
 /**
- * Resolves the latest Antigravity release from the official update manifest.
- * Cached for the process lifetime; failures are silent (the pinned fallback
- * stays valid). Skipped entirely when OPENCODE_ANTIGRAVITY_VERSION is set.
- */
-export function ensureAntigravityVersion(fetcher: typeof fetch = fetch, signal?: AbortSignal): Promise<void> {
-  if (process.env.OPENCODE_ANTIGRAVITY_VERSION || discoveredAntigravityVersion) return Promise.resolve();
-  if (antigravityVersionFetch) return antigravityVersionFetch;
-
-  antigravityVersionFetch = (async () => {
-    try {
-      const timeoutSignal = AbortSignal.timeout(ANTIGRAVITY_VERSION_FETCH_TIMEOUT_MS);
-      const response = await fetcher(ANTIGRAVITY_VERSION_MANIFEST_URL, {
-        headers: { "Cache-Control": "no-cache", "User-Agent": "electron-builder" },
-        signal: signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal,
-      });
-      if (response.ok) {
-        discoveredAntigravityVersion = parseAntigravityManifestVersion(await response.text());
-      }
-    } catch {
-      // Silent: pinned fallback remains valid when version discovery fails.
-    } finally {
-      if (!discoveredAntigravityVersion) antigravityVersionFetch = null;
-    }
-  })();
-  return antigravityVersionFetch;
-}
-
-/**
- * Antigravity User-Agent, captured from the real `antigravity/hub` client:
- * `antigravity/hub/2.8.0 (aidev_client; os_type=darwin; arch=arm64; cl=963137146)`.
- * os_type/arch are pinned to the darwin/arm64 reference client independent of
- * host platform; only the version gates backend models.
- * Overrides: OPENCODE_ANTIGRAVITY_VERSION / _CL / _OS / _ARCH.
+ * User-Agent of the native IDE language server:
+ * `antigravity/ide/2.5.5 (aidev_client; os_type=windows; arch=amd64)`.
+ * Overrides: OPENCODE_ANTIGRAVITY_VERSION / _OS / _ARCH.
  */
 export function getAntigravityUserAgent(): string {
-  const version = getAntigravityVersion();
-  const cl = process.env.OPENCODE_ANTIGRAVITY_CL || "963137146";
-  const os = process.env.OPENCODE_ANTIGRAVITY_OS || "darwin";
-  const arch = process.env.OPENCODE_ANTIGRAVITY_ARCH || "arm64";
-  return `antigravity/hub/${version} (aidev_client; os_type=${os}; arch=${arch}; cl=${cl})`;
+  const os = process.env.OPENCODE_ANTIGRAVITY_OS || "windows";
+  const arch = process.env.OPENCODE_ANTIGRAVITY_ARCH || "amd64";
+  return `antigravity/ide/${getAntigravityVersion()} (aidev_client; os_type=${os}; arch=${arch})`;
 }
 
-/** `anthropic-beta` header sent for reasoning Claude models on Antigravity. */
-export const CLAUDE_THINKING_BETA_HEADER = "interleaved-thinking-2025-05-14";
+/**
+ * User-Agent of the IDE's Electron (Node) side, which runs login and account
+ * provisioning: `antigravity/2.5.5 windows/amd64 google-api-nodejs-client/10.3.0`.
+ */
+export function getAntigravityNodeUserAgent(): string {
+  const os = process.env.OPENCODE_ANTIGRAVITY_OS || "windows";
+  const arch = process.env.OPENCODE_ANTIGRAVITY_ARCH || "amd64";
+  return `antigravity/${getAntigravityVersion()} ${os}/${arch} google-api-nodejs-client/10.3.0`;
+}
+
+/** Metrics platform enum: `WINDOWS_AMD64`. */
+export function getAntigravityPlatform(): string {
+  const os = process.env.OPENCODE_ANTIGRAVITY_OS || "windows";
+  const arch = process.env.OPENCODE_ANTIGRAVITY_ARCH || "amd64";
+  return `${os}_${arch}`.toUpperCase();
+}
+
+/** Header set of the language server's Go HTTP client on Cloud Code Assist calls. */
+export function antigravityHeaders(accessToken: string): Record<string, string> {
+  return {
+    "User-Agent": getAntigravityUserAgent(),
+    Authorization: `Bearer ${accessToken}`,
+    "Content-Type": "application/json",
+    "Accept-Encoding": "gzip",
+  };
+}
 
 /** CCA bypass accepted only when a Gemini 3 turn's first function call is unsigned. */
 const SKIP_THOUGHT_SIGNATURE = "skip_thought_signature_validator";
 
-/**
- * Per-wire-id Cloud Code Assist request constants captured from the real
- * `antigravity/hub` client. `modelEnum` is the opaque `labels.model_enum`
- * token; Claude-backed ids omit it. `maxOutputTokens` is the fixed
- * `generationConfig.maxOutputTokens` the backend enforces regardless of the
- * thinking budget (Claude rejects >64000 with a 400).
- */
-export interface AntigravityModelWireProfile {
-  modelEnum?: string;
+/** Tool-less requests (OpenCode's title generation) go out as native checkpoint calls on this model. */
+const CHECKPOINT_MODEL = "gemini-3.1-flash-lite";
+
+// ---------------------------------------------------------------------------
+// Agent model catalog
+// ---------------------------------------------------------------------------
+
+/** Carries the selected wire model id from the model/variant overlays to the HTTP hook. */
+export const WIRE_MODEL_HEADER = "x-antigravity-wire-model";
+
+/** The `fetchAvailableModels` entry fields the native client turns into request settings. */
+export interface WireModel {
+  displayName?: string;
+  /** Opaque enum sent as `labels.model_enum`. */
+  model?: string;
+  apiProvider?: string;
+  supportsImages?: boolean;
+  thinkingBudget?: number;
+  /** Anthropic thinking tier: 1/2/3 → LOW/MEDIUM/HIGH. */
+  thinkingLevel?: number;
+  maxTokens: number;
   maxOutputTokens: number;
 }
 
-export const ANTIGRAVITY_MODEL_WIRE_PROFILES: Readonly<Record<string, AntigravityModelWireProfile>> = {
-  "gemini-3.5-flash-extra-low": { modelEnum: "MODEL_PLACEHOLDER_M187", maxOutputTokens: 65536 },
-  "gemini-3.5-flash-low": { modelEnum: "MODEL_PLACEHOLDER_M20", maxOutputTokens: 65536 },
-  "gemini-3-flash-agent": { modelEnum: "MODEL_PLACEHOLDER_M132", maxOutputTokens: 65536 },
-  "gemini-3.1-pro-low": { modelEnum: "MODEL_PLACEHOLDER_M36", maxOutputTokens: 65535 },
-  "gemini-pro-agent": { modelEnum: "MODEL_PLACEHOLDER_M16", maxOutputTokens: 65535 },
-  "claude-sonnet-4-6": { maxOutputTokens: 64000 },
-  "claude-opus-4-6-thinking": { maxOutputTokens: 64000 },
+export type WireCatalog = Record<string, WireModel>;
+
+const ANTHROPIC = "API_PROVIDER_ANTHROPIC_VERTEX";
+const GEMINI = "API_PROVIDER_GOOGLE_GEMINI";
+const THINKING_LEVELS = ["UNSPECIFIED", "LOW", "MEDIUM", "HIGH"];
+const TIERS = ["low", "medium", "high"];
+
+/** The native agent model picker captured on 2026-10-03; used until live discovery succeeds. */
+export const SNAPSHOT_CATALOG: WireCatalog = {
+  "gemini-3.8-flash-high": { displayName: "Gemini 3.8 Flash (High)", model: "MODEL_PLACEHOLDER_M318", apiProvider: GEMINI, supportsImages: true, thinkingBudget: -1, maxTokens: 1048576, maxOutputTokens: 65536 },
+  "gemini-3.8-flash-medium": { displayName: "Gemini 3.8 Flash (Medium)", model: "MODEL_PLACEHOLDER_M319", apiProvider: GEMINI, supportsImages: true, thinkingBudget: 4000, maxTokens: 1048576, maxOutputTokens: 65536 },
+  "gemini-3.8-flash-low": { displayName: "Gemini 3.8 Flash (Low)", model: "MODEL_PLACEHOLDER_M320", apiProvider: GEMINI, supportsImages: true, thinkingBudget: 1000, maxTokens: 1048576, maxOutputTokens: 65536 },
+  "gemini-3.7-flash-high": { displayName: "Gemini 3.7 Flash (High)", model: "MODEL_PLACEHOLDER_M298", apiProvider: GEMINI, supportsImages: true, thinkingBudget: -1, maxTokens: 1048576, maxOutputTokens: 65536 },
+  "gemini-3.7-flash-medium": { displayName: "Gemini 3.7 Flash (Medium)", model: "MODEL_PLACEHOLDER_M299", apiProvider: GEMINI, supportsImages: true, thinkingBudget: 4000, maxTokens: 1048576, maxOutputTokens: 65536 },
+  "gemini-3.7-flash-low": { displayName: "Gemini 3.7 Flash (Low)", model: "MODEL_PLACEHOLDER_M300", apiProvider: GEMINI, supportsImages: true, thinkingBudget: 1000, maxTokens: 1048576, maxOutputTokens: 65536 },
+  "gemini-3.6-flash-high": { displayName: "Gemini 3.6 Flash (High)", model: "MODEL_PLACEHOLDER_M71", apiProvider: GEMINI, supportsImages: true, thinkingBudget: -1, maxTokens: 1048576, maxOutputTokens: 65536 },
+  "gemini-3.6-flash-medium": { displayName: "Gemini 3.6 Flash (Medium)", model: "MODEL_PLACEHOLDER_M72", apiProvider: GEMINI, supportsImages: true, thinkingBudget: 4000, maxTokens: 1048576, maxOutputTokens: 65536 },
+  "gemini-3.6-flash-low": { displayName: "Gemini 3.6 Flash (Low)", model: "MODEL_PLACEHOLDER_M73", apiProvider: GEMINI, supportsImages: true, thinkingBudget: 1000, maxTokens: 1048576, maxOutputTokens: 65536 },
+  "gemini-pro-agent": { displayName: "Gemini 3.1 Pro (High)", model: "MODEL_PLACEHOLDER_M16", apiProvider: GEMINI, supportsImages: true, thinkingBudget: 10001, maxTokens: 1048576, maxOutputTokens: 65535 },
+  "gemini-3.1-pro-low": { displayName: "Gemini 3.1 Pro (Low)", model: "MODEL_PLACEHOLDER_M36", apiProvider: GEMINI, supportsImages: true, thinkingBudget: 1001, maxTokens: 1048576, maxOutputTokens: 65535 },
+  "claude-opus-5-5-low": { displayName: "Claude Opus 5.5 (Low)", model: "MODEL_PLACEHOLDER_M400", apiProvider: ANTHROPIC, supportsImages: true, thinkingLevel: 1, maxTokens: 1000000, maxOutputTokens: 128000 },
+  "claude-opus-5-5-medium": { displayName: "Claude Opus 5.5 (Medium)", model: "MODEL_PLACEHOLDER_M401", apiProvider: ANTHROPIC, supportsImages: true, thinkingLevel: 2, maxTokens: 1000000, maxOutputTokens: 128000 },
+  "claude-opus-5-5-high": { displayName: "Claude Opus 5.5 (High)", model: "MODEL_PLACEHOLDER_M402", apiProvider: ANTHROPIC, supportsImages: true, thinkingLevel: 3, maxTokens: 1000000, maxOutputTokens: 128000 },
+  "claude-sonnet-5-5-low": { displayName: "Claude Sonnet 5.5 (Low)", model: "MODEL_PLACEHOLDER_M403", apiProvider: ANTHROPIC, supportsImages: true, thinkingLevel: 1, maxTokens: 1000000, maxOutputTokens: 128000 },
+  "claude-sonnet-5-5-medium": { displayName: "Claude Sonnet 5.5 (Medium)", model: "MODEL_PLACEHOLDER_M404", apiProvider: ANTHROPIC, supportsImages: true, thinkingLevel: 2, maxTokens: 1000000, maxOutputTokens: 128000 },
+  "claude-sonnet-5-5-high": { displayName: "Claude Sonnet 5.5 (High)", model: "MODEL_PLACEHOLDER_M405", apiProvider: ANTHROPIC, supportsImages: true, thinkingLevel: 3, maxTokens: 1000000, maxOutputTokens: 128000 },
+  "gpt-oss-120b-medium": { displayName: "GPT-OSS 120B (Medium)", model: "MODEL_OPENAI_GPT_OSS_120B_MEDIUM", apiProvider: "API_PROVIDER_OPENAI_VERTEX", thinkingBudget: 8192, maxTokens: 131072, maxOutputTokens: 32768 },
 };
-
-// ---------------------------------------------------------------------------
-// Model registry: logical models + effort-tier routing tables
-// ---------------------------------------------------------------------------
-
-export type Effort = "minimal" | "low" | "medium" | "high";
-const EFFORT_ORDER: readonly Effort[] = ["minimal", "low", "medium", "high"];
 
 /**
- * Default thinking budgets OMP applies for budget-mode families without baked
- * per-effort budgets (Claude, GPT-OSS, Gemini 2.5).
+ * One OpenCode model per tier family (`Claude Opus 5.5 (Low|Medium|High)`)
+ * with one variant per tier; the highest tier is the default. Every overlay
+ * names its wire id in WIRE_MODEL_HEADER.
  */
-export const DEFAULT_EFFORT_BUDGETS: Readonly<Record<Effort, number>> = {
-  minimal: 1024,
-  low: 4096,
-  medium: 8192,
-  high: 16384,
-};
-
-export interface AntigravityModelSpec {
-  name: string;
-  reasoning: boolean;
-  imageInput: boolean;
-  contextWindow: number;
-  outputLimit: number;
-  /** Thinking transport the family uses on daily-cloudcode-pa. */
-  transport: "level" | "budget";
-  /** Supported efforts; requests clamp unsupported efforts to the lowest one. */
-  efforts?: readonly Effort[];
-  /** Per-effort upstream wire id; "off" applies when thinking is disabled. */
-  routing?: Partial<Record<Effort | "off", string>>;
-  /** Fallback wire id when routing misses (OMP's requestModelId). */
-  requestModelId?: string;
-  /** Baked per-effort thinking budgets (budget transport only). */
-  budgets?: Readonly<Partial<Record<Effort, number>>>;
-  /** Thinking-off requests must explicitly suppress thinking on the wire. */
-  suppressWhenOff?: boolean;
-}
-
-function thinkingPair(baseId: string, name: string, ctx: number, out: number, image = true): AntigravityModelSpec {
-  return {
-    name,
-    reasoning: true,
-    imageInput: image,
-    contextWindow: ctx,
-    outputLimit: out,
-    transport: "budget",
-    routing: {
-      off: baseId,
-      minimal: `${baseId}-thinking`,
-      low: `${baseId}-thinking`,
-      medium: `${baseId}-thinking`,
-      high: `${baseId}-thinking`,
-    },
-  };
-}
-
-export const MODEL_SPECS: Readonly<Record<string, AntigravityModelSpec>> = {
-  "claude-opus-4-5": thinkingPair("claude-opus-4-5", "Claude Opus 4.5", 200_000, 64_000),
-  "claude-opus-4-6": {
-    name: "Claude Opus 4.6",
-    reasoning: true,
-    imageInput: true,
-    contextWindow: 250_000,
-    outputLimit: 64_000,
-    // Only the `-thinking` wire id exists upstream; thinking state rides the
-    // request body, so both on/off requests use it.
-    transport: "budget",
-    requestModelId: "claude-opus-4-6-thinking",
-  },
-  "claude-sonnet-4-5": thinkingPair("claude-sonnet-4-5", "Claude Sonnet 4.5", 1_000_000, 64_000),
-  "claude-sonnet-4-6": {
-    name: "Claude Sonnet 4.6",
-    reasoning: true,
-    imageInput: true,
-    contextWindow: 250_000,
-    outputLimit: 64_000,
-    // Only the bare wire id exists upstream (asymmetric exposure).
-    transport: "budget",
-  },
-  "gemini-2.5-flash": thinkingPair("gemini-2.5-flash", "Gemini 2.5 Flash", 1_048_576, 65_535),
-  "gemini-2.5-flash-lite": {
-    name: "Gemini 2.5 Flash Lite",
-    reasoning: true,
-    imageInput: true,
-    contextWindow: 1_048_576,
-    outputLimit: 65_535,
-    transport: "budget",
-  },
-  "gemini-2.5-pro": {
-    name: "Gemini 2.5 Pro",
-    reasoning: true,
-    imageInput: true,
-    contextWindow: 1_048_576,
-    outputLimit: 65_536,
-    transport: "budget",
-  },
-  "gemini-3-flash": flashBudgetFamily("gemini-3-flash", "Gemini 3 Flash"),
-  "gemini-3.5-flash": flashBudgetFamily("gemini-3.5-flash", "Gemini 3.5 Flash"),
-  "gemini-3-pro": {
-    name: "Gemini 3 Pro",
-    reasoning: true,
-    imageInput: true,
-    contextWindow: 1_048_576,
-    outputLimit: 65_535,
-    transport: "level",
-    efforts: ["low", "high"],
-    routing: { off: "gemini-3-pro-low", low: "gemini-3-pro-low", high: "gemini-3-pro-high" },
-    suppressWhenOff: true,
-  },
-  "gemini-3.1-pro": {
-    name: "Gemini 3.1 Pro Preview",
-    reasoning: true,
-    imageInput: true,
-    contextWindow: 1_048_576,
-    outputLimit: 65_535,
-    transport: "budget",
-    efforts: ["low", "high"],
-    // High routes to `gemini-pro-agent`: the upstream `gemini-3.1-pro-high`
-    // deployment returns INVALID_ARGUMENT on every streamGenerateContent call.
-    routing: { off: "gemini-3.1-pro-low", low: "gemini-3.1-pro-low", high: "gemini-pro-agent" },
-    budgets: { low: 1001, high: 10001 },
-    suppressWhenOff: true,
-  },
-  "gemini-3.6-flash": levelFlashFamily("gemini-3.6-flash", "Gemini 3.6 Flash"),
-  "gemini-3.7-flash": levelFlashFamily("gemini-3.7-flash", "Gemini 3.7 Flash"),
-  "gemini-3.8-flash": levelFlashFamily("gemini-3.8-flash", "Gemini 3.8 Flash"),
-  "gpt-oss-120b": {
-    name: "GPT-OSS 120B",
-    reasoning: true,
-    imageInput: false,
-    contextWindow: 131_072,
-    outputLimit: 32_768,
-    transport: "budget",
-    requestModelId: "gpt-oss-120b-medium",
-  },
-};
-
-/** Antigravity budget-mode Flash family: captured tier triplets + budgets. */
-function flashBudgetFamily(id: string, name: string): AntigravityModelSpec {
-  return {
-    name,
-    reasoning: true,
-    imageInput: true,
-    contextWindow: 1_048_576,
-    outputLimit: 65_536,
-    transport: "budget",
-    routing: {
-      off: "gemini-3.5-flash-extra-low",
-      minimal: "gemini-3.5-flash-extra-low",
-      low: "gemini-3.5-flash-extra-low",
-      medium: "gemini-3.5-flash-low",
-      high: "gemini-3-flash-agent",
-    },
-    budgets: { minimal: 1000, low: 1000, medium: 4000, high: 10000 },
-    suppressWhenOff: true,
-  };
-}
-
-/** Gemini 3.6+ Flash: one mandatory-reasoning wire id per level. */
-function levelFlashFamily(id: string, name: string): AntigravityModelSpec {
-  return {
-    name,
-    reasoning: true,
-    imageInput: true,
-    contextWindow: 1_048_576,
-    outputLimit: 65_536,
-    transport: "level",
-    routing: {
-      minimal: `${id}-low`,
-      low: `${id}-low`,
-      medium: `${id}-medium`,
-      high: `${id}-high`,
-    },
-  };
-}
-
-export function isClaudeModel(modelId: string): boolean {
-  return modelId.toLowerCase().includes("claude");
-}
-
-/** Clamp an effort to the spec's lowest supported effort (OMP minimumSupportedEffort). */
-function clampEffort(spec: AntigravityModelSpec, effort: Effort): Effort {
-  const supported = spec.efforts ?? EFFORT_ORDER;
-  return (supported as readonly string[]).includes(effort) ? effort : supported[0] ?? "minimal";
-}
-
-export interface ResolvedThinking {
-  /**
-   * Wire-routing effort. "off" also covers requests whose custom thinking
-   * controls cannot be mapped to a captured tier; those additionally set
-   * `unmatched` so the wire rewrite forwards them untouched.
-   */
-  effort: Effort | "off";
-  /** True when a thinkingConfig was present on the incoming request. */
-  requested: boolean;
-  /** Requested but unmappable custom control; never re-serialized. */
-  unmatched?: boolean;
-}
-
-/**
- * Extract the requested thinking tier from the request's generationConfig.
- *
- * OpenCode's default Google variants supply `thinkingLevel` for
- * Gemini 3 ids regardless of the family's native transport, and merged
- * variant options can carry level and budget together; this normalizes to
- * exactly the model spec's transport at the wire boundary:
- * - level families understand `thinkingLevel` only;
- * - budget families understand their captured budgets, then OpenCode-style
- *   levels mapped onto the family's tiers.
- */
-export function readRequestedEffort(
-  spec: AntigravityModelSpec,
-  thinkingConfig: Record<string, unknown> | undefined,
-): ResolvedThinking {
-  if (!thinkingConfig || !spec.reasoning) return { effort: "off", requested: false };
-  const levelRaw = typeof thinkingConfig.thinkingLevel === "string" ? thinkingConfig.thinkingLevel.toLowerCase() : undefined;
-  const budget =
-    typeof thinkingConfig.thinkingBudget === "number" && Number.isFinite(thinkingConfig.thinkingBudget)
-      ? thinkingConfig.thinkingBudget
-      : undefined;
-
-  if (spec.transport === "level") {
-    // Level families understand levels only; a bare budget never invents a tier.
-    if (levelRaw && (EFFORT_ORDER as readonly string[]).includes(levelRaw)) {
-      return { effort: clampEffort(spec, levelRaw as Effort), requested: true };
-    }
-  } else {
-    if (budget !== undefined) {
-      const budgets = spec.budgets ?? DEFAULT_EFFORT_BUDGETS;
-      for (const effort of EFFORT_ORDER) {
-        if (budgets[effort] === budget) return { effort, requested: true };
-      }
-    }
-    // OpenCode-style levels map onto the family's captured tiers.
-    if (levelRaw && (EFFORT_ORDER as readonly string[]).includes(levelRaw)) {
-      return { effort: clampEffort(spec, levelRaw as Effort), requested: true };
-    }
+export function providerModels(catalog: WireCatalog = SNAPSHOT_CATALOG): Model.Info[] {
+  const families = new Map<string, Array<{ wireId: string; tier?: string }>>();
+  for (const [wireId, model] of Object.entries(catalog)) {
+    const match = /^(.*) \((Low|Medium|High)\)$/.exec(model.displayName ?? "");
+    const name = match?.[1] ?? model.displayName ?? wireId;
+    families.set(name, [...(families.get(name) ?? []), { wireId, tier: match?.[2]?.toLowerCase() }]);
   }
-
-  // Reasoning requested without any usable control: OpenCode's intended
-  // reasoning default is high.
-  if (levelRaw === undefined && budget === undefined && thinkingConfig.includeThoughts === true) {
-    return { effort: clampEffort(spec, "high"), requested: true };
-  }
-
-  // No tier control at all (e.g. includeThoughts:false): an explicit off.
-  if (levelRaw === undefined && budget === undefined) {
-    return { effort: "off", requested: true };
-  }
-
-  // Custom/unmatched control: preserve untouched, route like off.
-  return { effort: "off", requested: true, unmatched: true };
-}
-
-/** The single transport-native thinking control for an effort on a spec. */
-function nativeThinkingControl(spec: AntigravityModelSpec, includeThoughts: boolean, effort: Effort): Record<string, unknown> {
-  const level = effort === "minimal" && spec.routing?.minimal === spec.routing?.low ? "low" : effort;
-  return spec.transport === "level"
-    ? { includeThoughts, thinkingLevel: level.toUpperCase() }
-    : { includeThoughts, thinkingBudget: spec.budgets?.[effort] ?? DEFAULT_EFFORT_BUDGETS[effort] };
-}
-
-/** Resolve the outbound wire id for a logical model under the requested effort. */
-export function resolveWireModelId(spec: AntigravityModelSpec, requested: ResolvedThinking, logicalModelId: string): string {
-  const routed =
-    requested.effort === "off"
-      ? spec.routing?.off
-      : spec.routing?.[clampEffort(spec, requested.effort as Effort)];
-  if (routed) return routed;
-  // Families without an "off" route are mandatory-reasoning: thinking-off
-  // requests clamp to the lowest supported effort (OMP minimumSupportedEffort).
-  if (requested.effort === "off") {
-    const lowest = (spec.efforts ?? EFFORT_ORDER)[0];
-    const clampedRoute = lowest ? spec.routing?.[lowest] : undefined;
-    if (clampedRoute) return clampedRoute;
-  }
-  return spec.requestModelId ?? logicalModelId;
-}
-
-// ---------------------------------------------------------------------------
-// Provider model registration
-// ---------------------------------------------------------------------------
-
-export interface DiscoveredModel {
-  maxTokens?: number;
-  maxOutputTokens?: number;
-  supportsImages?: boolean;
-  isInternal?: boolean;
-}
-
-/** Build the provider catalog; a discovered inventory drops unavailable models and effort variants. */
-export function providerModels(available?: Record<string, DiscoveredModel>): Model.Info[] {
-  const usable = (wireId: string) => !available || (available[wireId] !== undefined && !available[wireId].isInternal);
-  return Object.entries(MODEL_SPECS).flatMap(([id, spec]) => {
-    if (id === "gemini-2.5-pro") return []; // OMP excludes this deployment from discovery.
-    const wireId = resolveWireModelId(spec, { effort: "off", requested: false }, id);
-    // The default route must work even when no reasoning variant is selected.
-    if (!usable(wireId)) return [];
-    const discovered = available?.[wireId];
-    const imageInput = discovered?.supportsImages ?? spec.imageInput;
-    const variants = spec.reasoning
-      ? EFFORT_ORDER.flatMap((effort) => {
-          if (!usable(resolveWireModelId(spec, { effort, requested: true }, id))) return [];
-          const clamped = clampEffort(spec, effort);
-          const thinkingConfig =
-            spec.transport === "level"
-              ? { includeThoughts: true, thinkingLevel: clamped }
-              : { includeThoughts: true, thinkingBudget: spec.budgets?.[clamped] ?? DEFAULT_EFFORT_BUDGETS[clamped] };
-          return [{ id: Model.VariantID.make(effort), settings: { thinkingConfig } }];
-        })
-      : [];
-    return [{
-      id: Model.ID.make(id),
-      modelID: Model.ID.make(id),
+  return [...families].map(([name, members]) => {
+    members.sort((a, b) => TIERS.indexOf(a.tier!) - TIERS.indexOf(b.tier!));
+    // `gemini-3.1-pro-low` + `gemini-pro-agent` → `gemini-3.1-pro`.
+    const named = members.find((member) => member.wireId.endsWith(`-${member.tier}`));
+    const id = Model.ID.make(named ? named.wireId.slice(0, -named.tier!.length - 1) : members[0]!.wireId);
+    const fallback = members.at(-1)!.wireId;
+    const model = catalog[fallback]!;
+    return {
+      id,
+      modelID: id,
       providerID: PROVIDER_ID,
-      name: spec.name,
-      capabilities: { tools: true, input: imageInput ? ["text", "image"] : ["text"], output: ["text"] },
-      variants,
+      name,
+      headers: { [WIRE_MODEL_HEADER]: fallback },
+      capabilities: { tools: true, input: model.supportsImages ? ["text", "image"] : ["text"], output: ["text"] },
+      variants:
+        members.length > 1
+          ? members.map((member) => ({ id: Model.VariantID.make(member.tier!), headers: { [WIRE_MODEL_HEADER]: member.wireId } }))
+          : [],
       time: { released: 0 },
       cost: [],
       status: "active" as const,
       enabled: true,
-      limit: { context: discovered?.maxTokens ?? spec.contextWindow, output: discovered?.maxOutputTokens ?? spec.outputLimit },
-    }];
+      limit: { context: model.maxTokens, output: model.maxOutputTokens },
+    };
   });
 }
 
@@ -464,13 +178,20 @@ export interface AntigravitySessionState {
   agentId: string;
   trajectoryId: string;
   sessionId: string;
-  stepIndex: number;
+  /** Trajectory steps derived from the previous request's history. */
+  historySteps: number;
+  /** Steps hidden by history shrinking (compaction) so the step index never moves backwards. */
+  stepOffset: number;
+  userTurns: number;
+  /** Execution (user turn) in progress, and the one before it (`labels.last_execution_id`). */
+  executionId?: string;
   lastExecutionId?: string;
+  usedClaude: boolean;
+  usedNonGemini: boolean;
+  /** `writeTrajectoryAcls` precedes the trajectory's first agent request. */
+  aclWritten: boolean;
   /** Auto endpoint mode: where this session's next request goes (daily when unset). */
   endpoint?: string;
-  /** Last model.request invocation id seen; identical ids reuse the envelope so retries do not advance steps. */
-  lastInvocationId?: string;
-  lastEnvelope?: { requestId: string; step: number; labels: Record<string, string> };
 }
 
 export function createSessionState(): AntigravitySessionState {
@@ -478,42 +199,56 @@ export function createSessionState(): AntigravitySessionState {
     agentId: crypto.randomUUID(),
     trajectoryId: crypto.randomUUID(),
     sessionId: randomSignedDecimalSessionId(),
-    stepIndex: 1,
+    historySteps: 0,
+    stepOffset: 0,
+    userTurns: 0,
+    usedClaude: false,
+    usedNonGemini: false,
+    aclWritten: false,
   };
 }
 
 /**
- * Advance (or reuse) the per-conversation envelope. Mirrors the native
- * client: `requestId` is `agent/<agentId>/<ts>/<trajectoryId>/<step>` and
- * `labels.last_step_index` trails the requestId step by one. When the same
- * invocation id is presented again (a retry of the prepared request),
- * the previous envelope is returned unchanged.
+ * Request identity for one invocation, derived from its history so a retry
+ * of the same request reproduces it. Mirrors the native trajectory step
+ * count: one step per content, one per tool result, plus the checkpoint step
+ * that follows the first reply; `labels.last_step_index` trails it by one. A
+ * new user turn starts a new execution and labels carry the previous one.
  */
 export function advanceEnvelope(
   state: AntigravitySessionState,
-  wireModelId: string,
-  invocationId: string | undefined,
-  isClaude: boolean,
-): { sessionId: string; requestId: string; step: number; labels: Record<string, string> } {
-  if (invocationId && invocationId === state.lastInvocationId && state.lastEnvelope) {
-    return { sessionId: state.sessionId, ...state.lastEnvelope };
+  contents: Array<Record<string, any>>,
+  model: WireModel,
+): { requestId: string; labels: Record<string, string> } {
+  let steps = 1;
+  let userTurns = 0;
+  for (const content of contents) {
+    const results = content.parts.filter((part: Record<string, any>) => part.functionResponse).length;
+    steps += results || 1;
+    if (!results && content.role === "user") userTurns++;
   }
+  if (contents.some((content) => content.role === "model")) steps++;
+  if (steps < state.historySteps) state.stepOffset += state.historySteps - steps;
+  state.historySteps = steps;
+  const step = steps + state.stepOffset;
 
-  state.stepIndex += 1;
-  const step = state.stepIndex;
-  const profile = ANTIGRAVITY_MODEL_WIRE_PROFILES[wireModelId];
+  if (userTurns !== state.userTurns) {
+    state.userTurns = userTurns;
+    state.lastExecutionId = state.executionId;
+    state.executionId = crypto.randomUUID();
+  }
+  state.usedClaude ||= model.apiProvider === ANTHROPIC;
+  state.usedNonGemini ||= model.apiProvider !== GEMINI;
+
   const labels: Record<string, string> = {};
   if (state.lastExecutionId) labels["last_execution_id"] = state.lastExecutionId;
   labels["last_step_index"] = String(step - 1);
-  if (profile?.modelEnum !== undefined) labels["model_enum"] = profile.modelEnum;
+  if (model.model) labels["model_enum"] = model.model;
   labels["trajectory_id"] = state.trajectoryId;
-  labels["used_claude"] = String(isClaude);
-  labels["used_claude_conservative"] = String(isClaude);
-  const envelope = { requestId: `agent/${state.agentId}/${Date.now()}/${state.trajectoryId}/${step}`, step, labels };
-
-  state.lastInvocationId = invocationId;
-  state.lastEnvelope = envelope;
-  return { sessionId: state.sessionId, ...envelope };
+  labels["used_claude"] = String(state.usedClaude);
+  labels["used_claude_conservative"] = String(state.usedClaude);
+  labels["used_non_gemini_model"] = String(state.usedNonGemini);
+  return { requestId: `agent/${state.agentId}/${Date.now()}/${state.trajectoryId}/${step}`, labels };
 }
 
 // ---------------------------------------------------------------------------
@@ -529,132 +264,141 @@ export { normalizeSchemaForCCA };
 export interface BodyRewriteOptions {
   /** Native Gemini generateContent body sent by OpenCode's Google client. */
   args: Record<string, any>;
-  /** Logical OpenCode model id (registry key). */
+  /** Logical OpenCode model id (tier family). */
   logicalModelId: string;
+  wireModelId: string;
+  model: WireModel;
   projectId: string;
   state: AntigravitySessionState;
-  /** Per-invocation id from the model.request hook; retries present the same id. */
-  invocationId?: string;
-}
-
-export interface BodyRewriteResult {
-  body: string;
-  wireModelId: string;
 }
 
 /**
- * Wrap a standard Gemini generateContent payload in the Antigravity
- * Cloud Code Assist envelope: effort-routed wire model, VALIDATED function
- * calling (forced for Claude), role-tagged systemInstruction, wire-profile
- * maxOutputTokens/model_enum, session labels, and the signed-decimal session
- * id. Mirrors OMP's buildRequest for google-antigravity.
+ * Wrap a standard Gemini generateContent payload in the Antigravity Cloud
+ * Code Assist envelope, in the native client's key order. Agent requests get
+ * the catalog's output cap and thinking config, VALIDATED function calling
+ * (forced for Claude), native tool results, session labels, and session id.
+ * Requests without tools are OpenCode's title generation, which the native
+ * client runs as a `checkpoint` call that leaves the trajectory untouched.
  */
-export function rewriteBodyForAntigravity(options: BodyRewriteOptions): BodyRewriteResult {
-  const { args, logicalModelId, projectId, state, invocationId } = options;
-  const spec = MODEL_SPECS[logicalModelId];
-  if (!spec) throw new Error(`Unknown google-antigravity model "${logicalModelId}"`);
-  const generationConfig: Record<string, any> = { ...(args.generationConfig ?? {}) };
-
-  // Route the effort to its upstream wire id.
-  const requested = readRequestedEffort(spec, generationConfig.thinkingConfig);
-  const wireModelId = resolveWireModelId(spec, requested, logicalModelId);
-
-  // Thinking rewrite: normalize to exactly the family's transport. Explicit
-  // suppression when genuinely off (omitting thinkingConfig re-applies the
-  // baked server default); unmatched custom controls pass through untouched.
-  const incomingThinking = generationConfig.thinkingConfig as Record<string, unknown> | undefined;
-  if (requested.unmatched) {
-    // Keep the caller's custom control verbatim.
-  } else if (requested.requested && requested.effort !== "off") {
-    generationConfig.thinkingConfig = nativeThinkingControl(
-      spec,
-      incomingThinking?.includeThoughts !== false,
-      requested.effort as Effort,
-    );
-  } else if (!spec.suppressWhenOff) {
-    delete generationConfig.thinkingConfig;
-  } else {
-    generationConfig.thinkingConfig =
-      spec.transport === "level"
-        ? { includeThoughts: false, thinkingLevel: "MINIMAL" }
-        : { includeThoughts: false, thinkingBudget: 0 };
-  }
-
-  // The real client sends a fixed per-model output cap independent of the
-  // thinking budget.
-  const profile = ANTIGRAVITY_MODEL_WIRE_PROFILES[wireModelId];
-  if (profile) generationConfig.maxOutputTokens = profile.maxOutputTokens;
-
-  const request: Record<string, any> = {
-    contents: normalizeContentsForAntigravity(args.contents, logicalModelId),
-    ...(args.systemInstruction
-      ? {
-          // Antigravity tags system instructions with role "user".
-          systemInstruction: { role: "user", ...stripEmptyRole(args.systemInstruction) },
-        }
-      : {}),
-    ...(Object.keys(generationConfig).length > 0 ? { generationConfig } : {}),
+export function rewriteBodyForAntigravity(options: BodyRewriteOptions): Record<string, any> {
+  const { args, logicalModelId, wireModelId, model, projectId, state } = options;
+  // The native system prompt is one text part.
+  const systemInstruction = args.systemInstruction && {
+    role: "user",
+    parts: [{ text: args.systemInstruction.parts.map((part: Record<string, any>) => part.text).join("\n") }],
   };
 
-  const isClaude = isClaudeModel(logicalModelId);
-  const tools = Array.isArray(args.tools) ? normalizeTools(args.tools) : undefined;
-  if (tools) request["tools"] = tools;
-
-  // Antigravity's default tool mode is VALIDATED; Claude forces it even with
-  // no tools declared. An explicit non-AUTO tool choice wins otherwise.
-  if (isClaude) {
-    request["toolConfig"] = { functionCallingConfig: { mode: "VALIDATED" } };
-  } else if (tools) {
-    const sdkMode = args.toolConfig?.functionCallingConfig?.mode;
-    request["toolConfig"] =
-      sdkMode && sdkMode !== "AUTO" ? args.toolConfig : { functionCallingConfig: { mode: "VALIDATED" } };
+  if (!args.tools) {
+    return {
+      project: projectId,
+      requestId: `checkpoint/${crypto.randomUUID()}`,
+      request: {
+        contents: normalizeContentsForAntigravity(args.contents, CHECKPOINT_MODEL, false),
+        ...(systemInstruction ? { systemInstruction } : {}),
+        generationConfig: { maxOutputTokens: 16384, thinkingConfig: { includeThoughts: false, thinkingBudget: 0 } },
+        sessionId: state.sessionId,
+      },
+      model: CHECKPOINT_MODEL,
+      userAgent: "antigravity",
+      requestType: "checkpoint",
+    };
   }
 
-  const envelope = advanceEnvelope(state, wireModelId, invocationId, isClaude);
+  const claude = model.apiProvider === ANTHROPIC;
+  const contents = normalizeContentsForAntigravity(args.contents, logicalModelId, claude);
+  const request: Record<string, any> = {
+    contents,
+    ...(systemInstruction ? { systemInstruction } : {}),
+    tools: normalizeTools(args.tools),
+  };
+
+  // Antigravity's default tool mode is VALIDATED, forced for Claude. An
+  // explicit non-AUTO tool choice wins otherwise.
+  const sdkMode = args.toolConfig?.functionCallingConfig?.mode;
+  request["toolConfig"] =
+    !claude && sdkMode && sdkMode !== "AUTO" ? args.toolConfig : { functionCallingConfig: { mode: "VALIDATED" } };
+
+  const envelope = advanceEnvelope(state, contents, model);
   request["labels"] = envelope.labels;
-  request["sessionId"] = envelope.sessionId;
+  // Only the catalog's output cap and thinking config; OpenCode's sampling
+  // settings are not part of the native request.
+  request["generationConfig"] = {
+    maxOutputTokens: model.maxOutputTokens,
+    ...(claude
+      ? { thinkingConfig: { includeThoughts: true, thinkingBudget: 0, thinkingLevel: THINKING_LEVELS[model.thinkingLevel!] } }
+      : model.thinkingBudget !== undefined
+        ? { thinkingConfig: { includeThoughts: true, thinkingBudget: model.thinkingBudget } }
+        : {}),
+  };
+  request["sessionId"] = state.sessionId;
 
   return {
-    wireModelId,
-    body: JSON.stringify({
-      project: projectId,
-      requestId: envelope.requestId,
-      request,
-      model: wireModelId,
-      userAgent: "antigravity",
-      requestType: "agent",
-    }),
+    project: projectId,
+    requestId: envelope.requestId,
+    request,
+    model: wireModelId,
+    userAgent: "antigravity",
+    requestType: "agent",
   };
 }
 
-function normalizeContentsForAntigravity(contents: Record<string, any>[], logicalModelId: string): Record<string, any>[] {
-  const claude = isClaudeModel(logicalModelId);
+function normalizeContentsForAntigravity(
+  contents: Record<string, any>[],
+  logicalModelId: string,
+  claude: boolean,
+): Record<string, any>[] {
   const gemini3 = logicalModelId.startsWith("gemini-3");
-  if (!claude && !gemini3) return contents;
 
   return contents.flatMap((content: Record<string, any>) => {
+    if (content.parts.some((part: Record<string, any>) => part.functionResponse)) {
+      // Native tool results wrap the result text as `output`; only Anthropic
+      // models receive them as the user role.
+      return [{
+        role: claude ? "user" : "model",
+        parts: content.parts.map((part: Record<string, any>) =>
+          part.functionResponse
+            ? { ...part, functionResponse: { ...part.functionResponse, response: { output: part.functionResponse.response.content } } }
+            : part,
+        ),
+      }];
+    }
     if (content.role !== "model") return [content];
-    let firstFunctionCall = true;
-    const parts = content.parts.flatMap((part: Record<string, any>) => {
-      if (claude && part.thought === true && !part.thoughtSignature) return [];
-      if (!gemini3 || !part.functionCall) return [part];
 
-      const normalized = { ...part };
-      if (firstFunctionCall) {
-        if (!normalized.thoughtSignature) normalized.thoughtSignature = SKIP_THOUGHT_SIGNATURE;
-        firstFunctionCall = false;
-      } else if (!normalized.thoughtSignature || normalized.thoughtSignature === SKIP_THOUGHT_SIGNATURE) {
-        delete normalized.thoughtSignature;
+    // Native assistant replay: one joined thought part, one joined text part
+    // (omitted when whitespace-only), then calls. The message signature moves
+    // to the first non-thought part; call signatures stay on their calls.
+    // Claude rejects thinking that has no signature to replay.
+    const thoughts = content.parts.filter(
+      (part: Record<string, any>) => part.thought === true && (!claude || part.thoughtSignature),
+    );
+    const texts = content.parts.filter((part: Record<string, any>) => part.thought !== true && part.text !== undefined);
+    const signature = [...thoughts, ...texts].find((part) => part.thoughtSignature)?.thoughtSignature;
+    const parts: Record<string, any>[] = [];
+    if (thoughts.length > 0) {
+      parts.push({ text: thoughts.map((part: Record<string, any>) => part.text).join(""), thought: true });
+    }
+    const text = texts.map((part: Record<string, any>) => part.text).join("");
+    if (text.trim()) parts.push({ text });
+    parts.push(...content.parts.filter((part: Record<string, any>) => part.text === undefined).map((part: Record<string, any>) => ({ ...part })));
+    const target = parts.find((part) => part.thought !== true) ?? parts[0];
+    if (signature && target && (!target.thoughtSignature || target.thoughtSignature === SKIP_THOUGHT_SIGNATURE)) {
+      target.thoughtSignature = signature;
+    }
+
+    if (gemini3) {
+      let firstFunctionCall = true;
+      for (const part of parts) {
+        if (!part.functionCall) continue;
+        if (firstFunctionCall) {
+          part.thoughtSignature ??= SKIP_THOUGHT_SIGNATURE;
+          firstFunctionCall = false;
+        } else if (!part.thoughtSignature || part.thoughtSignature === SKIP_THOUGHT_SIGNATURE) {
+          delete part.thoughtSignature;
+        }
       }
-      return [normalized];
-    });
-    return parts.length > 0 ? [{ ...content, parts }] : [];
+    }
+    return parts.length > 0 ? [{ role: "model", parts }] : [];
   });
-}
-
-function stripEmptyRole(systemInstruction: Record<string, any>): Record<string, any> {
-  const { role: _role, ...rest } = systemInstruction;
-  return rest;
 }
 
 /**
@@ -695,13 +439,6 @@ export function unwrappedResponseHeaders(response: Response): Headers {
   return headers;
 }
 
-export interface SseUnwrapHooks {
-  /** Called once when the stream carries an in-band error event. */
-  onError?: (error: InBandError) => void;
-  /** Called after the stream reaches a candidate finish reason, with the last responseId. */
-  onComplete?: (lastResponseId: string | undefined) => void;
-}
-
 interface InBandError {
   code?: number;
   message?: string;
@@ -726,18 +463,28 @@ export function describeInBandError(error: InBandError): string {
   return `Cloud Code Assist error (${error.status ?? error.code ?? "unknown"}): ${detail}`;
 }
 
+export interface StreamCompletion {
+  /** Outer `traceId` of the stream's events. */
+  traceId?: string;
+  /** When the first non-empty text or thought arrived; unset for call-only turns. */
+  firstMessageAt?: number;
+}
+
 /**
  * Incrementally unwrap Cloud Code Assist SSE events (standard Gemini chunks
  * nested under `response`) without buffering the stream. SSE framing is
  * preserved line-by-line; an in-band top-level error event errors the stream
- * with a sanitized Error (no raw bodies or credentials).
+ * with a sanitized Error (no raw bodies or credentials); `onError` is called
+ * first. `onComplete` reports a stream that ended normally.
  */
-export function createCcaSseUnwrap(hooks: SseUnwrapHooks = {}): TransformStream<Uint8Array, Uint8Array> {
+export function createCcaSseUnwrap(
+  onError?: (error: InBandError) => void,
+  onComplete?: (completion: StreamCompletion) => void,
+): TransformStream<Uint8Array, Uint8Array> {
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
   let buffer = "";
-  let lastResponseId: string | undefined;
-  let sawFinishReason = false;
+  const completion: StreamCompletion = {};
 
   const handleData = (payload: string, controller: TransformStreamDefaultController<Uint8Array>): boolean => {
     if (payload === "[DONE]") {
@@ -753,19 +500,20 @@ export function createCcaSseUnwrap(hooks: SseUnwrapHooks = {}): TransformStream<
     }
     const inBand = readInBandError(parsed);
     if (inBand && parsed.response === undefined) {
-      hooks.onError?.(inBand);
+      onError?.(inBand);
       // Surface the failure instead of ending as a silent empty stream.
       controller.error(new Error(describeInBandError(inBand)));
       return false;
     }
     if (parsed.response !== undefined && typeof parsed.response === "object") {
-      const responseId = parsed.response.responseId;
-      if (typeof responseId === "string" && responseId.length > 0) lastResponseId = responseId;
+      completion.traceId ??= parsed.traceId;
       if (
-        Array.isArray(parsed.response.candidates) &&
-        parsed.response.candidates.some((candidate: Record<string, any>) => candidate.finishReason)
+        completion.firstMessageAt === undefined &&
+        parsed.response.candidates?.some((candidate: Record<string, any>) =>
+          candidate.content?.parts?.some((part: Record<string, any>) => part.text),
+        )
       ) {
-        sawFinishReason = true;
+        completion.firstMessageAt = Date.now();
       }
       controller.enqueue(encoder.encode(`data: ${JSON.stringify(parsed.response)}\n\n`));
       return true;
@@ -794,11 +542,11 @@ export function createCcaSseUnwrap(hooks: SseUnwrapHooks = {}): TransformStream<
         buffer = "";
         if (!line.startsWith("data:")) {
           controller.enqueue(encoder.encode(`${line}\n`));
-        } else if (!handleData(line.slice(5).trim(), controller)) {
-          return;
+        } else {
+          if (!handleData(line.slice(5).trim(), controller)) return;
         }
       }
-      if (sawFinishReason) hooks.onComplete?.(lastResponseId);
+      onComplete?.(completion);
     },
   });
 }

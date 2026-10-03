@@ -1,28 +1,29 @@
-import { Connection, Credential, Integration, Model, Plugin } from "@opencode/plugin";
+import { Connection, Credential, Integration, Plugin } from "@opencode/plugin";
 import { discoverModels } from "./discovery.ts";
 import {
   ANTIGRAVITY_DAILY_ENDPOINT,
   ANTIGRAVITY_ENDPOINTS,
   ANTIGRAVITY_SANDBOX_ENDPOINT,
-  CLAUDE_THINKING_BETA_HEADER,
   PROVIDER_ID,
+  SNAPSHOT_CATALOG,
+  WIRE_MODEL_HEADER,
+  antigravityHeaders,
   createCcaSseUnwrap,
   createSessionState,
   describeInBandError,
-  ensureAntigravityVersion,
-  getAntigravityUserAgent,
-  isClaudeModel,
+  getAntigravityPlatform,
+  getAntigravityVersion,
   providerModels,
   readInBandError,
   rewriteBodyForAntigravity,
   unwrapCcaJson,
   unwrappedResponseHeaders,
   type AntigravitySessionState,
+  type StreamCompletion,
+  type WireCatalog,
 } from "./wire.ts";
 import {
   CALLBACK_PATH,
-  CALLBACK_PORT,
-  REDIRECT_URI,
   accountVerificationMessage,
   buildAuthUrl,
   exchangeToken,
@@ -40,15 +41,12 @@ import {
 //
 // Then connect Google Antigravity and sign in with your Google account.
 // Requests are dispatched through Google's Cloud Code Assist endpoints with
-// the native `antigravity/hub` fingerprint, so Gemini, Claude, and GPT-OSS
+// the native Antigravity IDE fingerprint, so Gemini, Claude, and GPT-OSS
 // models are used with your free Antigravity tier.
 
 const INTEGRATION_ID = Integration.ID.make(PROVIDER_ID);
 const BROWSER_METHOD_ID = Integration.MethodID.make("browser");
 const PASTE_METHOD_ID = Integration.MethodID.make("paste");
-/** Per-invocation UUID; identical values mark retries of the same logical request. */
-const INVOCATION_HEADER = "x-antigravity-opencode-invocation";
-const WEB_SEARCH_USER_AGENT = "antigravity/ide/2.5.5 (aidev_client; os_type=windows; arch=amd64)";
 /** Login/browser-callback wait window. */
 export const FLOW_TIMEOUT_MS = 5 * 60 * 1000;
 
@@ -162,14 +160,12 @@ export default Plugin.define({
           ? [ANTIGRAVITY_SANDBOX_ENDPOINT]
           : [...ANTIGRAVITY_ENDPOINTS];
 
-    // Warm the manifest-discovered client version once per process; failures
-    // silently keep the pinned fallback.
-    ensureAntigravityVersion().catch(() => {});
-
     /** Per-OpenCode-session envelope identity; cleared on session deletion and credential switches. */
     const sessionStates = new Map<string, AntigravitySessionState>();
+    /** Dispatched generation calls, for the metrics the native client records after each stream. */
+    const pendingCalls = new WeakMap<Request, { sentAt: number; access: string; trajectoryId?: string }>();
     /** Account-specific state loaded from the active connection. */
-    let loaded: { connection?: Connection.Info; projectId?: string; models?: Model.Info[] } = {};
+    let loaded: { connection?: Connection.Info; projectId?: string; catalog?: WireCatalog } = {};
 
     const load = async () => {
       const connection = await ctx.integration.connection.active(INTEGRATION_ID);
@@ -178,12 +174,8 @@ export default Plugin.define({
         loaded = {};
         return;
       }
-      const available = await discoverModels(credential.access, endpoints);
-      loaded = {
-        connection,
-        projectId: credential.metadata?.projectId as string,
-        models: available && providerModels(available),
-      };
+      const projectId = credential.metadata?.projectId as string;
+      loaded = { connection, projectId, catalog: await discoverModels(credential.access, projectId, endpoints) };
     };
     let loading = Promise.resolve();
     const refresh = () =>
@@ -205,7 +197,7 @@ export default Plugin.define({
           let server: ReturnType<typeof Bun.serve>;
           try {
             server = Bun.serve({
-              port: CALLBACK_PORT,
+              port: 0,
               hostname: "127.0.0.1",
               fetch(request) {
                 const body = waiter.deliver(request.url);
@@ -218,18 +210,18 @@ export default Plugin.define({
           } catch (error) {
             waiter.dispose();
             throw new Error(
-              `Could not bind the Antigravity callback server on port ${CALLBACK_PORT}: ${(error as Error).message}. Use the "Antigravity (paste code)" login method instead.`,
+              `Could not bind the Antigravity callback server: ${(error as Error).message}. Use the "Antigravity (paste code)" login method instead.`,
             );
           }
+          const redirectUri = `http://localhost:${server.port}${CALLBACK_PATH}`;
 
           return {
-            url: buildAuthUrl(state, REDIRECT_URI),
-            instructions:
-              "Complete sign-in in your browser. A callback server is listening on 127.0.0.1:51121; if your browser cannot reach it, restart login with the paste-code method.",
+            url: buildAuthUrl(state, redirectUri),
+            instructions: `Complete sign-in in your browser. A callback server is listening on localhost:${server.port}; if your browser cannot reach it, restart login with the paste-code method.`,
             expiresAt: Date.now() + FLOW_TIMEOUT_MS,
             mode: "auto" as const,
             callback: waiter.promise
-              .then((code) => exchangeToken(code, REDIRECT_URI))
+              .then((code) => exchangeToken(code, redirectUri))
               .then((credentials) => toCredential(BROWSER_METHOD_ID, credentials))
               .finally(() => {
                 waiter.dispose();
@@ -245,10 +237,12 @@ export default Plugin.define({
         method: { id: PASTE_METHOD_ID, type: "oauth", label: "Antigravity (paste code)" },
         authorize: async () => {
           const state = newOAuthState();
+          // Any ephemeral loopback port, like the native flow; nothing listens on it.
+          const redirectUri = `http://localhost:${49152 + Math.floor(Math.random() * 16384)}${CALLBACK_PATH}`;
           return {
-            url: buildAuthUrl(state, REDIRECT_URI),
+            url: buildAuthUrl(state, redirectUri),
             instructions:
-              "Complete sign-in. Google will redirect to 127.0.0.1:51121 and the browser may show 'cannot connect' because paste mode intentionally runs no callback server. Copy the COMPLETE URL from the browser address bar and paste it here; use the URL generated by this login attempt.",
+              "Complete sign-in. Google will redirect to localhost and the browser may show 'cannot connect' because paste mode intentionally runs no callback server. Copy the COMPLETE URL from the browser address bar and paste it here; use the URL generated by this login attempt.",
             mode: "code" as const,
             callback: async (pasted: string) => {
               const code = extractPastedCode(pasted, state);
@@ -257,7 +251,7 @@ export default Plugin.define({
                   "Antigravity paste-code login failed: the pasted value is not a code or matching redirect URL from this login attempt",
                 );
               }
-              return toCredential(PASTE_METHOD_ID, await exchangeToken(code, REDIRECT_URI));
+              return toCredential(PASTE_METHOD_ID, await exchangeToken(code, redirectUri));
             },
           };
         },
@@ -266,8 +260,8 @@ export default Plugin.define({
       });
     });
 
-    // Static models until an account's live inventory is discovered; the
-    // provider is only available while a connection exists.
+    // Snapshot models until an account's live agent catalog is discovered;
+    // the provider is only available while a connection exists.
     await ctx.provider.transform((editor) => {
       editor.add({
         info: {
@@ -280,25 +274,15 @@ export default Plugin.define({
           package: "@opencode/ai/providers/google",
           settings: { baseURL: ANTIGRAVITY_DAILY_ENDPOINT },
         },
-        models: loaded.models ?? providerModels(),
-        sourceConnection: loaded.models && loaded.connection,
+        models: providerModels(loaded.catalog),
+        sourceConnection: loaded.catalog && loaded.connection,
       });
     });
 
-    await ctx.session.hook(
-      "model.request",
-      (evt) => {
-        // Fresh UUID per logical OpenCode LLM invocation. Retries reuse the
-        // prepared headers — and therefore this id — so they do not advance
-        // the request-chain step.
-        evt.headers[INVOCATION_HEADER] = crypto.randomUUID();
-      },
-      { providerID: PROVIDER_ID },
-    );
-
     // The native Gemini client sends `{baseURL}/models/<id>:streamGenerateContent`
-    // with the OAuth access token as `x-goog-api-key`. Rewrite it into the
-    // Cloud Code Assist envelope with the native `antigravity/hub` fingerprint.
+    // with the OAuth access token as `x-goog-api-key` and the selected wire
+    // model in WIRE_MODEL_HEADER. Rewrite it into the Cloud Code Assist
+    // envelope with the native IDE fingerprint.
     await ctx.session.hook(
       "http.request",
       async (evt) => {
@@ -313,29 +297,44 @@ export default Plugin.define({
           state = createSessionState();
           sessionStates.set(evt.sessionID, state);
         }
-        const rewritten = rewriteBodyForAntigravity({
+        const wireModelId = request.headers.get(WIRE_MODEL_HEADER)!;
+        const model = (loaded.catalog ?? SNAPSHOT_CATALOG)[wireModelId];
+        if (!model) throw new Error(`Antigravity model "${wireModelId}" is not in the current model catalog`);
+        const envelope = rewriteBodyForAntigravity({
           args: await request.json(),
           logicalModelId: match[1]!,
+          wireModelId,
+          model,
           projectId: loaded.projectId!,
           state,
-          invocationId: request.headers.get(INVOCATION_HEADER) ?? undefined,
         });
-
-        // Build the native inference fingerprint from scratch. OpenCode,
-        // Gemini-client, and user-supplied tracing headers must not leak.
-        const headers = new Headers({
-          Authorization: `Bearer ${request.headers.get("x-goog-api-key")}`,
-          "Content-Type": "application/json",
-          "User-Agent": getAntigravityUserAgent(),
-        });
-        if (stream) headers.set("Accept", "text/event-stream");
-        if (stream && isClaudeModel(rewritten.wireModelId)) headers.set("anthropic-beta", CLAUDE_THINKING_BETA_HEADER);
-
+        const agent = envelope.requestType === "agent";
+        // OpenCode sends the OAuth access token as the Gemini API key. The
+        // native header set is rebuilt from scratch so OpenCode, Gemini-client,
+        // and user-supplied tracing headers never leak.
+        const access = request.headers.get("x-goog-api-key")!;
+        const headers = antigravityHeaders(access);
         const endpoint = (endpointMode === "auto" && state.endpoint) || endpoints[0];
+
+        // The native client grants the trajectory's ACL before its first agent request.
+        if (agent && !state.aclWritten) {
+          await fetch(`${endpoint}/v1internal:writeTrajectoryAcls`, {
+            method: "POST",
+            headers,
+            body: JSON.stringify({ trajectoryId: state.trajectoryId }),
+          });
+          state.aclWritten = true;
+        }
+
         evt.request = new Request(`${endpoint}/v1internal:${verb}${stream ? "?alt=sse" : ""}`, {
           method: "POST",
           headers,
-          body: rewritten.body,
+          body: JSON.stringify(envelope),
+        });
+        pendingCalls.set(evt.request, {
+          sentAt: Date.now(),
+          access,
+          ...(agent ? { trajectoryId: state.trajectoryId } : {}),
         });
       },
       { providerID: PROVIDER_ID },
@@ -371,9 +370,7 @@ export default Plugin.define({
         if (endpointMode === "auto") state.endpoint = url.origin;
 
         if (verb === "generateContent") {
-          const payload = unwrapCcaJson(await response.json());
-          if (typeof payload.responseId === "string") state.lastExecutionId = payload.responseId;
-          evt.response = new Response(JSON.stringify(payload), {
+          evt.response = new Response(JSON.stringify(unwrapCcaJson(await response.json())), {
             status: response.status,
             statusText: response.statusText,
             headers: unwrappedResponseHeaders(response),
@@ -381,15 +378,38 @@ export default Plugin.define({
           return;
         }
 
-        // The response id commits only when the stream completes; failed or
-        // cancelled streams poison nothing.
-        evt.response = new Response(
-          response.body!.pipeThrough(
-            createCcaSseUnwrap({
-              onError: failover,
-              onComplete: (responseId) => (state.lastExecutionId = responseId),
+        // Like the native client, report each completed stream's latency.
+        const call = pendingCalls.get(evt.request)!;
+        const duration = (ms: number) => `${ms % 1000 ? (ms / 1000).toFixed(3) : ms / 1000}s`;
+        const recordMetrics = ({ traceId, firstMessageAt }: StreamCompletion) => {
+          const now = Date.now();
+          void fetch(`${url.origin}/v1internal:recordCodeAssistMetrics`, {
+            method: "POST",
+            headers: antigravityHeaders(call.access),
+            body: JSON.stringify({
+              project: loaded.projectId,
+              requestId: crypto.randomUUID(),
+              metadata: { ideType: "ANTIGRAVITY", ideVersion: getAntigravityVersion(), platform: getAntigravityPlatform() },
+              metrics: [{
+                timestamp: new Date(now).toISOString(),
+                conversationOffered: {
+                  status: "ACTION_STATUS_NO_ERROR",
+                  traceId,
+                  streamingLatency: {
+                    ...(firstMessageAt ? { firstMessageLatency: duration(firstMessageAt - call.sentAt) } : {}),
+                    totalLatency: duration(now - call.sentAt),
+                  },
+                  ...(call.trajectoryId
+                    ? { isAgentic: true, initiationMethod: "AGENT", trajectoryId: call.trajectoryId }
+                    : {}),
+                  language: "unspecified",
+                },
+              }],
             }),
-          ),
+          }).catch(() => {}); // Telemetry never affects the conversation.
+        };
+        evt.response = new Response(
+          response.body!.pipeThrough(createCcaSseUnwrap(failover, recordMetrics)),
           { status: response.status, statusText: response.statusText, headers: unwrappedResponseHeaders(response) },
         );
       },
@@ -407,16 +427,9 @@ export default Plugin.define({
           if (credential?.type !== "oauth") throw new Error("Connect Google Antigravity before using web search");
           const response = await fetch(`${endpoints[0]}/v1internal:generateContent`, {
             method: "POST",
-            headers: {
-              Authorization: `Bearer ${credential.access}`,
-              "Content-Type": "application/json",
-              "User-Agent": WEB_SEARCH_USER_AGENT,
-            },
+            headers: antigravityHeaders(credential.access),
             body: JSON.stringify({
               project: credential.metadata?.projectId,
-              model: "gemini-3.1-flash-lite",
-              userAgent: "antigravity",
-              requestType: "web_search",
               request: {
                 contents: [{ role: "user", parts: [{ text: query }] }],
                 systemInstruction: {
@@ -427,9 +440,12 @@ export default Plugin.define({
                     },
                   ],
                 },
-                generationConfig: { candidateCount: 1 },
                 tools: [{ googleSearch: { enhancedContent: { imageSearch: { maxResultCount: 5 } } } }],
+                generationConfig: { candidateCount: 1 },
               },
+              model: "gemini-3.1-flash-lite",
+              userAgent: "antigravity",
+              requestType: "web_search",
             }),
             signal,
           });

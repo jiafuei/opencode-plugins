@@ -1,8 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import plugin from "./server.ts";
-
-// Prevent live manifest discovery during plugin instantiation.
-process.env.OPENCODE_ANTIGRAVITY_VERSION ??= "2.8.0";
+import { WIRE_MODEL_HEADER } from "./wire.ts";
 
 const DAILY = "https://daily-cloudcode-pa.googleapis.com";
 const SANDBOX = "https://daily-cloudcode-pa.sandbox.googleapis.com";
@@ -123,11 +121,17 @@ function sseResponse(events: unknown[]): Response {
   return new Response(body, { headers: { "content-type": "text/event-stream" } });
 }
 
-/** A request as OpenCode's native Gemini client issues it. */
-function nativeRequest(modelId: string, body: Record<string, any>, headers: Record<string, string> = {}) {
+/** A request as OpenCode's native Gemini client issues it for a model/variant overlay. */
+function nativeRequest(wireModelId: string, body: Record<string, any>, headers: Record<string, string> = {}) {
+  const modelId = wireModelId.replace(/-(low|medium|high)$/, "");
   return new Request(`${DAILY}/models/${modelId}:streamGenerateContent?alt=sse`, {
     method: "POST",
-    headers: { "content-type": "application/json", "x-goog-api-key": "at-live", ...headers },
+    headers: {
+      "content-type": "application/json",
+      "x-goog-api-key": "at-live",
+      [WIRE_MODEL_HEADER]: wireModelId,
+      ...headers,
+    },
     body: JSON.stringify(body),
   });
 }
@@ -164,17 +168,28 @@ describe("provider registration", () => {
   test("an OAuth connection binds the discovered inventory to that connection", async () => {
     const harness = makeHarness(OAUTH_AUTH);
     await harness.ready();
+    const entry = (displayName: string) => ({ displayName, maxTokens: 1_000_000, maxOutputTokens: 128_000 });
     const mock = mockFetch((url, init) => {
       expect(url).toBe(`${DAILY}/v1internal:fetchAvailableModels`);
       expect(new Headers(init.headers).get("authorization")).toBe("Bearer at-live");
-      return Response.json({ models: { "claude-sonnet-4-6": {} } });
+      expect(JSON.parse(String(init.body))).toEqual({ project: "proj-42" });
+      return Response.json({
+        models: {
+          "claude-x-low": entry("Claude X (Low)"),
+          "claude-x-high": entry("Claude X (High)"),
+          "tab-only": entry("Tab"),
+        },
+        agentModelSorts: [{ groups: [{ modelIds: ["claude-x-high", "claude-x-low", "missing"] }] }],
+      });
     });
     try {
       await harness.emit({ type: "credential.switched", data: { integrationID: "google-antigravity" } });
       await Bun.sleep(10);
       let added: any;
       await harness.edit("provider", { add: (definition: unknown) => (added = definition) });
-      expect(added.models.map((model: any) => model.id)).toEqual(["claude-sonnet-4-6"]);
+      // Only the native agent picker's models are offered.
+      expect(added.models.map((model: any) => model.id)).toEqual(["claude-x"]);
+      expect(added.models[0].variants.map((variant: any) => variant.id)).toEqual(["low", "high"]);
       expect(added.sourceConnection).toMatchObject({ type: "credential", id: "cred-1" });
     } finally {
       mock.restore();
@@ -186,7 +201,7 @@ describe("provider registration", () => {
     let added: any;
     await harness.edit("provider", { add: (definition: unknown) => (added = definition) });
     expect(added.sourceConnection).toBeUndefined();
-    expect(added.models.map((model: any) => model.id)).toContain("gemini-3.1-pro");
+    expect(added.models.map((model: any) => model.id)).toContain("claude-opus-5-5");
   });
 });
 
@@ -210,7 +225,6 @@ describe("OAuth methods", () => {
       if (call === 2) return Response.json({ email: "me@example.com" });
       return Response.json({
         currentTier: { id: "free-tier" },
-        paidTier: { id: "free-tier" },
         cloudaicompanionProject: "project-1",
       });
     });
@@ -222,12 +236,16 @@ describe("OAuth methods", () => {
     const authorization = await browser.authorize({});
     const url = new URL(authorization.url);
     const state = url.searchParams.get("state");
-    expect(url.searchParams.get("redirect_uri")).toBe("http://127.0.0.1:51121/oauth-callback");
+    // Native flow: localhost on an ephemeral port.
+    const redirect = new URL(url.searchParams.get("redirect_uri")!);
+    expect(redirect.hostname).toBe("localhost");
+    expect(redirect.pathname).toBe("/oauth-callback");
     expect(authorization.mode).toBe("auto");
+    const callbackUrl = `http://127.0.0.1:${redirect.port}/oauth-callback`;
 
     const mock = loginResponses();
     try {
-      const response = await browserFetch(`http://127.0.0.1:51121/oauth-callback?code=code-1&state=${state}`);
+      const response = await browserFetch(`${callbackUrl}?code=code-1&state=${state}`);
       expect(response.status).toBe(200);
       expect(await response.text()).toContain("Sign-in complete");
       const credential = await authorization.callback;
@@ -244,18 +262,19 @@ describe("OAuth methods", () => {
 
     // The callback always tears the listener down.
     await Bun.sleep(5);
-    await expect(browserFetch("http://127.0.0.1:51121/oauth-callback")).rejects.toThrow();
+    await expect(browserFetch(callbackUrl)).rejects.toThrow();
   });
 
   test("paste method exchanges a complete failed-redirect URL", async () => {
     const { paste } = await methods();
     const authorization = await paste.authorize({});
-    const state = new URL(authorization.url).searchParams.get("state");
+    const url = new URL(authorization.url);
+    const state = url.searchParams.get("state");
 
     const mock = loginResponses();
     try {
       const credential = await authorization.callback(
-        `http://127.0.0.1:51121/oauth-callback?code=code-1&state=${state}&scope=profile`,
+        `${url.searchParams.get("redirect_uri")}?code=code-1&state=${state}&scope=profile`,
       );
       expect(credential).toMatchObject({ type: "oauth", methodID: "paste", access: "at", metadata: { projectId: "project-1" } });
     } finally {
@@ -267,7 +286,7 @@ describe("OAuth methods", () => {
     const { paste } = await methods();
     const authorization = await paste.authorize({});
     await expect(
-      authorization.callback("http://127.0.0.1:51121/oauth-callback?code=old&state=another-attempt"),
+      authorization.callback("http://localhost:50000/oauth-callback?code=old&state=another-attempt"),
     ).rejects.toThrow(/paste-code login failed: .*matching redirect URL from this login attempt/);
   });
 
@@ -382,78 +401,70 @@ describe("session HTTP hooks", () => {
       contents: [{ role: "user", parts: [{ text: "hello" }] }],
       systemInstruction: { parts: [{ text: "sys" }] },
       generationConfig: { thinkingConfig: { includeThoughts: true, thinkingLevel: "high" } },
+      tools: [],
     };
-    const chunk = { response: { candidates: [], usageMetadata: {}, responseId: "resp-9" } };
-    const mock = mockFetch(() => sseResponse([chunk]));
+    const chunk = {
+      response: { candidates: [{ content: { role: "model", parts: [{ text: "hi" }] } }], responseId: "resp-9" },
+      traceId: "trace-9",
+    };
+    const mock = mockFetch((url) => (url.includes("streamGenerateContent") ? sseResponse([chunk]) : Response.json({})));
     try {
       const response = await harness.send(
         "ses-1",
-        nativeRequest("gemini-3.1-pro", args, {
-          "x-antigravity-opencode-invocation": "inv-a",
-          "x-opencode-session": "ses-1",
-          "x-custom-trace": "trace-1",
-        }),
+        nativeRequest("claude-opus-5-5-high", args, { "x-opencode-session": "ses-1", "x-custom-trace": "trace-1" }),
       );
-      const call = mock.calls[0]!;
+      // The trajectory's ACL is granted before its first agent request.
+      expect(mock.calls[0]!.url).toBe(`${DAILY}/v1internal:writeTrajectoryAcls`);
+      const call = mock.calls[1]!;
       expect(call.url).toBe(`${DAILY}/v1internal:streamGenerateContent?alt=sse`);
       // Only the native inference header set reaches the wire.
       const headers = new Headers(call.init.headers);
-      expect([...headers.keys()].sort()).toEqual(["accept", "authorization", "content-type", "user-agent"]);
+      expect([...headers.keys()].sort()).toEqual(["accept-encoding", "authorization", "content-type", "user-agent"]);
+      expect(headers.get("accept-encoding")).toBe("gzip");
       expect(headers.get("authorization")).toBe("Bearer at-live");
-      expect(headers.get("user-agent")).toMatch(/^antigravity\/hub\/2\.8\.0 \(aidev_client;/);
-      expect(headers.get("accept")).toBe("text/event-stream");
+      expect(headers.get("user-agent")).toMatch(/^antigravity\/ide\/[\d.]+ \(aidev_client; os_type=windows; arch=amd64\)$/);
 
       const wireBody = JSON.parse(String(call.init.body));
-      expect(wireBody.project).toBe("proj-42");
-      expect(wireBody.model).toBe("gemini-pro-agent"); // high effort routes to the agent wire id
-      expect(wireBody.userAgent).toBe("antigravity");
-      expect(wireBody.requestType).toBe("agent");
+      expect(wireBody).toMatchObject({ project: "proj-42", model: "claude-opus-5-5-high", userAgent: "antigravity", requestType: "agent" });
       expect(wireBody.requestId).toMatch(/^agent\/[0-9a-f-]{36}\/\d+\/[0-9a-f-]{36}\/2$/);
-      expect(wireBody.request.systemInstruction.role).toBe("user");
-      // Budget transport: the OpenCode level input is normalized natively.
-      expect(wireBody.request.generationConfig.thinkingConfig).toEqual({ includeThoughts: true, thinkingBudget: 10001 });
+      expect(wireBody.request.generationConfig.thinkingConfig).toEqual({ includeThoughts: true, thinkingBudget: 0, thinkingLevel: "HIGH" });
+      expect(wireBody.request.labels.model_enum).toBe("MODEL_PLACEHOLDER_M402");
+      expect(JSON.parse(String(mock.calls[0]!.init.body))).toEqual({ trajectoryId: wireBody.request.labels.trajectory_id });
 
       // Raw Gemini chunks reach the native parser.
       const output = await readStream(response);
       const dataLine = output.trim().split("\n").at(-1)!.replace(/^data:\s*/, "");
       expect(JSON.parse(dataLine)).toEqual(chunk.response);
+
+      // The completed stream is reported like the native client's metrics.
+      expect(mock.calls).toHaveLength(3);
+      expect(mock.calls[2]!.url).toBe(`${DAILY}/v1internal:recordCodeAssistMetrics`);
+      const metrics = JSON.parse(String(mock.calls[2]!.init.body));
+      expect(metrics).toMatchObject({
+        project: "proj-42",
+        metadata: { ideType: "ANTIGRAVITY", ideVersion: "2.5.5", platform: "WINDOWS_AMD64" },
+        metrics: [{
+          conversationOffered: {
+            status: "ACTION_STATUS_NO_ERROR",
+            traceId: "trace-9",
+            isAgentic: true,
+            initiationMethod: "AGENT",
+            trajectoryId: wireBody.request.labels.trajectory_id,
+            language: "unspecified",
+          },
+        }],
+      });
+      expect(metrics.metrics[0].conversationOffered.streamingLatency.totalLatency).toMatch(/^\d+(\.\d{3})?s$/);
     } finally {
       mock.restore();
     }
   });
 
-  test("session chain advances across invocations and survives retries", async () => {
+  test("models outside the current catalog fail loudly", async () => {
     const harness = makeHarness(OAUTH_AUTH);
-    const mock = mockFetch(() =>
-      sseResponse([{ response: { candidates: [{ finishReason: "STOP" }], responseId: "r-1" } }]),
+    await expect(harness.send("ses-1", nativeRequest("claude-opus-4-6-thinking", { contents: [] }))).rejects.toThrow(
+      /not in the current model catalog/,
     );
-    try {
-      const send = (invocation: string) =>
-        harness.send(
-          "ses-x",
-          nativeRequest("claude-sonnet-4-6", { contents: [] }, { "x-antigravity-opencode-invocation": invocation }),
-        );
-
-      // Consume each stream fully so response-id commits land before the next
-      // invocation's assertions.
-      await readStream(await send("inv-1"));
-      const firstEnvelope = JSON.parse(String(mock.calls[0]!.init.body));
-      // A retry of the same logical invocation reuses the exact envelope.
-      await readStream(await send("inv-1"));
-      const retryEnvelope = JSON.parse(String(mock.calls[1]!.init.body));
-      expect(retryEnvelope.requestId).toBe(firstEnvelope.requestId);
-      expect(retryEnvelope.request.sessionId).toBe(firstEnvelope.request.sessionId);
-
-      // The next logical invocation advances the step and carries the prior
-      // response id.
-      await readStream(await send("inv-2"));
-      const secondEnvelope = JSON.parse(String(mock.calls[2]!.init.body));
-      const stepOf = (requestId: string) => Number(requestId.split("/").at(-1));
-      expect(stepOf(secondEnvelope.requestId)).toBe(stepOf(firstEnvelope.requestId) + 1);
-      expect(secondEnvelope.request.labels.last_execution_id).toBe("r-1");
-    } finally {
-      mock.restore();
-    }
   });
 
   test("auto mode moves a session to the other endpoint after a failure and stays there", async () => {
@@ -463,11 +474,12 @@ describe("session HTTP hooks", () => {
       return sseResponse([{ response: { candidates: [{ finishReason: "STOP" }] } }]);
     });
     try {
-      const send = () => harness.send("ses-fail", nativeRequest("gemini-2.5-pro", { contents: [] }));
+      const send = () => harness.send("ses-fail", nativeRequest("gemini-3.8-flash-low", { contents: [], tools: [] }));
       expect((await send()).status).toBe(503);
       await readStream(await send()); // core's retry
       await readStream(await send());
-      expect(mock.calls.map((call) => new URL(call.url).origin)).toEqual([DAILY, SANDBOX, SANDBOX]);
+      const generations = mock.calls.filter((call) => call.url.includes("streamGenerateContent"));
+      expect(generations.map((call) => new URL(call.url).origin)).toEqual([DAILY, SANDBOX, SANDBOX]);
     } finally {
       mock.restore();
     }
@@ -477,81 +489,46 @@ describe("session HTTP hooks", () => {
     const harness = makeHarness(OAUTH_AUTH, { endpointMode: "production" });
     const mock = mockFetch(() => new Response("boom", { status: 503 }));
     try {
-      await harness.send("ses-pin", nativeRequest("gemini-2.5-pro", { contents: [] }));
-      await harness.send("ses-pin", nativeRequest("gemini-2.5-pro", { contents: [] }));
-      expect(mock.calls.map((call) => new URL(call.url).origin)).toEqual([DAILY, DAILY]);
+      await harness.send("ses-pin", nativeRequest("gemini-3.8-flash-low", { contents: [], tools: [] }));
+      await harness.send("ses-pin", nativeRequest("gemini-3.8-flash-low", { contents: [], tools: [] }));
+      // The ACL write and both attempts all stay on daily.
+      expect(mock.calls.map((call) => new URL(call.url).origin)).toEqual([DAILY, DAILY, DAILY]);
     } finally {
       mock.restore();
     }
   });
 
-  test("session deletion clears the identity chain", async () => {
-    const harness = makeHarness(OAUTH_AUTH);
-    const mock = mockFetch(() => sseResponse([{ response: { candidates: [] } }]));
-    try {
-      const send = (invocation: string) =>
-        harness.send(
-          "ses-del",
-          nativeRequest("gemini-2.5-pro", { contents: [] }, { "x-antigravity-opencode-invocation": invocation }),
-        );
-      await readStream(await send("a"));
-      await readStream(await send("b"));
-      const stepOf = (init: RequestInit) => Number(JSON.parse(String(init.body)).requestId.split("/").at(-1));
-      const beforeDelete = [stepOf(mock.calls[0]!.init), stepOf(mock.calls[1]!.init)];
-      expect(beforeDelete[1]).toBe(beforeDelete[0]! + 1);
-      await harness.emit({ type: "session.deleted", data: { sessionID: "ses-del" } });
-      await readStream(await send("c"));
-      expect(stepOf(mock.calls[2]!.init)).toBe(beforeDelete[0]!); // fresh state starts over
-    } finally {
-      mock.restore();
-    }
-  });
-
-  test("credential switches reload the project and reset the per-session identity chain", async () => {
+  test("session deletion and credential switches reset the identity chain", async () => {
     const harness = makeHarness(OAUTH_AUTH);
     const mock = mockFetch((url) =>
-      url.includes("fetchAvailableModels")
-        ? new Response("unavailable", { status: 503 })
-        : sseResponse([{ response: { candidates: [], responseId: "r-old" } }]),
+      url.includes("fetchAvailableModels") ? new Response("unavailable", { status: 503 }) : sseResponse([{ response: { candidates: [] } }]),
     );
+    const turn = (text: string) => ({ role: "user", parts: [{ text }] });
     try {
-      const send = async (invocation: string, access: string) => {
-        const request = nativeRequest("gemini-2.5-pro", { contents: [] }, {
-          "x-goog-api-key": access,
-          "x-antigravity-opencode-invocation": invocation,
-        });
-        await readStream(await harness.send("ses-proj", request));
+      const send = async (sessionID: string, contents: unknown[], access = "at-live") => {
+        await readStream(await harness.send(sessionID, nativeRequest("gemini-3.8-flash-low", { contents, tools: [] }, { "x-goog-api-key": access })));
+        const dispatched = mock.calls.filter((call) => call.url.includes("streamGenerateContent")).at(-1)!;
+        return { envelope: JSON.parse(String(dispatched.init.body)), headers: new Headers(dispatched.init.headers) };
       };
-      await send("t-1", "at-live");
-      await send("t-2", "at-live");
+      const first = await send("ses-a", [turn("a")]);
+      const second = await send("ses-a", [turn("a"), turn("b")]);
+      expect(second.envelope.request.labels.trajectory_id).toBe(first.envelope.request.labels.trajectory_id);
+      expect(second.envelope.request.labels.last_execution_id).toBeDefined();
+
+      await harness.emit({ type: "session.deleted", data: { sessionID: "ses-a" } });
+      const afterDelete = await send("ses-a", [turn("a"), turn("b")]);
+      expect(afterDelete.envelope.request.labels.trajectory_id).not.toBe(first.envelope.request.labels.trajectory_id);
+      expect(afterDelete.envelope.request.labels.last_execution_id).toBeUndefined();
+
       harness.setCredential({ ...OAUTH_AUTH, access: "at-other", metadata: { projectId: "proj-other" } });
       await harness.emit({ type: "credential.switched", data: { integrationID: "google-antigravity" } });
       await Bun.sleep(10);
-      await send("t-3", "at-other");
-
-      const dispatched = mock.calls.filter((call) => call.url.includes("streamGenerateContent"));
-      const envelope = JSON.parse(String(dispatched[2]!.init.body));
-      expect(envelope.project).toBe("proj-other");
-      expect(envelope.requestId).toMatch(/\/2$/);
-      expect(envelope.request.labels.last_execution_id).toBeUndefined();
-      expect(new Headers(dispatched[2]!.init.headers).get("authorization")).toBe("Bearer at-other");
+      const afterSwitch = await send("ses-a", [turn("a")], "at-other");
+      expect(afterSwitch.envelope.project).toBe("proj-other");
+      expect(afterSwitch.envelope.request.labels.trajectory_id).not.toBe(afterDelete.envelope.request.labels.trajectory_id);
+      expect(afterSwitch.headers.get("authorization")).toBe("Bearer at-other");
     } finally {
       mock.restore();
     }
-  });
-});
-
-describe("model.request hook", () => {
-  test("marks each invocation with a fresh invocation id", async () => {
-    const harness = makeHarness(undefined);
-    await harness.ready();
-    const first = { sessionID: "s-1", headers: {} as Record<string, string> };
-    const second = { sessionID: "s-1", headers: {} as Record<string, string> };
-    harness.hooks["session.model.request"]!(first);
-    harness.hooks["session.model.request"]!(second);
-    expect(first.headers["x-antigravity-opencode-invocation"]).toBeDefined();
-    expect(second.headers["x-antigravity-opencode-invocation"]).not.toBe(
-      first.headers["x-antigravity-opencode-invocation"],
-    );
   });
 });

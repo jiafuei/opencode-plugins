@@ -1,9 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   CALLBACK_PATH,
-  CALLBACK_PORT,
   EXPIRY_SKEW_MS,
-  REDIRECT_URI,
   SCOPES,
   buildAuthUrl,
   exchangeToken,
@@ -12,6 +10,8 @@ import {
   newOAuthState,
   refreshToken,
 } from "./oauth_flow.ts";
+
+const REDIRECT_URI = `http://localhost:50000${CALLBACK_PATH}`;
 
 interface RecordedCall {
   url: string;
@@ -46,7 +46,7 @@ function jsonResponse(payload: unknown, status = 200): Response {
 describe("authorization URL", () => {
   test("mirrors the native installed-app flow", () => {
     const state = newOAuthState();
-    const url = new URL(buildAuthUrl(state));
+    const url = new URL(buildAuthUrl(state, REDIRECT_URI));
     expect(url.origin + url.pathname).toBe("https://accounts.google.com/o/oauth2/v2/auth");
     expect(url.searchParams.get("response_type")).toBe("code");
     expect(url.searchParams.get("redirect_uri")).toBe(REDIRECT_URI);
@@ -65,7 +65,7 @@ describe("paste-code extraction", () => {
   });
 
   test("accepts full redirect URLs with matching state", () => {
-    const input = `http://127.0.0.1:${CALLBACK_PORT}${CALLBACK_PATH}?code=abc&state=s`;
+    const input = `${REDIRECT_URI}?code=abc&state=s`;
     expect(extractPastedCode(input, "s")).toBe("abc");
   });
 
@@ -85,18 +85,7 @@ describe("token exchange", () => {
     const { fetcher, calls } = scriptedFetcher([
       () => jsonResponse({ access_token: "at-1", refresh_token: "rt-1", expires_in: 3600 }),
       () => jsonResponse({ email: "me@example.com" }),
-      () =>
-        jsonResponse({
-          currentTier: { id: "free-tier" },
-          paidTier: { id: "free-tier" },
-          cloudaicompanionProject: "proj-77",
-        }),
-      () =>
-        jsonResponse({
-          currentTier: { id: "free-tier" },
-          paidTier: { id: "free-tier" },
-          cloudaicompanionProject: "proj-77",
-        }),
+      () => jsonResponse({ currentTier: { id: "free-tier" }, cloudaicompanionProject: "proj-77" }),
     ]);
     const credentials = await exchangeToken("code-1", REDIRECT_URI, fetcher);
     expect(credentials).toMatchObject({ refresh: "rt-1", access: "at-1", projectId: "proj-77", email: "me@example.com" });
@@ -108,6 +97,16 @@ describe("token exchange", () => {
     expect(body.get("grant_type")).toBe("authorization_code");
     expect(body.get("code")).toBe("code-1");
     expect(body.get("redirect_uri")).toBe(REDIRECT_URI);
+    // Login runs on the IDE's Node side (google-auth-library form order and headers).
+    expect([...body.keys()]).toEqual(["client_id", "code", "grant_type", "redirect_uri", "client_secret"]);
+    expect(tokenCall.init.headers).toMatchObject({
+      "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+      "User-Agent": "google-api-nodejs-client/10.3.0",
+      "x-goog-api-client": "gl-node/22.21.1",
+    });
+    expect(calls[1]!.init.headers).toMatchObject({
+      "User-Agent": "antigravity/2.5.5 windows/amd64 google-api-nodejs-client/10.3.0",
+    });
   });
 
   test("endpoint errors never echo credential-bearing bodies", async () => {
@@ -141,6 +140,13 @@ describe("token refresh", () => {
     const body = new URLSearchParams(String(calls[0]!.init.body));
     expect(body.get("grant_type")).toBe("refresh_token");
     expect(body.get("refresh_token")).toBe("rt-old");
+    // Refresh runs in the language server's Go client: sorted form keys, Go's user agent.
+    expect([...body.keys()]).toEqual(["client_id", "client_secret", "grant_type", "refresh_token"]);
+    expect(calls[0]!.init.headers).toEqual({
+      "User-Agent": "Go-http-client/1.1",
+      "Content-Type": "application/x-www-form-urlencoded",
+      "Accept-Encoding": "gzip",
+    });
   });
 
   test("keeps the previous refresh token when upstream does not rotate", async () => {
