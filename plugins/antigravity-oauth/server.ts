@@ -55,12 +55,15 @@ export const FLOW_TIMEOUT_MS = 5 * 60 * 1000;
 
 type EndpointMode = "auto" | "production" | "sandbox";
 
-type TextMessage = { role: string; content: ReadonlyArray<{ type: string; text?: string }> };
+type TextMessage = {
+  role: string;
+  content: ReadonlyArray<{ type: string; text?: string; metadata?: { requests?: string[] } }>;
+};
 // The published plugin types predate this hook, so it is typed here.
 type NativeCompaction = {
   sessionID: string;
   messages: ReadonlyArray<TextMessage>;
-  retained: ReadonlyArray<unknown>;
+  retained: ReadonlyArray<TextMessage>;
   send: (input: { options: Record<string, unknown> }) => Promise<{ content: TextMessage["content"] }>;
   result?: { replacement: ReadonlyArray<unknown> };
 };
@@ -183,7 +186,15 @@ export default Plugin.define({
     /** Dispatched generation calls, for the metrics the native client records after each stream. */
     const pendingCalls = new WeakMap<
       Request,
-      { sentAt: number; access: string; projectId: string; wireModelId: string; trajectoryId?: string }
+      {
+        sentAt: number;
+        access: string;
+        projectId: string;
+        wireModelId: string;
+        trajectoryId?: string;
+        /** The request's session state, which outlives a credential switch clearing the map. */
+        state: AntigravitySessionState;
+      }
     >();
     /** Account-specific state loaded from the active connection. */
     let loaded: { connection?: Connection.Info; projectId?: string; catalog?: WireCatalog } = {};
@@ -370,6 +381,7 @@ export default Plugin.define({
           projectId: envelope.project,
           wireModelId,
           ...(agent ? { trajectoryId: state.trajectoryId } : {}),
+          state,
         });
       },
       { providerID: PROVIDER_ID },
@@ -384,7 +396,8 @@ export default Plugin.define({
         const url = new URL(evt.request.url);
         const verb = /^\/v1internal:(streamGenerateContent|generateContent)$/.exec(url.pathname)?.[1];
         if (!verb) return;
-        const state = sessionStates.get(evt.sessionID)!.get(evt.kind)!;
+        const call = pendingCalls.get(evt.request)!;
+        const state = call.state;
         const response = evt.response;
         const failover = () => {
           if (endpointMode === "auto") state.endpoint = endpoints.find((endpoint) => endpoint !== url.origin);
@@ -414,7 +427,6 @@ export default Plugin.define({
         }
 
         // Like the native client, report each completed stream's latency.
-        const call = pendingCalls.get(evt.request)!;
         // Protojson seconds at the native clock's 100ns resolution, trimmed to 0/3/6/9 digits.
         const seconds = (ms: number) => {
           const ticks = Math.round(ms * 1e4);
@@ -482,17 +494,19 @@ export default Plugin.define({
           .join("")
           .trim();
         if (!summary) throw new Error("Antigravity compaction returned no summary");
-        // The native message lists the latest ten user requests.
-        const requests = event.messages
-          .filter((message) => message.role === "user")
-          .map((message) =>
-            message.content
-              .filter((part) => part.type === "text")
-              .map((part) => part.text)
-              .join("\n"),
-          )
-          .filter((text) => text.trim())
-          .slice(-10);
+        // The native message lists the latest ten user requests. Core retains the
+        // user's own messages since the last compaction (typed text first, before
+        // attachments); earlier requests ride on the previous resume message.
+        const earlier = event.messages
+          .flatMap((message) => message.content)
+          .findLast((part) => part.text?.startsWith(COMPACTION_RESUME_HEADER))?.metadata?.requests;
+        const requests = [
+          ...(earlier ?? []),
+          ...event.retained.flatMap((message) => {
+            const text = message.content[0]?.type === "text" ? message.content[0].text! : "";
+            return text.trim() ? [text] : [];
+          }),
+        ].slice(-10);
         const resume = [
           COMPACTION_RESUME_HEADER,
           "",
@@ -505,7 +519,10 @@ export default Plugin.define({
           summary,
         ].join("\n");
         event.result = {
-          replacement: [...event.retained.slice(-1), { role: "user", content: [{ type: "text", text: resume }] }],
+          replacement: [
+            ...event.retained.slice(-1),
+            { role: "user", content: [{ type: "text", text: resume, metadata: { requests } }] },
+          ],
         };
       },
       { providerID: PROVIDER_ID },

@@ -582,7 +582,7 @@ describe("session HTTP hooks", () => {
       const event: Record<string, any> = {
         sessionID: "ses-native",
         messages: [message("user", "a"), message("assistant", "ok"), message("user", "b")],
-        retained: [message("user", "b")],
+        retained: [message("user", "a"), message("user", "b")],
         send: async () => {
           await readStream(
             await harness.send(
@@ -601,13 +601,25 @@ describe("session HTTP hooks", () => {
       expect(body.request.sessionId).toBe(primary.request.sessionId);
       expect(body.request.contents[0]).toEqual(primary.request.contents[0]);
       expect(body.request.contents.at(-1)).toEqual({ role: "user", parts: [{ text: COMPACTION_PROMPT }] });
-      expect(event.result.replacement).toEqual([
-        message("user", "b"),
-        message(
-          "user",
-          "# Resuming from a compaction\n\nYou are continuing work on the task described above, but you have lost access to the full conversation history, and need to resume work efficiently using the progress summary below:\n\n# User Requests\nThe following were user requests from the truncated conversation in chronological order:\n1. a\n2. b\n\n<summary>S</summary>",
-        ),
-      ]);
+      const resume = (requests: string[]) => ({
+        role: "user",
+        content: [{
+          type: "text",
+          text: `# Resuming from a compaction\n\nYou are continuing work on the task described above, but you have lost access to the full conversation history, and need to resume work efficiently using the progress summary below:\n\n# User Requests\nThe following were user requests from the truncated conversation in chronological order:\n${requests.map((text, index) => `${index + 1}. ${text}`).join("\n")}\n\n<summary>S</summary>`,
+          metadata: { requests },
+        }],
+      });
+      expect(event.result.replacement).toEqual([message("user", "b"), resume(["a", "b"])]);
+
+      // A later compaction keeps the earlier requests, not the previous resume message.
+      const again: Record<string, any> = {
+        ...event,
+        messages: [...event.result.replacement, message("assistant", "ok"), message("user", "c")],
+        retained: [message("user", "c")],
+        result: undefined,
+      };
+      await harness.hooks["session.experimental.compaction.native"]!(again);
+      expect(again.result.replacement).toEqual([message("user", "c"), resume(["a", "b", "c"])]);
     } finally {
       mock.restore();
     }
