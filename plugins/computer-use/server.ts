@@ -76,7 +76,7 @@ export default Plugin.define({
     let helper: ReturnType<typeof startHelper> | undefined;
     let queue: Promise<unknown> = Promise.resolve();
     let nextID = 0;
-    // Sessions that used the computer and are still running. The helper's overlay stays up until all of them stop.
+    // Sessions that used the computer and are still running. Hide immediately when all of them stop.
     const using = new Set<string>();
 
     async function exchange(request: Record<string, unknown>) {

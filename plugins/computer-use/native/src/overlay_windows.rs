@@ -1,4 +1,4 @@
-use std::{error::Error, ffi::c_void, io::BufRead, thread};
+use std::{error::Error, ffi::c_void, thread};
 use windows::core::w;
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::{
@@ -58,7 +58,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         let handle = hwnd.0 as isize;
         thread::spawn(move || {
             let hwnd = HWND(handle as *mut c_void);
-            let result = std::io::stdin().lock().lines().try_for_each(|line| update(hwnd, width, height, &line?));
+            let result = super::updates().try_for_each(|line| update(hwnd, width, height, &line?));
             if let Err(error) = &result {
                 eprintln!("computer-use overlay: {error}");
             }

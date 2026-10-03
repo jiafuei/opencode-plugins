@@ -1,10 +1,12 @@
 //! A glowing border and a status banner on the primary display while OpenCode controls the computer. The overlay is a
 //! separate process (this binary started with `--overlay`), so its window event loop never blocks requests. It reads
-//! one banner text per line on stdin, hides on an empty line, and exits when stdin closes, i.e. with the helper.
+//! one banner text per line on stdin, hides on an empty line or after 10 seconds idle, and exits when stdin closes.
 
 use std::error::Error;
-use std::io::Write;
+use std::io::{BufRead, Write};
 use std::process::{ChildStdin, Command, Stdio};
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::{thread, time::Duration};
 
 #[cfg(target_os = "macos")]
 #[path = "overlay_macos.rs"]
@@ -15,17 +17,32 @@ mod platform;
 
 pub use platform::run;
 
+fn updates() -> impl Iterator<Item = std::io::Result<String>> {
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        for line in std::io::stdin().lock().lines() {
+            if sender.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    std::iter::from_fn(move || match receiver.recv_timeout(Duration::from_secs(10)) {
+        Ok(line) => Some(line),
+        Err(RecvTimeoutError::Timeout) => Some(Ok(String::new())),
+        Err(RecvTimeoutError::Disconnected) => None,
+    })
+}
+
 #[derive(Default)]
 pub struct Overlay {
     stdin: Option<ChildStdin>,
-    text: String,
 }
 
 impl Overlay {
     /// Show the text in the banner, or hide the overlay when it is empty. The overlay process starts on the first show.
     pub fn set(&mut self, text: &str) -> Result<(), Box<dyn Error>> {
         let text = text.replace('\n', " ");
-        if text == self.text {
+        if text.is_empty() && self.stdin.is_none() {
             return Ok(());
         }
         let mut stdin = match self.stdin.take() {
@@ -45,7 +62,6 @@ impl Overlay {
         };
         writeln!(stdin, "{text}").map_err(|error| format!("the overlay process exited: {error}"))?;
         self.stdin = Some(stdin);
-        self.text = text;
         Ok(())
     }
 }

@@ -8,7 +8,7 @@ use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use objc2_core_graphics::CGColor;
 use objc2_foundation::NSString;
 use objc2_quartz_core::{kCAAlignmentCenter, kCATruncationEnd, CALayer, CATextLayer, CATransaction};
-use std::{error::Error, io::BufRead, thread};
+use std::{error::Error, thread};
 
 struct Overlay {
     panel: Retained<NSPanel>,
@@ -27,7 +27,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
     let overlay = MainThreadBound::new(create(mtm)?, mtm);
     thread::spawn(move || {
-        for line in std::io::stdin().lock().lines() {
+        for line in super::updates() {
             let Ok(text) = line else { break };
             run_on_main(|mtm| show(overlay.get(mtm), &text));
         }

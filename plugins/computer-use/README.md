@@ -57,8 +57,8 @@ ignore activation from a background process, so it then tries LaunchServices (`o
 
 While OpenCode drives the computer, the primary display gets a glowing orange border and a banner at the top saying
 what it is doing, e.g. `OpenCode is using your computer · Typing in Slack`. The overlay appears with the first
-`computer_*` action and disappears when every session that used the computer stops running (done, failed or
-interrupted); the next action shows it again. Typed text is never shown.
+`computer_*` action and auto-hides after 10 seconds without another action. It also disappears when every session that
+used the computer stops running (done, failed or interrupted); the next action shows it again. Typed text is never shown.
 
 The overlay is click-through and never takes focus. On macOS it is left out of screen captures; on Windows the model's
 screenshots show it, and the `computer_screenshot` description tells the model it is OpenCode's own overlay. It runs as a separate process, the helper started with `--overlay`, which reads one banner text per line on
@@ -249,7 +249,7 @@ Consider gating the tools with `"permission": { "computer_*": "ask" }`.
 2. macOS: the returned screenshot shows neither the border nor the banner. Windows: it shows both.
 3. Clicks and drags under the border and the banner land on the windows below; the frontmost window in the results never
    names the overlay, and the app being controlled keeps keyboard focus (type right after the overlay first appears).
-4. The overlay stays up between actions while the model thinks, and disappears when the session finishes, fails, or is
-   interrupted with Esc.
+4. The overlay hides after 10 seconds without an action and reappears on the next action. Repeating the same action
+   resets the timeout. It also disappears when the session finishes, fails, or is interrupted with Esc.
 5. With display scaling at 150% (Windows) or on a Retina display (macOS), the border hugs the screen edges and the banner
    text is sharp.
