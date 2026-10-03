@@ -66,8 +66,65 @@ export function antigravityHeaders(accessToken: string): Record<string, string> 
 /** CCA bypass accepted only when a Gemini 3 turn's first function call is unsigned. */
 const SKIP_THOUGHT_SIGNATURE = "skip_thought_signature_validator";
 
-/** Title and compaction requests use this checkpoint model. */
+/** Title requests use this checkpoint model. */
 const CHECKPOINT_MODEL = "gemini-3.1-flash-lite";
+
+/** The native client's compaction prompt, sent as the last user turn of a native compaction. */
+export const COMPACTION_PROMPT = `You have been working on the task described above but have not yet completed
+it. Write a continuation summary that will allow you (or another instance of
+yourself) to resume work efficiently in a future context window where the
+full conversation history will NOT be available—only this summary.
+
+This summary is all that will be available to you going forward in the future
+context window. Do not call any tools, simply just provide the summary based on
+the information available in the current context window.
+
+Your summary must be structured, concise, and actionable. Optimize for enabling immediate resumption with zero redundant work.
+
+Include the following sections:
+
+1. **Task Overview**
+   - The user's core request and success criteria
+   - Constraints, preferences, or scope boundaries they specified
+   - Any ambiguities that were resolved (and how)
+
+2. **Progress**
+   - What has been completed, with concrete references (file paths,
+     resource identifiers, tool outputs, URLs, etc.)
+   - Key artifacts produced and their current state
+   - What is in progress but incomplete, and its current state
+
+3. **Key Findings**
+   - Technical constraints, requirements, or domain details uncovered
+   - Decisions made and their rationale
+   - Errors encountered and their resolutions
+   - Approaches that were tried and abandoned (and why—this prevents
+     the successor from repeating them)
+
+4. **Active Context**
+   - State of any external resources, sessions, or environments in use
+   - Relevant intermediate results, hypotheses, or working assumptions
+   - Dependencies between components or steps
+
+5. **Next Steps**
+   - Specific actions needed to complete the task, in priority order
+   - Known blockers or open questions that must be resolved
+   - For each step, note any prerequisites or risks
+
+6. **Commitments & Constraints**
+   - Promises made to the user (e.g., "I said I would do X before Y")
+   - User preferences or style requirements
+   - Any boundaries the user set on approach, tools, or scope
+
+Be concise but complete—err on the side of including anything that would
+prevent duplicate work, repeated mistakes, or broken promises. Do not include
+information that is obvious from the task description itself.
+
+Wrap your response in <summary></summary> tags.
+`;
+
+/** Opens the native post-compaction message, which (like the summary prompt) is sent as plain user text. */
+export const COMPACTION_RESUME_HEADER = "# Resuming from a compaction";
 
 // ---------------------------------------------------------------------------
 // Agent model catalog
@@ -183,6 +240,10 @@ export interface AntigravitySessionState {
   /** Steps hidden by history shrinking (compaction) so the step index never moves backwards. */
   stepOffset: number;
   userTurns: number;
+  /** Latest annotated user turn, which identifies the execution across a compaction. */
+  lastUserTurn?: string;
+  /** Set by compaction: the next request rebases the turn count instead of starting an execution. */
+  rebase?: boolean;
   /** Execution (user turn) in progress, and the one before it (`labels.last_execution_id`). */
   executionId?: string;
   lastExecutionId?: string;
@@ -253,11 +314,16 @@ export function advanceEnvelope(
   state.historySteps = steps;
   const step = steps + state.stepOffset;
 
-  if (userTurns !== state.userTurns) {
-    state.userTurns = userTurns;
+  // Compaction shrinks the history but, like the native client, keeps the
+  // execution going unless the latest user turn changed.
+  const lastUserTurn = contents.findLast((content) => content.parts[0]?.text?.startsWith("<USER_REQUEST>"))?.parts[0].text;
+  if (state.rebase ? lastUserTurn !== state.lastUserTurn : userTurns !== state.userTurns) {
     state.lastExecutionId = state.executionId;
     state.executionId = crypto.randomUUID();
   }
+  state.userTurns = userTurns;
+  state.lastUserTurn = lastUserTurn;
+  state.rebase = false;
   state.usedClaude ||= model.apiProvider === ANTHROPIC;
   state.usedNonGemini ||= model.apiProvider !== GEMINI;
 
@@ -290,9 +356,12 @@ export interface BodyRewriteOptions {
   wireModelId: string;
   model: WireModel;
   projectId: string;
+  /** Trajectory state of this request kind. */
   state: AntigravitySessionState;
-  /** Route OpenCode title and compaction requests as checkpoint calls. */
-  checkpoint: boolean;
+  /** The conversation's state: session id and history annotations (the primary state for title and compaction). */
+  history: AntigravitySessionState;
+  /** Title and compaction requests go out as native checkpoints; everything else as agent requests. */
+  kind: "agent" | "title" | "compaction";
 }
 
 /**
@@ -300,17 +369,18 @@ export interface BodyRewriteOptions {
  * Code Assist envelope, in the native client's key order. Agent requests get
  * the catalog's output cap and thinking config, VALIDATED function calling,
  * native user turns and tool results, session labels, and session id.
- * Checkpoint calls use the native title model and leave the trajectory untouched.
+ * Checkpoint calls leave the trajectory untouched: titles use the native
+ * title model, compaction the current model with its tools disabled.
  */
 export function rewriteBodyForAntigravity(options: BodyRewriteOptions): Record<string, any> {
-  const { args, logicalModelId, wireModelId, model, projectId, state, checkpoint } = options;
+  const { args, logicalModelId, wireModelId, model, projectId, state, history, kind } = options;
   // The native system prompt is one text part.
   const systemInstruction = args.systemInstruction && {
     role: "user",
     parts: [{ text: args.systemInstruction.parts.map((part: Record<string, any>) => part.text).join("\n") }],
   };
 
-  if (checkpoint) {
+  if (kind === "title") {
     return {
       project: projectId,
       requestId: `checkpoint/${crypto.randomUUID()}`,
@@ -318,7 +388,7 @@ export function rewriteBodyForAntigravity(options: BodyRewriteOptions): Record<s
         contents: normalizeContentsForAntigravity(args.contents, CHECKPOINT_MODEL, false),
         ...(systemInstruction ? { systemInstruction } : {}),
         generationConfig: { maxOutputTokens: 16384, thinkingConfig: { includeThoughts: false, thinkingBudget: 0 } },
-        sessionId: state.sessionId,
+        sessionId: history.sessionId,
       },
       model: CHECKPOINT_MODEL,
       userAgent: "antigravity",
@@ -327,16 +397,48 @@ export function rewriteBodyForAntigravity(options: BodyRewriteOptions): Record<s
   }
 
   const claude = model.apiProvider === ANTHROPIC;
-  const contents = normalizeContentsForAntigravity(args.contents, logicalModelId, claude, {
-    state,
-    wireModelId,
-    modelName: model.displayName ?? wireModelId,
-  });
+  // A compaction request ends with its summary prompt, which stays plain user text.
+  const end =
+    kind === "compaction"
+      ? args.contents.findLastIndex(
+          (content: Record<string, any>) =>
+            content.role === "model" || content.parts.some((part: Record<string, any>) => part.functionResponse),
+        ) + 1
+      : args.contents.length;
+  const contents = [
+    ...normalizeContentsForAntigravity(args.contents.slice(0, end), logicalModelId, claude, {
+      state: history,
+      wireModelId,
+      modelName: model.displayName ?? wireModelId,
+    }),
+    ...args.contents.slice(end),
+  ];
   const request: Record<string, any> = {
     contents,
     ...(systemInstruction ? { systemInstruction } : {}),
     ...(args.tools ? { tools: normalizeTools(args.tools) } : {}),
   };
+  // Only the catalog's thinking config; OpenCode's sampling settings are not
+  // part of the native request.
+  const thinkingConfig = claude
+    ? { includeThoughts: true, thinkingBudget: 0, thinkingLevel: THINKING_LEVELS[model.thinkingLevel!] }
+    : model.thinkingBudget !== undefined
+      ? { includeThoughts: true, thinkingBudget: model.thinkingBudget }
+      : undefined;
+
+  if (kind === "compaction") {
+    request["toolConfig"] = { functionCallingConfig: { mode: "NONE" } };
+    request["generationConfig"] = { maxOutputTokens: 16384, ...(thinkingConfig ? { thinkingConfig } : {}) };
+    request["sessionId"] = history.sessionId;
+    return {
+      project: projectId,
+      requestId: `checkpoint/${crypto.randomUUID()}`,
+      request,
+      model: wireModelId,
+      userAgent: "antigravity",
+      requestType: "checkpoint",
+    };
+  }
 
   // VALIDATED like the native client, except NONE (OpenCode's step limit)
   // for Claude. Live-tested 2026-10-04: CCA ignores NONE and ANY on Gemini,
@@ -346,17 +448,8 @@ export function rewriteBodyForAntigravity(options: BodyRewriteOptions): Record<s
 
   const envelope = advanceEnvelope(state, contents, model);
   request["labels"] = envelope.labels;
-  // Only the catalog's output cap and thinking config; OpenCode's sampling
-  // settings are not part of the native request.
-  request["generationConfig"] = {
-    maxOutputTokens: model.maxOutputTokens,
-    ...(claude
-      ? { thinkingConfig: { includeThoughts: true, thinkingBudget: 0, thinkingLevel: THINKING_LEVELS[model.thinkingLevel!] } }
-      : model.thinkingBudget !== undefined
-        ? { thinkingConfig: { includeThoughts: true, thinkingBudget: model.thinkingBudget } }
-        : {}),
-  };
-  request["sessionId"] = state.sessionId;
+  request["generationConfig"] = { maxOutputTokens: model.maxOutputTokens, ...(thinkingConfig ? { thinkingConfig } : {}) };
+  request["sessionId"] = history.sessionId;
 
   return {
     project: projectId,
@@ -387,8 +480,12 @@ function normalizeContentsForAntigravity(
   const gemini3 = logicalModelId.startsWith("gemini-3");
   const now = Date.now();
   const occurrences = new Map<string, number>();
+  // Gemini 3 validates signatures only on calls after the latest user turn.
+  const turnStart = contents.findLastIndex(
+    (content) => content.role === "user" && !content.parts.some((part: Record<string, any>) => part.functionResponse),
+  );
 
-  return contents.flatMap((content: Record<string, any>) => {
+  return contents.flatMap((content: Record<string, any>, index) => {
     if (content.parts.some((part: Record<string, any>) => part.functionResponse)) {
       // Native tool results wrap the result text as `output`; only Anthropic
       // models receive them as the user role.
@@ -409,7 +506,16 @@ function normalizeContentsForAntigravity(
     }
     if (content.role !== "model") {
       const texts = content.parts.filter((part: Record<string, any>) => part.text !== undefined);
-      if (!agent || content.role !== "user" || texts.length === 0) return [content];
+      // Post-compaction summaries are plain user text, like the native resume message.
+      if (
+        !agent ||
+        content.role !== "user" ||
+        texts.length === 0 ||
+        texts[0].text.startsWith(COMPACTION_RESUME_HEADER) ||
+        texts[0].text.startsWith("<conversation-checkpoint>")
+      ) {
+        return [content];
+      }
       const text = texts.map((part: Record<string, any>) => part.text).join("\n");
       // Repeated identical turns ("continue") each keep their own metadata.
       const occurrence = (occurrences.get(text) ?? 0) + 1;
@@ -451,9 +557,10 @@ function normalizeContentsForAntigravity(
     // Native assistant replay: one joined thought part, one joined text part
     // (omitted when whitespace-only), then calls. The message signature moves
     // to the first non-thought part; call signatures stay on their calls.
-    // Claude rejects thinking when the message has no signature to replay.
+    // Like the native client, thinking without a signature (from another
+    // model) is dropped.
     const signed = source.some((part) => part.thoughtSignature && part.thoughtSignature !== SKIP_THOUGHT_SIGNATURE);
-    const thoughts = !claude || signed ? source.filter((part) => part.thought === true) : [];
+    const thoughts = signed ? source.filter((part) => part.thought === true) : [];
     const texts = source.filter((part) => part.thought !== true && part.text !== undefined);
     const signature = [...thoughts, ...texts].find((part) => part.thoughtSignature)?.thoughtSignature;
     const parts: Record<string, any>[] = [];
@@ -473,7 +580,8 @@ function normalizeContentsForAntigravity(
       target.thoughtSignature = signature;
     }
 
-    if (gemini3) {
+    // Native replays older unsigned calls bare; only the current turn needs the bypass.
+    if (gemini3 && index > turnStart) {
       let firstFunctionCall = true;
       for (const part of parts) {
         if (!part.functionCall) continue;

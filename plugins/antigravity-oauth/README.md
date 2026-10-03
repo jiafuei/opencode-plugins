@@ -61,6 +61,18 @@ Wire models whose display names differ only by a `(Low)` / `(Medium)` / `(High)`
 - `trajectoryAcls`: `true` sends `writeTrajectoryAcls` for a session's trajectory before its first agent request, as the native client does. Default `false`.
 - `metrics`: `true` sends `recordCodeAssistMetrics` (trace id and 100ns-resolution streaming latencies) after each agent or checkpoint stream that finishes, as the native client does. Default `false`.
 
+**Native compaction** (needs an OpenCode build with the experimental `experimental.compaction.native` hook; without it, compaction fails as unsupported)
+
+```jsonc
+{
+  "providers": {
+    "google-antigravity": { "settings": { "compaction": { "type": "native" } } }
+  }
+}
+```
+
+The plugin then compacts like the native client: the full history goes out with the native summary prompt, and the new window is the latest user request plus the native `# Resuming from a compaction` message (the last ten user requests and the summary). Without the setting, OpenCode's own summary compaction runs and only its request envelope is native.
+
 **Environment overrides**
 
 | Variable | Meaning | Default |
@@ -85,10 +97,10 @@ The provider uses OpenCode's native Gemini client (`@opencode/ai/providers/googl
   - Function calling is always `VALIDATED`, except OpenCode's step-limit `none`, which Claude gets as `NONE`. Live tests showed Cloud Code Assist ignores `NONE` and `ANY` on Gemini, GPT-OSS leaks raw harmony tokens under `NONE`, and Claude rejects `ANY` while thinking is on, so structured output relies on the model choosing the tool.
   - Tools are sent one declaration per `Tool`, sorted by name. Schemas are converted from `parametersJsonSchema` into the native converter's shape: uppercase type names, sorted `properties`, no `title` or `propertyOrdering`, with `format`, `pattern`, `minimum`/`maximum`, `minLength`/`maxLength`, and `minItems`/`maxItems` kept in proto field order (int64 bounds as strings).
   - User turns are wrapped as `<USER_REQUEST>…</USER_REQUEST>` followed by `<ADDITIONAL_METADATA>` with the local time the turn was first sent; the first turn and every model change also get the native `<USER_SETTINGS_CHANGE>` note. The metadata is cached per turn so replays stay byte-identical.
-  - Assistant turns are replayed the native way: one joined thought part, one joined text part (dropped when whitespace-only), then function calls, with the message signature on the first non-thought part. Empty or trailing `<tool_code>` wrappers are removed from the text. Claude thinking is kept only when the message carries a signature produced by the same wire model; switching Claude tiers drops earlier thinking and signatures like the native client.
+  - Assistant turns are replayed the native way: one joined thought part, one joined text part (dropped when whitespace-only), then function calls, with the message signature on the first non-thought part. Empty or trailing `<tool_code>` wrappers are removed from the text. Thinking is kept only when the message carries a signature (thinking from another model has none), and for Claude only when the same wire model produced it, so switching Claude tiers drops earlier thinking and signatures like the native client. Gemini 3's signature bypass is added only to unsigned calls after the latest user turn; older calls replay bare.
   - Tool results are sent as `functionResponse.response.output` in the provider's native role (`user` for Claude, `model` otherwise), prefixed with `Created At:` / `Completed At:` local timestamps (call streamed, result first sent).
-- Auxiliary requests: title and compaction requests use the `checkpoint` envelope (`gemini-3.1-flash-lite`, `requestId = checkpoint/<uuid>`, thinking off, 16,384 output tokens). Transient generation keeps its selected model. Each request kind has separate trajectory and retry-endpoint state, so auxiliary calls do not advance the primary conversation's trajectory.
-- Successful compaction starts a fresh primary trajectory and clears its step, execution, and ACL state, while preserving the conversation ID, session ID, and endpoint. Failed compaction leaves the trajectory intact.
+- Auxiliary requests use the `checkpoint` envelope (`requestId = checkpoint/<uuid>`, 16,384 output tokens, no labels) with the conversation's session id. Titles go to `gemini-3.1-flash-lite` with thinking off. Compaction goes to the current model with its thinking config, the conversation's tools, and `toolConfig: NONE`; the history replays with the conversation's cached annotations and the summary prompt stays plain user text. Transient generation keeps its selected model. Each request kind has separate trajectory and retry-endpoint state, so auxiliary calls do not advance the primary conversation's trajectory.
+- Compaction continues the primary trajectory like the native client: the trajectory id stays, the step never moves backwards, and the execution only changes when the latest user turn does. Plain-text summaries (the native resume message, OpenCode's `<conversation-checkpoint>`) are not wrapped as user requests.
 - Side calls (opt-in via `trajectoryAcls` / `metrics`): `writeTrajectoryAcls` for the trajectory before its first agent request (5 s timeout; a failed grant is retried on the next request and never blocks generation), and `recordCodeAssistMetrics` after each completed agent or checkpoint stream. Without them only generation requests are sent.
 - Responses: SSE events wrapping Gemini chunks under `response` are unwrapped incrementally (no full buffering) for the native parser. In-band error events surface as stream errors with sanitized messages (and count as endpoint failures in `"auto"` mode).
 
@@ -110,6 +122,7 @@ OpenCode stores the OAuth credential (`refresh`, `access`, `expires`) and refres
 - Tool errors are sent as `output` rather than the native `error` key, because OpenCode's Gemini request does not mark failed tool results.
 - The tool timestamps, per-turn metadata, and signature-to-model map live in memory: after a restart, replayed history gets fresh timestamps and Claude tier-switch detection only covers new signatures.
 - `<ADDITIONAL_METADATA>` has no editor-state section (open files, cursor), since OpenCode has no editor.
+- OpenCode's summary compaction sends only the older part of the history with its own prompt (and one reminder if the reply skips its template), and later requests open with its `<conversation-checkpoint>` message. Native compaction (above) avoids this. The native step after compaction also advances past the checkpoint; the plugin only keeps it from moving backwards.
 - OMP's flash "planning leak" filtering and forced-tool directive text are not reproduced; requests rely on OpenCode's own Gemini serialization otherwise.
 - Schema normalization covers the constructs OpenCode emits in practice (`anyOf`/`oneOf` folding, null unions, unsupported keyword stripping) but not OMP's full combiner-merge matrix.
 - There is no in-request endpoint failover or first-event watchdog: `"auto"` mode only switches endpoints between attempts, relying on OpenCode's retry policy to re-issue a failed request.

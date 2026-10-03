@@ -110,7 +110,12 @@ function baseArgs(): Record<string, any> {
   };
 }
 
-function rewrite(args: Record<string, any>, wireModelId: string, state = createSessionState()): Record<string, any> {
+function rewrite(
+  args: Record<string, any>,
+  wireModelId: string,
+  state = createSessionState(),
+  kind: "agent" | "title" | "compaction" = "agent",
+): Record<string, any> {
   return rewriteBodyForAntigravity({
     args,
     logicalModelId: wireModelId.replace(/-(low|medium|high)$/, ""),
@@ -118,7 +123,8 @@ function rewrite(args: Record<string, any>, wireModelId: string, state = createS
     model: SNAPSHOT_CATALOG[wireModelId]!,
     projectId: "proj-1",
     state,
-    checkpoint: false,
+    history: state,
+    kind,
   });
 }
 
@@ -169,15 +175,7 @@ describe("body rewrite", () => {
 
   test("title requests become checkpoint calls that leave the trajectory untouched", () => {
     const state = createSessionState();
-    const body = rewriteBodyForAntigravity({
-      args: { ...baseArgs(), generationConfig: { temperature: 0.5 } },
-      logicalModelId: "claude-opus-5-5",
-      wireModelId: "claude-opus-5-5-high",
-      model: SNAPSHOT_CATALOG["claude-opus-5-5-high"]!,
-      projectId: "proj-1",
-      state,
-      checkpoint: true,
-    });
+    const body = rewrite({ ...baseArgs(), generationConfig: { temperature: 0.5 } }, "claude-opus-5-5-high", state, "title");
     expect(body).toEqual({
       project: "proj-1",
       requestId: expect.stringMatching(/^checkpoint\/[0-9a-f-]{36}$/),
@@ -198,6 +196,30 @@ describe("body rewrite", () => {
     const agent = rewrite(baseArgs(), "claude-opus-5-5-high");
     expect(agent).toMatchObject({ model: "claude-opus-5-5-high", requestType: "agent" });
     expect(agent.request.tools).toBeUndefined();
+  });
+
+  test("compaction is a checkpoint on the current model with tools disabled", () => {
+    const state = createSessionState();
+    const args = {
+      ...baseArgs(),
+      contents: [user("a"), call("x"), results("x")],
+      tools: [{ functionDeclarations: [{ name: "t", parameters: { type: "object", properties: {} } }] }],
+    };
+    const agent = rewrite(args, "gemini-3.8-flash-medium", state);
+    const steps = state.historySteps;
+
+    const body = rewrite({ ...args, contents: [...args.contents, user("Summarize")] }, "gemini-3.8-flash-medium", state, "compaction");
+    expect(body).toMatchObject({ model: "gemini-3.8-flash-medium", requestType: "checkpoint" });
+    expect(Object.keys(body.request)).toEqual(["contents", "systemInstruction", "tools", "toolConfig", "generationConfig", "sessionId"]);
+    expect(body.request.toolConfig).toEqual({ functionCallingConfig: { mode: "NONE" } });
+    expect(body.request.generationConfig).toEqual({
+      maxOutputTokens: 16384,
+      thinkingConfig: { includeThoughts: true, thinkingBudget: 4000 },
+    });
+    // The history replays byte-identically; the summary prompt stays plain user text.
+    expect(body.request.contents.slice(0, 3)).toEqual(agent.request.contents);
+    expect(body.request.contents[3]).toEqual(user("Summarize"));
+    expect(state.historySteps).toBe(steps);
   });
 
   test("sends VALIDATED except NONE for Claude", () => {
@@ -249,6 +271,10 @@ describe("body rewrite", () => {
 
   test("normalizes Gemini 3 function-call signatures per model turn", () => {
     const contents = [
+      user("a"),
+      { role: "model", parts: [{ functionCall: { name: "older", args: {} } }] },
+      results("older"),
+      user("b"),
       {
         role: "model",
         parts: [
@@ -261,12 +287,20 @@ describe("body rewrite", () => {
     ];
     const body = rewrite({ contents }, "gemini-3.8-flash-low");
 
-    expect(body.request.contents[0].parts[0].thoughtSignature).toBe("signed");
-    expect(body.request.contents[0].parts[1].thoughtSignature).toBeUndefined();
-    expect(body.request.contents[2].parts[0].thoughtSignature).toBe("skip_thought_signature_validator");
+    // Calls before the latest user turn replay bare, like the native client.
+    expect(body.request.contents[1].parts[0].thoughtSignature).toBeUndefined();
+    expect(body.request.contents[4].parts[0].thoughtSignature).toBe("signed");
+    expect(body.request.contents[4].parts[1].thoughtSignature).toBeUndefined();
+    expect(body.request.contents[6].parts[0].thoughtSignature).toBe("skip_thought_signature_validator");
   });
 
-  test("keeps Claude thinking only for messages that carry a signature", () => {
+  test("keeps thinking only for messages that carry a signature", () => {
+    // Unsigned thinking comes from another model; native drops it for every family.
+    expect(
+      rewrite({ contents: [{ role: "model", parts: [{ text: "unsigned", thought: true }, { text: "answer" }] }] }, "gemini-3.8-flash-low")
+        .request.contents,
+    ).toEqual([{ role: "model", parts: [{ text: "answer" }] }]);
+
     const body = rewrite(
       {
         contents: [

@@ -5,6 +5,8 @@ import {
   ANTIGRAVITY_DAILY_ENDPOINT,
   ANTIGRAVITY_ENDPOINTS,
   ANTIGRAVITY_SANDBOX_ENDPOINT,
+  COMPACTION_PROMPT,
+  COMPACTION_RESUME_HEADER,
   PROVIDER_ID,
   SNAPSHOT_CATALOG,
   WIRE_MODEL_HEADER,
@@ -52,6 +54,16 @@ const PASTE_METHOD_ID = Integration.MethodID.make("paste");
 export const FLOW_TIMEOUT_MS = 5 * 60 * 1000;
 
 type EndpointMode = "auto" | "production" | "sandbox";
+
+type TextMessage = { role: string; content: ReadonlyArray<{ type: string; text?: string }> };
+// The published plugin types predate this hook, so it is typed here.
+type NativeCompaction = {
+  sessionID: string;
+  messages: ReadonlyArray<TextMessage>;
+  retained: ReadonlyArray<unknown>;
+  send: (input: { options: Record<string, unknown> }) => Promise<{ content: TextMessage["content"] }>;
+  result?: { replacement: ReadonlyArray<unknown> };
+};
 
 /** The Cloud Code Assist project and account email ride the credential metadata. */
 function toCredential(methodID: Integration.MethodID, credentials: OAuthCredentials): Credential.OAuth {
@@ -166,6 +178,8 @@ export default Plugin.define({
 
     /** Per-OpenCode-session envelope identity; cleared on session deletion and credential switches. */
     const sessionStates = new Map<string, Map<string, AntigravitySessionState>>();
+    /** Sessions with a native compaction in flight; its request carries the native summary prompt. */
+    const nativeCompactions = new Set<string>();
     /** Dispatched generation calls, for the metrics the native client records after each stream. */
     const pendingCalls = new WeakMap<
       Request,
@@ -299,28 +313,32 @@ export default Plugin.define({
         const verb = match[2]!;
         const stream = verb === "streamGenerateContent";
 
-        let states = sessionStates.get(evt.sessionID);
-        if (!states) {
-          states = new Map();
-          sessionStates.set(evt.sessionID, states);
-        }
-        // Auxiliary calls keep their own trajectory and retry endpoint.
-        let state = states.get(evt.kind);
-        if (!state) {
-          state = createSessionState();
-          states.set(evt.kind, state);
-        }
+        const states = sessionStates.get(evt.sessionID) ?? new Map<string, AntigravitySessionState>();
+        sessionStates.set(evt.sessionID, states);
+        const stateFor = (kind: string) => {
+          if (!states.has(kind)) states.set(kind, createSessionState());
+          return states.get(kind)!;
+        };
+        // Auxiliary calls keep their own trajectory and retry endpoint; title
+        // and compaction share the conversation's session id and annotations.
+        const state = stateFor(evt.kind);
+        const kind = evt.kind === "title" || evt.kind === "compaction" ? evt.kind : "agent";
         const wireModelId = request.headers.get(WIRE_MODEL_HEADER)!;
         const model = (loaded.catalog ?? SNAPSHOT_CATALOG)[wireModelId];
         if (!model) throw new Error(`Antigravity model "${wireModelId}" is not in the current model catalog`);
+        const args = await request.json();
+        if (kind === "compaction" && nativeCompactions.has(evt.sessionID)) {
+          args.contents.push({ role: "user", parts: [{ text: COMPACTION_PROMPT }] });
+        }
         const envelope = rewriteBodyForAntigravity({
-          args: await request.json(),
+          args,
           logicalModelId: match[1]!,
           wireModelId,
           model,
           projectId: loaded.projectId!,
           state,
-          checkpoint: evt.kind === "title" || evt.kind === "compaction",
+          history: kind === "agent" ? state : stateFor("primary"),
+          kind,
         });
         const agent = envelope.requestType === "agent";
         // OpenCode sends the OAuth access token as the Gemini API key. The
@@ -450,6 +468,49 @@ export default Plugin.define({
       { providerID: PROVIDER_ID },
     );
 
+    // Native compaction (opt in with the provider's `compaction.type: "native"`;
+    // the hook needs an OpenCode build that has it): the native summary prompt
+    // over the full history, and the native resume message as the new window.
+    await (ctx.session.hook as any)(
+      "experimental.compaction.native",
+      async (event: NativeCompaction) => {
+        nativeCompactions.add(event.sessionID);
+        const { content } = await event.send({ options: {} }).finally(() => nativeCompactions.delete(event.sessionID));
+        const summary = content
+          .filter((part) => part.type === "text")
+          .map((part) => part.text)
+          .join("")
+          .trim();
+        if (!summary) throw new Error("Antigravity compaction returned no summary");
+        // The native message lists the latest ten user requests.
+        const requests = event.messages
+          .filter((message) => message.role === "user")
+          .map((message) =>
+            message.content
+              .filter((part) => part.type === "text")
+              .map((part) => part.text)
+              .join("\n"),
+          )
+          .filter((text) => text.trim())
+          .slice(-10);
+        const resume = [
+          COMPACTION_RESUME_HEADER,
+          "",
+          "You are continuing work on the task described above, but you have lost access to the full conversation history, and need to resume work efficiently using the progress summary below:",
+          "",
+          "# User Requests",
+          "The following were user requests from the truncated conversation in chronological order:",
+          ...requests.map((text, index) => `${index + 1}. ${text}`),
+          "",
+          summary,
+        ].join("\n");
+        event.result = {
+          replacement: [...event.retained.slice(-1), { role: "user", content: [{ type: "text", text: resume }] }],
+        };
+      },
+      { providerID: PROVIDER_ID },
+    );
+
     await ctx.websearch.transform((editor) => {
       if (!loaded.connection) return;
       editor.add({
@@ -520,19 +581,11 @@ export default Plugin.define({
     void (async () => {
       for await (const event of ctx.event.subscribe()) {
         if (event.type === "session.deleted") sessionStates.delete(event.data.sessionID);
+        // Like the native client, compaction continues the trajectory; the
+        // next request only rebases the shrunken history.
         if (event.type === "session.compaction.ended") {
           const state = sessionStates.get(event.data.sessionID)?.get("primary");
-          if (state) {
-            Object.assign(state, {
-              trajectoryId: crypto.randomUUID(),
-              historySteps: 0,
-              stepOffset: 0,
-              userTurns: 0,
-              executionId: undefined,
-              lastExecutionId: undefined,
-              aclWritten: false,
-            });
-          }
+          if (state) state.rebase = true;
         }
         if (event.type === "credential.switched" && event.data.integrationID === INTEGRATION_ID) {
           sessionStates.clear();

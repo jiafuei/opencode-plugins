@@ -1,6 +1,6 @@
 import { describe, expect, mock, test } from "bun:test";
 import plugin from "./server.ts";
-import { WIRE_MODEL_HEADER } from "./wire.ts";
+import { COMPACTION_PROMPT, WIRE_MODEL_HEADER } from "./wire.ts";
 
 // Route the native-framed transports through the global fetch the tests mock.
 mock.module("./transport.ts", () => {
@@ -534,7 +534,7 @@ describe("session HTTP hooks", () => {
     }
   });
 
-  test("only committed compaction resets the primary trajectory while retaining conversation identity and endpoint", async () => {
+  test("compaction continues the primary trajectory and execution, like the native client", async () => {
     const harness = makeHarness(OAUTH_AUTH, { trajectoryAcls: true });
     let attempts = 0;
     const mock = mockFetch((url) => {
@@ -550,23 +550,63 @@ describe("session HTTP hooks", () => {
     try {
       await send([turn("first")]);
       const before = await send([turn("first"), turn("second")]);
-      expect(before.body.request.labels.last_execution_id).toBeDefined();
-      await harness.emit({ type: "session.compaction.failed", data: { sessionID: "ses-compact" } });
-      const failed = await send([turn("first"), turn("second")]);
-      expect(failed.body.request.labels).toEqual(before.body.request.labels);
+      const labels = before.body.request.labels;
+      expect(labels.last_execution_id).toBeDefined();
 
-      await harness.emit({ type: "session.compaction.ended", data: { sessionID: "ses-compact" } });
-      const after = await send([turn("summary")]);
-      expect(after.body.request.labels.trajectory_id).not.toBe(before.body.request.labels.trajectory_id);
-      expect(after.body.request.labels.last_execution_id).toBeUndefined();
-      expect(after.body.request.labels.last_step_index).toBe("1");
-      expect(after.body.requestId.split("/")[1]).toBe(before.body.requestId.split("/")[1]);
+      await harness.emit({ type: "session.compaction.ended", data: { sessionID: "ses-compact", reason: "auto" } });
+      const after = await send([turn("second"), turn("# Resuming from a compaction\n\nsummary")]);
+      expect(after.body.request.contents[1].parts[0].text).toBe("# Resuming from a compaction\n\nsummary");
+      expect(after.body.request.labels.trajectory_id).toBe(labels.trajectory_id);
+      expect(after.body.request.labels.last_execution_id).toBe(labels.last_execution_id);
+      expect(Number(after.body.request.labels.last_step_index)).toBeGreaterThanOrEqual(Number(labels.last_step_index));
       expect(after.body.request.sessionId).toBe(before.body.request.sessionId);
       expect(new URL(after.url).origin).toBe(SANDBOX);
-      const grants = mock.calls.filter((call) => call.url.includes("writeTrajectoryAcls"));
-      expect(grants.map((call) => JSON.parse(String(call.init.body)).trajectoryId)).toEqual([
-        before.body.request.labels.trajectory_id,
-        after.body.request.labels.trajectory_id,
+      expect(mock.calls.filter((call) => call.url.includes("writeTrajectoryAcls"))).toHaveLength(1);
+
+      // The next new turn starts an execution as usual.
+      const next = await send([turn("second"), turn("# Resuming from a compaction\n\nsummary"), turn("third")]);
+      expect(next.body.request.labels.last_execution_id).not.toBe(labels.last_execution_id);
+    } finally {
+      mock.restore();
+    }
+  });
+
+  test("native compaction sends the native prompt and installs the native resume window", async () => {
+    const harness = makeHarness(OAUTH_AUTH);
+    const mock = mockFetch(() => sseResponse([]));
+    const turn = (text: string) => ({ role: "user", parts: [{ text }] });
+    const message = (role: string, text: string) => ({ role, content: [{ type: "text", text }] });
+    try {
+      await readStream(await harness.send("ses-native", nativeRequest("gemini-3.8-flash-medium", { contents: [turn("a")] })));
+      const primary = JSON.parse(String(mock.calls.at(-1)!.init.body));
+      const event: Record<string, any> = {
+        sessionID: "ses-native",
+        messages: [message("user", "a"), message("assistant", "ok"), message("user", "b")],
+        retained: [message("user", "b")],
+        send: async () => {
+          await readStream(
+            await harness.send(
+              "ses-native",
+              nativeRequest("gemini-3.8-flash-medium", { contents: [turn("a"), { role: "model", parts: [{ text: "ok" }] }, turn("b")] }),
+              "compaction",
+            ),
+          );
+          return { content: [{ type: "reasoning", text: "hmm" }, { type: "text", text: "<summary>S</summary>" }] };
+        },
+      };
+      await harness.hooks["session.experimental.compaction.native"]!(event);
+
+      const body = JSON.parse(String(mock.calls.at(-1)!.init.body));
+      expect(body).toMatchObject({ model: "gemini-3.8-flash-medium", requestType: "checkpoint" });
+      expect(body.request.sessionId).toBe(primary.request.sessionId);
+      expect(body.request.contents[0]).toEqual(primary.request.contents[0]);
+      expect(body.request.contents.at(-1)).toEqual({ role: "user", parts: [{ text: COMPACTION_PROMPT }] });
+      expect(event.result.replacement).toEqual([
+        message("user", "b"),
+        message(
+          "user",
+          "# Resuming from a compaction\n\nYou are continuing work on the task described above, but you have lost access to the full conversation history, and need to resume work efficiently using the progress summary below:\n\n# User Requests\nThe following were user requests from the truncated conversation in chronological order:\n1. a\n2. b\n\n<summary>S</summary>",
+        ),
       ]);
     } finally {
       mock.restore();
