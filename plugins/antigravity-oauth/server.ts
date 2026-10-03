@@ -36,7 +36,7 @@ import {
 // Configure in `opencode.json` like:
 //
 // {
-//   "plugins": [{ "package": "@jiafuei/opencode-antigravity-oauth", "options": { "endpointMode": "auto" } }]
+//   "plugins": [{ "package": "@jiafuei/opencode-antigravity-oauth", "options": { "endpointMode": "auto", "trajectoryAcls": false, "metrics": false } }]
 // }
 //
 // Then connect Google Antigravity and sign in with your Google account.
@@ -142,7 +142,7 @@ export function createCallbackWaiter(state: string, timeoutMs: number = FLOW_TIM
 export default Plugin.define({
   id: "antigravity_oauth",
   setup: async (ctx) => {
-    const options = ctx.options as { endpointMode?: EndpointMode };
+    const options = ctx.options as { endpointMode?: EndpointMode; trajectoryAcls?: boolean; metrics?: boolean };
     if (
       options.endpointMode !== undefined &&
       options.endpointMode !== "auto" &&
@@ -152,6 +152,9 @@ export default Plugin.define({
       throw new Error(`Unsupported Antigravity endpointMode "${String(options.endpointMode)}"`);
     }
     const endpointMode: EndpointMode = options.endpointMode ?? "auto";
+    /** Opt-in native side calls around generation requests. */
+    const trajectoryAcls = options.trajectoryAcls ?? false;
+    const metrics = options.metrics ?? false;
     // Pinned modes use one endpoint; auto starts at daily and falls back to sandbox.
     const endpoints: string[] =
       endpointMode === "production"
@@ -163,7 +166,7 @@ export default Plugin.define({
     /** Per-OpenCode-session envelope identity; cleared on session deletion and credential switches. */
     const sessionStates = new Map<string, AntigravitySessionState>();
     /** Dispatched generation calls, for the metrics the native client records after each stream. */
-    const pendingCalls = new WeakMap<Request, { sentAt: number; access: string; trajectoryId?: string }>();
+    const pendingCalls = new WeakMap<Request, { sentAt: number; access: string; projectId: string; trajectoryId?: string }>();
     /** Account-specific state loaded from the active connection. */
     let loaded: { connection?: Connection.Info; projectId?: string; catalog?: WireCatalog } = {};
 
@@ -307,6 +310,7 @@ export default Plugin.define({
           model,
           projectId: loaded.projectId!,
           state,
+          checkpoint: evt.kind === "title",
         });
         const agent = envelope.requestType === "agent";
         // OpenCode sends the OAuth access token as the Gemini API key. The
@@ -316,14 +320,15 @@ export default Plugin.define({
         const headers = antigravityHeaders(access);
         const endpoint = (endpointMode === "auto" && state.endpoint) || endpoints[0];
 
-        // The native client grants the trajectory's ACL before its first agent request.
-        if (agent && !state.aclWritten) {
-          await fetch(`${endpoint}/v1internal:writeTrajectoryAcls`, {
+        // The native client grants the trajectory's ACL before its first agent
+        // request. A failed grant never blocks generation and is retried next time.
+        if (trajectoryAcls && agent && !state.aclWritten) {
+          state.aclWritten = await fetch(`${endpoint}/v1internal:writeTrajectoryAcls`, {
             method: "POST",
             headers,
             body: JSON.stringify({ trajectoryId: state.trajectoryId }),
-          });
-          state.aclWritten = true;
+            signal: AbortSignal.timeout(5_000),
+          }).then((response) => response.ok, () => false);
         }
 
         evt.request = new Request(`${endpoint}/v1internal:${verb}${stream ? "?alt=sse" : ""}`, {
@@ -332,8 +337,9 @@ export default Plugin.define({
           body: JSON.stringify(envelope),
         });
         pendingCalls.set(evt.request, {
-          sentAt: Date.now(),
+          sentAt: performance.now(),
           access,
+          projectId: loaded.projectId!,
           ...(agent ? { trajectoryId: state.trajectoryId } : {}),
         });
       },
@@ -380,18 +386,25 @@ export default Plugin.define({
 
         // Like the native client, report each completed stream's latency.
         const call = pendingCalls.get(evt.request)!;
-        const duration = (ms: number) => `${ms % 1000 ? (ms / 1000).toFixed(3) : ms / 1000}s`;
+        // Protojson seconds at the native clock's 100ns resolution, trimmed to 0/3/6/9 digits.
+        const seconds = (ms: number) => {
+          const ticks = Math.round(ms * 1e4);
+          const nanos = String((ticks % 1e7) * 100).padStart(9, "0").replace(/(000)+$/, "");
+          return `${Math.floor(ticks / 1e7)}${nanos && `.${nanos}`}`;
+        };
+        const duration = (ms: number) => `${seconds(ms)}s`;
         const recordMetrics = ({ traceId, firstMessageAt }: StreamCompletion) => {
-          const now = Date.now();
+          const now = performance.now();
+          const epoch = performance.timeOrigin + now;
           void fetch(`${url.origin}/v1internal:recordCodeAssistMetrics`, {
             method: "POST",
             headers: antigravityHeaders(call.access),
             body: JSON.stringify({
-              project: loaded.projectId,
+              project: call.projectId,
               requestId: crypto.randomUUID(),
               metadata: { ideType: "ANTIGRAVITY", ideVersion: getAntigravityVersion(), platform: getAntigravityPlatform() },
               metrics: [{
-                timestamp: new Date(now).toISOString(),
+                timestamp: `${new Date(epoch).toISOString().slice(0, 19)}${seconds(epoch % 1000).slice(1)}Z`,
                 conversationOffered: {
                   status: "ACTION_STATUS_NO_ERROR",
                   traceId,
@@ -409,7 +422,7 @@ export default Plugin.define({
           }).catch(() => {}); // Telemetry never affects the conversation.
         };
         evt.response = new Response(
-          response.body!.pipeThrough(createCcaSseUnwrap(failover, recordMetrics)),
+          response.body!.pipeThrough(createCcaSseUnwrap(failover, metrics ? recordMetrics : undefined)),
           { status: response.status, statusText: response.statusText, headers: unwrappedResponseHeaders(response) },
         );
       },

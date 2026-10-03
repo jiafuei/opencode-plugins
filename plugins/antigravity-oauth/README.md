@@ -50,7 +50,7 @@ Wire models whose display names differ only by a `(Low)` / `(Medium)` / `(High)`
 // opencode.json
 {
   "plugins": [
-    { "package": "@jiafuei/opencode-antigravity-oauth", "options": { "endpointMode": "auto" } }
+    { "package": "@jiafuei/opencode-antigravity-oauth", "options": { "endpointMode": "auto", "trajectoryAcls": false, "metrics": false } }
   ]
 }
 ```
@@ -58,6 +58,8 @@ Wire models whose display names differ only by a `(Low)` / `(Medium)` / `(High)`
 **Options**
 
 - `endpointMode`: `"auto"` (default) dispatches to `https://daily-cloudcode-pa.googleapis.com` first; a failed response moves that session to the other endpoint (sandbox, or back to daily), so OpenCode's retry lands there, and a successful one keeps it. `"production"` / `"sandbox"` pin one endpoint.
+- `trajectoryAcls`: `true` sends `writeTrajectoryAcls` for a session's trajectory before its first agent request, as the native client does. Default `false`.
+- `metrics`: `true` sends `recordCodeAssistMetrics` (trace id and 100ns-resolution streaming latencies) after each agent or checkpoint stream that finishes, as the native client does. Default `false`.
 
 **Environment overrides**
 
@@ -82,10 +84,10 @@ The provider uses OpenCode's native Gemini client (`@opencode/ai/providers/googl
   - `generationConfig` holds only the catalog's `maxOutputTokens` and thinking config: `thinkingBudget` for Gemini and GPT-OSS, `thinkingLevel` (`LOW`/`MEDIUM`/`HIGH`) for Claude. OpenCode's sampling settings (temperature, topP, topK, stop sequences, seed) are not sent.
   - Function calling defaults to `VALIDATED` (forced for Claude).
   - Tool schemas are converted from `parametersJsonSchema` into the native converter's shape: uppercase type names, sorted `properties`, no `title` or `propertyOrdering`.
-  - Assistant turns are replayed the native way: one joined thought part, one joined text part (dropped when whitespace-only), then function calls, with the message signature on the first non-thought part.
+  - Assistant turns are replayed the native way: one joined thought part, one joined text part (dropped when whitespace-only), then function calls, with the message signature on the first non-thought part. Empty or trailing `<tool_code>` wrappers are removed from the text. Claude thinking is kept only when the message carries a signature.
   - Tool results are sent as `functionResponse.response.output` in the provider's native role (`user` for Claude, `model` otherwise).
-- Title generation: OpenCode's tool-less title requests go out as native `checkpoint` calls (`gemini-3.1-flash-lite`, `requestId = checkpoint/<uuid>`, thinking off, 16,384 output tokens) and do not advance the session's trajectory.
-- Side calls: `writeTrajectoryAcls` for the trajectory before its first agent request, and `recordCodeAssistMetrics` (trace id and streaming latencies) after each completed agent or checkpoint stream, as the native client does.
+- Title generation: OpenCode's title requests go out as native `checkpoint` calls (`gemini-3.1-flash-lite`, `requestId = checkpoint/<uuid>`, thinking off, 16,384 output tokens) and do not advance the session's trajectory.
+- Side calls (opt-in via `trajectoryAcls` / `metrics`): `writeTrajectoryAcls` for the trajectory before its first agent request (5 s timeout; a failed grant is retried on the next request and never blocks generation), and `recordCodeAssistMetrics` after each completed agent or checkpoint stream. Without them only generation requests are sent.
 - Responses: SSE events wrapping Gemini chunks under `response` are unwrapped incrementally (no full buffering) for the native parser. In-band error events surface as stream errors with sanitized messages (and count as endpoint failures in `"auto"` mode).
 
 Credentials only ever go to the two official Cloud Code Assist endpoints: the target URL is built from the endpoint mode, not from the configured `baseURL`. There is no plain API-key mode.
@@ -104,7 +106,6 @@ OpenCode stores the OAuth credential (`refresh`, `access`, `expires`) and refres
 - Free-tier quota windows (daily/weekly buckets per backend) are enforced server-side; the plugin does not track or display usage.
 - Bun's HTTP client cannot reproduce the Go client exactly: it always adds `Accept: */*` and `Connection: keep-alive`, sends streaming bodies with `Content-Length`, and has its own header order and TLS handshake.
 - Tool errors are sent as `output` rather than the native `error` key, because OpenCode's Gemini request does not mark failed tool results.
-- A tool-less request from any OpenCode agent, not only title generation, is sent as a checkpoint call on `gemini-3.1-flash-lite`.
 - Switching models mid-session keeps OpenCode's history serialization as is; the native client's model-switch body handling is not reproduced.
 - OMP's flash "planning leak" filtering and forced-tool directive text are not reproduced; requests rely on OpenCode's own Gemini serialization otherwise.
 - Schema normalization covers the constructs OpenCode emits in practice (`anyOf`/`oneOf` folding, null unions, unsupported keyword stripping) but not OMP's full combiner-merge matrix.

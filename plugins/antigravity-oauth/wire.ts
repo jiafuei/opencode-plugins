@@ -270,6 +270,8 @@ export interface BodyRewriteOptions {
   model: WireModel;
   projectId: string;
   state: AntigravitySessionState;
+  /** OpenCode's title generation, which the native client runs as a `checkpoint` call. */
+  checkpoint: boolean;
 }
 
 /**
@@ -277,18 +279,17 @@ export interface BodyRewriteOptions {
  * Code Assist envelope, in the native client's key order. Agent requests get
  * the catalog's output cap and thinking config, VALIDATED function calling
  * (forced for Claude), native tool results, session labels, and session id.
- * Requests without tools are OpenCode's title generation, which the native
- * client runs as a `checkpoint` call that leaves the trajectory untouched.
+ * Checkpoint calls use the native title model and leave the trajectory untouched.
  */
 export function rewriteBodyForAntigravity(options: BodyRewriteOptions): Record<string, any> {
-  const { args, logicalModelId, wireModelId, model, projectId, state } = options;
+  const { args, logicalModelId, wireModelId, model, projectId, state, checkpoint } = options;
   // The native system prompt is one text part.
   const systemInstruction = args.systemInstruction && {
     role: "user",
     parts: [{ text: args.systemInstruction.parts.map((part: Record<string, any>) => part.text).join("\n") }],
   };
 
-  if (!args.tools) {
+  if (checkpoint) {
     return {
       project: projectId,
       requestId: `checkpoint/${crypto.randomUUID()}`,
@@ -309,7 +310,7 @@ export function rewriteBodyForAntigravity(options: BodyRewriteOptions): Record<s
   const request: Record<string, any> = {
     contents,
     ...(systemInstruction ? { systemInstruction } : {}),
-    tools: normalizeTools(args.tools),
+    ...(args.tools ? { tools: normalizeTools(args.tools) } : {}),
   };
 
   // Antigravity's default tool mode is VALIDATED, forced for Claude. An
@@ -367,17 +368,23 @@ function normalizeContentsForAntigravity(
     // Native assistant replay: one joined thought part, one joined text part
     // (omitted when whitespace-only), then calls. The message signature moves
     // to the first non-thought part; call signatures stay on their calls.
-    // Claude rejects thinking that has no signature to replay.
-    const thoughts = content.parts.filter(
-      (part: Record<string, any>) => part.thought === true && (!claude || part.thoughtSignature),
+    // Claude rejects thinking when the message has no signature to replay.
+    const signed = content.parts.some(
+      (part: Record<string, any>) => part.thoughtSignature && part.thoughtSignature !== SKIP_THOUGHT_SIGNATURE,
     );
+    const thoughts = !claude || signed ? content.parts.filter((part: Record<string, any>) => part.thought === true) : [];
     const texts = content.parts.filter((part: Record<string, any>) => part.thought !== true && part.text !== undefined);
     const signature = [...thoughts, ...texts].find((part) => part.thoughtSignature)?.thoughtSignature;
     const parts: Record<string, any>[] = [];
     if (thoughts.length > 0) {
       parts.push({ text: thoughts.map((part: Record<string, any>) => part.text).join(""), thought: true });
     }
-    const text = texts.map((part: Record<string, any>) => part.text).join("");
+    // Like the native client, drop empty or trailing `<tool_code>` wrappers.
+    const text = texts
+      .map((part: Record<string, any>) => part.text)
+      .join("")
+      .replace(/<tool_code>(\s*)<\/tool_code>/g, "")
+      .replace(/<tool_code>\s*$/, "");
     if (text.trim()) parts.push({ text });
     parts.push(...content.parts.filter((part: Record<string, any>) => part.text === undefined).map((part: Record<string, any>) => ({ ...part })));
     const target = parts.find((part) => part.thought !== true) ?? parts[0];
@@ -466,7 +473,7 @@ export function describeInBandError(error: InBandError): string {
 export interface StreamCompletion {
   /** Outer `traceId` of the stream's events. */
   traceId?: string;
-  /** When the first non-empty text or thought arrived; unset for call-only turns. */
+  /** `performance.now()` when the first non-empty text or thought arrived; unset for call-only turns. */
   firstMessageAt?: number;
 }
 
@@ -475,7 +482,7 @@ export interface StreamCompletion {
  * nested under `response`) without buffering the stream. SSE framing is
  * preserved line-by-line; an in-band top-level error event errors the stream
  * with a sanitized Error (no raw bodies or credentials); `onError` is called
- * first. `onComplete` reports a stream that ended normally.
+ * first. `onComplete` reports a stream that ended with a finish reason.
  */
 export function createCcaSseUnwrap(
   onError?: (error: InBandError) => void,
@@ -485,6 +492,7 @@ export function createCcaSseUnwrap(
   const encoder = new TextEncoder();
   let buffer = "";
   const completion: StreamCompletion = {};
+  let finished = false;
 
   const handleData = (payload: string, controller: TransformStreamDefaultController<Uint8Array>): boolean => {
     if (payload === "[DONE]") {
@@ -507,13 +515,14 @@ export function createCcaSseUnwrap(
     }
     if (parsed.response !== undefined && typeof parsed.response === "object") {
       completion.traceId ??= parsed.traceId;
+      finished ||= parsed.response.candidates?.some((candidate: Record<string, any>) => candidate.finishReason) ?? false;
       if (
         completion.firstMessageAt === undefined &&
         parsed.response.candidates?.some((candidate: Record<string, any>) =>
           candidate.content?.parts?.some((part: Record<string, any>) => part.text),
         )
       ) {
-        completion.firstMessageAt = Date.now();
+        completion.firstMessageAt = performance.now();
       }
       controller.enqueue(encoder.encode(`data: ${JSON.stringify(parsed.response)}\n\n`));
       return true;
@@ -546,7 +555,7 @@ export function createCcaSseUnwrap(
           if (!handleData(line.slice(5).trim(), controller)) return;
         }
       }
-      onComplete?.(completion);
+      if (finished) onComplete?.(completion);
     },
   });
 }

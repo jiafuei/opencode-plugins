@@ -87,13 +87,14 @@ function makeHarness(credential: StoredCredential | undefined, options: Record<s
       transforms[name]!(editor);
     },
     /** Dispatch a native Gemini request through the http.request/http.response hooks. */
-    async send(sessionID: string, request: Request): Promise<Response> {
+    async send(sessionID: string, request: Request, kind = "primary"): Promise<Response> {
       await ready();
-      const before = { sessionID, request };
+      const before = { sessionID, kind, request };
       await hooks["session.http.request"]!(before);
       const sent = before.request;
       const after = {
         sessionID,
+        kind,
         request: sent,
         response: await fetch(sent.url, { method: sent.method, headers: sent.headers, body: await sent.clone().text() }),
       };
@@ -396,7 +397,7 @@ describe("web search provider", () => {
 
 describe("session HTTP hooks", () => {
   test("rewrites native Gemini requests into the Cloud Code Assist envelope and unwraps SSE", async () => {
-    const harness = makeHarness(OAUTH_AUTH);
+    const harness = makeHarness(OAUTH_AUTH, { trajectoryAcls: true, metrics: true });
     const args = {
       contents: [{ role: "user", parts: [{ text: "hello" }] }],
       systemInstruction: { parts: [{ text: "sys" }] },
@@ -404,7 +405,7 @@ describe("session HTTP hooks", () => {
       tools: [],
     };
     const chunk = {
-      response: { candidates: [{ content: { role: "model", parts: [{ text: "hi" }] } }], responseId: "resp-9" },
+      response: { candidates: [{ content: { role: "model", parts: [{ text: "hi" }] }, finishReason: "STOP" }], responseId: "resp-9" },
       traceId: "trace-9",
     };
     const mock = mockFetch((url) => (url.includes("streamGenerateContent") ? sseResponse([chunk]) : Response.json({})));
@@ -454,7 +455,8 @@ describe("session HTTP hooks", () => {
           },
         }],
       });
-      expect(metrics.metrics[0].conversationOffered.streamingLatency.totalLatency).toMatch(/^\d+(\.\d{3})?s$/);
+      expect(metrics.metrics[0].conversationOffered.streamingLatency.totalLatency).toMatch(/^\d+(\.\d{3}|\.\d{6}|\.\d{9})?s$/);
+      expect(metrics.metrics[0].timestamp).toMatch(/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d{3}|\.\d{6}|\.\d{9})?Z$/);
     } finally {
       mock.restore();
     }
@@ -485,14 +487,42 @@ describe("session HTTP hooks", () => {
     }
   });
 
+  test("side calls are off by default", async () => {
+    const harness = makeHarness(OAUTH_AUTH);
+    const chunk = { response: { candidates: [{ content: { role: "model", parts: [{ text: "hi" }] }, finishReason: "STOP" }] }, traceId: "t" };
+    const mock = mockFetch(() => sseResponse([chunk]));
+    try {
+      await readStream(await harness.send("ses-quiet", nativeRequest("gemini-3.8-flash-low", { contents: [], tools: [] })));
+      expect(mock.calls.map((call) => new URL(call.url).pathname)).toEqual(["/v1internal:streamGenerateContent"]);
+    } finally {
+      mock.restore();
+    }
+  });
+
+  test("a rejected trajectory ACL does not block generation and is retried", async () => {
+    const harness = makeHarness(OAUTH_AUTH, { trajectoryAcls: true });
+    const mock = mockFetch((url) => (url.includes("writeTrajectoryAcls") ? new Response("denied", { status: 403 }) : sseResponse([])));
+    try {
+      await readStream(await harness.send("ses-acl", nativeRequest("gemini-3.8-flash-low", { contents: [] })));
+      await readStream(await harness.send("ses-acl", nativeRequest("gemini-3.8-flash-low", { contents: [] })));
+      expect(mock.calls.map((call) => new URL(call.url).pathname)).toEqual([
+        "/v1internal:writeTrajectoryAcls",
+        "/v1internal:streamGenerateContent",
+        "/v1internal:writeTrajectoryAcls",
+        "/v1internal:streamGenerateContent",
+      ]);
+    } finally {
+      mock.restore();
+    }
+  });
+
   test("pinned production mode never touches the sandbox endpoint", async () => {
     const harness = makeHarness(OAUTH_AUTH, { endpointMode: "production" });
     const mock = mockFetch(() => new Response("boom", { status: 503 }));
     try {
       await harness.send("ses-pin", nativeRequest("gemini-3.8-flash-low", { contents: [], tools: [] }));
       await harness.send("ses-pin", nativeRequest("gemini-3.8-flash-low", { contents: [], tools: [] }));
-      // The ACL write and both attempts all stay on daily.
-      expect(mock.calls.map((call) => new URL(call.url).origin)).toEqual([DAILY, DAILY, DAILY]);
+      expect(mock.calls.map((call) => new URL(call.url).origin)).toEqual([DAILY, DAILY]);
     } finally {
       mock.restore();
     }

@@ -112,12 +112,13 @@ function baseArgs(): Record<string, any> {
 
 function rewrite(args: Record<string, any>, wireModelId: string, state = createSessionState()): Record<string, any> {
   return rewriteBodyForAntigravity({
-    args: { tools: [], ...args },
+    args,
     logicalModelId: wireModelId.replace(/-(low|medium|high)$/, ""),
     wireModelId,
     model: SNAPSHOT_CATALOG[wireModelId]!,
     projectId: "proj-1",
     state,
+    checkpoint: false,
   });
 }
 
@@ -166,7 +167,7 @@ describe("body rewrite", () => {
     });
   });
 
-  test("tool-less requests become checkpoint calls that leave the trajectory untouched", () => {
+  test("title requests become checkpoint calls that leave the trajectory untouched", () => {
     const state = createSessionState();
     const body = rewriteBodyForAntigravity({
       args: { ...baseArgs(), generationConfig: { temperature: 0.5 } },
@@ -175,6 +176,7 @@ describe("body rewrite", () => {
       model: SNAPSHOT_CATALOG["claude-opus-5-5-high"]!,
       projectId: "proj-1",
       state,
+      checkpoint: true,
     });
     expect(body).toEqual({
       project: "proj-1",
@@ -191,6 +193,11 @@ describe("body rewrite", () => {
     });
     expect(state.historySteps).toBe(0);
     expect(state.usedClaude).toBe(false);
+
+    // A tool-less agent request keeps its model and simply has no tools.
+    const agent = rewrite(baseArgs(), "claude-opus-5-5-high");
+    expect(agent).toMatchObject({ model: "claude-opus-5-5-high", requestType: "agent" });
+    expect(agent.request.tools).toBeUndefined();
   });
 
   test("forces VALIDATED for Claude", () => {
@@ -239,18 +246,19 @@ describe("body rewrite", () => {
     expect(body.request.contents[2].parts[0].thoughtSignature).toBe("skip_thought_signature_validator");
   });
 
-  test("drops unsigned Claude thinking while preserving signed thinking", () => {
+  test("keeps Claude thinking only for messages that carry a signature", () => {
     const body = rewrite(
       {
         contents: [
           {
             role: "model",
             parts: [
-              { text: "unsigned", thought: true },
-              { text: "signed", thought: true, thoughtSignature: "opaque" },
+              { text: "first ", thought: true },
+              { text: "second", thought: true, thoughtSignature: "opaque" },
               { functionCall: { name: "tool", args: {} } },
             ],
           },
+          { role: "model", parts: [{ text: "unsigned", thought: true }, { text: "answer" }] },
         ],
       },
       "claude-opus-5-5-high",
@@ -261,10 +269,11 @@ describe("body rewrite", () => {
       {
         role: "model",
         parts: [
-          { text: "signed", thought: true },
+          { text: "first second", thought: true },
           { functionCall: { name: "tool", args: {} }, thoughtSignature: "opaque" },
         ],
       },
+      { role: "model", parts: [{ text: "answer" }] },
     ]);
   });
 
@@ -278,8 +287,8 @@ describe("body rewrite", () => {
               { text: "a", thought: true },
               { text: "b", thought: true },
               { functionCall: { name: "first", args: {} }, thoughtSignature: "call-sig" },
-              { text: "x", thoughtSignature: "text-sig" },
-              { text: "y" },
+              { text: "x<tool_code> </tool_code>", thoughtSignature: "text-sig" },
+              { text: "y<tool_code>\n" },
               { functionCall: { name: "second", args: {} } },
             ],
           },
@@ -888,8 +897,11 @@ describe("response unwrapping", () => {
   });
 
   test("[DONE] and non-data lines pass through", async () => {
-    const output = await collect(createCcaSseUnwrap(), ["event: x\ndata: [DONE]\n\n"]);
+    const completions: unknown[] = [];
+    const output = await collect(createCcaSseUnwrap(undefined, (completion) => completions.push(completion)), ["event: x\ndata: [DONE]\n\n"]);
     expect(output).toContain("event: x\n");
     expect(output).toContain("data: [DONE]\n\n");
+    // A stream without a finish reason is not a completed response.
+    expect(completions).toEqual([]);
   });
 });
