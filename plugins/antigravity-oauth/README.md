@@ -61,7 +61,7 @@ Wire models whose display names differ only by a `(Low)` / `(Medium)` / `(High)`
 - `trajectoryAcls`: `true` sends `writeTrajectoryAcls` for a session's trajectory before its first agent request, as the native client does. Default `false`.
 - `metrics`: `true` sends `recordCodeAssistMetrics` (trace id and 100ns-resolution streaming latencies) after each agent or checkpoint stream that finishes, as the native client does. Default `false`.
 
-**Native compaction** (needs an OpenCode build with the experimental `experimental.compaction.native` hook; without it, compaction fails as unsupported)
+**Native compaction** (needs an OpenCode build with the experimental `experimental.compaction.native` hook that stores plugin windows as model-neutral, fork commit `5a39a06e74`; without it, compaction fails as unsupported because Gemini routes have no fixed endpoint path)
 
 ```jsonc
 {
@@ -71,7 +71,7 @@ Wire models whose display names differ only by a `(Low)` / `(Medium)` / `(High)`
 }
 ```
 
-The plugin then compacts like the native client: the full history goes out with the native summary prompt, and the new window is the latest user request plus the native `# Resuming from a compaction` message (the last ten user requests and the summary). Without the setting, OpenCode's own summary compaction runs and only its request envelope is native.
+The plugin then compacts like the native client: the full history goes out with the native summary prompt, and the new window is the latest user request plus the native `# Resuming from a compaction` message (the last ten user requests and the summary). Every model reads that window, so it carries over model switches like the native client's. Without the setting, OpenCode's own summary compaction runs and only its request envelope is native.
 
 **Environment overrides**
 
