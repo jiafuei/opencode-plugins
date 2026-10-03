@@ -6,9 +6,11 @@ Standalone plugins for [OpenCode](https://opencode.ai), maintained as independen
 
 - [Anthropic compaction](plugins/anthropic-compaction/README.md): run OpenCode's native compaction through Anthropic's server-side compaction for Claude models.
 - [Antigravity OAuth](plugins/antigravity-oauth/README.md): sign in with Google Antigravity to run Gemini, Claude, and GPT-OSS on the free Cloud Code Assist tier with the native client fingerprint.
+- [Claude OAuth](plugins/claude-oauth/README.md): use a Claude Pro/Max subscription through the built-in Anthropic integration, with `/anthropic-usage` for plan limits.
 - [Codex usage](plugins/codex-usage/README.md): `/codex-usage` shows your ChatGPT plan's Codex rate-limit windows.
+- [Computer use](plugins/computer-use/README.md): screenshot-driven desktop control on Windows (OpenCode in WSL2) and macOS. Not published; load it from a local checkout.
 - [Memory](plugins/memory/README.md): project-scoped automatic memory with a `/memory` browser.
-- [Web search](plugins/websearch/README.md): provider-native web search, currently backed by OpenAI hosted search with a ChatGPT subscription.
+- [Web search](plugins/websearch/README.md): web search for the built-in `websearch` tool through OpenAI, Google, or Anthropic hosted search.
 - [Redact keys](plugins/redact-keys/README.md): redact secrets from protected files before they reach the model.
 - [OpenRouter](plugins/openrouter/README.md): routing and privacy settings with global, folder, and session overrides and a local web UI.
 - [Workflows](plugins/workflows/README.md): declarative child-agent workflows with steering and a native TUI inspector.
@@ -20,13 +22,16 @@ Install a plugin into the global OpenCode configuration:
 ```sh
 opencode plugin add @jiafuei/opencode-anthropic-compaction
 opencode plugin add @jiafuei/opencode-antigravity-oauth
+opencode plugin add @jiafuei/opencode-claude-oauth
+opencode plugin add @jiafuei/opencode-codex-usage
 opencode plugin add @jiafuei/opencode-memory
+opencode plugin add @jiafuei/opencode-openrouter
 opencode plugin add @jiafuei/opencode-websearch
 opencode plugin add @jiafuei/opencode-redact-keys
 opencode plugin add @jiafuei/opencode-workflows
 ```
 
-Plugins are listed in the `plugins` array of `opencode.json`, either as a package name or as `{ "package": "...", "options": { ... } }`. Memory and Workflows expose both server and TUI entrypoints; OpenCode loads each from the same entry.
+Plugins are listed in the `plugins` array of `opencode.json`, either as a package name or as `{ "package": "...", "options": { ... } }`. Plugins with a TUI side load it from the same entry.
 
 ## Retired plugins
 

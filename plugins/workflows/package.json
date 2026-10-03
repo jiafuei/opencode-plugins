@@ -13,6 +13,7 @@
     "tui.tsx",
     "workflow_shared.ts",
     "workflow_coordination.ts",
+    "DESIGN.md",
     "README.md"
   ],
   "keywords": [

@@ -16,6 +16,7 @@
     "local_storage.ts",
     "rpc.ts",
     "tui.ts",
+    "DESIGN.md",
     "README.md"
   ],
   "keywords": [

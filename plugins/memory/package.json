@@ -12,6 +12,7 @@
     "server.tsx",
     "tui.tsx",
     "rpc.ts",
+    "DESIGN.md",
     "README.md"
   ],
   "keywords": [

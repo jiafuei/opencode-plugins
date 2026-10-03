@@ -1,15 +1,11 @@
 # OpenRouter settings
 
-OpenCode V2 plugin for OpenRouter provider routing and privacy. Includes a local browser UI for configuration and effective-settings previews.
+Control OpenRouter provider routing and privacy from OpenCode: which upstream providers serve your requests, data-collection and ZDR policies, price caps, and more. Settings can be global, per folder, per session, or per model, and are edited in a local browser UI that previews the effective result.
 
 ## Install
 
-Add this directory to the global OpenCode configuration to enable it in every folder:
-
-```jsonc
-{
-  "plugins": ["/absolute/path/to/opencode-plugins/plugins/openrouter"]
-}
+```sh
+opencode plugin add @jiafuei/opencode-openrouter
 ```
 
 Uses your existing OpenCode OpenRouter connection. Open **OpenRouter settings** in the command palette or run `/openrouter`. The plugin starts a loopback-only server on an available port and opens your browser. The launch URL grants access to the settings UI; no OpenRouter credential is sent to the browser. Reopen the command after restarting OpenCode.
@@ -43,8 +39,8 @@ Supports every field in OpenRouter's [provider-selection guide](https://openrout
 
 Lists accept one slug per line or comma-separated values, including specific endpoint slugs. Sorting, price caps, and performance thresholds use JSON inputs to support their complete object forms. Price caps support `prompt`, `completion`, `request`, `image`, and `audio`.
 
-The native HTTP request hook is scoped to OpenCode provider ID `openrouter`. It transforms requests for all session request kinds: main agent/tool continuations, subagents, titles, compaction, and transient session generation. It preserves authentication, messages, and other request fields. Standalone `ctx.generate.text` calls outside sessions do not expose session HTTP hooks.
+Settings apply to every session request sent to the `openrouter` provider: agent turns, subagents, titles, compaction, and generation. Plugin calls made outside a session are not covered.
 
 The preview includes configured OpenCode model/variant defaults and unsaved edits, with field provenance. Other plugins' live request changes cannot be predicted by a configuration preview. OpenRouter account policies still apply. No requests, responses, or upstream-provider history are recorded.
 
-The UI is intended for a local OpenCode server. Only the server plugin and its TUI entrypoint are required; there is no separate frontend build or web framework.
+The UI is intended for a local OpenCode server.
