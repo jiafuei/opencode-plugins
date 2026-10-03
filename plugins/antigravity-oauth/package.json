@@ -4,7 +4,9 @@
   "description": "Google Antigravity OAuth for OpenCode: Gemini, Claude, and GPT-OSS through Cloud Code Assist with the native Antigravity IDE wire fingerprint",
   "type": "module",
   "exports": {
-    "./server": "./server.ts"
+    "./server": "./server.ts",
+    "./tui": "./tui.ts",
+    "./rpc": "./rpc.ts"
   },
   "files": [
     "server.ts",
@@ -13,6 +15,8 @@
     "schema.ts",
     "transport.ts",
     "wire.ts",
+    "rpc.ts",
+    "tui.ts",
     "README.md"
   ],
   "keywords": [

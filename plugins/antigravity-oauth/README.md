@@ -110,6 +110,10 @@ Credentials only ever go to the two official Cloud Code Assist endpoints: the ta
 
 While an Antigravity connection exists, the plugin registers an `antigravity` web search provider for OpenCode's built-in `websearch` tool. It dispatches the dedicated `gemini-3.1-flash-lite` `web_search` operation captured from the native client and returns each grounding source with the answer segments it supports.
 
+## Usage limits
+
+Run `/antigravity-usage` (or **Antigravity usage** in the command palette) to show each model group's 5-hour and weekly quota as percent used, with reset times. It sends the native client's `retrieveUserQuotaSummary` request (October 3 capture) for the connection's project to the first endpoint of the endpoint mode.
+
 ## Credential storage
 
 OpenCode stores the OAuth credential (`refresh`, `access`, `expires`) and refreshes it through the plugin's refresh callback, preserving rotated refresh tokens. The Cloud Code Assist **project id** and the account email are kept in the credential metadata; the email labels the connection. No secondary credential store exists, and tokens are never written to logs or error messages.

@@ -51,6 +51,7 @@ function makeHarness(credential: StoredCredential | undefined, options: Record<s
       transform: async (callback: any) => void (transforms.websearch = callback),
       reload: async () => {},
     },
+    rpc: { register: async () => {} },
     session: { hook: async (name: string, callback: any) => void (hooks[`session.${name}`] = callback) },
     event: {
       subscribe: async function* () {

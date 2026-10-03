@@ -1,6 +1,7 @@
 import { Connection, Credential, Integration, Plugin } from "@opencode/plugin";
 import { discoverModels } from "./discovery.ts";
 import { goFetch } from "./transport.ts";
+import { AntigravityRpc } from "./rpc.ts";
 import {
   ANTIGRAVITY_DAILY_ENDPOINT,
   ANTIGRAVITY_ENDPOINTS,
@@ -523,6 +524,31 @@ export default Plugin.define({
       },
       { providerID: PROVIDER_ID },
     );
+
+    // The native client's quota summary request (October 3 capture).
+    await ctx.rpc.register(AntigravityRpc, {
+      usage: async () => {
+        const connection = await ctx.integration.connection.active(INTEGRATION_ID);
+        const credential = connection && (await ctx.integration.connection.resolve(connection));
+        if (credential?.type !== "oauth") throw new Error("Google Antigravity is not connected.");
+        const response = await goFetch(`${endpoints[0]}/v1internal:retrieveUserQuotaSummary`, {
+          method: "POST",
+          headers: antigravityHeaders(credential.access),
+          body: JSON.stringify({ project: credential.metadata?.projectId }),
+          signal: AbortSignal.timeout(10_000),
+        });
+        if (!response.ok) throw new Error(`Antigravity quota request failed: ${response.status}`);
+        const summary = (await response.json()) as {
+          groups: { displayName: string; buckets: { window: string; remainingFraction: number; resetTime: string }[] }[];
+        };
+        return {
+          groups: summary.groups.map((group) => ({
+            name: group.displayName,
+            buckets: group.buckets.map(({ window, remainingFraction, resetTime }) => ({ window, remainingFraction, resetTime })),
+          })),
+        };
+      },
+    });
 
     await ctx.websearch.transform((editor) => {
       if (!loaded.connection) return;
