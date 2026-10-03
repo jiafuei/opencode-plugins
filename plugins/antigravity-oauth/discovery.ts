@@ -1,3 +1,4 @@
+import { goFetch } from "./transport.ts";
 import { antigravityHeaders, type WireCatalog } from "./wire.ts";
 
 interface AvailableModels {
@@ -13,7 +14,7 @@ export async function discoverModels(
   accessToken: string,
   projectId: string,
   endpoints: string[],
-  fetcher: typeof fetch = fetch,
+  fetcher: typeof fetch = goFetch,
 ): Promise<WireCatalog | undefined> {
   for (const endpoint of endpoints) {
     try {

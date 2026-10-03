@@ -200,31 +200,51 @@ describe("body rewrite", () => {
     expect(agent.request.tools).toBeUndefined();
   });
 
-  test("forces VALIDATED for Claude", () => {
-    const body = rewrite({ contents: [], toolConfig: { functionCallingConfig: { mode: "ANY" } } }, "claude-opus-5-5-high");
-    expect(body.request.toolConfig.functionCallingConfig.mode).toBe("VALIDATED");
-    expect(body.request.labels.used_claude).toBe("true");
+  test("sends VALIDATED except NONE for Claude", () => {
+    const mode = (sdkMode: string, wireModelId: string) =>
+      rewrite({ ...baseArgs(), toolConfig: { functionCallingConfig: { mode: sdkMode } } }, wireModelId).request.toolConfig
+        .functionCallingConfig;
+    expect(mode("NONE", "claude-opus-5-5-high")).toEqual({ mode: "NONE" });
+    for (const [sdkMode, wireModelId] of [["AUTO", "claude-opus-5-5-high"], ["ANY", "claude-opus-5-5-high"], ["NONE", "gemini-3.8-flash-low"], ["ANY", "gemini-3.8-flash-low"], ["NONE", "gpt-oss-120b-medium"]]) {
+      expect(mode(sdkMode!, wireModelId!)).toEqual({ mode: "VALIDATED" });
+    }
   });
 
-  test("keeps explicit non-AUTO SDK tool choices and defaults plain tools to VALIDATED", () => {
-    const forced = baseArgs();
-    forced.tools = [{ functionDeclarations: [{ name: "t", parameters: { type: "object", properties: {} } }] }];
-    forced.toolConfig = { functionCallingConfig: { mode: "ANY", allowedFunctionNames: ["t"] } };
-    expect(rewrite(forced, "gemini-3.8-flash-low").request.toolConfig.functionCallingConfig.mode).toBe("ANY");
-
-    const plain = baseArgs();
-    plain.tools = [{ functionDeclarations: [{ name: "t", parameters: { type: "object", properties: {} } }] }];
-    expect(rewrite(plain, "gemini-3.8-flash-low").request.toolConfig.functionCallingConfig.mode).toBe("VALIDATED");
-  });
-
-  test("tool results carry output text in the provider's native role", () => {
+  test("tool results carry timestamped output text in the provider's native role", () => {
     const args = { contents: [user("a"), call("x"), results("x")] };
-    const nativeResult = (role: string) => ({
-      role,
-      parts: [{ functionResponse: { id: "x", name: "x", response: { output: "ok" } } }],
-    });
-    expect(rewrite(args, "gemini-3.8-flash-low").request.contents[2]).toEqual(nativeResult("model"));
-    expect(rewrite(args, "claude-opus-5-5-low").request.contents[2]).toEqual(nativeResult("user"));
+    for (const [wireModelId, role] of [["gemini-3.8-flash-low", "model"], ["claude-opus-5-5-low", "user"]]) {
+      const content = rewrite(args, wireModelId!).request.contents[2];
+      expect(content.role).toBe(role);
+      expect(content.parts[0].functionResponse).toMatchObject({ id: "x", name: "x" });
+      expect(content.parts[0].functionResponse.response.output).toMatch(/^Created At: \S+\nCompleted At: \S+\nok$/);
+    }
+  });
+
+  test("annotates user turns once, with a settings note after model switches", () => {
+    const state = createSessionState();
+    const first = rewrite({ contents: [user("a")] }, "claude-opus-5-5-low", state).request.contents;
+    expect(first[0].parts[0].text).toMatch(
+      /^<USER_REQUEST>\na\n<\/USER_REQUEST>\n<ADDITIONAL_METADATA>\nThe current local time is: \S+\.\n<\/ADDITIONAL_METADATA>\n<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from None to Claude Opus 5\.5 \(Low\)\. /,
+    );
+
+    // Earlier turns and tool results replay byte-identically; only the next new turn notes the switch.
+    const history = { contents: [user("a"), call("x"), results("x"), user("b")] };
+    const second = rewrite(history, "claude-opus-5-5-high", state).request.contents;
+    expect(second[0]).toEqual(first[0]);
+    expect(second[3].parts[0].text).toContain("from Claude Opus 5.5 (Low) to Claude Opus 5.5 (High).");
+    expect(rewrite(history, "claude-opus-5-5-high", state).request.contents).toEqual(second);
+  });
+
+  test("drops thinking signed by another Claude tier", () => {
+    const state = createSessionState();
+    state.signatureModels.set("sig-low", "claude-opus-5-5-low");
+    const turn = { role: "model", parts: [{ text: "thinking", thought: true, thoughtSignature: "sig-low" }, { text: "answer" }] };
+    const args = { contents: [user("a"), turn, user("b")] };
+    expect(rewrite(args, "claude-opus-5-5-low", state).request.contents[1].parts).toEqual([
+      { text: "thinking", thought: true },
+      { text: "answer", thoughtSignature: "sig-low" },
+    ]);
+    expect(rewrite(args, "claude-opus-5-5-medium", state).request.contents[1].parts).toEqual([{ text: "answer" }]);
   });
 
   test("normalizes Gemini 3 function-call signatures per model turn", () => {
@@ -339,15 +359,15 @@ describe("body rewrite", () => {
       },
     ];
     const body = rewrite(args, "claude-opus-5-5-high");
-    // Like the native client, each declaration gets its own Tool.
+    // Like the native client, each declaration gets its own Tool, sorted by name.
     expect(body.request.tools).toHaveLength(2);
-    const declarations = body.request.tools.map((tool: Record<string, any>) => {
+    const [legacy, declaration] = body.request.tools.map((tool: Record<string, any>) => {
       expect(tool.functionDeclarations).toHaveLength(1);
       return tool.functionDeclarations[0];
     });
-    expect(declarations[0].parametersJsonSchema).toBeUndefined();
+    expect(declaration.parametersJsonSchema).toBeUndefined();
     // Native protojson shape: enum-name types, sorted property maps, and int64 bounds as strings.
-    expect(declarations[0].parameters).toEqual({
+    expect(declaration.parameters).toEqual({
       type: "OBJECT",
       properties: {
         extra: {},
@@ -357,10 +377,10 @@ describe("body rewrite", () => {
       },
       required: ["path"],
     });
-    expect(Object.keys(declarations[0].parameters.properties)).toEqual(["extra", "limit", "path", "tags"]);
+    expect(Object.keys(declaration.parameters.properties)).toEqual(["extra", "limit", "path", "tags"]);
     // Fields follow Schema proto declaration order.
-    expect(Object.keys(declarations[0].parameters.properties.path)).toEqual(["type", "format", "pattern"]);
-    expect(declarations[1]).toEqual({ name: "legacy", description: "", parameters: { type: "OBJECT", properties: {} } });
+    expect(Object.keys(declaration.parameters.properties.path)).toEqual(["type", "format", "pattern"]);
+    expect(legacy).toEqual({ name: "legacy", description: "", parameters: { type: "OBJECT", properties: {} } });
   });
 
   test("normalizes tool schemas for CCA", () => {

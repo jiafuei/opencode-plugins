@@ -1,5 +1,6 @@
 import { Connection, Credential, Integration, Plugin } from "@opencode/plugin";
 import { discoverModels } from "./discovery.ts";
+import { goFetch } from "./transport.ts";
 import {
   ANTIGRAVITY_DAILY_ENDPOINT,
   ANTIGRAVITY_ENDPOINTS,
@@ -166,7 +167,10 @@ export default Plugin.define({
     /** Per-OpenCode-session envelope identity; cleared on session deletion and credential switches. */
     const sessionStates = new Map<string, Map<string, AntigravitySessionState>>();
     /** Dispatched generation calls, for the metrics the native client records after each stream. */
-    const pendingCalls = new WeakMap<Request, { sentAt: number; access: string; projectId: string; trajectoryId?: string }>();
+    const pendingCalls = new WeakMap<
+      Request,
+      { sentAt: number; access: string; projectId: string; wireModelId: string; trajectoryId?: string }
+    >();
     /** Account-specific state loaded from the active connection. */
     let loaded: { connection?: Connection.Info; projectId?: string; catalog?: WireCatalog } = {};
 
@@ -329,7 +333,7 @@ export default Plugin.define({
         // The native client grants the trajectory's ACL before its first agent
         // request. A failed grant never blocks generation and is retried next time.
         if (trajectoryAcls && agent && !state.aclWritten) {
-          state.aclWritten = await fetch(`${endpoint}/v1internal:writeTrajectoryAcls`, {
+          state.aclWritten = await goFetch(`${endpoint}/v1internal:writeTrajectoryAcls`, {
             method: "POST",
             headers,
             body: JSON.stringify({ trajectoryId: state.trajectoryId }),
@@ -346,6 +350,7 @@ export default Plugin.define({
           sentAt: performance.now(),
           access,
           projectId: envelope.project,
+          wireModelId,
           ...(agent ? { trajectoryId: state.trajectoryId } : {}),
         });
       },
@@ -402,7 +407,7 @@ export default Plugin.define({
         const recordMetrics = ({ traceId, firstMessageAt }: StreamCompletion) => {
           const now = performance.now();
           const epoch = performance.timeOrigin + now;
-          void fetch(`${url.origin}/v1internal:recordCodeAssistMetrics`, {
+          void goFetch(`${url.origin}/v1internal:recordCodeAssistMetrics`, {
             method: "POST",
             headers: antigravityHeaders(call.access),
             body: JSON.stringify({
@@ -427,8 +432,18 @@ export default Plugin.define({
             }),
           }).catch(() => {}); // Telemetry never affects the conversation.
         };
+        // Remember which model signed each response and when each tool call
+        // arrived, for model-switch replay and native tool-result timestamps.
+        const recordChunk = (chunk: Record<string, any>) => {
+          for (const part of chunk.candidates?.[0]?.content?.parts ?? []) {
+            if (part.thoughtSignature) state.signatureModels.set(part.thoughtSignature, call.wireModelId);
+            if (part.functionCall?.id && !state.callTimes.has(part.functionCall.id)) {
+              state.callTimes.set(part.functionCall.id, { created: Date.now() });
+            }
+          }
+        };
         evt.response = new Response(
-          response.body!.pipeThrough(createCcaSseUnwrap(failover, metrics ? recordMetrics : undefined)),
+          response.body!.pipeThrough(createCcaSseUnwrap(failover, metrics ? recordMetrics : undefined, recordChunk)),
           { status: response.status, statusText: response.statusText, headers: unwrappedResponseHeaders(response) },
         );
       },
@@ -444,7 +459,7 @@ export default Plugin.define({
           const connection = await ctx.integration.connection.active(INTEGRATION_ID);
           const credential = connection && (await ctx.integration.connection.resolve(connection));
           if (credential?.type !== "oauth") throw new Error("Connect Google Antigravity before using web search");
-          const response = await fetch(`${endpoints[0]}/v1internal:generateContent`, {
+          const response = await goFetch(`${endpoints[0]}/v1internal:generateContent`, {
             method: "POST",
             headers: antigravityHeaders(credential.access),
             body: JSON.stringify({

@@ -2,12 +2,14 @@
  * Antigravity OAuth: Google installed-app authorization-code flow plus Cloud
  * Code Assist project discovery/provisioning. Login and provisioning mirror
  * the IDE's Electron (Node) client; token refresh mirrors the language
- * server's Go client, which refreshes for inference.
+ * server's Go client, which refreshes for inference. Both go through
+ * `transport.ts` so the requests carry each client's header framing.
  *
  * All network functions take an injectable `fetcher` so tests stay fully
  * mocked. Errors carry status/message only — never credential material.
  */
 
+import { go2Fetch, nodeFetch } from "./transport.ts";
 import {
   ANTIGRAVITY_DAILY_ENDPOINT,
   getAntigravityNodeUserAgent,
@@ -156,7 +158,7 @@ async function postToken(
 export async function exchangeToken(
   code: string,
   redirectUri: string,
-  fetcher: typeof fetch = fetch,
+  fetcher: typeof fetch = nodeFetch,
 ): Promise<OAuthCredentials> {
   // google-auth-library's getToken form order and headers.
   const data = await postToken(
@@ -184,9 +186,9 @@ export async function exchangeToken(
 /** Refresh an access token; preserves the (possibly rotated) refresh token. */
 export async function refreshToken(
   storedRefreshToken: string,
-  fetcher: typeof fetch = fetch,
+  fetcher: typeof fetch = go2Fetch,
 ): Promise<Pick<OAuthCredentials, "refresh" | "access" | "expires">> {
-  // golang.org/x/oauth2 over HTTP/1.1: sorted form keys, Go's default user agent.
+  // golang.org/x/oauth2 over HTTP/2: sorted form keys, Go's default user agent.
   const data = await postToken(
     {
       client_id: CLIENT_ID,
@@ -195,9 +197,9 @@ export async function refreshToken(
       refresh_token: storedRefreshToken,
     },
     {
-      "User-Agent": "Go-http-client/1.1",
       "Content-Type": "application/x-www-form-urlencoded",
       "Accept-Encoding": "gzip",
+      "User-Agent": "Go-http-client/2.0",
     },
     fetcher,
   );
@@ -226,7 +228,7 @@ async function finalizeCredentials(
 }
 
 /** Best-effort user email; failures are ignored (it is optional metadata). */
-export async function fetchUserEmail(accessToken: string, fetcher: typeof fetch = fetch): Promise<string | undefined> {
+export async function fetchUserEmail(accessToken: string, fetcher: typeof fetch = nodeFetch): Promise<string | undefined> {
   try {
     const { "Content-Type": _json, ...headers } = nodeHeaders(accessToken);
     const response = await fetcher(USERINFO_URL, {
@@ -403,7 +405,7 @@ async function onboardUser(
  */
 export async function discoverProject(
   accessToken: string,
-  fetcher: typeof fetch = fetch,
+  fetcher: typeof fetch = nodeFetch,
   onProgress?: (message: string) => void,
   timing: ProvisionTiming = {},
 ): Promise<string> {

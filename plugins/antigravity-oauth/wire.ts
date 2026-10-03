@@ -192,6 +192,14 @@ export interface AntigravitySessionState {
   aclWritten: boolean;
   /** Auto endpoint mode: where this session's next request goes (daily when unset). */
   endpoint?: string;
+  /** Wire model that produced each response signature. */
+  signatureModels: Map<string, string>;
+  /** When each tool call arrived and its result was first sent. */
+  callTimes: Map<string, { created: number; completed?: number }>;
+  /** Each user turn's native metadata block, fixed when the turn is first sent. */
+  turnMetadata: Map<string, string>;
+  /** Display name of the model the latest new user turn went to (`None` before the first). */
+  modelName: string;
 }
 
 export function createSessionState(): AntigravitySessionState {
@@ -205,7 +213,20 @@ export function createSessionState(): AntigravitySessionState {
     usedClaude: false,
     usedNonGemini: false,
     aclWritten: false,
+    signatureModels: new Map(),
+    callTimes: new Map(),
+    turnMetadata: new Map(),
+    modelName: "None",
   };
+}
+
+/** RFC 3339 local time with offset, like the native client's metadata: `2026-10-03T18:37:29+08:00`. */
+function localTimestamp(ms: number): string {
+  const offset = -new Date(ms).getTimezoneOffset();
+  const local = new Date(ms + offset * 60_000).toISOString().slice(0, 19);
+  if (offset === 0) return `${local}Z`;
+  const abs = Math.abs(offset);
+  return `${local}${offset > 0 ? "+" : "-"}${String(Math.floor(abs / 60)).padStart(2, "0")}:${String(abs % 60).padStart(2, "0")}`;
 }
 
 /**
@@ -277,8 +298,8 @@ export interface BodyRewriteOptions {
 /**
  * Wrap a standard Gemini generateContent payload in the Antigravity Cloud
  * Code Assist envelope, in the native client's key order. Agent requests get
- * the catalog's output cap and thinking config, VALIDATED function calling
- * (forced for Claude), native tool results, session labels, and session id.
+ * the catalog's output cap and thinking config, VALIDATED function calling,
+ * native user turns and tool results, session labels, and session id.
  * Checkpoint calls use the native title model and leave the trajectory untouched.
  */
 export function rewriteBodyForAntigravity(options: BodyRewriteOptions): Record<string, any> {
@@ -306,18 +327,22 @@ export function rewriteBodyForAntigravity(options: BodyRewriteOptions): Record<s
   }
 
   const claude = model.apiProvider === ANTHROPIC;
-  const contents = normalizeContentsForAntigravity(args.contents, logicalModelId, claude);
+  const contents = normalizeContentsForAntigravity(args.contents, logicalModelId, claude, {
+    state,
+    wireModelId,
+    modelName: model.displayName ?? wireModelId,
+  });
   const request: Record<string, any> = {
     contents,
     ...(systemInstruction ? { systemInstruction } : {}),
     ...(args.tools ? { tools: normalizeTools(args.tools) } : {}),
   };
 
-  // Antigravity's default tool mode is VALIDATED, forced for Claude. An
-  // explicit non-AUTO tool choice wins otherwise.
-  const sdkMode = args.toolConfig?.functionCallingConfig?.mode;
-  request["toolConfig"] =
-    !claude && sdkMode && sdkMode !== "AUTO" ? args.toolConfig : { functionCallingConfig: { mode: "VALIDATED" } };
+  // VALIDATED like the native client, except NONE (OpenCode's step limit)
+  // for Claude. Live-tested 2026-10-04: CCA ignores NONE and ANY on Gemini,
+  // GPT-OSS leaks harmony tokens under NONE, and Claude 400s on ANY.
+  const none = claude && args.toolConfig?.functionCallingConfig?.mode === "NONE";
+  request["toolConfig"] = { functionCallingConfig: { mode: none ? "NONE" : "VALIDATED" } };
 
   const envelope = advanceEnvelope(state, contents, model);
   request["labels"] = envelope.labels;
@@ -343,12 +368,25 @@ export function rewriteBodyForAntigravity(options: BodyRewriteOptions): Record<s
   };
 }
 
+const SETTINGS_CHANGE_NOTE =
+  "No need to comment on this change if the user doesn't ask about it. If reporting what model you are, please use a human readable name instead of the exact string.";
+
+/**
+ * Agent requests also annotate history like the native client: user turns
+ * get the `<USER_REQUEST>` / `<ADDITIONAL_METADATA>` wrapper (plus a
+ * `<USER_SETTINGS_CHANGE>` note on the first turn after a model switch) and
+ * tool results get `Created At` / `Completed At` lines. Both are fixed the
+ * first time they are sent, so replays stay byte-identical.
+ */
 function normalizeContentsForAntigravity(
   contents: Record<string, any>[],
   logicalModelId: string,
   claude: boolean,
+  agent?: { state: AntigravitySessionState; wireModelId: string; modelName: string },
 ): Record<string, any>[] {
   const gemini3 = logicalModelId.startsWith("gemini-3");
+  const now = Date.now();
+  const occurrences = new Map<string, number>();
 
   return contents.flatMap((content: Record<string, any>) => {
     if (content.parts.some((part: Record<string, any>) => part.functionResponse)) {
@@ -356,24 +394,67 @@ function normalizeContentsForAntigravity(
       // models receive them as the user role.
       return [{
         role: claude ? "user" : "model",
-        parts: content.parts.map((part: Record<string, any>) =>
-          part.functionResponse
-            ? { ...part, functionResponse: { ...part.functionResponse, response: { output: part.functionResponse.response.content } } }
-            : part,
-        ),
+        parts: content.parts.map((part: Record<string, any>) => {
+          if (!part.functionResponse) return part;
+          let output = part.functionResponse.response.content;
+          if (agent) {
+            const times = agent.state.callTimes.get(part.functionResponse.id) ?? { created: now };
+            times.completed ??= now;
+            agent.state.callTimes.set(part.functionResponse.id, times);
+            output = `Created At: ${localTimestamp(times.created)}\nCompleted At: ${localTimestamp(times.completed)}\n${output}`;
+          }
+          return { ...part, functionResponse: { ...part.functionResponse, response: { output } } };
+        }),
       }];
     }
-    if (content.role !== "model") return [content];
+    if (content.role !== "model") {
+      const texts = content.parts.filter((part: Record<string, any>) => part.text !== undefined);
+      if (!agent || content.role !== "user" || texts.length === 0) return [content];
+      const text = texts.map((part: Record<string, any>) => part.text).join("\n");
+      // Repeated identical turns ("continue") each keep their own metadata.
+      const occurrence = (occurrences.get(text) ?? 0) + 1;
+      occurrences.set(text, occurrence);
+      const key = `${occurrence}:${text}`;
+      let metadata = agent.state.turnMetadata.get(key);
+      if (metadata === undefined) {
+        metadata = `<ADDITIONAL_METADATA>\nThe current local time is: ${localTimestamp(now)}.\n</ADDITIONAL_METADATA>`;
+        if (agent.state.modelName !== agent.modelName) {
+          metadata += `\n<USER_SETTINGS_CHANGE>\nThe user changed setting \`Model Selection\` from ${agent.state.modelName} to ${agent.modelName}. ${SETTINGS_CHANGE_NOTE}\n</USER_SETTINGS_CHANGE>`;
+          agent.state.modelName = agent.modelName;
+        }
+        agent.state.turnMetadata.set(key, metadata);
+      }
+      return [{
+        role: "user",
+        parts: [
+          { text: `<USER_REQUEST>\n${text}\n</USER_REQUEST>\n${metadata}` },
+          ...content.parts.filter((part: Record<string, any>) => part.text === undefined),
+        ],
+      }];
+    }
+
+    // The native client drops thinking and signatures produced by another
+    // Claude tier (Gemini tiers stay compatible; OpenCode already strips
+    // signatures across model families).
+    const foreign =
+      claude &&
+      agent &&
+      content.parts.some(
+        (part: Record<string, any>) =>
+          part.thoughtSignature &&
+          (agent.state.signatureModels.get(part.thoughtSignature) ?? agent.wireModelId) !== agent.wireModelId,
+      );
+    const source: Record<string, any>[] = foreign
+      ? content.parts.map(({ thoughtSignature: _, ...part }: Record<string, any>) => part)
+      : content.parts;
 
     // Native assistant replay: one joined thought part, one joined text part
     // (omitted when whitespace-only), then calls. The message signature moves
     // to the first non-thought part; call signatures stay on their calls.
     // Claude rejects thinking when the message has no signature to replay.
-    const signed = content.parts.some(
-      (part: Record<string, any>) => part.thoughtSignature && part.thoughtSignature !== SKIP_THOUGHT_SIGNATURE,
-    );
-    const thoughts = !claude || signed ? content.parts.filter((part: Record<string, any>) => part.thought === true) : [];
-    const texts = content.parts.filter((part: Record<string, any>) => part.thought !== true && part.text !== undefined);
+    const signed = source.some((part) => part.thoughtSignature && part.thoughtSignature !== SKIP_THOUGHT_SIGNATURE);
+    const thoughts = !claude || signed ? source.filter((part) => part.thought === true) : [];
+    const texts = source.filter((part) => part.thought !== true && part.text !== undefined);
     const signature = [...thoughts, ...texts].find((part) => part.thoughtSignature)?.thoughtSignature;
     const parts: Record<string, any>[] = [];
     if (thoughts.length > 0) {
@@ -386,7 +467,7 @@ function normalizeContentsForAntigravity(
       .replace(/<tool_code>(\s*)<\/tool_code>/g, "")
       .replace(/<tool_code>\s*$/, "");
     if (text.trim()) parts.push({ text });
-    parts.push(...content.parts.filter((part: Record<string, any>) => part.text === undefined).map((part: Record<string, any>) => ({ ...part })));
+    parts.push(...source.filter((part) => part.text === undefined).map((part) => ({ ...part })));
     const target = parts.find((part) => part.thought !== true) ?? parts[0];
     if (signature && target && (!target.thoughtSignature || target.thoughtSignature === SKIP_THOUGHT_SIGNATURE)) {
       target.thoughtSignature = signature;
@@ -411,19 +492,18 @@ function normalizeContentsForAntigravity(
 /**
  * Normalize tool declarations for Cloud Code Assist: normalize both legacy
  * `parameters` and the `parametersJsonSchema` field emitted by OpenCode's
- * Gemini client into the CCA `parameters` form, and wrap each declaration in
- * its own Tool like the native client.
+ * Gemini client into the CCA `parameters` form. Like the native client, each
+ * declaration gets its own Tool, sorted by function name.
  */
 function normalizeTools(tools: Array<Record<string, any>>): Array<Record<string, any>> {
-  return tools.flatMap((tool) =>
-    tool.functionDeclarations
-      ? tool.functionDeclarations.map((declaration: Record<string, any>) => {
-          const { parameters, parametersJsonSchema, ...rest } = declaration;
-          const schema = Object.hasOwn(declaration, "parameters") ? parameters : parametersJsonSchema;
-          return { functionDeclarations: [{ ...rest, parameters: normalizeToolSchemaForCCA(schema) }] };
-        })
-      : [tool],
-  );
+  return tools
+    .flatMap((tool) => tool.functionDeclarations as Array<Record<string, any>>)
+    .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
+    .map((declaration) => {
+      const { parameters, parametersJsonSchema, ...rest } = declaration;
+      const schema = Object.hasOwn(declaration, "parameters") ? parameters : parametersJsonSchema;
+      return { functionDeclarations: [{ ...rest, parameters: normalizeToolSchemaForCCA(schema) }] };
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -483,11 +563,13 @@ export interface StreamCompletion {
  * nested under `response`) without buffering the stream. SSE framing is
  * preserved line-by-line; an in-band top-level error event errors the stream
  * with a sanitized Error (no raw bodies or credentials); `onError` is called
- * first. `onComplete` reports a stream that ended with a finish reason.
+ * first. `onComplete` reports a stream that ended with a finish reason, and
+ * `onChunk` sees each unwrapped Gemini chunk.
  */
 export function createCcaSseUnwrap(
   onError?: (error: InBandError) => void,
   onComplete?: (completion: StreamCompletion) => void,
+  onChunk?: (chunk: Record<string, any>) => void,
 ): TransformStream<Uint8Array, Uint8Array> {
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
@@ -515,6 +597,7 @@ export function createCcaSseUnwrap(
       return false;
     }
     if (parsed.response !== undefined && typeof parsed.response === "object") {
+      onChunk?.(parsed.response);
       completion.traceId ??= parsed.traceId;
       finished ||= parsed.response.candidates?.some((candidate: Record<string, any>) => candidate.finishReason) ?? false;
       if (

@@ -140,12 +140,12 @@ describe("token refresh", () => {
     const body = new URLSearchParams(String(calls[0]!.init.body));
     expect(body.get("grant_type")).toBe("refresh_token");
     expect(body.get("refresh_token")).toBe("rt-old");
-    // Refresh runs in the language server's Go client: sorted form keys, Go's user agent.
+    // Refresh runs in the language server's Go HTTP/2 client: sorted form keys, Go's user agent.
     expect([...body.keys()]).toEqual(["client_id", "client_secret", "grant_type", "refresh_token"]);
     expect(calls[0]!.init.headers).toEqual({
-      "User-Agent": "Go-http-client/1.1",
       "Content-Type": "application/x-www-form-urlencoded",
       "Accept-Encoding": "gzip",
+      "User-Agent": "Go-http-client/2.0",
     });
   });
 
