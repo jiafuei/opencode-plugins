@@ -36,6 +36,14 @@
         "effect": "4.0.0-rc.112",
       },
     },
+    "plugins/codex-usage": {
+      "name": "@jiafuei/opencode-codex-usage",
+      "version": "0.0.1",
+      "dependencies": {
+        "@opencode/plugin": "2.0.15",
+        "effect": "4.0.0-rc.112",
+      },
+    },
     "plugins/computer-use": {
       "name": "@jiafuei/opencode-computer-use",
       "version": "0.0.1",
@@ -235,6 +243,8 @@
     "@jiafuei/opencode-antigravity-oauth": ["@jiafuei/opencode-antigravity-oauth@workspace:plugins/antigravity-oauth"],
 
     "@jiafuei/opencode-claude-oauth": ["@jiafuei/opencode-claude-oauth@workspace:plugins/claude-oauth"],
+
+    "@jiafuei/opencode-codex-usage": ["@jiafuei/opencode-codex-usage@workspace:plugins/codex-usage"],
 
     "@jiafuei/opencode-computer-use": ["@jiafuei/opencode-computer-use@workspace:plugins/computer-use"],
 

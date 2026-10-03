@@ -1,0 +1,33 @@
+{
+  "name": "@jiafuei/opencode-codex-usage",
+  "version": "0.0.1",
+  "description": "Show ChatGPT Codex plan usage limits in OpenCode",
+  "type": "module",
+  "exports": {
+    "./server": "./server.ts",
+    "./tui": "./tui.ts",
+    "./rpc": "./rpc.ts"
+  },
+  "files": [
+    "server.ts",
+    "rpc.ts",
+    "tui.ts",
+    "README.md"
+  ],
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "openai",
+    "codex"
+  ],
+  "engines": {
+    "opencode": ">=2.0.15"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "@opencode/plugin": "2.0.15",
+    "effect": "4.0.0-rc.112"
+  }
+}
