@@ -164,7 +164,7 @@ export default Plugin.define({
           : [...ANTIGRAVITY_ENDPOINTS];
 
     /** Per-OpenCode-session envelope identity; cleared on session deletion and credential switches. */
-    const sessionStates = new Map<string, AntigravitySessionState>();
+    const sessionStates = new Map<string, Map<string, AntigravitySessionState>>();
     /** Dispatched generation calls, for the metrics the native client records after each stream. */
     const pendingCalls = new WeakMap<Request, { sentAt: number; access: string; projectId: string; trajectoryId?: string }>();
     /** Account-specific state loaded from the active connection. */
@@ -295,10 +295,16 @@ export default Plugin.define({
         const verb = match[2]!;
         const stream = verb === "streamGenerateContent";
 
-        let state = sessionStates.get(evt.sessionID);
+        let states = sessionStates.get(evt.sessionID);
+        if (!states) {
+          states = new Map();
+          sessionStates.set(evt.sessionID, states);
+        }
+        // Auxiliary calls keep their own trajectory and retry endpoint.
+        let state = states.get(evt.kind);
         if (!state) {
           state = createSessionState();
-          sessionStates.set(evt.sessionID, state);
+          states.set(evt.kind, state);
         }
         const wireModelId = request.headers.get(WIRE_MODEL_HEADER)!;
         const model = (loaded.catalog ?? SNAPSHOT_CATALOG)[wireModelId];
@@ -310,7 +316,7 @@ export default Plugin.define({
           model,
           projectId: loaded.projectId!,
           state,
-          checkpoint: evt.kind === "title",
+          checkpoint: evt.kind === "title" || evt.kind === "compaction",
         });
         const agent = envelope.requestType === "agent";
         // OpenCode sends the OAuth access token as the Gemini API key. The
@@ -339,7 +345,7 @@ export default Plugin.define({
         pendingCalls.set(evt.request, {
           sentAt: performance.now(),
           access,
-          projectId: loaded.projectId!,
+          projectId: envelope.project,
           ...(agent ? { trajectoryId: state.trajectoryId } : {}),
         });
       },
@@ -355,7 +361,7 @@ export default Plugin.define({
         const url = new URL(evt.request.url);
         const verb = /^\/v1internal:(streamGenerateContent|generateContent)$/.exec(url.pathname)?.[1];
         if (!verb) return;
-        const state = sessionStates.get(evt.sessionID)!;
+        const state = sessionStates.get(evt.sessionID)!.get(evt.kind)!;
         const response = evt.response;
         const failover = () => {
           if (endpointMode === "auto") state.endpoint = endpoints.find((endpoint) => endpoint !== url.origin);
@@ -499,6 +505,20 @@ export default Plugin.define({
     void (async () => {
       for await (const event of ctx.event.subscribe()) {
         if (event.type === "session.deleted") sessionStates.delete(event.data.sessionID);
+        if (event.type === "session.compaction.ended") {
+          const state = sessionStates.get(event.data.sessionID)?.get("primary");
+          if (state) {
+            Object.assign(state, {
+              trajectoryId: crypto.randomUUID(),
+              historySteps: 0,
+              stepOffset: 0,
+              userTurns: 0,
+              executionId: undefined,
+              lastExecutionId: undefined,
+              aclWritten: false,
+            });
+          }
+        }
         if (event.type === "credential.switched" && event.data.integrationID === INTEGRATION_ID) {
           sessionStates.clear();
           void refresh();

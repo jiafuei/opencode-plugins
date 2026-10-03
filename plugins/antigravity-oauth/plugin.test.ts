@@ -528,6 +528,45 @@ describe("session HTTP hooks", () => {
     }
   });
 
+  test("only committed compaction resets the primary trajectory while retaining conversation identity and endpoint", async () => {
+    const harness = makeHarness(OAUTH_AUTH, { trajectoryAcls: true });
+    let attempts = 0;
+    const mock = mockFetch((url) => {
+      if (url.includes("writeTrajectoryAcls")) return new Response("{}");
+      return attempts++ === 0 ? new Response("retry", { status: 503 }) : sseResponse([]);
+    });
+    const turn = (text: string) => ({ role: "user", parts: [{ text }] });
+    const send = async (contents: unknown[]) => {
+      await readStream(await harness.send("ses-compact", nativeRequest("gemini-3.8-flash-low", { contents })));
+      const call = mock.calls.filter((call) => call.url.includes("streamGenerateContent")).at(-1)!;
+      return { url: call.url, body: JSON.parse(String(call.init.body)) };
+    };
+    try {
+      await send([turn("first")]);
+      const before = await send([turn("first"), turn("second")]);
+      expect(before.body.request.labels.last_execution_id).toBeDefined();
+      await harness.emit({ type: "session.compaction.failed", data: { sessionID: "ses-compact" } });
+      const failed = await send([turn("first"), turn("second")]);
+      expect(failed.body.request.labels).toEqual(before.body.request.labels);
+
+      await harness.emit({ type: "session.compaction.ended", data: { sessionID: "ses-compact" } });
+      const after = await send([turn("summary")]);
+      expect(after.body.request.labels.trajectory_id).not.toBe(before.body.request.labels.trajectory_id);
+      expect(after.body.request.labels.last_execution_id).toBeUndefined();
+      expect(after.body.request.labels.last_step_index).toBe("1");
+      expect(after.body.requestId.split("/")[1]).toBe(before.body.requestId.split("/")[1]);
+      expect(after.body.request.sessionId).toBe(before.body.request.sessionId);
+      expect(new URL(after.url).origin).toBe(SANDBOX);
+      const grants = mock.calls.filter((call) => call.url.includes("writeTrajectoryAcls"));
+      expect(grants.map((call) => JSON.parse(String(call.init.body)).trajectoryId)).toEqual([
+        before.body.request.labels.trajectory_id,
+        after.body.request.labels.trajectory_id,
+      ]);
+    } finally {
+      mock.restore();
+    }
+  });
+
   test("session deletion and credential switches reset the identity chain", async () => {
     const harness = makeHarness(OAUTH_AUTH);
     const mock = mockFetch((url) =>

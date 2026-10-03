@@ -66,7 +66,7 @@ export function antigravityHeaders(accessToken: string): Record<string, string> 
 /** CCA bypass accepted only when a Gemini 3 turn's first function call is unsigned. */
 const SKIP_THOUGHT_SIGNATURE = "skip_thought_signature_validator";
 
-/** Tool-less requests (OpenCode's title generation) go out as native checkpoint calls on this model. */
+/** Title and compaction requests use this checkpoint model. */
 const CHECKPOINT_MODEL = "gemini-3.1-flash-lite";
 
 // ---------------------------------------------------------------------------
@@ -270,7 +270,7 @@ export interface BodyRewriteOptions {
   model: WireModel;
   projectId: string;
   state: AntigravitySessionState;
-  /** OpenCode's title generation, which the native client runs as a `checkpoint` call. */
+  /** Route OpenCode title and compaction requests as checkpoint calls. */
   checkpoint: boolean;
 }
 
