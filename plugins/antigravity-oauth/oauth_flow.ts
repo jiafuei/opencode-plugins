@@ -30,16 +30,16 @@ const TOKEN_URL = "https://oauth2.googleapis.com/token";
 const USERINFO_URL = "https://www.googleapis.com/oauth2/v2/userinfo";
 
 /** Per-request timeout for provisioning-phase HTTP calls (OMP OAUTH_REQUEST_TIMEOUT_MS). */
-export const OAUTH_REQUEST_TIMEOUT_MS = 30_000;
+const OAUTH_REQUEST_TIMEOUT_MS = 30_000;
 /** LRO polling cadence and overall deadline for onboardUser (OMP constants). */
-export const ONBOARD_POLL_INTERVAL_MS = 1_000;
-export const ONBOARD_TIMEOUT_MS = 30_000;
+const ONBOARD_POLL_INTERVAL_MS = 1_000;
+const ONBOARD_TIMEOUT_MS = 30_000;
 /** Access-token lifetimes are shortened by this skew so requests never send near-stale bearers. */
-export const EXPIRY_SKEW_MS = 5 * 60 * 1000;
+const EXPIRY_SKEW_MS = 5 * 60 * 1000;
 
 const FREE_TIER_ID = "free-tier";
 
-export const SCOPES = [
+const SCOPES = [
   "https://www.googleapis.com/auth/cloud-platform",
   "https://www.googleapis.com/auth/userinfo.email",
   "https://www.googleapis.com/auth/userinfo.profile",
@@ -51,7 +51,7 @@ export const SCOPES = [
 const NODE_API_CLIENT = "gl-node/22.21.1";
 
 /** Client metadata the IDE's Node side sends with loadCodeAssist and onboardUser. */
-export function nodeIdeMetadata(): Record<string, string> {
+function nodeIdeMetadata(): Record<string, string> {
   return { ide_type: "ANTIGRAVITY", ide_version: getAntigravityVersion(), ide_name: "antigravity" };
 }
 
@@ -265,12 +265,6 @@ interface OnboardOperation {
   response?: { cloudaicompanionProject?: string } | null;
 }
 
-export interface ProvisionTiming {
-  pollIntervalMs?: number;
-  timeoutMs?: number;
-  sleep?: (ms: number) => Promise<void>;
-}
-
 /** Header set of the IDE's Node client (google-api-nodejs-client via gaxios). */
 function nodeHeaders(accessToken: string): Record<string, string> {
   return {
@@ -342,18 +336,16 @@ function assertFreeTierEligible(payload: LoadCodeAssistResponse): void {
 async function onboardUser(
   accessToken: string,
   fetcher: typeof fetch,
-  timing: ProvisionTiming,
+  sleep: (ms: number) => Promise<void>,
 ): Promise<void> {
-  const timeoutMs = timing.timeoutMs ?? ONBOARD_TIMEOUT_MS;
-  const deadline = Date.now() + timeoutMs;
+  const deadline = Date.now() + ONBOARD_TIMEOUT_MS;
   // One deadline spans the initial POST, every sleep, and every poll —
   // exactly like OMP's remainingOnboardTime.
   const remaining = (): number => {
     const left = deadline - Date.now();
     if (left > 0) return left;
-    throw new Error(`onboardUser timed out after ${timeoutMs}ms`);
+    throw new Error(`onboardUser timed out after ${ONBOARD_TIMEOUT_MS}ms`);
   };
-  const sleep = timing.sleep ?? ((ms: number) => Bun.sleep(ms));
 
   let operation = (await cloudCodeAssistRequest(
     {
@@ -372,7 +364,7 @@ async function onboardUser(
   )) as OnboardOperation;
 
   while (operation.done !== true) {
-    await sleep(Math.min(timing.pollIntervalMs ?? ONBOARD_POLL_INTERVAL_MS, remaining()));
+    await sleep(Math.min(ONBOARD_POLL_INTERVAL_MS, remaining()));
     const operationName = operation.name ?? "";
     if (operationName.length === 0) {
       throw new Error("onboardUser returned an operation without a name");
@@ -406,17 +398,13 @@ async function onboardUser(
 export async function discoverProject(
   accessToken: string,
   fetcher: typeof fetch = nodeFetch,
-  onProgress?: (message: string) => void,
-  timing: ProvisionTiming = {},
+  sleep = (ms: number) => Bun.sleep(ms),
 ): Promise<string> {
-  onProgress?.("Checking Cloud Code Assist account status...");
   let payload = await loadCodeAssist(accessToken, fetcher);
 
   assertFreeTierEligible(payload);
   if (payload.currentTier == null) {
-    onProgress?.("Provisioning the Antigravity free tier...");
-    await onboardUser(accessToken, fetcher, timing);
-    onProgress?.("Refreshing Cloud Code Assist project...");
+    await onboardUser(accessToken, fetcher, sleep);
     payload = await loadCodeAssist(accessToken, fetcher);
   }
 

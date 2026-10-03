@@ -8,7 +8,7 @@
  */
 
 import { Model, Provider } from "@opencode/plugin";
-import { normalizeSchemaForCCA, normalizeToolSchemaForCCA } from "./schema.ts";
+import { normalizeToolSchemaForCCA } from "./schema.ts";
 
 export const PROVIDER_ID = Provider.ID.make("google-antigravity");
 
@@ -337,12 +337,6 @@ export function advanceEnvelope(
   labels["used_non_gemini_model"] = String(state.usedNonGemini);
   return { requestId: `agent/${state.agentId}/${Date.now()}/${state.trajectoryId}/${step}`, labels };
 }
-
-// ---------------------------------------------------------------------------
-// Tool schema normalization (CCA subset)
-// ---------------------------------------------------------------------------
-
-export { normalizeSchemaForCCA };
 
 // ---------------------------------------------------------------------------
 // Request body rewrite

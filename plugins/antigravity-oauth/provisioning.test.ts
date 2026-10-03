@@ -1,6 +1,5 @@
-import { describe, expect, test } from "bun:test";
-import { discoverProject, nodeIdeMetadata } from "./oauth_flow.ts";
-import { getAntigravityVersion } from "./wire.ts";
+import { describe, expect, setSystemTime, test } from "bun:test";
+import { discoverProject } from "./oauth_flow.ts";
 
 interface RecordedCall {
   url: string;
@@ -28,7 +27,8 @@ function jsonResponse(payload: unknown, status = 200): Response {
   });
 }
 
-const immediateTiming = { pollIntervalMs: 1, timeoutMs: 30_000, sleep: async () => {} };
+const instant = async () => {};
+const IDE_METADATA = { ide_type: "ANTIGRAVITY", ide_version: "2.5.5", ide_name: "antigravity" };
 
 describe("project discovery", () => {
   test("HTTP account challenges surface only the verification URL and recovery action", async () => {
@@ -47,10 +47,10 @@ describe("project discovery", () => {
     const { fetcher, calls } = scriptedFetcher([
       () => jsonResponse({ currentTier: { id: "free-tier" }, cloudaicompanionProject: "proj-1" }),
     ]);
-    const project = await discoverProject("tok", fetcher, undefined, immediateTiming);
+    const project = await discoverProject("tok", fetcher, instant);
     expect(project).toBe("proj-1");
     expect(calls).toHaveLength(1);
-    expect(JSON.parse(String(calls[0]!.init.body))).toEqual({ metadata: nodeIdeMetadata() });
+    expect(JSON.parse(String(calls[0]!.init.body))).toEqual({ metadata: IDE_METADATA });
     expect(calls[0]!.url).toBe("https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist");
     // Login-time provisioning runs on the IDE's Node side.
     expect(calls[0]!.init.headers).toMatchObject({
@@ -74,18 +74,14 @@ describe("project discovery", () => {
       () => jsonResponse({ currentTier: { id: "free-tier" }, cloudaicompanionProject: "proj-new" }),
     ]);
     const sleeps: number[] = [];
-    const timing = { pollIntervalMs: 1000, timeoutMs: 30_000, sleep: async (ms: number) => void sleeps.push(ms) };
-    const project = await discoverProject("tok", fetcher, undefined, timing);
+    const project = await discoverProject("tok", fetcher, async (ms) => void sleeps.push(ms));
     expect(project).toBe("proj-new");
     expect(polls).toBe(1);
     expect(sleeps).toEqual([1000]); // one-second polling cadence
 
     const onboardCall = calls[1]!;
     expect(onboardCall.url).toBe("https://daily-cloudcode-pa.googleapis.com/v1internal:onboardUser");
-    expect(JSON.parse(String(onboardCall.init.body))).toEqual({
-      tier_id: "free-tier",
-      metadata: { ide_type: "ANTIGRAVITY", ide_version: getAntigravityVersion(), ide_name: "antigravity" },
-    });
+    expect(JSON.parse(String(onboardCall.init.body))).toEqual({ tier_id: "free-tier", metadata: IDE_METADATA });
     // LRO polls carry the shared native context, Content-Type included.
     const pollCall = calls[2]!;
     expect(pollCall.url).toBe("https://daily-cloudcode-pa.googleapis.com/v1internal/operations/abc");
@@ -99,18 +95,23 @@ describe("project discovery", () => {
       () => jsonResponse({ allowedTiers: [{ id: "free-tier" }] }),
       () => jsonResponse({ name: "operations/x", done: true, error: { code: 7, message: "permission denied" } }),
     ]);
-    await expect(discoverProject("t", fetcher, undefined, immediateTiming)).rejects.toThrow(
+    await expect(discoverProject("t", fetcher, instant)).rejects.toThrow(
       /OnboardUser operation failed.*7.*permission denied/s,
     );
   });
 
-  test("onboarding respects the single 30s deadline", async () => {
-    const { fetcher } = scriptedFetcher([
-      () => jsonResponse({ allowedTiers: [{ id: "free-tier" }] }),
-      () => jsonResponse({ name: "operations/x", done: false }),
-    ]);
-    const timing = { pollIntervalMs: 1000, timeoutMs: -1, sleep: async () => {} };
-    await expect(discoverProject("t", fetcher, undefined, timing)).rejects.toThrow(/timed out after -1ms/);
+  test("onboarding gives up 30 seconds after it starts", async () => {
+    // The operation never finishes; each poll's sleep moves the clock forward.
+    const fetcher = (async (url: string) =>
+      jsonResponse(url.endsWith(":loadCodeAssist") ? { allowedTiers: [{ id: "free-tier" }] } : { name: "operations/x", done: false })) as unknown as typeof fetch;
+    let now = Date.now();
+    try {
+      await expect(discoverProject("t", fetcher, async (ms) => void setSystemTime((now += ms)))).rejects.toThrow(
+        "onboardUser timed out after 30000ms",
+      );
+    } finally {
+      setSystemTime();
+    }
   });
 
   test("free-tier ineligibility surfaces reason and validation URL", async () => {
@@ -127,7 +128,7 @@ describe("project discovery", () => {
         }),
     ]);
     try {
-      await discoverProject("t", fetcher, undefined, immediateTiming);
+      await discoverProject("t", fetcher, instant);
       throw new Error("should have thrown");
     } catch (error) {
       const message = (error as Error).message;

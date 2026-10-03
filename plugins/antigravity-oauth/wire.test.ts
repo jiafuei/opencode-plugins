@@ -6,10 +6,12 @@ import {
   createCcaSseUnwrap,
   createSessionState,
   getAntigravityUserAgent,
-  normalizeSchemaForCCA,
   providerModels,
   rewriteBodyForAntigravity,
 } from "./wire.ts";
+import { normalizeSchemaForCCA } from "./schema.ts";
+
+const SKIP = "skip_thought_signature_validator";
 
 // ---------------------------------------------------------------------------
 // User agent
@@ -216,12 +218,16 @@ describe("body rewrite", () => {
       maxOutputTokens: 16384,
       thinkingConfig: { includeThoughts: true, thinkingBudget: 4000 },
     });
-    // The history replays as is, except the summary prompt (kept plain user
-    // text) ends the turn, so the unsigned call no longer needs the bypass.
-    expect(agent.request.contents[1].parts[0].thoughtSignature).toBe("skip_thought_signature_validator");
-    delete agent.request.contents[1].parts[0].thoughtSignature;
-    expect(body.request.contents.slice(0, 3)).toEqual(agent.request.contents);
-    expect(body.request.contents[3]).toEqual(user("Summarize"));
+    // The history replays as is, but the summary prompt (plain user text) ends
+    // the turn, so the unsigned call drops the bypass it carried mid-turn.
+    const [first, unsigned, result] = agent.request.contents;
+    expect(unsigned.parts[0].thoughtSignature).toBe(SKIP);
+    expect(body.request.contents).toEqual([
+      first,
+      { ...unsigned, parts: [{ ...unsigned.parts[0], thoughtSignature: undefined }] },
+      result,
+      user("Summarize"),
+    ]);
     expect(state.historySteps).toBe(steps);
   });
 
@@ -275,34 +281,35 @@ describe("body rewrite", () => {
   test("normalizes Gemini 3 function-call signatures per model turn", () => {
     const contents = [
       user("a"),
-      { role: "model", parts: [{ functionCall: { name: "older", args: {} }, thoughtSignature: "skip_thought_signature_validator" }] },
+      { role: "model", parts: [{ functionCall: { name: "older", args: {} }, thoughtSignature: SKIP }] },
       results("older"),
       user("b"),
       {
         role: "model",
         parts: [
           { functionCall: { name: "first", args: {} }, thoughtSignature: "signed" },
-          { functionCall: { name: "second", args: {} }, thoughtSignature: "skip_thought_signature_validator" },
+          { functionCall: { name: "second", args: {} }, thoughtSignature: SKIP },
         ],
       },
       { role: "user", parts: [{ functionResponse: { name: "first", response: { content: "" } } }] },
       { role: "model", parts: [{ functionCall: { name: "unsigned", args: {} } }] },
     ];
-    const body = rewrite({ contents }, "gemini-3.8-flash-low");
+    const signatures = rewrite({ contents }, "gemini-3.8-flash-low")
+      .request.contents.flatMap((content: Record<string, any>) => content.parts)
+      .filter((part: Record<string, any>) => part.functionCall)
+      .map((part: Record<string, any>) => part.thoughtSignature);
 
-    // Calls before the latest user turn replay bare, like the native client.
-    expect(body.request.contents[1].parts[0].thoughtSignature).toBeUndefined();
-    expect(body.request.contents[4].parts[0].thoughtSignature).toBe("signed");
-    expect(body.request.contents[4].parts[1].thoughtSignature).toBeUndefined();
-    expect(body.request.contents[6].parts[0].thoughtSignature).toBe("skip_thought_signature_validator");
+    // Calls before the latest user turn replay bare, like the native client;
+    // only a current-turn message's first unsigned call gets the bypass.
+    expect(signatures).toEqual([undefined, "signed", undefined, SKIP]);
   });
 
   test("keeps thinking only for messages that carry a signature", () => {
     // Unsigned thinking comes from another model; native drops it for every family.
-    expect(
-      rewrite({ contents: [{ role: "model", parts: [{ text: "unsigned", thought: true }, { text: "answer" }] }] }, "gemini-3.8-flash-low")
-        .request.contents,
-    ).toEqual([{ role: "model", parts: [{ text: "answer" }] }]);
+    const unsigned = { role: "model", parts: [{ text: "unsigned", thought: true }, { text: "answer" }] };
+    expect(rewrite({ contents: [unsigned] }, "gemini-3.8-flash-low").request.contents).toEqual([
+      { role: "model", parts: [{ text: "answer" }] },
+    ]);
 
     const body = rewrite(
       {
@@ -315,7 +322,7 @@ describe("body rewrite", () => {
               { functionCall: { name: "tool", args: {} } },
             ],
           },
-          { role: "model", parts: [{ text: "unsigned", thought: true }, { text: "answer" }] },
+          unsigned,
         ],
       },
       "claude-opus-5-5-high",

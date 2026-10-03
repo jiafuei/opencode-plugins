@@ -1,8 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
   CALLBACK_PATH,
-  EXPIRY_SKEW_MS,
-  SCOPES,
   buildAuthUrl,
   exchangeToken,
   extractPastedCode,
@@ -53,23 +51,22 @@ describe("authorization URL", () => {
     expect(url.searchParams.get("state")).toBe(state);
     expect(url.searchParams.get("access_type")).toBe("offline");
     expect(url.searchParams.get("prompt")).toBe("consent");
-    expect(url.searchParams.get("scope")?.split(" ")).toEqual(SCOPES);
+    expect(url.searchParams.get("scope")?.split(" ")).toEqual([
+      "https://www.googleapis.com/auth/cloud-platform",
+      "https://www.googleapis.com/auth/userinfo.email",
+      "https://www.googleapis.com/auth/userinfo.profile",
+      "https://www.googleapis.com/auth/cclog",
+      "https://www.googleapis.com/auth/experimentsandconfigs",
+    ]);
     // The native flow does not use PKCE.
     expect(url.searchParams.get("code_challenge")).toBeNull();
   });
 });
 
 describe("paste-code extraction", () => {
-  test("accepts bare codes", () => {
+  // Full redirect URLs are covered end to end by the paste method in plugin.test.ts.
+  test("accepts bare codes and rejects other attempts' state before any exchange", () => {
     expect(extractPastedCode("4/0AxxxCode", "s")).toBe("4/0AxxxCode");
-  });
-
-  test("accepts full redirect URLs with matching state", () => {
-    const input = `${REDIRECT_URI}?code=abc&state=s`;
-    expect(extractPastedCode(input, "s")).toBe("abc");
-  });
-
-  test("rejects state mismatches before any exchange", () => {
     expect(extractPastedCode("abc#other", "s")).toBeUndefined();
     expect(extractPastedCode("http://x/?code=abc&state=zzz", "s")).toBeUndefined();
     expect(extractPastedCode("", "s")).toBeUndefined();
@@ -89,7 +86,7 @@ describe("token exchange", () => {
     ]);
     const credentials = await exchangeToken("code-1", REDIRECT_URI, fetcher);
     expect(credentials).toMatchObject({ refresh: "rt-1", access: "at-1", projectId: "proj-77", email: "me@example.com" });
-    expect(credentials.expires).toBeGreaterThanOrEqual(Date.now() + 3600_000 - EXPIRY_SKEW_MS - 1000);
+    expect(credentials.expires - Date.now()).toBeWithin(55 * 60_000 - 1000, 55 * 60_000 + 1);
 
     const tokenCall = calls[0]!;
     expect(tokenCall.url).toBe("https://oauth2.googleapis.com/token");
@@ -135,7 +132,8 @@ describe("token refresh", () => {
     const credentials = await refreshToken("rt-old", fetcher);
     expect(credentials.refresh).toBe("rt-rotated");
     expect(credentials.access).toBe("at-2");
-    expect(credentials.expires).toBeGreaterThan(Date.now() + 3600_000 - EXPIRY_SKEW_MS - 1000);
+    // A one-hour token is used for 55 minutes.
+    expect(credentials.expires - Date.now()).toBeWithin(55 * 60_000 - 1000, 55 * 60_000 + 1);
 
     const body = new URLSearchParams(String(calls[0]!.init.body));
     expect(body.get("grant_type")).toBe("refresh_token");

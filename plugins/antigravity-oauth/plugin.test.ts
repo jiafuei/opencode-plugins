@@ -554,17 +554,20 @@ describe("session HTTP hooks", () => {
       expect(labels.last_execution_id).toBeDefined();
 
       await harness.emit({ type: "session.compaction.ended", data: { sessionID: "ses-compact", reason: "auto" } });
-      const after = await send([turn("second"), turn("# Resuming from a compaction\n\nsummary")]);
-      expect(after.body.request.contents[1].parts[0].text).toBe("# Resuming from a compaction\n\nsummary");
-      expect(after.body.request.labels.trajectory_id).toBe(labels.trajectory_id);
-      expect(after.body.request.labels.last_execution_id).toBe(labels.last_execution_id);
+      const window = [turn("second"), turn("# Resuming from a compaction\n\nsummary")];
+      const after = await send(window);
+      expect(after.body.request.contents[1]).toEqual(window[1]);
+      expect(after.body.request.labels).toMatchObject({
+        trajectory_id: labels.trajectory_id,
+        last_execution_id: labels.last_execution_id,
+      });
       expect(Number(after.body.request.labels.last_step_index)).toBeGreaterThanOrEqual(Number(labels.last_step_index));
       expect(after.body.request.sessionId).toBe(before.body.request.sessionId);
       expect(new URL(after.url).origin).toBe(SANDBOX);
       expect(mock.calls.filter((call) => call.url.includes("writeTrajectoryAcls"))).toHaveLength(1);
 
       // The next new turn starts an execution as usual.
-      const next = await send([turn("second"), turn("# Resuming from a compaction\n\nsummary"), turn("third")]);
+      const next = await send([...window, turn("third")]);
       expect(next.body.request.labels.last_execution_id).not.toBe(labels.last_execution_id);
     } finally {
       mock.restore();
@@ -576,67 +579,52 @@ describe("session HTTP hooks", () => {
     const mock = mockFetch(() => sseResponse([]));
     const turn = (text: string) => ({ role: "user", parts: [{ text }] });
     const message = (role: string, text: string) => ({ role, content: [{ type: "text", text }] });
-    try {
-      await readStream(await harness.send("ses-native", nativeRequest("gemini-3.8-flash-medium", { contents: [turn("a")] })));
-      const primary = JSON.parse(String(mock.calls.at(-1)!.init.body));
+    const resume = (requests: string[]) => ({
+      role: "user",
+      content: [{
+        type: "text",
+        text: `# Resuming from a compaction\n\nYou are continuing work on the task described above, but you have lost access to the full conversation history, and need to resume work efficiently using the progress summary below:\n\n# User Requests\nThe following were user requests from the truncated conversation in chronological order:\n${requests.map((text, index) => `${index + 1}. ${text}`).join("\n")}\n\n<summary>S</summary>`,
+        metadata: { requests },
+      }],
+    });
+    const compact = async (messages: unknown[], retained: unknown[]) => {
       const event: Record<string, any> = {
         sessionID: "ses-native",
-        messages: [message("user", "a"), message("assistant", "ok"), message("user", "b")],
-        retained: [message("user", "a"), message("user", "b")],
+        messages,
+        retained,
         send: async () => {
-          await readStream(
-            await harness.send(
-              "ses-native",
-              nativeRequest("gemini-3.8-flash-medium", { contents: [turn("a"), { role: "model", parts: [{ text: "ok" }] }, turn("b")] }),
-              "compaction",
-            ),
-          );
+          const contents = [turn("a"), { role: "model", parts: [{ text: "ok" }] }, turn("b")];
+          await readStream(await harness.send("ses-native", nativeRequest("gemini-3.8-flash-medium", { contents }), "compaction"));
           return { content: [{ type: "reasoning", text: "hmm" }, { type: "text", text: "<summary>S</summary>" }] };
         },
       };
       await harness.hooks["session.experimental.compaction.native"]!(event);
-
+      return event.result.replacement;
+    };
+    try {
+      await readStream(await harness.send("ses-native", nativeRequest("gemini-3.8-flash-medium", { contents: [turn("a")] })));
+      const primary = JSON.parse(String(mock.calls.at(-1)!.init.body));
+      const first = await compact(
+        [message("user", "a"), message("assistant", "ok"), message("user", "b")],
+        [message("user", "a"), message("user", "b")],
+      );
       const body = JSON.parse(String(mock.calls.at(-1)!.init.body));
       expect(body).toMatchObject({ model: "gemini-3.8-flash-medium", requestType: "checkpoint" });
       expect(body.request.sessionId).toBe(primary.request.sessionId);
       expect(body.request.contents[0]).toEqual(primary.request.contents[0]);
       expect(body.request.contents.at(-1)).toEqual({ role: "user", parts: [{ text: COMPACTION_PROMPT }] });
-      const resume = (requests: string[]) => ({
-        role: "user",
-        content: [{
-          type: "text",
-          text: `# Resuming from a compaction\n\nYou are continuing work on the task described above, but you have lost access to the full conversation history, and need to resume work efficiently using the progress summary below:\n\n# User Requests\nThe following were user requests from the truncated conversation in chronological order:\n${requests.map((text, index) => `${index + 1}. ${text}`).join("\n")}\n\n<summary>S</summary>`,
-          metadata: { requests },
-        }],
-      });
-      expect(event.result.replacement).toEqual([message("user", "b"), resume(["a", "b"])]);
+      expect(first).toEqual([message("user", "b"), resume(["a", "b"])]);
 
-      // A later compaction keeps the earlier requests, not the previous resume message.
+      // Earlier requests come from the previous resume message, never the resume text itself.
       const latest = {
         role: "user",
-        content: [
-          { type: "text", text: "c" },
-          { type: "media", media: { source: { type: "url", url: "https://example.com/image.png", mediaType: "image/png" } } },
-        ],
+        content: [{ type: "text", text: "c" }, { type: "media", media: { source: { type: "url", url: "https://x/c.png", mediaType: "image/png" } } }],
       };
-      const again: Record<string, any> = {
-        ...event,
-        messages: [...event.result.replacement, message("assistant", "ok"), latest],
-        retained: [latest],
-        result: undefined,
-      };
-      await harness.hooks["session.experimental.compaction.native"]!(again);
-      expect(again.result.replacement).toEqual([latest, resume(["a", "b", "c"])]);
+      const second = await compact([...first, message("assistant", "ok"), latest], [latest]);
+      expect(second).toEqual([latest, resume(["a", "b", "c"])]);
 
-      // Continued work can compact again before the user sends another request.
-      const continued: Record<string, any> = {
-        ...event,
-        messages: [...again.result.replacement, message("assistant", "continued work")],
-        retained: [],
-        result: undefined,
-      };
-      await harness.hooks["session.experimental.compaction.native"]!(continued);
-      expect(continued.result.replacement).toEqual([latest, resume(["a", "b", "c"])]);
+      // Compacting again before another user request keeps that window's latest request.
+      expect(await compact([...second, message("assistant", "more")], [])).toEqual(second);
     } finally {
       mock.restore();
     }
