@@ -612,14 +612,31 @@ describe("session HTTP hooks", () => {
       expect(event.result.replacement).toEqual([message("user", "b"), resume(["a", "b"])]);
 
       // A later compaction keeps the earlier requests, not the previous resume message.
+      const latest = {
+        role: "user",
+        content: [
+          { type: "text", text: "c" },
+          { type: "media", media: { source: { type: "url", url: "https://example.com/image.png", mediaType: "image/png" } } },
+        ],
+      };
       const again: Record<string, any> = {
         ...event,
-        messages: [...event.result.replacement, message("assistant", "ok"), message("user", "c")],
-        retained: [message("user", "c")],
+        messages: [...event.result.replacement, message("assistant", "ok"), latest],
+        retained: [latest],
         result: undefined,
       };
       await harness.hooks["session.experimental.compaction.native"]!(again);
-      expect(again.result.replacement).toEqual([message("user", "c"), resume(["a", "b", "c"])]);
+      expect(again.result.replacement).toEqual([latest, resume(["a", "b", "c"])]);
+
+      // Continued work can compact again before the user sends another request.
+      const continued: Record<string, any> = {
+        ...event,
+        messages: [...again.result.replacement, message("assistant", "continued work")],
+        retained: [],
+        result: undefined,
+      };
+      await harness.hooks["session.experimental.compaction.native"]!(continued);
+      expect(continued.result.replacement).toEqual([latest, resume(["a", "b", "c"])]);
     } finally {
       mock.restore();
     }

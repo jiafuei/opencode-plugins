@@ -497,9 +497,15 @@ export default Plugin.define({
         // The native message lists the latest ten user requests. Core retains the
         // user's own messages since the last compaction (typed text first, before
         // attachments); earlier requests ride on the previous resume message.
-        const earlier = event.messages
-          .flatMap((message) => message.content)
-          .findLast((part) => part.text?.startsWith(COMPACTION_RESUME_HEADER))?.metadata?.requests;
+        const previous = event.messages.findLastIndex((message) =>
+          message.content.some((part) => part.text?.startsWith(COMPACTION_RESUME_HEADER)),
+        );
+        const earlier = event.messages[previous]?.content
+          .find((part) => part.text?.startsWith(COMPACTION_RESUME_HEADER))?.metadata?.requests;
+        // A prior window pairs the last real user message with its resume message.
+        const retained = event.retained.length
+          ? event.retained.slice(-1)
+          : previous > 0 ? event.messages.slice(previous - 1, previous) : [];
         const requests = [
           ...(earlier ?? []),
           ...event.retained.flatMap((message) => {
@@ -520,7 +526,7 @@ export default Plugin.define({
         ].join("\n");
         event.result = {
           replacement: [
-            ...event.retained.slice(-1),
+            ...retained,
             { role: "user", content: [{ type: "text", text: resume, metadata: { requests } }] },
           ],
         };
