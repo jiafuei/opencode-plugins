@@ -11,6 +11,7 @@
     "discovery.ts",
     "oauth_flow.ts",
     "schema.ts",
+    "transport.ts",
     "wire.ts",
     "README.md"
   ],

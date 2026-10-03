@@ -198,12 +198,11 @@ export default Plugin.define({
       const projectId = credential.metadata?.projectId as string;
       loaded = { connection, projectId, catalog: await discoverModels(credential.access, projectId, endpoints) };
     };
+    // Requests wait for the account state, so a prompt sent right after
+    // startup or a connection switch still carries the project.
     let loading = Promise.resolve();
     const refresh = () =>
-      (loading = loading
-        .then(load)
-        .then(() => Promise.all([ctx.provider.reload(), ctx.websearch.reload()]))
-        .then(() => {}));
+      (loading = loading.then(load)).then(() => Promise.all([ctx.provider.reload(), ctx.websearch.reload()]));
 
     await ctx.integration.transform((editor) => {
       editor.update(INTEGRATION_ID, (integration) => (integration.name = "Google Antigravity"));
@@ -310,6 +309,7 @@ export default Plugin.define({
         const request = evt.request;
         const match = /\/models\/([^/:]+):(streamGenerateContent|generateContent)$/.exec(new URL(request.url).pathname);
         if (!match) return;
+        await loading;
         const verb = match[2]!;
         const stream = verb === "streamGenerateContent";
 

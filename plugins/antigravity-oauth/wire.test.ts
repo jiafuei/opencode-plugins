@@ -216,7 +216,10 @@ describe("body rewrite", () => {
       maxOutputTokens: 16384,
       thinkingConfig: { includeThoughts: true, thinkingBudget: 4000 },
     });
-    // The history replays byte-identically; the summary prompt stays plain user text.
+    // The history replays as is, except the summary prompt (kept plain user
+    // text) ends the turn, so the unsigned call no longer needs the bypass.
+    expect(agent.request.contents[1].parts[0].thoughtSignature).toBe("skip_thought_signature_validator");
+    delete agent.request.contents[1].parts[0].thoughtSignature;
     expect(body.request.contents.slice(0, 3)).toEqual(agent.request.contents);
     expect(body.request.contents[3]).toEqual(user("Summarize"));
     expect(state.historySteps).toBe(steps);
@@ -272,7 +275,7 @@ describe("body rewrite", () => {
   test("normalizes Gemini 3 function-call signatures per model turn", () => {
     const contents = [
       user("a"),
-      { role: "model", parts: [{ functionCall: { name: "older", args: {} } }] },
+      { role: "model", parts: [{ functionCall: { name: "older", args: {} }, thoughtSignature: "skip_thought_signature_validator" }] },
       results("older"),
       user("b"),
       {

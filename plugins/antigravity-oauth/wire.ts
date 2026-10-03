@@ -405,14 +405,12 @@ export function rewriteBodyForAntigravity(options: BodyRewriteOptions): Record<s
             content.role === "model" || content.parts.some((part: Record<string, any>) => part.functionResponse),
         ) + 1
       : args.contents.length;
-  const contents = [
-    ...normalizeContentsForAntigravity(args.contents.slice(0, end), logicalModelId, claude, {
-      state: history,
-      wireModelId,
-      modelName: model.displayName ?? wireModelId,
-    }),
-    ...args.contents.slice(end),
-  ];
+  const contents = normalizeContentsForAntigravity(args.contents, logicalModelId, claude, {
+    state: history,
+    wireModelId,
+    modelName: model.displayName ?? wireModelId,
+    end,
+  });
   const request: Record<string, any> = {
     contents,
     ...(systemInstruction ? { systemInstruction } : {}),
@@ -475,7 +473,7 @@ function normalizeContentsForAntigravity(
   contents: Record<string, any>[],
   logicalModelId: string,
   claude: boolean,
-  agent?: { state: AntigravitySessionState; wireModelId: string; modelName: string },
+  agent?: { state: AntigravitySessionState; wireModelId: string; modelName: string; end: number },
 ): Record<string, any>[] {
   const gemini3 = logicalModelId.startsWith("gemini-3");
   const now = Date.now();
@@ -486,6 +484,7 @@ function normalizeContentsForAntigravity(
   );
 
   return contents.flatMap((content: Record<string, any>, index) => {
+    if (agent && index >= agent.end) return [content];
     if (content.parts.some((part: Record<string, any>) => part.functionResponse)) {
       // Native tool results wrap the result text as `output`; only Anthropic
       // models receive them as the user role.
@@ -580,18 +579,14 @@ function normalizeContentsForAntigravity(
       target.thoughtSignature = signature;
     }
 
-    // Native replays older unsigned calls bare; only the current turn needs the bypass.
-    if (gemini3 && index > turnStart) {
-      let firstFunctionCall = true;
-      for (const part of parts) {
-        if (!part.functionCall) continue;
-        if (firstFunctionCall) {
-          part.thoughtSignature ??= SKIP_THOUGHT_SIGNATURE;
-          firstFunctionCall = false;
-        } else if (!part.thoughtSignature || part.thoughtSignature === SKIP_THOUGHT_SIGNATURE) {
-          delete part.thoughtSignature;
-        }
-      }
+    // OpenCode marks unsigned Gemini 3 calls with the bypass. Native replays
+    // them bare; only a current-turn message needs it, on its first call.
+    let bypass = gemini3 && index > turnStart;
+    for (const part of parts) {
+      if (!part.functionCall) continue;
+      if (part.thoughtSignature === SKIP_THOUGHT_SIGNATURE) delete part.thoughtSignature;
+      if (bypass) part.thoughtSignature ??= SKIP_THOUGHT_SIGNATURE;
+      bypass = false;
     }
     return parts.length > 0 ? [{ role: "model", parts }] : [];
   });
