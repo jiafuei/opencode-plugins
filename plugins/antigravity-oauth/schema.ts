@@ -40,8 +40,9 @@ const SUPPORTED_TYPES: Readonly<Record<string, true>> = {
  * This allowlist is the single source of truth for wire safety: meta/reference
  * keywords ($schema/$ref/$defs/$comment/...), annotations (deprecated,
  * readOnly, writeOnly), MCP transport annotations (x-mcp-header), object-key
- * validators (additionalProperties, propertyNames), and value validators
- * (pattern, format, min/max bounds) all fail it and are dropped.
+ * validators (additionalProperties, propertyNames), and the validators the
+ * native converter does not translate (exclusive bounds, multipleOf,
+ * uniqueItems, min/maxProperties) all fail it and are dropped.
  */
 const OUTPUT_KEYS: Readonly<Record<string, true>> = {
   type: true,
@@ -53,6 +54,14 @@ const OUTPUT_KEYS: Readonly<Record<string, true>> = {
   required: true,
   propertyOrdering: true,
   items: true,
+  format: true,
+  pattern: true,
+  minimum: true,
+  maximum: true,
+  minLength: true,
+  maxLength: true,
+  minItems: true,
+  maxItems: true,
 };
 
 /** Output keys valid on every type (subset of OUTPUT_KEYS). */
@@ -65,11 +74,11 @@ const SHARED_KEYS: Readonly<Record<string, true>> = {
 
 /** Type-specific output keys that survive normalization per chosen type. */
 const TYPE_KEYS: Readonly<Record<string, Readonly<Record<string, true>>>> = {
-  array: { items: true },
+  array: { items: true, minItems: true, maxItems: true },
   object: { properties: true, required: true, propertyOrdering: true },
-  string: {},
-  number: {},
-  integer: {},
+  string: { format: true, pattern: true, minLength: true, maxLength: true },
+  number: { format: true, minimum: true, maximum: true },
+  integer: { format: true, minimum: true, maximum: true },
   boolean: {},
 };
 
@@ -345,6 +354,21 @@ function normalizeObjectNode(obj: JsonObject, visiting: Set<object>): JsonObject
         // Tuple-form (array) items are not representable: omit them, widening.
         if (isPlainObject(entry) || typeof entry === "boolean") result.items = normalizeNode(entry, visiting);
         break;
+      // A mistyped validator would fail the whole request's protojson parse: drop it.
+      case "format":
+      case "pattern":
+        if (typeof entry === "string") result[key] = entry;
+        break;
+      case "minimum":
+      case "maximum":
+        if (Number.isFinite(entry)) result[key] = entry;
+        break;
+      case "minLength":
+      case "maxLength":
+      case "minItems":
+      case "maxItems":
+        if (Number.isSafeInteger(entry) && (entry as number) >= 0) result[key] = entry;
+        break;
       default:
         break; // everything else fails the OUTPUT_KEYS allowlist: stripped
     }
@@ -432,7 +456,20 @@ function intersectAllOfSchemas(left: JsonObject, right: JsonObject): JsonObject 
     result.items = right.items;
   }
 
-  for (const key of ["title", "description", "default", "propertyOrdering"] as const) {
+  for (const key of [
+    "title",
+    "description",
+    "default",
+    "propertyOrdering",
+    "format",
+    "pattern",
+    "minimum",
+    "maximum",
+    "minLength",
+    "maxLength",
+    "minItems",
+    "maxItems",
+  ] as const) {
     if (result[key] === undefined && right[key] !== undefined) result[key] = right[key];
   }
   return result;
@@ -728,6 +765,8 @@ function tryMixedTypeCollapse(node: JsonObject, key: "anyOf" | "oneOf", variants
   for (const variant of variants) {
     for (const [k, v] of Object.entries(variant)) {
       if (k === "type" || !Object.hasOwn(chosenAllowed, k) || Object.hasOwn(next, k)) continue;
+      // Another type's validators (e.g. an integer branch's int64 format) don't apply.
+      if (Object.hasOwn(ALL_TYPE_KEYS, k) && variant.type !== chosen) continue;
       next[k] = v;
     }
   }
@@ -955,15 +994,18 @@ export function normalizeToolSchemaForCCA(value: unknown): unknown {
 
 /**
  * The native schema converter's output: enum-name types, fields in Schema
- * proto order, sorted property maps, and no `title`/`propertyOrdering`
- * (the converter never sets them).
+ * proto order, sorted property maps, int64 bounds as protojson strings, and
+ * no `title`/`propertyOrdering` (the converter never sets them).
  */
 function toNativeSchema(node: JsonObject): JsonObject {
   const result: JsonObject = {};
   if (typeof node.type === "string") result.type = node.type.toUpperCase();
+  if (node.format !== undefined) result.format = node.format;
   if (node.description !== undefined) result.description = node.description;
   if (node.default !== undefined) result.default = node.default;
   if (isPlainObject(node.items)) result.items = toNativeSchema(node.items);
+  if (node.minItems !== undefined) result.minItems = String(node.minItems);
+  if (node.maxItems !== undefined) result.maxItems = String(node.maxItems);
   if (node.enum !== undefined) result.enum = node.enum;
   if (isPlainObject(node.properties)) {
     const properties = node.properties;
@@ -972,5 +1014,10 @@ function toNativeSchema(node: JsonObject): JsonObject {
     );
   }
   if (node.required !== undefined) result.required = node.required;
+  if (node.minimum !== undefined) result.minimum = node.minimum;
+  if (node.maximum !== undefined) result.maximum = node.maximum;
+  if (node.minLength !== undefined) result.minLength = String(node.minLength);
+  if (node.maxLength !== undefined) result.maxLength = String(node.maxLength);
+  if (node.pattern !== undefined) result.pattern = node.pattern;
   return result;
 }

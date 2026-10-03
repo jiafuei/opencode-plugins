@@ -409,20 +409,21 @@ function normalizeContentsForAntigravity(
 }
 
 /**
- * Normalize tool declarations for Cloud Code Assist exactly like OMP's
- * `normalizeAntigravityTools`: normalize both legacy `parameters` and the
- * `parametersJsonSchema` field emitted by OpenCode's Gemini client, then emit only
- * the CCA `parameters` form.
+ * Normalize tool declarations for Cloud Code Assist: normalize both legacy
+ * `parameters` and the `parametersJsonSchema` field emitted by OpenCode's
+ * Gemini client into the CCA `parameters` form, and wrap each declaration in
+ * its own Tool like the native client.
  */
 function normalizeTools(tools: Array<Record<string, any>>): Array<Record<string, any>> {
-  return tools.map((tool) => ({
-    ...tool,
-    functionDeclarations: (tool.functionDeclarations ?? []).map((declaration: Record<string, any>) => {
-      const { parameters, parametersJsonSchema, ...rest } = declaration;
-      const schema = Object.hasOwn(declaration, "parameters") ? parameters : parametersJsonSchema;
-      return { ...rest, parameters: normalizeToolSchemaForCCA(schema) };
-    }),
-  }));
+  return tools.flatMap((tool) =>
+    tool.functionDeclarations
+      ? tool.functionDeclarations.map((declaration: Record<string, any>) => {
+          const { parameters, parametersJsonSchema, ...rest } = declaration;
+          const schema = Object.hasOwn(declaration, "parameters") ? parameters : parametersJsonSchema;
+          return { functionDeclarations: [{ ...rest, parameters: normalizeToolSchemaForCCA(schema) }] };
+        })
+      : [tool],
+  );
 }
 
 // ---------------------------------------------------------------------------

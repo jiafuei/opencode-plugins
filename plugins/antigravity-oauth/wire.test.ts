@@ -323,7 +323,12 @@ describe("body rewrite", () => {
             // Actual @ai-sdk/google 3.x shape (OpenAPI-style schema).
             parametersJsonSchema: {
               type: "object",
-              properties: { path: { type: "string", title: "Path", pattern: "^/" }, extra: true },
+              properties: {
+                path: { type: "string", title: "Path", pattern: "^/", format: "uri" },
+                limit: { type: "integer", minimum: 1, maximum: 100, exclusiveMaximum: 101 },
+                tags: { type: "array", items: { type: "string", maxLength: 20 }, minItems: 1 },
+                extra: true,
+              },
               required: ["path"],
               additionalProperties: false,
             },
@@ -334,15 +339,27 @@ describe("body rewrite", () => {
       },
     ];
     const body = rewrite(args, "claude-opus-5-5-high");
-    const declarations = body.request.tools[0].functionDeclarations;
+    // Like the native client, each declaration gets its own Tool.
+    expect(body.request.tools).toHaveLength(2);
+    const declarations = body.request.tools.map((tool: Record<string, any>) => {
+      expect(tool.functionDeclarations).toHaveLength(1);
+      return tool.functionDeclarations[0];
+    });
     expect(declarations[0].parametersJsonSchema).toBeUndefined();
-    // Native protojson shape: enum-name types and sorted property maps.
+    // Native protojson shape: enum-name types, sorted property maps, and int64 bounds as strings.
     expect(declarations[0].parameters).toEqual({
       type: "OBJECT",
-      properties: { extra: {}, path: { type: "STRING" } },
+      properties: {
+        extra: {},
+        limit: { type: "INTEGER", minimum: 1, maximum: 100 },
+        path: { type: "STRING", format: "uri", pattern: "^/" },
+        tags: { type: "ARRAY", items: { type: "STRING", maxLength: "20" }, minItems: "1" },
+      },
       required: ["path"],
     });
-    expect(Object.keys(declarations[0].parameters.properties)).toEqual(["extra", "path"]);
+    expect(Object.keys(declarations[0].parameters.properties)).toEqual(["extra", "limit", "path", "tags"]);
+    // Fields follow Schema proto declaration order.
+    expect(Object.keys(declarations[0].parameters.properties.path)).toEqual(["type", "format", "pattern"]);
     expect(declarations[1]).toEqual({ name: "legacy", description: "", parameters: { type: "OBJECT", properties: {} } });
   });
 
@@ -364,10 +381,10 @@ describe("body rewrite", () => {
       required: ["nested"],
     }) as Record<string, any>;
     expect(normalized.type).toBe("object");
-    // Nullable type arrays reduce to the non-null scalar; validators are stripped.
-    expect(normalized.properties.value).toEqual({ type: "string" });
-    // Mixed string|number union narrows to the first non-null type.
-    expect(normalized.properties.mode).toEqual({ type: "string" });
+    // Nullable type arrays reduce to the non-null scalar; untranslatable validators are stripped.
+    expect(normalized.properties.value).toEqual({ type: "string", pattern: "^a" });
+    // Mixed string|number union narrows to the first non-null type, keeping only its validators.
+    expect(normalized.properties.mode).toEqual({ type: "string", format: "uri" });
     expect(normalized.properties.nested).toEqual({
       type: "object",
       properties: { a: { type: "string", enum: ["b"] } },
@@ -441,14 +458,8 @@ function assertNoForbiddenConstructs(schema: unknown): void {
     "propertyNames",
     "prefixItems",
     "patternProperties",
-    "pattern",
-    "format",
-    "minimum",
-    "maximum",
-    "minLength",
-    "maxLength",
-    "minItems",
-    "maxItems",
+    "exclusiveMinimum",
+    "exclusiveMaximum",
     "uniqueItems",
     "deprecated",
     "readOnly",
@@ -785,7 +796,7 @@ describe("CCA tool schema normalization", () => {
     });
     expect(normalizeSchemaForCCA({ type: "array", items: { type: "string", pattern: "^x" } })).toEqual({
       type: "array",
-      items: { type: "string" },
+      items: { type: "string", pattern: "^x" },
     });
     // Objects always carry properties on the wire.
     expect(normalizeSchemaForCCA({ type: "object" })).toEqual({ type: "object", properties: {} });
