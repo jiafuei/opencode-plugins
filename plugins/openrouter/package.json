@@ -1,0 +1,19 @@
+{
+  "name": "@jiafuei/opencode-openrouter",
+  "version": "0.0.1",
+  "description": "OpenRouter routing and privacy settings with a local web UI",
+  "type": "module",
+  "exports": {
+    "./server": "./server.ts",
+    "./tui": "./tui.ts",
+    "./rpc": "./rpc.ts"
+  },
+  "files": ["server.ts", "settings.ts", "tui.ts", "rpc.ts", "web", "README.md"],
+  "keywords": ["opencode", "opencode-plugin", "openrouter"],
+  "engines": { "opencode": ">=2.0.15" },
+  "publishConfig": { "access": "public" },
+  "dependencies": {
+    "@opencode/plugin": "2.0.15",
+    "zod": "4.1.8"
+  }
+}

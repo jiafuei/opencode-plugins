@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>OpenRouter settings · OpenCode</title>
+    <link rel="stylesheet" href="/style.css">
+    <script type="module" src="/app.js"></script>
+  </head>
+  <body>
+    <header>
+      <div class="brand">OpenCode <span>/</span> OpenRouter</div>
+      <a href="https://openrouter.ai/docs/guides/routing/provider-selection" target="_blank" rel="noreferrer">Routing reference ↗</a>
+    </header>
+    <main>
+      <div class="intro">
+        <p class="eyebrow">Connection settings</p>
+        <h1>Choose how your requests are routed.</h1>
+        <p>Routing and privacy preferences for every OpenRouter request. Saved changes apply on the next call.</p>
+      </div>
+      <p id="error" role="alert" hidden></p>
+      <section class="context card" aria-label="Configuration scope">
+        <div class="selectors">
+          <label>Scope<select id="scope"><option value="global">Global</option><option value="folder">This folder</option><option value="session">This session</option></select></label>
+          <label>Model override<input id="model" list="models" placeholder="All models (defaults)" autocomplete="off"><span class="help">Leave empty to edit defaults for this scope.</span></label>
+        </div>
+        <datalist id="models"></datalist>
+        <p id="location" class="location"></p>
+        <p id="session" class="help"></p>
+      </section>
+      <div class="layout">
+        <form id="settings">
+          <div class="editor-heading"><h2>Preferences</h2><button type="button" id="reset" class="quiet">Inherit all</button></div>
+          <p class="help">Inherit keeps the earlier value. Remove omits a field from the request. Lists can replace or append.</p>
+          <div id="fields"></div>
+          <div class="save-bar"><span id="status" role="status">Loading…</span><button type="submit" id="save" disabled>Save settings</button></div>
+        </form>
+        <aside class="card preview" aria-labelledby="preview-title">
+          <p class="eyebrow">Resolved configuration</p>
+          <h2 id="preview-title">Effective settings</h2>
+          <label>Preview model<input id="preview-model" list="models" placeholder="Select or enter a model ID" autocomplete="off"></label>
+          <label>OpenCode variant<select id="variant"><option value="">Default</option></select></label>
+          <p class="help">OpenCode defaults → global → folder → parent sessions → session. Within each scope, model overrides follow defaults.</p>
+          <p id="preview-note" class="help"></p>
+          <dl id="sources"></dl>
+          <div class="json-heading"><h3>Request provider object</h3><button type="button" id="copy" class="quiet">Copy</button></div>
+          <pre id="effective" tabindex="0">{}</pre>
+          <p class="help">Preview includes unsaved edits and configured OpenCode model/variant defaults. Other request-time hooks and OpenRouter account policies may change the final result.</p>
+        </aside>
+      </div>
+    </main>
+  </body>
+</html>

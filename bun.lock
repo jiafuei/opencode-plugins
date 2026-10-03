@@ -56,6 +56,14 @@
         "solid-js": "1.9.12",
       },
     },
+    "plugins/openrouter": {
+      "name": "@jiafuei/opencode-openrouter",
+      "version": "0.0.1",
+      "dependencies": {
+        "@opencode/plugin": "2.0.15",
+        "zod": "4.1.8",
+      },
+    },
     "plugins/redact-keys": {
       "name": "@jiafuei/opencode-redact-keys",
       "version": "0.0.1",
@@ -231,6 +239,8 @@
     "@jiafuei/opencode-computer-use": ["@jiafuei/opencode-computer-use@workspace:plugins/computer-use"],
 
     "@jiafuei/opencode-memory": ["@jiafuei/opencode-memory@workspace:plugins/memory"],
+
+    "@jiafuei/opencode-openrouter": ["@jiafuei/opencode-openrouter@workspace:plugins/openrouter"],
 
     "@jiafuei/opencode-redact-keys": ["@jiafuei/opencode-redact-keys@workspace:plugins/redact-keys"],
 

@@ -9,6 +9,7 @@ Standalone plugins for [OpenCode](https://opencode.ai), maintained as independen
 - [Memory](plugins/memory/README.md): project-scoped automatic memory with a `/memory` browser.
 - [Web search](plugins/websearch/README.md): provider-native web search, currently backed by OpenAI hosted search with a ChatGPT subscription.
 - [Redact keys](plugins/redact-keys/README.md): redact secrets from protected files before they reach the model.
+- [OpenRouter](plugins/openrouter/README.md): routing and privacy settings with global, folder, and session overrides and a local web UI.
 - [Workflows](plugins/workflows/README.md): declarative child-agent workflows with steering and a native TUI inspector.
 
 ## Installation
