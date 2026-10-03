@@ -185,6 +185,16 @@ token exchange and refresh calls. The account identity resolved at login
 (account, email, organization) is kept in the credential's metadata, and the
 email labels the connection.
 
+## Usage limits
+
+Run `/anthropic-usage` (or **Anthropic usage** in the command palette) to show
+the plan's 5-hour and weekly utilization with reset times, and whether extra
+usage is enabled. It sends Claude Code's `/usage` request
+(`GET /api/oauth/usage` with the `oauth-2025-04-20` beta and the profile's
+User-Agent, per an October 3 capture) using the active Claude Pro/Max
+credential. Limits come from the response's `limits` list, so new limit kinds
+show under their raw names.
+
 ## What it does
 
 When the active Anthropic connection is the Claude Pro/Max OAuth credential,

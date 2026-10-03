@@ -3,6 +3,7 @@ import { randomBytes, randomUUID } from "node:crypto";
 import { createSseToolNameTransform, resolveSpoofingProfile, uncloakedResponseHeaders } from "./wire_format.ts";
 import { cliHeaders, rewriteCliBody, type CliAttribution, type CliProfile } from "./cli_wire.ts";
 import { createCliRelay } from "./cli_transport.ts";
+import { ClaudeOAuthRpc } from "./rpc.ts";
 
 // Configure in `opencode.json` like:
 //
@@ -23,6 +24,7 @@ const AUTHORIZE_URL = rot13("uggcf://pynhqr.pbz/pnv/bnhgu/nhgubevmr");
 const TOKEN_URL = rot13("uggcf://cyngsbez.pynhqr.pbz/i1/bnhgu/gbxra");
 const PROFILE_URL = rot13("uggcf://ncv.naguebcvp.pbz/ncv/bnhgu/cebsvyr");
 const ROLES_URL = rot13("uggcf://ncv.naguebcvp.pbz/ncv/bnhgu/pynhqr_pyv/ebyrf");
+const USAGE_URL = rot13("uggcf://ncv.naguebcvp.pbz/ncv/bnhgu/hfntr");
 const REDIRECT_URI = rot13("uggcf://cyngsbez.pynhqr.pbz/bnhgu/pbqr/pnyyonpx");
 const SCOPES =
   rot13("bet:perngr_ncv_xrl hfre:cebsvyr hfre:vasrerapr hfre:frffvbaf:pynhqr_pbqr hfre:zpc_freiref hfre:svyr_hcybnq");
@@ -327,6 +329,37 @@ export default Plugin.define({
     });
 
     await load();
+
+    // Mirrors Claude Code's /usage request (October 3 capture).
+    await ctx.rpc.register(ClaudeOAuthRpc, {
+      usage: async () => {
+        const connection = await ctx.integration.connection.active("anthropic");
+        // Resolving refreshes a token close to expiry.
+        const credential = connection ? await ctx.integration.connection.resolve(connection) : undefined;
+        if (credential?.type !== "oauth" || credential.methodID !== METHOD_ID) {
+          throw new Error("Anthropic is not connected with Claude Pro/Max.");
+        }
+        const response = await fetch(USAGE_URL, {
+          headers: {
+            Authorization: `Bearer ${credential.access}`,
+            "anthropic-beta": "oauth-2025-04-20",
+            "Content-Type": "application/json",
+            "User-Agent": profile.userAgent,
+            Accept: AXIOS_ACCEPT,
+          },
+          signal: AbortSignal.timeout(10_000),
+        });
+        if (!response.ok) throw new Error(`Anthropic usage request failed: ${response.status}`);
+        const usage = (await response.json()) as {
+          limits: { kind: string; percent: number; resets_at: string | null }[];
+          spend: { enabled: boolean };
+        };
+        return {
+          limits: usage.limits.map((limit) => ({ kind: limit.kind, percent: limit.percent, resetsAt: limit.resets_at })),
+          extraUsage: usage.spend.enabled,
+        };
+      },
+    });
 
     await ctx.session.hook("context", async (event) => {
       if (!oauth) return;

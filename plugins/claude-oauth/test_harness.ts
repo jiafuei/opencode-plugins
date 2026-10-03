@@ -29,6 +29,7 @@ export async function setupPlugin(options: Record<string, unknown> = {}, credent
         resolve: async () => state.credential,
       },
     },
+    rpc: { register: async () => {} },
     model: {
       transform: async (callback: any) => (modelTransform = callback),
       reload: async () => {
