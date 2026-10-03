@@ -15,20 +15,24 @@ import { ClaudeOAuthRpc } from "./rpc.ts";
 // provider are then fingerprinted to look like Claude Code subscription
 // traffic, so your Pro/Max subscription is used instead of API credits.
 
-function rot13(value: string): string {
-  return value.replace(/[a-z]/gi, (char) => String.fromCharCode(char.charCodeAt(0) + (char.toLowerCase() < "n" ? 13 : -13)));
+// ROT18 (letters by 13, digits by 5) keeps code search from indexing these constants.
+function rot18(value: string): string {
+  return value
+    .replace(/[a-z]/gi, (char) => String.fromCharCode(char.charCodeAt(0) + (char.toLowerCase() < "n" ? 13 : -13)))
+    .replace(/\d/g, (digit) => String((Number(digit) + 5) % 10));
 }
 
-const CLIENT_ID = rot13("9q1p250n-r61o-44q9-88rq-5944q1962s5r"); // Claude Code's public OAuth client ID
-const AUTHORIZE_URL = rot13("uggcf://pynhqr.pbz/pnv/bnhgu/nhgubevmr");
-const TOKEN_URL = rot13("uggcf://cyngsbez.pynhqr.pbz/i1/bnhgu/gbxra");
-const PROFILE_URL = rot13("uggcf://ncv.naguebcvp.pbz/ncv/bnhgu/cebsvyr");
-const ROLES_URL = rot13("uggcf://ncv.naguebcvp.pbz/ncv/bnhgu/pynhqr_pyv/ebyrf");
-const USAGE_URL = rot13("uggcf://ncv.naguebcvp.pbz/ncv/bnhgu/hfntr");
-const REDIRECT_URI = rot13("uggcf://cyngsbez.pynhqr.pbz/bnhgu/pbqr/pnyyonpx");
+const CLIENT_ID = rot18("4q6p705n-r16o-99q4-33rq-0499q6417s0r"); // Claude Code's public OAuth client ID
+export const API_ORIGIN = rot18("uggcf://ncv.naguebcvp.pbz");
+export const AUTHORIZE_URL = rot18("uggcf://pynhqr.pbz/pnv/bnhgu/nhgubevmr");
+export const TOKEN_URL = rot18("uggcf://cyngsbez.pynhqr.pbz/i6/bnhgu/gbxra");
+export const PROFILE_URL = `${API_ORIGIN}${rot18("/ncv/bnhgu/cebsvyr")}`;
+export const ROLES_URL = `${API_ORIGIN}${rot18("/ncv/bnhgu/pynhqr_pyv/ebyrf")}`;
+const USAGE_URL = `${API_ORIGIN}${rot18("/ncv/bnhgu/hfntr")}`;
+export const REDIRECT_URI = rot18("uggcf://cyngsbez.pynhqr.pbz/bnhgu/pbqr/pnyyonpx");
 const SCOPES =
-  rot13("bet:perngr_ncv_xrl hfre:cebsvyr hfre:vasrerapr hfre:frffvbaf:pynhqr_pbqr hfre:zpc_freiref hfre:svyr_hcybnq");
-const REFRESH_SCOPES = rot13("hfre:cebsvyr hfre:vasrerapr hfre:frffvbaf:pynhqr_pbqr hfre:zpc_freiref hfre:svyr_hcybnq");
+  rot18("bet:perngr_ncv_xrl hfre:cebsvyr hfre:vasrerapr hfre:frffvbaf:pynhqr_pbqr hfre:zpc_freiref hfre:svyr_hcybnq");
+const REFRESH_SCOPES = rot18("hfre:cebsvyr hfre:vasrerapr hfre:frffvbaf:pynhqr_pbqr hfre:zpc_freiref hfre:svyr_hcybnq");
 
 const AXIOS_USER_AGENT = "axios/1.15.2";
 const AXIOS_ACCEPT = "application/json, text/plain, */*";

@@ -1,4 +1,4 @@
-import plugin from "./server.ts";
+import plugin, { API_ORIGIN } from "./server.ts";
 
 // Minimal stand-in for the v2 plugin host: records the OAuth method, the model
 // transform, and the session hooks, and drives an Anthropic /v1/messages
@@ -73,7 +73,7 @@ export async function setupPlugin(options: Record<string, unknown> = {}, credent
     const scope = { sessionID, agent: "build", model: { providerID: "anthropic", modelID: String(body.model) }, kind: "primary" };
     const modelEvent = {
       ...scope,
-      baseURL: "https://api.anthropic.com/v1",
+      baseURL: `${API_ORIGIN}/v1`,
       headers: {
         "x-session-affinity": sessionID,
         "X-Session-Id": sessionID,
@@ -85,7 +85,7 @@ export async function setupPlugin(options: Record<string, unknown> = {}, credent
     const credential = state.credential as { type: string; access?: string; key?: string } | undefined;
     const requestEvent = {
       ...scope,
-      request: new Request("https://api.anthropic.com/v1/messages?beta=true", {
+      request: new Request(`${API_ORIGIN}/v1/messages?beta=true`, {
         method: "POST",
         headers: {
           ...modelEvent.headers,

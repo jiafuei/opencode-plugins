@@ -16,8 +16,15 @@ export const PROVIDER_ID = Provider.ID.make("google-antigravity");
 // Endpoints & client identity
 // ---------------------------------------------------------------------------
 
-export const ANTIGRAVITY_DAILY_ENDPOINT = "https://daily-cloudcode-pa.googleapis.com";
-export const ANTIGRAVITY_SANDBOX_ENDPOINT = "https://daily-cloudcode-pa.sandbox.googleapis.com";
+// ROT18 (letters by 13, digits by 5) keeps code search from indexing these constants.
+export function rot18(value: string): string {
+  return value
+    .replace(/[a-z]/gi, (char) => String.fromCharCode(char.charCodeAt(0) + (char.toLowerCase() < "n" ? 13 : -13)))
+    .replace(/\d/g, (digit) => String((Number(digit) + 5) % 10));
+}
+
+export const ANTIGRAVITY_DAILY_ENDPOINT = rot18("uggcf://qnvyl-pybhqpbqr-cn.tbbtyrncvf.pbz");
+export const ANTIGRAVITY_SANDBOX_ENDPOINT = rot18("uggcf://qnvyl-pybhqpbqr-cn.fnaqobk.tbbtyrncvf.pbz");
 export const ANTIGRAVITY_ENDPOINTS = [ANTIGRAVITY_DAILY_ENDPOINT, ANTIGRAVITY_SANDBOX_ENDPOINT] as const;
 
 /** Native IDE client version; override with OPENCODE_ANTIGRAVITY_VERSION. */

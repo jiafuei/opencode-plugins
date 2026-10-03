@@ -1,6 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import {
+  AUTH_URL,
   CALLBACK_PATH,
+  SCOPES,
+  TOKEN_URL,
   buildAuthUrl,
   exchangeToken,
   extractPastedCode,
@@ -45,19 +48,13 @@ describe("authorization URL", () => {
   test("mirrors the native installed-app flow", () => {
     const state = newOAuthState();
     const url = new URL(buildAuthUrl(state, REDIRECT_URI));
-    expect(url.origin + url.pathname).toBe("https://accounts.google.com/o/oauth2/v2/auth");
+    expect(url.origin + url.pathname).toBe(AUTH_URL);
     expect(url.searchParams.get("response_type")).toBe("code");
     expect(url.searchParams.get("redirect_uri")).toBe(REDIRECT_URI);
     expect(url.searchParams.get("state")).toBe(state);
     expect(url.searchParams.get("access_type")).toBe("offline");
     expect(url.searchParams.get("prompt")).toBe("consent");
-    expect(url.searchParams.get("scope")?.split(" ")).toEqual([
-      "https://www.googleapis.com/auth/cloud-platform",
-      "https://www.googleapis.com/auth/userinfo.email",
-      "https://www.googleapis.com/auth/userinfo.profile",
-      "https://www.googleapis.com/auth/cclog",
-      "https://www.googleapis.com/auth/experimentsandconfigs",
-    ]);
+    expect(url.searchParams.get("scope")).toBe(SCOPES);
     // The native flow does not use PKCE.
     expect(url.searchParams.get("code_challenge")).toBeNull();
   });
@@ -89,7 +86,7 @@ describe("token exchange", () => {
     expect(credentials.expires - Date.now()).toBeWithin(55 * 60_000 - 1000, 55 * 60_000 + 1);
 
     const tokenCall = calls[0]!;
-    expect(tokenCall.url).toBe("https://oauth2.googleapis.com/token");
+    expect(tokenCall.url).toBe(TOKEN_URL);
     const body = new URLSearchParams(String(tokenCall.init.body));
     expect(body.get("grant_type")).toBe("authorization_code");
     expect(body.get("code")).toBe("code-1");

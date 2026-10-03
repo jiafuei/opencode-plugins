@@ -1,15 +1,12 @@
 import { describe, expect, mock, test } from "bun:test";
 import plugin from "./server.ts";
-import { COMPACTION_PROMPT, WIRE_MODEL_HEADER } from "./wire.ts";
+import { ANTIGRAVITY_DAILY_ENDPOINT as DAILY, ANTIGRAVITY_SANDBOX_ENDPOINT as SANDBOX, COMPACTION_PROMPT, WIRE_MODEL_HEADER } from "./wire.ts";
 
 // Route the native-framed transports through the global fetch the tests mock.
 mock.module("./transport.ts", () => {
   const viaGlobalFetch = ((url: string, init: RequestInit) => globalThis.fetch(url, init)) as typeof fetch;
   return { goFetch: viaGlobalFetch, nodeFetch: viaGlobalFetch, go2Fetch: viaGlobalFetch };
 });
-
-const DAILY = "https://daily-cloudcode-pa.googleapis.com";
-const SANDBOX = "https://daily-cloudcode-pa.sandbox.googleapis.com";
 
 interface StoredCredential {
   type: string;

@@ -189,10 +189,9 @@ email labels the connection.
 
 Run `/anthropic-usage` (or **Anthropic usage** in the command palette) to show
 the plan's 5-hour and weekly utilization with reset times, and whether extra
-usage is enabled. It sends Claude Code's `/usage` request
-(`GET /api/oauth/usage` with the `oauth-2025-04-20` beta and the profile's
-User-Agent, per an October 3 capture) using the active Claude Pro/Max
-credential. Limits come from the response's `limits` list, so new limit kinds
+usage is enabled. It sends Claude Code's `/usage` request (the OAuth usage
+endpoint with the `oauth-2025-04-20` beta and the profile's User-Agent, per an
+October 3 capture) using the active Claude Pro/Max credential. Limits come from the response's `limits` list, so new limit kinds
 show under their raw names.
 
 ## What it does

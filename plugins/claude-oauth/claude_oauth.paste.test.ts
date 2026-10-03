@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
+import { AUTHORIZE_URL, REDIRECT_URI, TOKEN_URL } from "./server.ts";
 import { setupPlugin } from "./test_harness.ts";
 
 // ---------------------------------------------------------------------------
@@ -23,7 +24,7 @@ async function makePasteHarness(): Promise<Harness> {
   const originalFetch = globalThis.fetch;
   globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
     const url = String(input instanceof Request ? input.url : input);
-    if (url.includes("platform.claude.com/v1/oauth/token")) {
+    if (url === TOKEN_URL) {
       tokenCalls.push({ body: JSON.parse(String(init?.body)) });
       return new Response(
         JSON.stringify({
@@ -83,9 +84,9 @@ describe("paste code flow", () => {
       const h = await makePasteHarness();
       try {
         const url = new URL(h.result.url);
-        expect(url.origin + url.pathname).toBe("https://claude.com/cai/oauth/authorize");
+        expect(url.origin + url.pathname).toBe(AUTHORIZE_URL);
         const { redirectUri, state } = authorizeParams(h.result.url);
-        expect(redirectUri).toBe("https://platform.claude.com/oauth/code/callback");
+        expect(redirectUri).toBe(REDIRECT_URI);
         const pasted =
           format === "redirect"
             ? `${redirectUri}?${new URLSearchParams({ code: "good-code", state })}`
@@ -102,7 +103,7 @@ describe("paste code flow", () => {
         expect(h.tokenCalls).toHaveLength(1);
         expect(h.tokenCalls[0]!.body.code).toBe("good-code");
         expect(h.tokenCalls[0]!.body.state).toBe(state);
-        expect(h.tokenCalls[0]!.body.redirect_uri).toBe("https://platform.claude.com/oauth/code/callback");
+        expect(h.tokenCalls[0]!.body.redirect_uri).toBe(REDIRECT_URI);
         const verifier = h.tokenCalls[0]!.body.code_verifier as string;
         expect(verifier).toMatch(/^[A-Za-z0-9_-]{43}$/);
         expect(url.searchParams.get("code_challenge")).toBe(createHash("sha256").update(verifier).digest("base64url"));

@@ -18,7 +18,7 @@ The plugin registers the `google-antigravity` integration and provider. The prov
 
 1. Connect the **Google Antigravity** integration in OpenCode.
 2. Choose a sign-in method:
-   - **Antigravity (browser)** — opens `accounts.google.com` in your browser and completes login against a local callback server on an ephemeral port, redirecting to `http://localhost:<port>/oauth-callback` like the native client. Keep OpenCode open until the redirect completes.
+   - **Antigravity (browser)** — opens Google sign-in in your browser and completes login against a local callback server on an ephemeral port, redirecting to `http://localhost:<port>/oauth-callback` like the native client. Keep OpenCode open until the redirect completes.
    - **Antigravity (paste code)** — use this when the browser cannot reach the callback server (remote OpenCode, container, or restricted loopback forwarding). This method intentionally does not start a server: it picks a random `localhost` port, so after Google redirects the browser shows “cannot connect.” Copy the complete `http://localhost:<port>/oauth-callback?...` URL from its address bar and paste that URL into OpenCode. Start a fresh paste-code login first; a redirect from an older browser-method attempt has a different `state` and is rejected.
 3. On first login the plugin calls `loadCodeAssist` once, provisions the Antigravity free tier through `onboardUser` if the account has no tier yet (one long-running operation polled every second under a 30-second deadline), and stores the resolved project.
 
@@ -57,7 +57,7 @@ Wire models whose display names differ only by a `(Low)` / `(Medium)` / `(High)`
 
 **Options**
 
-- `endpointMode`: `"auto"` (default) dispatches to `https://daily-cloudcode-pa.googleapis.com` first; a failed response moves that session to the other endpoint (sandbox, or back to daily), so OpenCode's retry lands there, and a successful one keeps it. `"production"` / `"sandbox"` pin one endpoint.
+- `endpointMode`: `"auto"` (default) dispatches to the daily Cloud Code Assist endpoint first; a failed response moves that session to the other endpoint (sandbox, or back to daily), so OpenCode's retry lands there, and a successful one keeps it. `"production"` / `"sandbox"` pin one endpoint.
 - `trajectoryAcls`: `true` sends `writeTrajectoryAcls` for a session's trajectory before its first agent request, as the native client does. Default `false`.
 - `metrics`: `true` sends `recordCodeAssistMetrics` (trace id and 100ns-resolution streaming latencies) after each agent or checkpoint stream that finishes, as the native client does. Default `false`.
 

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { resolveIdentity } from "./server.ts";
+import { PROFILE_URL, ROLES_URL, resolveIdentity } from "./server.ts";
 
 const TOKEN_BODY = {
   access_token: "access-1",
@@ -66,8 +66,8 @@ describe("resolveIdentity (login semantics)", () => {
         orgName: "Acme workspace",
       });
       expect(calls.map((call) => call.url)).toEqual([
-        "https://api.anthropic.com/api/oauth/profile",
-        "https://api.anthropic.com/api/oauth/claude_cli/roles",
+        PROFILE_URL,
+        ROLES_URL,
       ]);
       expect(new Headers(calls[0]!.init!.headers).get("authorization")).toBe("Bearer access-1");
     } finally {

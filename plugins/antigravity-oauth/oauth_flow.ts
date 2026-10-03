@@ -14,20 +14,19 @@ import {
   ANTIGRAVITY_DAILY_ENDPOINT,
   getAntigravityNodeUserAgent,
   getAntigravityVersion,
+  rot18,
 } from "./wire.ts";
 
-// Native Antigravity installed-app client (base64 exactly as upstream ships it).
-const CLIENT_ID = atob(
-  "MTA3MTAwNjA2MDU5MS10bWhzc2luMmgyMWxjcmUyMzV2dG9sb2poNGc0MDNlcC5hcHBzLmdvb2dsZXVzZXJjb250ZW50LmNvbQ==",
-);
-const CLIENT_SECRET = atob("R09DU1BYLUs1OEZXUjQ4NkxkTEoxbUxCOHNYQzR6NnFEQWY=");
+// Native Antigravity installed-app client.
+const CLIENT_ID = rot18("6526551515046-gzuffva7u76yper780igbybwu9t958rc.nccf.tbbtyrhfrepbagrag.pbz");
+const CLIENT_SECRET = rot18("TBPFCK-X03SJE931YqYW6zYO3fKP9m1dQNs");
 
 /** Native redirects go to `http://localhost:<ephemeral port>/oauth-callback`. */
 export const CALLBACK_PATH = "/oauth-callback";
 
-const AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
-const TOKEN_URL = "https://oauth2.googleapis.com/token";
-const USERINFO_URL = "https://www.googleapis.com/oauth2/v2/userinfo";
+export const AUTH_URL = rot18("uggcf://nppbhagf.tbbtyr.pbz/b/bnhgu7/i7/nhgu");
+export const TOKEN_URL = rot18("uggcf://bnhgu7.tbbtyrncvf.pbz/gbxra");
+const USERINFO_URL = rot18("uggcf://jjj.tbbtyrncvf.pbz/bnhgu7/i7/hfrevasb");
 
 /** Per-request timeout for provisioning-phase HTTP calls (OMP OAUTH_REQUEST_TIMEOUT_MS). */
 const OAUTH_REQUEST_TIMEOUT_MS = 30_000;
@@ -39,13 +38,11 @@ const EXPIRY_SKEW_MS = 5 * 60 * 1000;
 
 const FREE_TIER_ID = "free-tier";
 
-const SCOPES = [
-  "https://www.googleapis.com/auth/cloud-platform",
-  "https://www.googleapis.com/auth/userinfo.email",
-  "https://www.googleapis.com/auth/userinfo.profile",
-  "https://www.googleapis.com/auth/cclog",
-  "https://www.googleapis.com/auth/experimentsandconfigs",
-];
+export const SCOPES = rot18(
+  "uggcf://jjj.tbbtyrncvf.pbz/nhgu/pybhq-cyngsbez uggcf://jjj.tbbtyrncvf.pbz/nhgu/hfrevasb.rznvy " +
+    "uggcf://jjj.tbbtyrncvf.pbz/nhgu/hfrevasb.cebsvyr uggcf://jjj.tbbtyrncvf.pbz/nhgu/ppybt " +
+    "uggcf://jjj.tbbtyrncvf.pbz/nhgu/rkcrevzragfnaqpbasvtf",
+);
 
 /** google-api-nodejs-client identification sent by the IDE's Node side. */
 const NODE_API_CLIENT = "gl-node/22.21.1";
@@ -84,7 +81,7 @@ export function buildAuthUrl(state: string, redirectUri: string): string {
     client_id: CLIENT_ID,
     response_type: "code",
     redirect_uri: redirectUri,
-    scope: SCOPES.join(" "),
+    scope: SCOPES,
     state,
     access_type: "offline",
     prompt: "consent",

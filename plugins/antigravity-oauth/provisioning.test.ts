@@ -1,5 +1,6 @@
 import { describe, expect, setSystemTime, test } from "bun:test";
 import { discoverProject } from "./oauth_flow.ts";
+import { ANTIGRAVITY_DAILY_ENDPOINT } from "./wire.ts";
 
 interface RecordedCall {
   url: string;
@@ -51,7 +52,7 @@ describe("project discovery", () => {
     expect(project).toBe("proj-1");
     expect(calls).toHaveLength(1);
     expect(JSON.parse(String(calls[0]!.init.body))).toEqual({ metadata: IDE_METADATA });
-    expect(calls[0]!.url).toBe("https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist");
+    expect(calls[0]!.url).toBe(`${ANTIGRAVITY_DAILY_ENDPOINT}/v1internal:loadCodeAssist`);
     // Login-time provisioning runs on the IDE's Node side.
     expect(calls[0]!.init.headers).toMatchObject({
       "User-Agent": "antigravity/2.5.5 windows/amd64 google-api-nodejs-client/10.3.0",
@@ -80,11 +81,11 @@ describe("project discovery", () => {
     expect(sleeps).toEqual([1000]); // one-second polling cadence
 
     const onboardCall = calls[1]!;
-    expect(onboardCall.url).toBe("https://daily-cloudcode-pa.googleapis.com/v1internal:onboardUser");
+    expect(onboardCall.url).toBe(`${ANTIGRAVITY_DAILY_ENDPOINT}/v1internal:onboardUser`);
     expect(JSON.parse(String(onboardCall.init.body))).toEqual({ tier_id: "free-tier", metadata: IDE_METADATA });
     // LRO polls carry the shared native context, Content-Type included.
     const pollCall = calls[2]!;
-    expect(pollCall.url).toBe("https://daily-cloudcode-pa.googleapis.com/v1internal/operations/abc");
+    expect(pollCall.url).toBe(`${ANTIGRAVITY_DAILY_ENDPOINT}/v1internal/operations/abc`);
     const pollHeaders = pollCall.init.headers as Record<string, string>;
     expect(pollHeaders["Content-Type"]).toBe("application/json");
     expect(pollHeaders["User-Agent"]).toStartWith("antigravity/2.5.5 ");
