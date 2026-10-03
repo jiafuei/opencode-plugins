@@ -31,26 +31,20 @@ function toResponse(status: number, headers: ResponseHeaders, chunks: Buffer[]):
   return new Response(body, { status, headers: out });
 }
 
+// Responses decode in `then`, so a decoding error rejects the fetch.
 function http1(url: string, init: RequestInit, body: string | undefined, headers: Record<string, string>): Promise<Response> {
-  return new Promise((resolve, reject) => {
+  return new Promise<Parameters<typeof toResponse>>((resolve, reject) => {
     const request = https.request(url, { method: init.method ?? "GET", headers, signal: init.signal ?? undefined }, (response) => {
       const chunks: Buffer[] = [];
       response.on("data", (chunk: Buffer) => chunks.push(chunk));
-      // Decoding runs in an event callback, so its errors must reject the promise to reach the caller.
-      response.on("end", () => {
-        try {
-          resolve(toResponse(response.statusCode!, response.headers, chunks));
-        } catch (error) {
-          reject(error);
-        }
-      });
+      response.on("end", () => resolve([response.statusCode!, response.headers, chunks]));
       response.on("error", reject);
     });
     // Without an explicit Connection header, send none (the Go client's framing).
     if (!("Connection" in headers)) request.removeHeader("Connection");
     request.on("error", reject);
     request.end(body);
-  });
+  }).then((raw) => toResponse(...raw));
 }
 
 /**
@@ -90,7 +84,7 @@ export const go2Fetch = ((url: string, init: RequestInit = {}) => {
   const target = new URL(url);
   const { "User-Agent": userAgent, "Accept-Encoding": acceptEncoding, ...rest } = init.headers as Record<string, string>;
   const body = String(init.body);
-  return new Promise((resolve, reject) => {
+  return new Promise<Parameters<typeof toResponse>>((resolve, reject) => {
     const session = http2.connect(target.origin);
     const fail = (error: unknown) => {
       session.destroy();
@@ -116,13 +110,9 @@ export const go2Fetch = ((url: string, init: RequestInit = {}) => {
     stream.on("data", (chunk: Buffer) => chunks.push(chunk));
     stream.on("end", () => {
       session.close();
-      try {
-        resolve(toResponse(Number(headers[":status"]), headers, chunks));
-      } catch (error) {
-        reject(error);
-      }
+      resolve([Number(headers[":status"]), headers, chunks]);
     });
     stream.on("error", fail);
     stream.end(body);
-  });
+  }).then((raw) => toResponse(...raw));
 }) as typeof fetch;

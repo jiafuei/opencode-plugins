@@ -495,23 +495,16 @@ export default Plugin.define({
           .trim();
         if (!summary) throw new Error("Antigravity compaction returned no summary");
         // The native message lists the latest ten user requests. Core retains the
-        // user's own messages since the last compaction (typed text first, before
-        // attachments); earlier requests ride on the previous resume message.
-        const previous = event.messages.findLastIndex((message) =>
-          message.content.some((part) => part.text?.startsWith(COMPACTION_RESUME_HEADER)),
-        );
-        const earlier = event.messages[previous]?.content
-          .find((part) => part.text?.startsWith(COMPACTION_RESUME_HEADER))?.metadata?.requests;
-        // A prior window pairs the last real user message with its resume message.
-        const retained = event.retained.length
+        // user's own messages since the last compaction (typed text first); earlier
+        // requests ride on the previous resume message, which follows that window's
+        // latest user request.
+        const previous = event.messages.findLastIndex((message) => message.content[0]?.metadata?.requests);
+        const latest = event.retained.length
           ? event.retained.slice(-1)
           : previous > 0 ? event.messages.slice(previous - 1, previous) : [];
         const requests = [
-          ...(earlier ?? []),
-          ...event.retained.flatMap((message) => {
-            const text = message.content[0]?.type === "text" ? message.content[0].text! : "";
-            return text.trim() ? [text] : [];
-          }),
+          ...(event.messages[previous]?.content[0]!.metadata!.requests ?? []),
+          ...event.retained.flatMap(({ content: [part] }) => (part?.type === "text" && part.text!.trim() ? [part.text!] : [])),
         ].slice(-10);
         const resume = [
           COMPACTION_RESUME_HEADER,
@@ -525,10 +518,7 @@ export default Plugin.define({
           summary,
         ].join("\n");
         event.result = {
-          replacement: [
-            ...retained,
-            { role: "user", content: [{ type: "text", text: resume, metadata: { requests } }] },
-          ],
+          replacement: [...latest, { role: "user", content: [{ type: "text", text: resume, metadata: { requests } }] }],
         };
       },
       { providerID: PROVIDER_ID },
