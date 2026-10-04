@@ -1,21 +1,10 @@
-/**
- * Tool-schema normalization for the Cloud Code Assist (`daily-cloudcode-pa`)
- * Schema proto, ported from oh-my-pi's `utils/schema` CCA profile.
- *
- * CCA protojson rejects unknown Schema fields outright ("Cannot find field"),
- * so normalization is driven by an explicit output-key allowlist rather than a
- * blacklist: local JSON Pointer `$ref`s are inlined from `$defs`/`definitions`,
- * snake_case SDK/MCP keys are renamed, validators/annotations the wire cannot
- * express are stripped, unions are collapsed to one representable schema, and
- * malformed or unrepresentable subschemas are widened locally so valid tool
- * parameters survive. An unusable root falls back to an empty object schema.
- */
+// CCA rejects unknown schema fields. Convert JSON tool schemas to its supported
+// subset, widening incompatible parameters without discarding their siblings.
 
 type JsonObject = Record<string, unknown>;
 
 class UnrepresentableSchema extends Error {}
 
-/** Safe terminal schema for tools whose parameters cannot be represented. */
 const CCA_FALLBACK_SCHEMA: JsonObject = { type: "object", properties: {} };
 
 /** snake_case keys used by python-genai-style SDKs and MCP servers. */
@@ -26,7 +15,6 @@ const SNAKE_TO_CAMEL_RENAMES: Record<string, string> = {
   property_ordering: "propertyOrdering",
 };
 
-/** Type names accepted by the native schema converter. */
 const SUPPORTED_TYPES: Readonly<Record<string, true>> = {
   string: true,
   number: true,
@@ -37,43 +25,10 @@ const SUPPORTED_TYPES: Readonly<Record<string, true>> = {
   null: true,
 };
 
-/**
- * Keys permitted on the final CCA wire schema; everything else is stripped.
- * This allowlist is the single source of truth for wire safety: meta/reference
- * keywords ($schema/$ref/$defs/$comment/...), annotations (deprecated,
- * readOnly, writeOnly), MCP transport annotations (x-mcp-header), object-key
- * validators (additionalProperties, propertyNames), and the validators the
- * native converter does not translate (exclusive bounds, multipleOf,
- * uniqueItems, min/maxProperties) all fail it and are dropped.
- */
-const OUTPUT_KEYS: Readonly<Record<string, true>> = {
-  type: true,
-  description: true,
-  title: true,
-  default: true,
-  enum: true,
-  properties: true,
-  required: true,
-  propertyOrdering: true,
-  items: true,
-  format: true,
-  pattern: true,
-  minimum: true,
-  maximum: true,
-  minLength: true,
-  maxLength: true,
-  minItems: true,
-  maxItems: true,
-};
-
 const TYPE_SPECIFIC_KEYS = [
   "items", "minItems", "maxItems", "properties", "required", "propertyOrdering",
   "format", "pattern", "minLength", "maxLength", "minimum", "maximum",
 ] as const;
-
-// ---------------------------------------------------------------------------
-// Small JSON helpers
-// ---------------------------------------------------------------------------
 
 function isPlainObject(value: unknown): value is JsonObject {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -86,46 +41,6 @@ function stringArray(value: unknown): string[] {
 function setOwn(target: JsonObject, key: string, value: unknown): void {
   Object.defineProperty(target, key, { value, enumerable: true, configurable: true, writable: true });
 }
-
-function jsonTypeOf(value: unknown): string {
-  if (value === null) return "null";
-  if (Array.isArray(value)) return "array";
-  switch (typeof value) {
-    case "string":
-      return "string";
-    case "number":
-      return "number";
-    case "boolean":
-      return "boolean";
-    default:
-      return "object";
-  }
-}
-
-/** Deep structural equality of two JSON-shaped values. */
-function jsonEquals(left: unknown, right: unknown, seen = new Map<object, Set<object>>()): boolean {
-  if (Object.is(left, right)) return true;
-  if (Array.isArray(left) || Array.isArray(right)) {
-    if (!Array.isArray(left) || !Array.isArray(right) || left.length !== right.length) return false;
-    let rights = seen.get(left);
-    if (rights?.has(right)) return true;
-    if (!rights) seen.set(left, (rights = new Set()));
-    rights.add(right);
-    return left.every((entry, i) => jsonEquals(entry, right[i], seen));
-  }
-  if (!isPlainObject(left) || !isPlainObject(right)) return false;
-  let rights = seen.get(left);
-  if (rights?.has(right)) return true;
-  if (!rights) seen.set(left, (rights = new Set()));
-  rights.add(right);
-  const leftKeys = Object.keys(left);
-  if (leftKeys.length !== Object.keys(right).length) return false;
-  return leftKeys.every((key) => Object.hasOwn(right, key) && jsonEquals(left[key], right[key], seen));
-}
-
-// ---------------------------------------------------------------------------
-// $ref dereferencing (local JSON Pointers into $defs / definitions)
-// ---------------------------------------------------------------------------
 
 /**
  * Resolve a local pointer-style `$ref` against the root schema's `$defs` or
@@ -146,85 +61,46 @@ function resolveLocalRef(ref: string, root: JsonObject): JsonObject | undefined 
   return isPlainObject(node) ? node : undefined;
 }
 
-const SINGLE_SUBSCHEMA_KEYS: Readonly<Record<string, true>> = {
-  items: true,
-  not: true,
-  if: true,
-  then: true,
-  else: true,
-  contains: true,
-  propertyNames: true,
-  contentSchema: true,
-};
-
-const SUBSCHEMA_ARRAY_KEYS: Readonly<Record<string, true>> = {
-  anyOf: true,
-  oneOf: true,
-  allOf: true,
-  prefixItems: true,
-};
-
 /** Inline local refs while never descending into enum/default/example literals. */
 function dereferenceNode(
   node: unknown,
   root: JsonObject,
   visitingRefs: Set<string>,
-  visitingObjects: Set<object>,
 ): unknown {
   if (!isPlainObject(node)) return node;
-  if (visitingObjects.has(node)) return {};
-  visitingObjects.add(node);
-  try {
-    const ref = node["$ref"];
-    if (typeof ref === "string") {
-      if (visitingRefs.has(ref)) return {};
-      const resolved = resolveLocalRef(ref, root);
-      if (!resolved) return node;
-      visitingRefs.add(ref);
-      const inlined = dereferenceNode(resolved, root, visitingRefs, visitingObjects);
-      visitingRefs.delete(ref);
-      if (!isPlainObject(inlined)) return inlined;
-      const siblings = dereferenceSchemaEntries(node, root, visitingRefs, visitingObjects, true);
-      return { allOf: [siblings, inlined] };
-    }
-    return dereferenceSchemaEntries(node, root, visitingRefs, visitingObjects, false);
-  } finally {
-    visitingObjects.delete(node);
+  const ref = node.$ref;
+  if (typeof ref === "string") {
+    if (visitingRefs.has(ref)) return {};
+    const resolved = resolveLocalRef(ref, root);
+    if (!resolved) return node;
+    visitingRefs.add(ref);
+    const inlined = dereferenceNode(resolved, root, visitingRefs);
+    visitingRefs.delete(ref);
+    const siblings = dereferenceSchemaEntries(node, root, visitingRefs);
+    return { allOf: [siblings, inlined] };
   }
+  return dereferenceSchemaEntries(node, root, visitingRefs);
 }
 
 function dereferenceSchemaEntries(
   node: JsonObject,
   root: JsonObject,
   visitingRefs: Set<string>,
-  visitingObjects: Set<object>,
-  skipRef: boolean,
 ): JsonObject {
   const result: JsonObject = {};
   for (const [key, value] of Object.entries(node)) {
-    if (key === "$defs" || key === "definitions" || (skipRef && key === "$ref")) continue;
+    if (key === "$defs" || key === "definitions" || key === "$ref") continue;
     const normalizedKey = SNAKE_TO_CAMEL_RENAMES[key] ?? key;
-    if (normalizedKey === "properties" || normalizedKey === "patternProperties" || normalizedKey === "dependentSchemas") {
-      if (!isPlainObject(value)) {
-        result[key] = value;
-        continue;
-      }
-      const map: JsonObject = {};
-      for (const [name, subschema] of Object.entries(value)) {
-        setOwn(map, name, dereferenceNode(subschema, root, visitingRefs, visitingObjects));
-      }
-      result[key] = map;
+    if (normalizedKey === "properties" && isPlainObject(value)) {
+      result[key] = Object.fromEntries(Object.entries(value).map(([name, schema]) => [name, dereferenceNode(schema, root, visitingRefs)]));
       continue;
     }
-    if (Object.hasOwn(SUBSCHEMA_ARRAY_KEYS, normalizedKey) && Array.isArray(value)) {
-      result[key] = value.map((entry) => dereferenceNode(entry, root, visitingRefs, visitingObjects));
+    if (["anyOf", "oneOf", "allOf"].includes(normalizedKey) && Array.isArray(value)) {
+      result[key] = value.map((entry) => dereferenceNode(entry, root, visitingRefs));
       continue;
     }
-    if (
-      Object.hasOwn(SINGLE_SUBSCHEMA_KEYS, normalizedKey) ||
-      (normalizedKey === "additionalProperties" && isPlainObject(value))
-    ) {
-      result[key] = dereferenceNode(value, root, visitingRefs, visitingObjects);
+    if (normalizedKey === "items") {
+      result[key] = dereferenceNode(value, root, visitingRefs);
       continue;
     }
     result[key] = value;
@@ -232,30 +108,13 @@ function dereferenceSchemaEntries(
   return result;
 }
 
-function dereferenceJsonSchema(schema: unknown): unknown {
-  if (!isPlainObject(schema)) return schema;
-  if (schema["$defs"] === undefined && schema["definitions"] === undefined) return schema;
-  return dereferenceNode(schema, schema, new Set(), new Set());
-}
-
-// ---------------------------------------------------------------------------
-// Normalization walk
-// ---------------------------------------------------------------------------
-
 /**
  * Rename known snake_case schema keys (python-genai collision rule: snake wins
  * over an existing camelCase entry). Only applied at schema nodes; property
  * map iteration never renames arbitrary property names.
  */
 function renameSnakeKeys(obj: JsonObject): JsonObject {
-  let needsRename = false;
-  for (const key of Object.keys(obj)) {
-    if (Object.hasOwn(SNAKE_TO_CAMEL_RENAMES, key)) {
-      needsRename = true;
-      break;
-    }
-  }
-  if (!needsRename) return obj;
+  if (!Object.keys(obj).some((key) => Object.hasOwn(SNAKE_TO_CAMEL_RENAMES, key))) return obj;
   const out: JsonObject = {};
   for (const key of Object.keys(obj)) {
     const renamed = SNAKE_TO_CAMEL_RENAMES[key];
@@ -265,84 +124,45 @@ function renameSnakeKeys(obj: JsonObject): JsonObject {
   return out;
 }
 
-function normalizeNode(value: unknown, visiting: Set<object>): unknown {
-  // A bare boolean is a JSON Schema subschema only in subschema slots, which
-  // is where this function is called. `true` is open; `false` cannot be
-  // represented without CCA's forbidden `not`.
+function normalizeNode(value: unknown): JsonObject {
   if (value === true) return {};
-  if (value === false) throw new UnrepresentableSchema("False schemas are not representable by CCA");
-  if (typeof value !== "object" || value === null) return value; // malformed: caught by validation
-  if (visiting.has(value)) return {}; // cyclic JS object graph: widen
-  visiting.add(value);
-  try {
-    return normalizeObjectNode(renameSnakeKeys(value as JsonObject), visiting);
-  } finally {
-    visiting.delete(value);
-  }
+  if (!isPlainObject(value)) throw new UnrepresentableSchema("Expected a schema object");
+  return normalizeObjectNode(renameSnakeKeys(value));
 }
 
-function normalizeSubschema(value: unknown, visiting: Set<object>): unknown {
+function normalizeSubschema(value: unknown): JsonObject {
   try {
-    const normalized = normalizeNode(value, visiting);
-    return isValidCcaSchema(normalized, new Set()) ? normalized : {};
+    return normalizeNode(value);
   } catch (error) {
     if (!(error instanceof UnrepresentableSchema)) throw error;
     return {};
   }
 }
 
-function normalizePropertiesMap(map: unknown, visiting: Set<object>): JsonObject | undefined {
-  if (!isPlainObject(map)) return undefined;
-  const result: JsonObject = {};
-  for (const [name, subschema] of Object.entries(map)) {
-    // Property names are literal payload keys, not schema keywords.
-    setOwn(result, name, normalizeSubschema(subschema, visiting));
-  }
-  return result;
-}
-
-function normalizeObjectNode(obj: JsonObject, visiting: Set<object>): JsonObject {
-  const result: JsonObject = {};
-  const unions: Partial<Record<"anyOf" | "oneOf", unknown[]>> = {};
-  const allOfEntries: unknown[] = [];
-  let constValue: unknown;
-  let hasConst = false;
+function normalizeObjectNode(obj: JsonObject): JsonObject {
+  let result: JsonObject = {};
 
   for (const [key, entry] of Object.entries(obj)) {
-    if (key === "anyOf" || key === "oneOf") {
-      if (Array.isArray(entry)) unions[key] = entry;
-      continue;
-    }
-    if (key === "allOf") {
-      if (Array.isArray(entry)) allOfEntries.push(...entry);
-      continue;
-    }
-    if (key === "const") {
-      constValue = entry;
-      hasConst = true;
-      continue;
-    }
-    // Nullability is widened after normalization; `not` has no wire field.
-    if (key === "nullable" || key === "not") continue;
-
     switch (key) {
       case "type":
-      case "description":
-      case "title":
       case "default":
       case "enum": // entries are literals, never walked as schemas
-      case "required":
-      case "propertyOrdering":
         result[key] = entry;
         break;
+      case "required":
+      case "propertyOrdering":
+        result[key] = stringArray(entry);
+        break;
       case "properties":
-        if (isPlainObject(entry)) result.properties = normalizePropertiesMap(entry, visiting);
+        if (isPlainObject(entry)) result.properties = Object.fromEntries(Object.entries(entry).map(([name, schema]) => [name, normalizeSubschema(schema)]));
         break;
       case "items":
         // Tuple-form (array) items are not representable: omit them, widening.
-        if (isPlainObject(entry) || typeof entry === "boolean") result.items = normalizeSubschema(entry, visiting);
+        if (isPlainObject(entry) || typeof entry === "boolean") result.items = normalizeSubschema(entry);
         break;
       // A mistyped validator would fail the whole request's protojson parse: drop it.
+      case "description":
+      case "title":
       case "format":
       case "pattern":
         if (typeof entry === "string") result[key] = entry;
@@ -357,19 +177,20 @@ function normalizeObjectNode(obj: JsonObject, visiting: Set<object>): JsonObject
       case "maxItems":
         if (Number.isSafeInteger(entry) && (entry as number) >= 0) result[key] = entry;
         break;
-      default:
-        break; // everything else fails the OUTPUT_KEYS allowlist: stripped
     }
   }
 
   resolveTypeKeyword(result);
-  if (hasConst) applyConst(result, constValue);
+  if (Object.hasOwn(obj, "const")) {
+    if (Array.isArray(result.enum) && !result.enum.some((value) => Bun.deepEquals(value, obj.const, true))) {
+      throw new UnrepresentableSchema("Conflicting const and enum constraints");
+    }
+    result.enum = [obj.const];
+  }
   finalizeEnum(result);
 
-  // allOf intersection: inline branches before union collapsing so merged
-  // results participate in collapse. Never becomes anyOf.
-  for (const entry of allOfEntries) {
-    const branch = normalizeNode(entry, visiting);
+  for (const entry of Array.isArray(obj.allOf) ? obj.allOf : []) {
+    const branch = normalizeNode(entry);
     // A branch may declare required/order names while a later branch declares
     // their properties. Keep those names until the full intersection is built.
     if (isPlainObject(entry) && isPlainObject(branch)) {
@@ -379,10 +200,12 @@ function normalizeObjectNode(obj: JsonObject, visiting: Set<object>): JsonObject
       if (required.length > 0) branch.required = required;
       if (propertyOrdering.length > 0) branch.propertyOrdering = propertyOrdering;
     }
-    mergeAllOfBranch(result, branch);
+    result = intersectAllOfSchemas(result, branch);
   }
 
-  collapseUnions(result, unions, visiting);
+  for (const key of ["anyOf", "oneOf"] as const) {
+    if (Array.isArray(obj[key])) result = collapseUnion(result, obj[key].map(normalizeNode));
+  }
   finalizeEnum(result);
   finalizeStructure(result);
   if (obj.nullable === true && result.type !== "null") {
@@ -391,12 +214,6 @@ function normalizeObjectNode(obj: JsonObject, visiting: Set<object>): JsonObject
     for (const key of TYPE_SPECIFIC_KEYS) delete result[key];
   }
   return result;
-}
-
-/** Merge allOf branches, repairing conflicts at property and item boundaries. */
-function mergeAllOfBranch(node: JsonObject, branch: unknown): void {
-  if (!isPlainObject(branch)) throw new UnrepresentableSchema("Malformed allOf branch");
-  replaceNodeKeys(node, intersectAllOfSchemas(node, branch));
 }
 
 function intersectAllOfSchemas(left: JsonObject, right: JsonObject): JsonObject {
@@ -419,7 +236,7 @@ function intersectAllOfSchemas(left: JsonObject, right: JsonObject): JsonObject 
   if (Array.isArray(left.enum) || Array.isArray(right.enum)) {
     if (Array.isArray(left.enum) && Array.isArray(right.enum)) {
       const rightEnum = right.enum as unknown[];
-      const intersection = left.enum.filter((value) => rightEnum.some((candidate) => jsonEquals(value, candidate)));
+      const intersection = left.enum.filter((value) => rightEnum.includes(value));
       if (intersection.length === 0) throw new UnrepresentableSchema("Conflicting allOf enums");
       result.enum = intersection;
     } else {
@@ -479,7 +296,7 @@ function intersectAllOfSchemas(left: JsonObject, right: JsonObject): JsonObject 
 }
 
 function intersectAllOfPropertySchemas(left: unknown, right: unknown): unknown {
-  if (jsonEquals(left, right)) return left;
+  if (Bun.deepEquals(left, right, true)) return left;
   if (!isPlainObject(left) || !isPlainObject(right)) return {};
   try {
     return intersectAllOfSchemas(left, right);
@@ -495,38 +312,20 @@ function intersectAllOfPropertySchemas(left: unknown, right: unknown): unknown {
  * anything else widens to `{}` rather than emitting a forbidden combiner.
  */
 function mergePropertySchemas(existing: unknown, incoming: unknown): unknown {
-  if (jsonEquals(existing, incoming)) return existing;
+  if (Bun.deepEquals(existing, incoming, true)) return existing;
   if (
     isPlainObject(existing) &&
     isPlainObject(incoming) &&
     Array.isArray(existing.enum) &&
     Array.isArray(incoming.enum)
   ) {
-    const rest = Object.keys(existing).filter((key) => key !== "enum");
-    const sameShape =
-      rest.length === Object.keys(incoming).filter((key) => key !== "enum").length &&
-      rest.every(
-        (key) =>
-          key !== "enum" && Object.hasOwn(incoming, key) && !Array.isArray(incoming[key]) && jsonEquals(existing[key], incoming[key]),
-      );
-    if (sameShape) {
-      const mergedEnum = [...(existing.enum as unknown[])];
-      for (const value of incoming.enum as unknown[]) {
-        if (!mergedEnum.some((candidate) => jsonEquals(candidate, value))) mergedEnum.push(value);
-      }
-      return { ...existing, enum: mergedEnum };
+    const { enum: leftEnum, ...left } = existing;
+    const { enum: rightEnum, ...right } = incoming;
+    if (Bun.deepEquals(left, right, true)) {
+      return { ...left, enum: [...new Set([...(leftEnum as string[]), ...(rightEnum as string[])])] };
     }
   }
-  return {}; // unrepresentable intersection: widen the property
-}
-
-function applyConst(result: JsonObject, constValue: unknown): void {
-  if (Array.isArray(result.enum)) {
-    if (!result.enum.some((candidate) => jsonEquals(candidate, constValue))) {
-      throw new UnrepresentableSchema("Conflicting const and enum constraints");
-    }
-  }
-  result.enum = [constValue];
+  return {};
 }
 
 /** Keep representable type unions; otherwise widen without inferring a branch's type. */
@@ -544,61 +343,33 @@ function resolveTypeKeyword(result: JsonObject): void {
   }
 }
 
-// ---------------------------------------------------------------------------
-// Union collapsing (anyOf / oneOf must not survive anywhere)
-// ---------------------------------------------------------------------------
-
 /**
  * Collapse anyOf/oneOf to the supported field set. Object and same-type enum
  * unions retain structure; mixed types widen instead of selecting one branch.
  */
-function collapseUnions(
-  node: JsonObject,
-  unions: Partial<Record<"anyOf" | "oneOf", unknown[]>>,
-  visiting: Set<object>,
-): void {
-  for (const key of ["anyOf", "oneOf"] as const) {
-    const rawList = unions[key];
-    if (!rawList) continue;
-    node[key] = rawList.map((branch) => normalizeNode(branch, visiting));
-    collapseOneUnion(node, key);
-  }
-}
-
-function collapseOneUnion(node: JsonObject, key: "anyOf" | "oneOf"): void {
-  const raw = node[key] as unknown[];
-  if (raw.length === 0) {
-    delete node[key];
-    return;
-  }
-  const variants: JsonObject[] = [];
-  for (const entry of raw) {
-    if (!isPlainObject(entry)) return; // Leave the malformed union for local repair.
-    variants.push(entry);
-  }
-
-  // An unconstrained branch makes the union unconstrained.
-  if (variants.some((variant) => Object.keys(variant).length === 0)) {
-    delete node[key];
-    return;
-  }
-
-  // Object union: merge properties, intersect required across variants.
-  if (variants.every(isObjectShapeVariant)) {
-    delete node[key];
+function collapseUnion(node: JsonObject, variants: JsonObject[]): JsonObject {
+  if (variants.length === 0 || variants.some((variant) => Object.keys(variant).length === 0)) return node;
+  if (variants.every((variant) => variant.type === "object")) {
     mergeObjectVariants(node, variants);
-    return;
+    return node;
   }
 
-  if (tryMixedTypeCollapse(node, key, variants)) return;
-  if (trySameTypeCollapse(node, key, variants)) return;
-  delete node[key];
-}
+  const types = new Set(variants.map((variant) => variant.type));
+  if (types.size > 1) {
+    if (![...types].every((type) => type === "number" || type === "integer")) return node;
+    variants = variants.map((variant) => ({ ...variant, type: "number" }));
+  }
+  const type = variants[0]!.type;
+  if (type === undefined) return node;
 
-function isObjectShapeVariant(variant: JsonObject): boolean {
-  if (variant.type === "object") return true;
-  if (variant.type !== undefined) return false;
-  return isPlainObject(variant.properties) || Array.isArray(variant.required);
+  const collapsed: JsonObject = { type };
+  for (const [field, value] of Object.entries(variants[0]!)) {
+    if (field !== "enum" && variants.every((variant) => Bun.deepEquals(variant[field], value, true))) collapsed[field] = value;
+  }
+  if (variants.every((variant) => Array.isArray(variant.enum))) {
+    collapsed.enum = [...new Set(variants.flatMap((variant) => variant.enum as string[]))];
+  }
+  return intersectAllOfSchemas(node, collapsed);
 }
 
 function mergeObjectVariants(node: JsonObject, variants: JsonObject[]): void {
@@ -651,53 +422,6 @@ function mergeObjectVariants(node: JsonObject, variants: JsonObject[]): void {
   else delete node.required;
 }
 
-/** Numeric unions remain NUMBER; other mixed unions impose no extra constraints. */
-function tryMixedTypeCollapse(node: JsonObject, key: "anyOf" | "oneOf", variants: JsonObject[]): boolean | undefined {
-  const types = [...new Set(variants.map((variant) => variant.type))];
-  if (types.length < 2) return undefined;
-  if (types.every((type) => type === "number" || type === "integer")) {
-    return trySameTypeCollapse(node, key, variants.map((variant) => ({ ...variant, type: "number" })));
-  }
-  delete node[key];
-  return true;
-}
-
-/**
- * Keep common constraints and union enum values. Branch-specific annotations
- * and validators must not narrow the other branches.
- */
-function trySameTypeCollapse(node: JsonObject, key: "anyOf" | "oneOf", variants: JsonObject[]): boolean | undefined {
-  const commonType = variants[0]!.type;
-  if (typeof commonType !== "string" || !Object.hasOwn(SUPPORTED_TYPES, commonType)) return undefined;
-  if (!variants.every((variant) => variant.type === commonType)) return undefined;
-
-  const collapsed: JsonObject = { type: commonType };
-  for (const [field, value] of Object.entries(variants[0]!)) {
-    if (field !== "enum" && variants.every((variant) => jsonEquals(variant[field], value))) collapsed[field] = value;
-  }
-  if (variants.every((variant) => Array.isArray(variant.enum))) {
-    const mergedEnum: unknown[] = [];
-    for (const variant of variants) {
-      for (const value of variant.enum as unknown[]) {
-        if (!mergedEnum.some((candidate) => jsonEquals(candidate, value))) mergedEnum.push(value);
-      }
-    }
-    collapsed.enum = mergedEnum;
-  }
-  delete node[key];
-  replaceNodeKeys(node, intersectAllOfSchemas(node, collapsed));
-  return true;
-}
-
-function replaceNodeKeys(node: JsonObject, next: JsonObject): void {
-  for (const key of Object.keys(node)) delete node[key];
-  Object.assign(node, next);
-}
-
-// ---------------------------------------------------------------------------
-// Enum / structural finalization
-// ---------------------------------------------------------------------------
-
 /**
  * Encode the final enum for the wire: CCA's Schema proto declares enum as
  * repeated string even for numeric/boolean schema types, so finite numbers and
@@ -707,18 +431,12 @@ function replaceNodeKeys(node: JsonObject, next: JsonObject): void {
  */
 function finalizeEnum(result: JsonObject): void {
   if (!("enum" in result)) return;
-  const valuesRaw = Array.isArray(result.enum) ? result.enum : [];
+  const values = Array.isArray(result.enum) ? result.enum : [];
 
-  if (valuesRaw.length > 0 && valuesRaw.every((value) => value === null)) {
+  if (values.length > 0 && values.every((value) => value === null)) {
     result.type ??= "null";
     delete result.enum;
     return;
-  }
-
-  // Deduplicate by deep equality.
-  const values: unknown[] = [];
-  for (const value of valuesRaw) {
-    if (!values.some((candidate) => jsonEquals(candidate, value))) values.push(value);
   }
 
   const scalar = values.every(
@@ -733,12 +451,12 @@ function finalizeEnum(result: JsonObject): void {
   }
 
   if (!("type" in result)) {
-    const inferred = new Set(values.map(jsonTypeOf));
+    const inferred = new Set(values.map((value) => typeof value));
     if (inferred.size !== 1) {
       delete result.enum; // mixed scalar kinds cannot pick one type: drop, don't narrow
       return;
     }
-    result.type = values.map(jsonTypeOf)[0];
+    result.type = typeof values[0];
   }
   if (result.type === "null") {
     delete result.enum;
@@ -756,28 +474,11 @@ function finalizeStructure(result: JsonObject): void {
       result.type = "array";
     }
   }
-  if ("propertyOrdering" in result) {
+  for (const key of ["required", "propertyOrdering"] as const) {
     const properties = isPlainObject(result.properties) ? result.properties : {};
-    const seen = new Set<string>();
-    const clean = stringArray(result.propertyOrdering).filter((name) => {
-      if (seen.has(name) || !Object.hasOwn(properties, name)) return false;
-      seen.add(name);
-      return true;
-    });
-    if (clean.length > 0) result.propertyOrdering = clean;
-    else delete result.propertyOrdering;
-  }
-  if (Array.isArray(result.required)) {
-    const props = isPlainObject(result.properties) ? result.properties : {};
-    const seen = new Set<string>();
-    const clean: string[] = [];
-    for (const name of stringArray(result.required)) {
-      if (seen.has(name) || !Object.hasOwn(props, name)) continue;
-      seen.add(name);
-      clean.push(name);
-    }
-    if (clean.length > 0) result.required = clean;
-    else delete result.required;
+    const names = [...new Set(stringArray(result[key]))].filter((name) => Object.hasOwn(properties, name));
+    if (names.length > 0) result[key] = names;
+    else delete result[key];
   }
   if (result.type === "object") {
     if (!isPlainObject(result.properties)) result.properties = {};
@@ -788,56 +489,6 @@ function finalizeStructure(result: JsonObject): void {
     delete result.propertyOrdering;
     if (result.type !== "array") delete result.items;
   }
-  if ("items" in result && !isPlainObject(result.items)) delete result.items;
-}
-
-// ---------------------------------------------------------------------------
-// Final structural validation
-// ---------------------------------------------------------------------------
-
-/**
- * Recursively verify the produced tree only contains allowed keys with valid
- * value shapes (cycle-safe). Any violation — including a residual forbidden
- * combiner — disqualifies the whole tool schema.
- */
-function isValidCcaSchema(value: unknown, seen: Set<object>): boolean {
-  if (!isPlainObject(value)) return false;
-  if (seen.has(value)) return true;
-  seen.add(value);
-  for (const key of Object.keys(value)) {
-    if (!Object.hasOwn(OUTPUT_KEYS, key)) return false;
-  }
-  if (value.type !== undefined && !(typeof value.type === "string" && Object.hasOwn(SUPPORTED_TYPES, value.type))) return false;
-  if (value.description !== undefined && typeof value.description !== "string") return false;
-  if (value.title !== undefined && typeof value.title !== "string") return false;
-  if (value.enum !== undefined) {
-    if (!Array.isArray(value.enum) || value.enum.some((entry) => typeof entry !== "string")) return false;
-  }
-  if (value.required !== undefined) {
-    if (
-      !Array.isArray(value.required) ||
-      value.required.some((entry) => typeof entry !== "string") ||
-      new Set(value.required as string[]).size !== (value.required as string[]).length
-    ) {
-      return false;
-    }
-  }
-  if (value.propertyOrdering !== undefined) {
-    if (
-      !Array.isArray(value.propertyOrdering) ||
-      (value.propertyOrdering as unknown[]).some((entry) => typeof entry !== "string")
-    ) {
-      return false;
-    }
-  }
-  if (value.properties !== undefined) {
-    if (!isPlainObject(value.properties)) return false;
-    for (const subschema of Object.values(value.properties)) {
-      if (!isValidCcaSchema(subschema, seen)) return false;
-    }
-  }
-  if (value.items !== undefined && !isValidCcaSchema(value.items, seen)) return false;
-  return true;
 }
 
 /**
@@ -845,10 +496,12 @@ function isValidCcaSchema(value: unknown, seen: Set<object>): boolean {
  * or an unrepresentable root returns the object fallback. Nested failures are
  * repaired at property and item boundaries.
  */
-export function normalizeSchemaForCCA(value: unknown): unknown {
+export function normalizeSchemaForCCA(value: unknown): JsonObject {
   try {
-    const normalized = normalizeNode(dereferenceJsonSchema(value), new Set());
-    return isValidCcaSchema(normalized, new Set()) ? normalized : { ...CCA_FALLBACK_SCHEMA };
+    if (isPlainObject(value) && (value.$defs !== undefined || value.definitions !== undefined)) {
+      value = dereferenceNode(value, value, new Set());
+    }
+    return normalizeNode(value);
   } catch (error) {
     if (!(error instanceof UnrepresentableSchema)) throw error;
     return { ...CCA_FALLBACK_SCHEMA };
@@ -863,7 +516,7 @@ export function normalizeSchemaForCCA(value: unknown): unknown {
 export function normalizeToolSchemaForCCA(value: unknown): unknown {
   const normalized = normalizeSchemaForCCA(value);
   return toNativeSchema(
-    isPlainObject(normalized) && normalized.type === "object" ? normalized : { ...CCA_FALLBACK_SCHEMA },
+    normalized.type === "object" ? normalized : CCA_FALLBACK_SCHEMA,
   );
 }
 
