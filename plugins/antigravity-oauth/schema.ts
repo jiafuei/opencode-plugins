@@ -26,7 +26,7 @@ const SNAKE_TO_CAMEL_RENAMES: Record<string, string> = {
   property_ordering: "propertyOrdering",
 };
 
-/** Type names the CCA Schema proto understands (never "null" on this wire). */
+/** Type names accepted by the native schema converter. */
 const SUPPORTED_TYPES: Readonly<Record<string, true>> = {
   string: true,
   number: true,
@@ -34,6 +34,7 @@ const SUPPORTED_TYPES: Readonly<Record<string, true>> = {
   boolean: true,
   object: true,
   array: true,
+  null: true,
 };
 
 /**
@@ -65,34 +66,10 @@ const OUTPUT_KEYS: Readonly<Record<string, true>> = {
   maxItems: true,
 };
 
-/** Output keys valid on every type (subset of OUTPUT_KEYS). */
-const SHARED_KEYS: Readonly<Record<string, true>> = {
-  title: true,
-  description: true,
-  default: true,
-  enum: true,
-};
-
-/** Type-specific output keys that survive normalization per chosen type. */
-const TYPE_KEYS: Readonly<Record<string, Readonly<Record<string, true>>>> = {
-  array: { items: true, minItems: true, maxItems: true },
-  object: { properties: true, required: true, propertyOrdering: true },
-  string: { format: true, pattern: true, minLength: true, maxLength: true },
-  number: { format: true, minimum: true, maximum: true },
-  integer: { format: true, minimum: true, maximum: true },
-  boolean: {},
-};
-
-/** Flat set of every type-specific key across types. */
-const ALL_TYPE_KEYS: Readonly<Record<string, true>> = buildAllTypeKeys();
-
-function buildAllTypeKeys(): Record<string, true> {
-  const all: Record<string, true> = {};
-  for (const keys of Object.values(TYPE_KEYS)) {
-    for (const key in keys) all[key] = true;
-  }
-  return all;
-}
+const TYPE_SPECIFIC_KEYS = [
+  "items", "minItems", "maxItems", "properties", "required", "propertyOrdering",
+  "format", "pattern", "minLength", "maxLength", "minimum", "maximum",
+] as const;
 
 // ---------------------------------------------------------------------------
 // Small JSON helpers
@@ -208,7 +185,7 @@ function dereferenceNode(
       visitingRefs.delete(ref);
       if (!isPlainObject(inlined)) return inlined;
       const siblings = dereferenceSchemaEntries(node, root, visitingRefs, visitingObjects, true);
-      return { ...inlined, ...siblings };
+      return { allOf: [siblings, inlined] };
     }
     return dereferenceSchemaEntries(node, root, visitingRefs, visitingObjects, false);
   } finally {
@@ -345,7 +322,7 @@ function normalizeObjectNode(obj: JsonObject, visiting: Set<object>): JsonObject
       hasConst = true;
       continue;
     }
-    // Nullability is dropped outright on this wire; `not` has no field.
+    // Nullability is widened after normalization; `not` has no wire field.
     if (key === "nullable" || key === "not") continue;
 
     switch (key) {
@@ -385,6 +362,10 @@ function normalizeObjectNode(obj: JsonObject, visiting: Set<object>): JsonObject
     }
   }
 
+  resolveTypeKeyword(result);
+  if (hasConst) applyConst(result, constValue);
+  finalizeEnum(result);
+
   // allOf intersection: inline branches before union collapsing so merged
   // results participate in collapse. Never becomes anyOf.
   for (const entry of allOfEntries) {
@@ -401,11 +382,14 @@ function normalizeObjectNode(obj: JsonObject, visiting: Set<object>): JsonObject
     mergeAllOfBranch(result, branch);
   }
 
-  if (hasConst) applyConst(result, constValue);
-  resolveTypeKeyword(result);
-  collapseUnionsFixpoint(result, unions, visiting);
+  collapseUnions(result, unions, visiting);
   finalizeEnum(result);
   finalizeStructure(result);
+  if (obj.nullable === true && result.type !== "null") {
+    delete result.type;
+    delete result.enum;
+    for (const key of TYPE_SPECIFIC_KEYS) delete result[key];
+  }
   return result;
 }
 
@@ -423,11 +407,14 @@ function intersectAllOfSchemas(left: JsonObject, right: JsonObject): JsonObject 
     typeof right.type === "string" &&
     left.type !== right.type
   ) {
-    throw new UnrepresentableSchema("Conflicting allOf types");
+    if (![left.type, right.type].every((type) => type === "number" || type === "integer")) {
+      throw new UnrepresentableSchema("Conflicting allOf types");
+    }
   }
 
   const result: JsonObject = { ...left };
   if (result.type === undefined && right.type !== undefined) result.type = right.type;
+  if (left.type === "number" && right.type === "integer") result.type = "integer";
 
   if (Array.isArray(left.enum) || Array.isArray(right.enum)) {
     if (Array.isArray(left.enum) && Array.isArray(right.enum)) {
@@ -474,14 +461,19 @@ function intersectAllOfSchemas(left: JsonObject, right: JsonObject): JsonObject 
     "propertyOrdering",
     "format",
     "pattern",
-    "minimum",
-    "maximum",
-    "minLength",
-    "maxLength",
-    "minItems",
-    "maxItems",
   ] as const) {
     if (result[key] === undefined && right[key] !== undefined) result[key] = right[key];
+  }
+  for (const [minimum, maximum] of [["minimum", "maximum"], ["minLength", "maxLength"], ["minItems", "maxItems"]] as const) {
+    if (typeof right[minimum] === "number") {
+      result[minimum] = Math.max((left[minimum] as number | undefined) ?? -Infinity, right[minimum]);
+    }
+    if (typeof right[maximum] === "number") {
+      result[maximum] = Math.min((left[maximum] as number | undefined) ?? Infinity, right[maximum]);
+    }
+    if (typeof result[minimum] === "number" && typeof result[maximum] === "number" && result[minimum] > result[maximum]) {
+      throw new UnrepresentableSchema(`Conflicting allOf ${minimum}/${maximum}`);
+    }
   }
   return result;
 }
@@ -537,37 +529,30 @@ function applyConst(result: JsonObject, constValue: unknown): void {
   result.enum = [constValue];
 }
 
-/** Reduce type arrays/null tokens to one supported non-null scalar type name. */
+/** Keep representable type unions; otherwise widen without inferring a branch's type. */
 function resolveTypeKeyword(result: JsonObject): void {
   const raw = result.type;
-  if (Array.isArray(raw)) {
-    const types = raw.filter(
-      (entry): entry is string => typeof entry === "string" && Object.hasOwn(SUPPORTED_TYPES, entry),
-    );
-    const nonNull = types.filter((entry) => entry !== "null");
-    if (nonNull.length > 0) result.type = nonNull[0];
-    else delete result.type; // pure-null or empty array: widen
-    return;
+  const types = [...new Set((Array.isArray(raw) ? raw : [raw])
+    .filter((entry): entry is string => typeof entry === "string")
+    .map((entry) => entry.toLowerCase())
+    .filter((entry) => Object.hasOwn(SUPPORTED_TYPES, entry)))];
+  if (types.length === 1) result.type = types[0];
+  else if (types.length > 1 && types.every((type) => type === "number" || type === "integer")) result.type = "number";
+  else {
+    delete result.type;
+    if (types.length > 1) for (const key of TYPE_SPECIFIC_KEYS) delete result[key];
   }
-  if (typeof raw !== "string" || !Object.hasOwn(SUPPORTED_TYPES, raw)) delete result.type; // "null"/unknown token: widen
 }
 
 // ---------------------------------------------------------------------------
 // Union collapsing (anyOf / oneOf must not survive anywhere)
 // ---------------------------------------------------------------------------
 
-interface CollapseOutcome {
-  applied: boolean;
-  stuck?: boolean;
-}
-
 /**
- * Repeatedly collapse anyOf/oneOf until stable. Strategies in order: bare-null
- * extraction, ⊤ (empty) branch absorption, bare-const folding, object-union
- * merging, mixed-type narrowing, same-type picking. When no strategy applies
- * the combiner stays and final validation falls back.
+ * Collapse anyOf/oneOf to the supported field set. Object and same-type enum
+ * unions retain structure; mixed types widen instead of selecting one branch.
  */
-function collapseUnionsFixpoint(
+function collapseUnions(
   node: JsonObject,
   unions: Partial<Record<"anyOf" | "oneOf", unknown[]>>,
   visiting: Set<object>,
@@ -575,124 +560,45 @@ function collapseUnionsFixpoint(
   for (const key of ["anyOf", "oneOf"] as const) {
     const rawList = unions[key];
     if (!rawList) continue;
-    // Bare {type:"null"} variants must be extracted before branch
-    // normalization (which widens them to {}) so X|null collapses to X.
-    const kept = rawList.filter((entry) => !isRawNullSchema(entry));
-    if (kept.length === rawList.length) {
-      node[key] = rawList.map((branch) => normalizeNode(branch, visiting));
-    } else if (kept.length === 0) {
-      // Pure-null union: unconstrained on this wire.
-    } else if (kept.length === 1) {
-      const sole = normalizeNode(kept[0], visiting);
-      if (!isPlainObject(sole) || !adoptBranchKeys(node, key, sole)) {
-        node[key] = [sole]; // unadoptable: leave for the fixpoint/validator
-      }
-    } else {
-      node[key] = kept.map((branch) => normalizeNode(branch, visiting));
-    }
-  }
-
-  let changed = true;
-  while (changed) {
-    changed = false;
-    for (const key of ["anyOf", "oneOf"] as const) {
-      const outcome = collapseOneUnion(node, key);
-      if (outcome.applied) changed = true;
-      if (outcome.stuck) return; // residual combiner: validator will fall back
-    }
+    node[key] = rawList.map((branch) => normalizeNode(branch, visiting));
+    collapseOneUnion(node, key);
   }
 }
 
-function isRawNullSchema(value: unknown): boolean {
-  return isPlainObject(value) && value["type"] === "null";
-}
-
-/** Collapse one step of `node[key]`; returns whether progress was made. */
-function collapseOneUnion(node: JsonObject, key: "anyOf" | "oneOf"): CollapseOutcome {
-  if (!(key in node)) return { applied: false };
-  const raw = node[key];
-  if (!Array.isArray(raw)) {
-    delete node[key];
-    return { applied: true };
-  }
+function collapseOneUnion(node: JsonObject, key: "anyOf" | "oneOf"): void {
+  const raw = node[key] as unknown[];
   if (raw.length === 0) {
     delete node[key];
-    return { applied: true };
+    return;
   }
   const variants: JsonObject[] = [];
   for (const entry of raw) {
-    if (!isPlainObject(entry)) return { applied: false, stuck: true }; // malformed branch
+    if (!isPlainObject(entry)) return; // Leave the malformed union for local repair.
     variants.push(entry);
   }
 
-  // ⊤ branch: a fully-empty variant admits anything (or is a widened
-  // {type:"null"} already extracted upstream), so the whole union does.
+  // An unconstrained branch makes the union unconstrained.
   if (variants.some((variant) => Object.keys(variant).length === 0)) {
     delete node[key];
-    return { applied: true };
-  }
-
-  // Every branch a bare const: fold into a deduplicated typed enum.
-  if (variants.every((variant) => "const" in variant)) {
-    const values: unknown[] = [];
-    for (const variant of variants) {
-      if (!values.some((candidate) => jsonEquals(candidate, variant.const))) values.push(variant.const);
-    }
-    const existing = Array.isArray(node.enum) ? (node.enum as unknown[]) : [];
-    for (const value of values) {
-      if (!existing.some((candidate) => jsonEquals(candidate, value))) existing.push(value);
-    }
-    delete node[key];
-    node.enum = existing;
-    if (!("type" in node)) {
-      const inferredTypes = [...new Set(values.map(jsonTypeOf).filter((t) => t !== "null"))];
-      if (inferredTypes.length === 1) node.type = inferredTypes[0];
-    }
-    return { applied: true };
+    return;
   }
 
   // Object union: merge properties, intersect required across variants.
   if (variants.every(isObjectShapeVariant)) {
     delete node[key];
     mergeObjectVariants(node, variants);
-    return { applied: true };
+    return;
   }
 
-  const mixed = tryMixedTypeCollapse(node, key, variants);
-  if (mixed) return { applied: true };
-  if (mixed === false) return { applied: false, stuck: true };
-
-  const same = trySameTypeCollapse(node, key, variants);
-  if (same) return { applied: true };
-  if (same === false) return { applied: false, stuck: true };
-
-  return { applied: false }; // nothing applicable this pass
+  if (tryMixedTypeCollapse(node, key, variants)) return;
+  if (trySameTypeCollapse(node, key, variants)) return;
+  delete node[key];
 }
 
 function isObjectShapeVariant(variant: JsonObject): boolean {
   if (variant.type === "object") return true;
   if (variant.type !== undefined) return false;
   return isPlainObject(variant.properties) || Array.isArray(variant.required);
-}
-
-/**
- * Adopt a sole non-null branch's keys into the parent (X|null ≡ X). Parent
- * sibling keys win; conflicting values bail so the residual combiner falls
- * back instead of being silently narrowed.
- */
-function adoptBranchKeys(node: JsonObject, key: "anyOf" | "oneOf", branch: JsonObject): boolean {
-  for (const [k, value] of Object.entries(branch)) {
-    if (!(k in node)) continue;
-    if (jsonEquals(node[k], value)) continue;
-    if (k === "description" && typeof node.description === "string" && typeof value === "string") continue;
-    return false;
-  }
-  delete node[key];
-  for (const [k, value] of Object.entries(branch)) {
-    if (k in node) continue;
-    node[k] = value;
-  }
-  return true;
 }
 
 function mergeObjectVariants(node: JsonObject, variants: JsonObject[]): void {
@@ -745,94 +651,41 @@ function mergeObjectVariants(node: JsonObject, variants: JsonObject[]): void {
   else delete node.required;
 }
 
-/**
- * Mixed-type union with distinct supported types whose fields each fit their
- * own type: pick the first non-null type and keep only fields valid for it.
- * Returns true (collapsed), false (conflict → residual), undefined (n/a).
- */
+/** Numeric unions remain NUMBER; other mixed unions impose no extra constraints. */
 function tryMixedTypeCollapse(node: JsonObject, key: "anyOf" | "oneOf", variants: JsonObject[]): boolean | undefined {
-  const types: string[] = [];
-  for (const variant of variants) {
-    const variantType = variant.type;
-    if (typeof variantType !== "string" || !Object.hasOwn(SUPPORTED_TYPES, variantType)) return undefined;
-    if (types.includes(variantType)) return undefined; // duplicate type: same-type path
-    types.push(variantType);
-  }
+  const types = [...new Set(variants.map((variant) => variant.type))];
   if (types.length < 2) return undefined;
-
-  for (const variant of variants) {
-    const allowed = { ...SHARED_KEYS, ...TYPE_KEYS[variant.type as string] };
-    for (const k of Object.keys(variant)) {
-      if (k !== "type" && !Object.hasOwn(allowed, k)) return undefined;
-    }
+  if (types.every((type) => type === "number" || type === "integer")) {
+    return trySameTypeCollapse(node, key, variants.map((variant) => ({ ...variant, type: "number" })));
   }
-
-  const chosen = types.find((t) => t !== "null") ?? types[0]!;
-  const chosenAllowed = { ...SHARED_KEYS, ...TYPE_KEYS[chosen] };
-
-  const next: JsonObject = {};
-  for (const [k, v] of Object.entries(node)) {
-    if (k === key) continue;
-    // Strip sibling keys copied from the parent that belong to another type.
-    if (Object.hasOwn(ALL_TYPE_KEYS, k) && !Object.hasOwn(chosenAllowed, k)) continue;
-    next[k] = v;
-  }
-  next.type = chosen;
-  for (const variant of variants) {
-    for (const [k, v] of Object.entries(variant)) {
-      if (k === "type" || !Object.hasOwn(chosenAllowed, k) || Object.hasOwn(next, k)) continue;
-      // Another type's validators (e.g. an integer branch's int64 format) don't apply.
-      if (Object.hasOwn(ALL_TYPE_KEYS, k) && variant.type !== chosen) continue;
-      next[k] = v;
-    }
-  }
-  replaceNodeKeys(node, next);
+  delete node[key];
   return true;
 }
 
 /**
- * Same-type union: union pure enum branches' members when their other keys
- * agree; otherwise broaden to the common type. Returns true (collapsed),
- * false (conflict → residual), undefined (n/a).
+ * Keep common constraints and union enum values. Branch-specific annotations
+ * and validators must not narrow the other branches.
  */
 function trySameTypeCollapse(node: JsonObject, key: "anyOf" | "oneOf", variants: JsonObject[]): boolean | undefined {
   const commonType = variants[0]!.type;
   if (typeof commonType !== "string" || !Object.hasOwn(SUPPORTED_TYPES, commonType)) return undefined;
   if (!variants.every((variant) => variant.type === commonType)) return undefined;
 
-  let collapsed: JsonObject;
+  const collapsed: JsonObject = { type: commonType };
+  for (const [field, value] of Object.entries(variants[0]!)) {
+    if (field !== "enum" && variants.every((variant) => jsonEquals(variant[field], value))) collapsed[field] = value;
+  }
   if (variants.every((variant) => Array.isArray(variant.enum))) {
-    const base = variants[0]!;
-    for (const variant of variants.slice(1)) {
-      for (const [k, v] of Object.entries(variant)) {
-        if (k === "enum") continue;
-        if (!(k in base) || !jsonEquals(base[k], v)) return false;
-      }
-      for (const k of Object.keys(base)) {
-        if (k !== "enum" && !(k in variant)) return false;
-      }
-    }
     const mergedEnum: unknown[] = [];
     for (const variant of variants) {
       for (const value of variant.enum as unknown[]) {
         if (!mergedEnum.some((candidate) => jsonEquals(candidate, value))) mergedEnum.push(value);
       }
     }
-    collapsed = { ...base, enum: mergedEnum };
-  } else {
-    // A same-type union that cannot be merged losslessly broadens to the type
-    // itself rather than selecting one branch and silently narrowing inputs.
-    collapsed = { type: commonType };
+    collapsed.enum = mergedEnum;
   }
-
-  const next: JsonObject = {};
-  for (const [k, v] of Object.entries(node)) {
-    if (k !== key) next[k] = v;
-  }
-  for (const [k, v] of Object.entries(collapsed)) {
-    if (!(k in next)) next[k] = v;
-  }
-  replaceNodeKeys(node, next);
+  delete node[key];
+  replaceNodeKeys(node, intersectAllOfSchemas(node, collapsed));
   return true;
 }
 
@@ -855,6 +708,12 @@ function replaceNodeKeys(node: JsonObject, next: JsonObject): void {
 function finalizeEnum(result: JsonObject): void {
   if (!("enum" in result)) return;
   const valuesRaw = Array.isArray(result.enum) ? result.enum : [];
+
+  if (valuesRaw.length > 0 && valuesRaw.every((value) => value === null)) {
+    result.type ??= "null";
+    delete result.enum;
+    return;
+  }
 
   // Deduplicate by deep equality.
   const values: unknown[] = [];
@@ -883,7 +742,6 @@ function finalizeEnum(result: JsonObject): void {
   }
   if (result.type === "null") {
     delete result.enum;
-    delete result.type;
     return;
   }
   result.enum = [...new Set(values.map(String))];

@@ -381,7 +381,7 @@ describe("body rewrite", () => {
                 limit: { type: "integer", minimum: 1, maximum: 100, exclusiveMaximum: 101 },
                 tags: { type: "array", items: { type: "string", maxLength: 20 }, minItems: 1 },
                 extra: true,
-                depth: { anyOf: [{ type: "integer", enum: [1, 2] }, { type: "null" }] },
+                depth: { type: "integer", enum: [1, 2] },
                 enabled: { type: "boolean", enum: [true, false] },
               },
               required: ["path"],
@@ -445,10 +445,41 @@ describe("body rewrite", () => {
         limit: {},
         entries: { type: "ARRAY", items: {} },
         options: { type: "OBJECT", properties: {
-          malformed: {}, union: {}, disabled: {}, valid: { type: "BOOLEAN" },
+          malformed: {}, union: { type: "STRING", enum: ["a", "b"] }, disabled: {}, valid: { type: "BOOLEAN" },
         }, required: ["valid"] },
       },
       required: ["path", "limit"],
+    });
+  });
+
+  test("preserves representable references, unions, and intersections on the CCA wire", () => {
+    const args = baseArgs();
+    args.tools = [{ functionDeclarations: [{ name: "configure", parametersJsonSchema: {
+      type: "Object",
+      $defs: { path: { type: "STRING", description: "File path", minLength: 1, maxLength: 100 } },
+      properties: {
+        path: { $ref: "#/$defs/path", minLength: 3, maxLength: 200 },
+        count: { allOf: [{ type: "NUMBER", minimum: 0, maximum: 100 }, { type: "Integer", minimum: 2, maximum: 20 }] },
+        name: { allOf: [{ type: "String", minLength: 1, maxLength: 20 }, { type: "string", minLength: 3, maxLength: 8 }] },
+        choice: { description: "Mode", oneOf: [{ const: "a", title: "First" }, { const: "b", description: "Second" }] },
+        numeric: { type: ["INTEGER", "number"], minimum: 0 },
+        nil: { type: "NuLl", default: null },
+        impossible: { allOf: [{ type: "number", minimum: 10 }, { type: "number", maximum: 3 }] },
+      },
+      required: ["path", "nil"],
+    } }] }];
+    expect(rewrite(args, "gemini-3.8-flash-low").request.tools[0].functionDeclarations[0].parameters).toEqual({
+      type: "OBJECT",
+      properties: {
+        path: { type: "STRING", description: "File path", minLength: "3", maxLength: "100" },
+        count: { type: "INTEGER", minimum: 2, maximum: 20 },
+        name: { type: "STRING", minLength: "3", maxLength: "8" },
+        choice: { type: "STRING", description: "Mode", enum: ["a", "b"] },
+        numeric: { type: "NUMBER", minimum: 0 },
+        nil: { type: "NULL", default: null },
+        impossible: {},
+      },
+      required: ["path", "nil"],
     });
   });
 
@@ -470,10 +501,8 @@ describe("body rewrite", () => {
       required: ["nested"],
     }) as Record<string, any>;
     expect(normalized.type).toBe("object");
-    // Nullable type arrays reduce to the non-null scalar; untranslatable validators are stripped.
-    expect(normalized.properties.value).toEqual({ type: "string", pattern: "^a" });
-    // Mixed string|number union narrows to the first non-null type, keeping only its validators.
-    expect(normalized.properties.mode).toEqual({ type: "string", format: "uri" });
+    expect(normalized.properties.value).toEqual({});
+    expect(normalized.properties.mode).toEqual({});
     expect(normalized.properties.nested).toEqual({
       type: "object",
       properties: { a: { type: "string", enum: ["b"] } },
@@ -491,13 +520,9 @@ describe("body rewrite", () => {
 // ---------------------------------------------------------------------------
 
 describe("CCA tool schema normalization", () => {
-  test("collapses nullable unions by dropping the null branch", () => {
-    expect(normalizeSchemaForCCA({ type: "string", nullable: true })).toEqual({ type: "string" });
-    expect(normalizeSchemaForCCA({ anyOf: [{ type: "string" }, { type: "null" }] })).toEqual({ type: "string" });
-    expect(
-      normalizeSchemaForCCA({ anyOf: [{ type: "string" }, { type: "null", description: "none" }] }),
-    ).toEqual({ type: "string" });
-    // Nullable unions become optional-ish but keep their non-null shape.
+  test("widens nullable parameters without making required fields optional", () => {
+    expect(normalizeSchemaForCCA({ type: "string", nullable: true })).toEqual({});
+    expect(normalizeSchemaForCCA({ anyOf: [{ type: "string" }, { type: "null" }] })).toEqual({});
     expect(
       normalizeSchemaForCCA({
         type: "object",
@@ -506,17 +531,21 @@ describe("CCA tool schema normalization", () => {
       }),
     ).toEqual({
       type: "object",
-      properties: { value: { type: "string", enum: ["A", "B"] }, other: { type: "number" } },
+      properties: { value: {}, other: { type: "number" } },
       required: ["value", "other"],
     });
   });
 
-  test("narrows mixed array|string|null unions to the first non-null representable branch", () => {
-    const normalized = normalizeSchemaForCCA({
-      anyOf: [{ type: "array", items: { type: "string" } }, { type: "string" }, { type: "null" }],
-    }) as Record<string, unknown>;
-    // Lossy collapse: array|string|null narrows to array.
-    expect(normalized).toEqual({ type: "array", items: { type: "string" } });
+  test("mixed unions widen independently of branch order and retain parent constraints", () => {
+    const branches = [{ type: "array", items: { type: "string" } }, { type: "string" }, { type: "null" }];
+    for (const variants of [branches, branches.toReversed()]) {
+      expect(normalizeSchemaForCCA({ description: "One or many", anyOf: variants })).toEqual({ description: "One or many" });
+      expect(normalizeSchemaForCCA({ type: "string", pattern: "^x", oneOf: variants })).toEqual({ type: "string", pattern: "^x" });
+    }
+    expect(normalizeSchemaForCCA({ type: ["ARRAY", "String"], items: { type: "string" }, description: "One or many" }))
+      .toEqual({ description: "One or many" });
+    expect(normalizeSchemaForCCA({ description: "Parent", anyOf: [{ description: "First" }, { description: "Second" }] }))
+      .toEqual({ description: "Parent" });
   });
 
   test("unions same-type enum branches losslessly", () => {
@@ -670,7 +699,7 @@ describe("CCA tool schema normalization", () => {
     expect(normalized.additionalProperties).toBeUndefined();
     expect(normalized.propertyOrdering).toEqual(["mode"]);
     // any_of participates in union collapsing exactly like anyOf.
-    expect(normalized.properties.mode).toEqual({ type: "integer" });
+    expect(normalized.properties.mode).toEqual({ type: "number" });
 
     // python-genai collision rule: snake_case overwrites an existing camelCase key.
     expect(normalizeSchemaForCCA({ anyOf: [{ type: "string" }], any_of: [{ type: "integer" }] })).toEqual({
@@ -728,15 +757,6 @@ describe("CCA tool schema normalization", () => {
     // sending a forbidden combiner.
     expect(normalizeSchemaForCCA({ anyOf: [{ type: "string" }, 42] })).toEqual(fallback);
     expect(normalizeSchemaForCCA(false)).toEqual(fallback);
-    // Same-type enum branches whose metadata disagrees cannot merge safely.
-    expect(
-      normalizeSchemaForCCA({
-        anyOf: [
-          { type: "string", enum: ["a"], title: "First" },
-          { type: "string", enum: ["b"] },
-        ],
-      }),
-    ).toEqual(fallback);
   });
 
   test("deduplicates required arrays and enum values, dropping stale names", () => {
@@ -778,6 +798,7 @@ describe("CCA tool schema normalization", () => {
       enum: ["definition", "references"],
     });
     expect(normalizeSchemaForCCA({ const: "FOO" })).toEqual({ type: "string", enum: ["FOO"] });
+    expect(normalizeSchemaForCCA({ const: null })).toEqual({ type: "null" });
     expect(normalizeSchemaForCCA({ type: "string", const: "FOO" })).toEqual({ type: "string", enum: ["FOO"] });
     expect(normalizeSchemaForCCA({ type: "string", enum: ["A"], const: "B" })).toEqual({
       type: "object",
