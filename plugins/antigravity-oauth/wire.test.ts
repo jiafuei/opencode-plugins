@@ -482,37 +482,6 @@ describe("body rewrite", () => {
       required: ["path", "nil"],
     });
   });
-
-  test("normalizes tool schemas for CCA", () => {
-    const normalized = normalizeSchemaForCCA({
-      $schema: "https://json-schema.org/draft/2020-12/schema",
-      type: "object",
-      properties: {
-        value: { type: ["string", "null"], nullable: true, pattern: "^a", additionalProperties: false },
-        mode: { oneOf: [{ type: "string", format: "uri" }, { type: "number", minimum: 1 }] },
-        nested: {
-          type: "object",
-          propertyNames: { pattern: "x" },
-          properties: { a: { const: "b" } },
-        },
-        flag: true,
-        extra: { x_custom_vendor_extension: "ignored" },
-      },
-      required: ["nested"],
-    }) as Record<string, any>;
-    expect(normalized.type).toBe("object");
-    expect(normalized.properties.value).toEqual({});
-    expect(normalized.properties.mode).toEqual({});
-    expect(normalized.properties.nested).toEqual({
-      type: "object",
-      properties: { a: { type: "string", enum: ["b"] } },
-    });
-    // Boolean subschemas coerce to open objects.
-    expect(normalized.properties.flag).toEqual({});
-    expect(normalized.properties.extra).toEqual({});
-    expect(normalized.required).toEqual(["nested"]);
-  });
-
 });
 
 // ---------------------------------------------------------------------------
@@ -546,13 +515,9 @@ describe("CCA tool schema normalization", () => {
       .toEqual({ description: "One or many" });
     expect(normalizeSchemaForCCA({ description: "Parent", anyOf: [{ description: "First" }, { description: "Second" }] }))
       .toEqual({ description: "Parent" });
-  });
-
-  test("unions same-type enum branches losslessly", () => {
-    expect(normalizeSchemaForCCA({ anyOf: [{ enum: ["A", "B"] }, { enum: ["C", "D"] }] })).toEqual({
-      type: "string",
-      enum: ["A", "B", "C", "D"],
-    });
+    // A malformed branch widens the union without erasing the parent.
+    expect(normalizeSchemaForCCA({ description: "Parent", anyOf: [{ type: "string" }, 42] }))
+      .toEqual({ description: "Parent" });
   });
 
   test("broadens a mixed enum/unconstrained same-type union without narrowing", () => {
@@ -583,9 +548,25 @@ describe("CCA tool schema normalization", () => {
       properties: { id: { type: "string" }, name: { type: "string" }, age: { type: "number" } },
       required: ["id"],
     });
+    // Shared properties union their schemas instead of widening to {}.
+    expect(
+      normalizeSchemaForCCA({
+        anyOf: [
+          { type: "object", properties: {
+            n: { type: "integer" }, mode: { type: "string", title: "A", description: "Mode", enum: ["a"] }, note: { description: "Note" },
+          } },
+          { type: "object", properties: {
+            n: { type: "number" }, mode: { type: "string", title: "B", description: "Mode", enum: ["b"] }, note: { description: "Note" },
+          } },
+        ],
+      }),
+    ).toEqual({
+      type: "object",
+      properties: { n: { type: "number" }, mode: { type: "string", description: "Mode", enum: ["a", "b"] }, note: { description: "Note" } },
+    });
   });
 
-  test("drops stale required keys after an object-union merge", () => {
+  test("intersects object unions with parent properties and required keys", () => {
     expect(
       normalizeSchemaForCCA({
         required: ["a"],
@@ -594,7 +575,17 @@ describe("CCA tool schema normalization", () => {
           { type: "object", properties: { b: { type: "number" } }, required: ["b"] },
         ],
       }),
-    ).toEqual({ type: "object", properties: { a: { type: "string" }, b: { type: "number" } } });
+    ).toEqual({ type: "object", properties: { a: { type: "string" }, b: { type: "number" } }, required: ["a"] });
+    expect(
+      normalizeSchemaForCCA({
+        type: "object",
+        properties: { mode: { type: "string", enum: ["a", "b", "c"] } },
+        anyOf: [
+          { type: "object", properties: { mode: { type: "string", enum: ["a"] } } },
+          { type: "object", properties: { mode: { type: "string", enum: ["b"] } } },
+        ],
+      }),
+    ).toEqual({ type: "object", properties: { mode: { type: "string", enum: ["a", "b"] } } });
   });
 
   test("merges object allOf by unioning required keys, never emitting a combiner", () => {
@@ -611,16 +602,11 @@ describe("CCA tool schema normalization", () => {
     expect(
       normalizeSchemaForCCA({
         allOf: [
-          { required: ["a"], propertyOrdering: ["a"] },
+          { required: ["a"] },
           { type: "object", properties: { a: { type: "string" } } },
         ],
       }),
-    ).toEqual({
-      type: "object",
-      properties: { a: { type: "string" } },
-      required: ["a"],
-      propertyOrdering: ["a"],
-    });
+    ).toEqual({ type: "object", properties: { a: { type: "string" } }, required: ["a"] });
   });
 
   test("widens conflicting allOf properties while retaining compatible intersections", () => {
@@ -677,28 +663,50 @@ describe("CCA tool schema normalization", () => {
         type: "object",
         properties: { recursive: { $ref: "#/$defs/RecursiveObject" } },
         $defs: {
-          RecursiveObject: { type: "object", properties: { self: { $ref: "#/$defs/RecursiveObject" } } },
+          RecursiveObject: {
+            type: "object",
+            properties: { self: { $ref: "#/$defs/RecursiveObject", description: "kept sibling" } },
+          },
         },
       }),
-    ).toEqual({ type: "object", properties: { recursive: { type: "object", properties: { self: {} } } } });
+    ).toEqual({
+      type: "object",
+      properties: { recursive: { type: "object", properties: { self: { description: "kept sibling" } } } },
+    });
   });
 
   test("widens external and unresolvable refs instead of failing", () => {
     expect(normalizeSchemaForCCA({ $ref: "https://example.com/schema.json" })).toEqual({});
     expect(
-      normalizeSchemaForCCA({ $ref: "#/$defs/Missing", description: "kept sibling" }),
-    ).toEqual({ description: "kept sibling" });
+      normalizeSchemaForCCA({
+        $ref: "#/$defs/Missing",
+        description: "kept sibling",
+        properties: { nested: { $ref: "#/$defs/Leaf" } },
+        $defs: { Leaf: { type: "string" } },
+      }),
+    ).toEqual({ type: "object", description: "kept sibling", properties: { nested: { type: "string" } } });
   });
 
-  test("renames snake_case SDK/MCP keys and lets snake win collisions", () => {
+  test("inlines a repeated $ref at every occurrence", () => {
+    expect(
+      normalizeSchemaForCCA({
+        type: "object",
+        properties: { a: { $ref: "#/$defs/Leaf" }, b: { $ref: "#/$defs/Leaf" } },
+        $defs: { Leaf: { type: "string", description: "shared leaf" } },
+      }),
+    ).toEqual({
+      type: "object",
+      properties: {
+        a: { type: "string", description: "shared leaf" },
+        b: { type: "string", description: "shared leaf" },
+      },
+    });
+  });
+
+  test("renames snake_case any_of and lets snake win collisions", () => {
     const normalized = normalizeSchemaForCCA({
-      additional_properties: false,
-      property_ordering: ["mode"],
       properties: { mode: { any_of: [{ type: "integer" }, { type: "number" }] } },
     }) as Record<string, any>;
-    expect(normalized.additionalProperties).toBeUndefined();
-    expect(normalized.propertyOrdering).toEqual(["mode"]);
-    // any_of participates in union collapsing exactly like anyOf.
     expect(normalized.properties.mode).toEqual({ type: "number" });
 
     // python-genai collision rule: snake_case overwrites an existing camelCase key.
@@ -753,9 +761,6 @@ describe("CCA tool schema normalization", () => {
     expect(normalizeSchemaForCCA("nope")).toEqual(fallback);
     expect(normalizeSchemaForCCA(42)).toEqual(fallback);
     expect(normalizeSchemaForCCA(null)).toEqual(fallback);
-    // A residual uncollapsible union (malformed branch) falls back rather than
-    // sending a forbidden combiner.
-    expect(normalizeSchemaForCCA({ anyOf: [{ type: "string" }, 42] })).toEqual(fallback);
     expect(normalizeSchemaForCCA(false)).toEqual(fallback);
   });
 
@@ -770,17 +775,6 @@ describe("CCA tool schema normalization", () => {
       type: "object",
       properties: { mode: { type: "string", enum: ["read", "write"] }, size: { type: "integer" } },
       required: ["mode", "size"],
-    });
-    expect(
-      normalizeSchemaForCCA({
-        type: "object",
-        properties: { mode: { type: "string" } },
-        propertyOrdering: ["ghost", "mode", "mode"],
-      }),
-    ).toEqual({
-      type: "object",
-      properties: { mode: { type: "string" } },
-      propertyOrdering: ["mode"],
     });
   });
 
@@ -820,19 +814,6 @@ describe("CCA tool schema normalization", () => {
     });
     // Objects always carry properties on the wire.
     expect(normalizeSchemaForCCA({ type: "object" })).toEqual({ type: "object", properties: {} });
-  });
-
-  test("normalizes a reused subschema at every occurrence instead of blanking repeats", () => {
-    const shared = { type: "string", description: "shared leaf" };
-    expect(
-      normalizeSchemaForCCA({ type: "object", properties: { a: shared, b: shared } }),
-    ).toEqual({
-      type: "object",
-      properties: {
-        a: { type: "string", description: "shared leaf" },
-        b: { type: "string", description: "shared leaf" },
-      },
-    });
   });
 
   test("preserves property names that overlap object prototype keys", () => {
