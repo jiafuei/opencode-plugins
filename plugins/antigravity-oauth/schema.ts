@@ -7,12 +7,13 @@
  * blacklist: local JSON Pointer `$ref`s are inlined from `$defs`/`definitions`,
  * snake_case SDK/MCP keys are renamed, validators/annotations the wire cannot
  * express are stripped, unions are collapsed to one representable schema, and
- * the final tree is structurally validated — a malformed or unrepresentable
- * tool falls back to an empty object schema so one bad tool cannot 400 the
- * whole request.
+ * malformed or unrepresentable subschemas are widened locally so valid tool
+ * parameters survive. An unusable root falls back to an empty object schema.
  */
 
 type JsonObject = Record<string, unknown>;
+
+class UnrepresentableSchema extends Error {}
 
 /** Safe terminal schema for tools whose parameters cannot be represented. */
 const CCA_FALLBACK_SCHEMA: JsonObject = { type: "object", properties: {} };
@@ -290,9 +291,9 @@ function renameSnakeKeys(obj: JsonObject): JsonObject {
 function normalizeNode(value: unknown, visiting: Set<object>): unknown {
   // A bare boolean is a JSON Schema subschema only in subschema slots, which
   // is where this function is called. `true` is open; `false` cannot be
-  // represented without CCA's forbidden `not`, so fail the whole tool safely.
+  // represented without CCA's forbidden `not`.
   if (value === true) return {};
-  if (value === false) throw new Error("False schemas are not representable by CCA");
+  if (value === false) throw new UnrepresentableSchema("False schemas are not representable by CCA");
   if (typeof value !== "object" || value === null) return value; // malformed: caught by validation
   if (visiting.has(value)) return {}; // cyclic JS object graph: widen
   visiting.add(value);
@@ -303,12 +304,22 @@ function normalizeNode(value: unknown, visiting: Set<object>): unknown {
   }
 }
 
+function normalizeSubschema(value: unknown, visiting: Set<object>): unknown {
+  try {
+    const normalized = normalizeNode(value, visiting);
+    return isValidCcaSchema(normalized, new Set()) ? normalized : {};
+  } catch (error) {
+    if (!(error instanceof UnrepresentableSchema)) throw error;
+    return {};
+  }
+}
+
 function normalizePropertiesMap(map: unknown, visiting: Set<object>): JsonObject | undefined {
   if (!isPlainObject(map)) return undefined;
   const result: JsonObject = {};
   for (const [name, subschema] of Object.entries(map)) {
     // Property names are literal payload keys, not schema keywords.
-    setOwn(result, name, normalizeNode(subschema, visiting));
+    setOwn(result, name, normalizeSubschema(subschema, visiting));
   }
   return result;
 }
@@ -352,7 +363,7 @@ function normalizeObjectNode(obj: JsonObject, visiting: Set<object>): JsonObject
         break;
       case "items":
         // Tuple-form (array) items are not representable: omit them, widening.
-        if (isPlainObject(entry) || typeof entry === "boolean") result.items = normalizeNode(entry, visiting);
+        if (isPlainObject(entry) || typeof entry === "boolean") result.items = normalizeSubschema(entry, visiting);
         break;
       // A mistyped validator would fail the whole request's protojson parse: drop it.
       case "format":
@@ -398,9 +409,9 @@ function normalizeObjectNode(obj: JsonObject, visiting: Set<object>): JsonObject
   return result;
 }
 
-/** Merge a normalized allOf branch into the node without weakening conflicts. */
+/** Merge allOf branches, repairing conflicts at property and item boundaries. */
 function mergeAllOfBranch(node: JsonObject, branch: unknown): void {
-  if (!isPlainObject(branch)) throw new Error("Malformed allOf branch");
+  if (!isPlainObject(branch)) throw new UnrepresentableSchema("Malformed allOf branch");
   replaceNodeKeys(node, intersectAllOfSchemas(node, branch));
 }
 
@@ -412,7 +423,7 @@ function intersectAllOfSchemas(left: JsonObject, right: JsonObject): JsonObject 
     typeof right.type === "string" &&
     left.type !== right.type
   ) {
-    throw new Error("Conflicting allOf types");
+    throw new UnrepresentableSchema("Conflicting allOf types");
   }
 
   const result: JsonObject = { ...left };
@@ -422,7 +433,7 @@ function intersectAllOfSchemas(left: JsonObject, right: JsonObject): JsonObject 
     if (Array.isArray(left.enum) && Array.isArray(right.enum)) {
       const rightEnum = right.enum as unknown[];
       const intersection = left.enum.filter((value) => rightEnum.some((candidate) => jsonEquals(value, candidate)));
-      if (intersection.length === 0) throw new Error("Conflicting allOf enums");
+      if (intersection.length === 0) throw new UnrepresentableSchema("Conflicting allOf enums");
       result.enum = intersection;
     } else {
       result.enum = Array.isArray(left.enum) ? left.enum : right.enum;
@@ -434,7 +445,7 @@ function intersectAllOfSchemas(left: JsonObject, right: JsonObject): JsonObject 
       (left.properties !== undefined && !isPlainObject(left.properties)) ||
       (right.properties !== undefined && !isPlainObject(right.properties))
     ) {
-      throw new Error("Malformed allOf properties");
+      throw new UnrepresentableSchema("Malformed allOf properties");
     }
     const properties: JsonObject = { ...(isPlainObject(left.properties) ? left.properties : {}) };
     for (const [name, schema] of Object.entries(isPlainObject(right.properties) ? right.properties : {})) {
@@ -477,8 +488,13 @@ function intersectAllOfSchemas(left: JsonObject, right: JsonObject): JsonObject 
 
 function intersectAllOfPropertySchemas(left: unknown, right: unknown): unknown {
   if (jsonEquals(left, right)) return left;
-  if (!isPlainObject(left) || !isPlainObject(right)) throw new Error("Malformed allOf property");
-  return intersectAllOfSchemas(left, right);
+  if (!isPlainObject(left) || !isPlainObject(right)) return {};
+  try {
+    return intersectAllOfSchemas(left, right);
+  } catch (error) {
+    if (!(error instanceof UnrepresentableSchema)) throw error;
+    return {};
+  }
 }
 
 /**
@@ -515,7 +531,7 @@ function mergePropertySchemas(existing: unknown, incoming: unknown): unknown {
 function applyConst(result: JsonObject, constValue: unknown): void {
   if (Array.isArray(result.enum)) {
     if (!result.enum.some((candidate) => jsonEquals(candidate, constValue))) {
-      throw new Error("Conflicting const and enum constraints");
+      throw new UnrepresentableSchema("Conflicting const and enum constraints");
     }
   }
   result.enum = [constValue];
@@ -968,14 +984,15 @@ function isValidCcaSchema(value: unknown, seen: Set<object>): boolean {
 
 /**
  * Normalize one tool parameter schema for Cloud Code Assist. Malformed input
- * or an unrepresentable construct returns the safe fallback schema instead of
- * a payload that would 400 the entire request.
+ * or an unrepresentable root returns the object fallback. Nested failures are
+ * repaired at property and item boundaries.
  */
 export function normalizeSchemaForCCA(value: unknown): unknown {
   try {
     const normalized = normalizeNode(dereferenceJsonSchema(value), new Set());
     return isValidCcaSchema(normalized, new Set()) ? normalized : { ...CCA_FALLBACK_SCHEMA };
-  } catch {
+  } catch (error) {
+    if (!(error instanceof UnrepresentableSchema)) throw error;
     return { ...CCA_FALLBACK_SCHEMA };
   }
 }

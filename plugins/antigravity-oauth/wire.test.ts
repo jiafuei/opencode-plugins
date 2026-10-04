@@ -420,6 +420,38 @@ describe("body rewrite", () => {
     expect(legacy).toEqual({ name: "legacy", description: "", parameters: { type: "OBJECT", properties: {} } });
   });
 
+  test("repairs incompatible subschemas without erasing the tool parameters", () => {
+    const args = baseArgs();
+    args.tools = [{ functionDeclarations: [{ name: "read_file", parametersJsonSchema: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "File to read" },
+        limit: { allOf: [{ type: "integer" }, { type: "string" }] },
+        entries: { type: "array", items: { type: "string", enum: ["a"], const: "b" } },
+        options: { type: "object", properties: {
+          malformed: "broken",
+          union: { anyOf: [{ type: "string", enum: ["a"], title: "First" }, { type: "string", enum: ["b"] }] },
+          disabled: false,
+          valid: { type: "boolean" },
+        }, required: ["valid"] },
+      },
+      required: ["path", "limit"],
+    } }] }];
+    const declaration = rewrite(args, "claude-opus-5-5-high").request.tools[0].functionDeclarations[0];
+    expect(declaration.parameters).toEqual({
+      type: "OBJECT",
+      properties: {
+        path: { type: "STRING", description: "File to read" },
+        limit: {},
+        entries: { type: "ARRAY", items: {} },
+        options: { type: "OBJECT", properties: {
+          malformed: {}, union: {}, disabled: {}, valid: { type: "BOOLEAN" },
+        }, required: ["valid"] },
+      },
+      required: ["path", "limit"],
+    });
+  });
+
   test("normalizes tool schemas for CCA", () => {
     const normalized = normalizeSchemaForCCA({
       $schema: "https://json-schema.org/draft/2020-12/schema",
@@ -562,7 +594,7 @@ describe("CCA tool schema normalization", () => {
     });
   });
 
-  test("fails the whole tool safely when allOf constraints conflict", () => {
+  test("widens conflicting allOf properties while retaining compatible intersections", () => {
     const fallback = { type: "object", properties: {} };
     expect(normalizeSchemaForCCA({ allOf: [{ type: "string" }, { type: "number" }] })).toEqual(fallback);
     expect(
@@ -572,7 +604,7 @@ describe("CCA tool schema normalization", () => {
           { type: "object", properties: { value: { type: "number" } } },
         ],
       }),
-    ).toEqual(fallback);
+    ).toEqual({ type: "object", properties: { value: {} } });
     expect(
       normalizeSchemaForCCA({
         allOf: [
@@ -692,8 +724,6 @@ describe("CCA tool schema normalization", () => {
     expect(normalizeSchemaForCCA("nope")).toEqual(fallback);
     expect(normalizeSchemaForCCA(42)).toEqual(fallback);
     expect(normalizeSchemaForCCA(null)).toEqual(fallback);
-    // Scalar subschema in a property slot is malformed.
-    expect(normalizeSchemaForCCA({ type: "object", properties: { x: "broken" } })).toEqual(fallback);
     // A residual uncollapsible union (malformed branch) falls back rather than
     // sending a forbidden combiner.
     expect(normalizeSchemaForCCA({ anyOf: [{ type: "string" }, 42] })).toEqual(fallback);
