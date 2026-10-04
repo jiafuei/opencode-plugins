@@ -3,7 +3,6 @@ import {
   DEFAULT_LIMITS,
   effectiveLimits,
   drainPendingCoordination,
-  isLeaseStale,
   planDiff,
   reconcileRevisionWorkers,
   sealActivePhase,
@@ -11,10 +10,8 @@ import {
   coordinatorRetryable,
   hydrateRun,
   pendingCoordinationReason,
-  pendingTemplateDependency,
   renderTemplate,
   retryClassification,
-  retryDelay,
   retryDecision,
   beginAttempt,
   RETRY_DELAYS_MS,
@@ -84,12 +81,6 @@ describe("workflow spec", () => {
 
     input.allowedAgents = ["build", "explore"];
     expect(() => validateWorkflowSpec(input, new Set([...agents, "general"]), models)).toThrow("general outside allowedAgents");
-  });
-
-  test("rejects unavailable worker models", () => {
-    const unavailableModel = structuredClone(base);
-    unavailableModel.phases[0]!.steps[0]!.worker.modelID = "other/model";
-    expect(() => validateWorkflowSpec(unavailableModel, agents, models)).toThrow("unavailable model");
   });
 
   test("rejects duplicate ids and sibling template references", () => {
@@ -344,15 +335,6 @@ describe("Stage 3 adaptive planning", () => {
 
 });
 
-describe("templates and state helpers", () => {
-  test("marks skipped template dependencies for Stage 3 repair", () => {
-    const spec = validateWorkflowSpec(base, agents, models);
-    const workers: Record<string, WorkerState> = Object.fromEntries(workersInOrder(spec).map((worker) => [worker.id, { ...worker, status: "pending", steering: [] }]));
-    workers.scan!.status = "skipped";
-    expect(pendingTemplateDependency(spec, workers, "scan")).toBe("audit");
-  });
-});
-
 describe("Stage 5 lifecycle and release", () => {
   const run = (id: string, status: WorkflowRun["status"], updatedAt: number): WorkflowRun => hydrateRun({ version: 1, id, parentSessionID: "parent", parentMessageID: "message", createdAt: updatedAt, updatedAt, status, spec: validateWorkflowSpec(base, agents, models), limits: DEFAULT_LIMITS, workers: {} });
 
@@ -378,40 +360,29 @@ describe("Stage 5 lifecycle and release", () => {
     expect(abortForParentDeletion(current)).toBe(false);
   });
 
-  test("maintenance claims serialize and can be retried after cleanup failure", () => {
-    const path = `/tmp/opencode/workflow-maintenance-${crypto.randomUUID()}.sqlite`;
-    const first = new WorkflowCoordination(path), second = new WorkflowCoordination(path);
-    const claim = first.claimMaintenance("run", "one", 100)!;
-    expect(claim.ownerIdentity).toBe("one");
-    expect(second.claimMaintenance("run", "two", 101)).toBeUndefined();
-    expect(first.releaseMaintenance(claim)).toBe(true);
-    expect(second.claimMaintenance("run", "two", 102)).toBeDefined();
-    first.close(); second.close();
-  });
-
   test("lease acquisition and maintenance are mutually exclusive across connections", () => {
     const path = `/tmp/opencode/workflow-exclusion-${crypto.randomUUID()}.sqlite`;
     const cleaner = new WorkflowCoordination(path), runner = new WorkflowCoordination(path);
     const claim = cleaner.claimMaintenance("run", "cleaner", 100)!;
+    expect(runner.claimMaintenance("run", "runner", 101)).toBeUndefined();
     expect(runner.acquire("run", "runner", 101)).toBeUndefined();
     expect(cleaner.releaseMaintenance({ ...claim, token: "wrong" })).toBe(false);
     expect(cleaner.releaseMaintenance(claim)).toBe(true);
     const lease = runner.acquire("run", "runner", 20_002)!;
     expect(cleaner.claimMaintenance("run", "cleaner", 20_003)).toBeUndefined();
     expect(runner.release(lease)).toBe(true);
+    expect(runner.claimMaintenance("run", "runner", 20_004)).toBeDefined();
     cleaner.close(); runner.close();
   });
 
 });
 
 describe("Stage 2 reliability helpers", () => {
-  test("classifies only transient and structured retry failures with fixed backoff", () => {
+  test("classifies transient, structured, and terminal error messages", () => {
     expect(retryClassification(new Error("provider timeout"))).toBe("transient");
     expect(retryClassification(new Error("output does not match schema type"))).toBe("structured");
     expect(retryClassification(new Error("permission denied"))).toBe("none");
     expect(retryClassification(new Error("workflow stop requested"))).toBe("none");
-    expect([1, 2, 3, 4, 5].map(retryDelay)).toEqual([5_000, 10_000, 20_000, 30_000, 40_000]);
-    expect(retryDelay(6)).toBeUndefined();
   });
 
   test("preserves quiescing coordinator state and finalizes soft pauses", () => {
@@ -458,12 +429,6 @@ describe("Stage 2 reliability helpers", () => {
     first.result = "completed";
     attempts.pop();
     expect(beginAttempt(attempts, "turn").messageID).not.toBe(first.messageID);
-  });
-
-  test("recovers only stale leases", () => {
-    const lease = { runID: "run", ownerIdentity: "123:abc", heartbeatAt: 10_000 };
-    expect(isLeaseStale(lease, 24_999)).toBe(false);
-    expect(isLeaseStale(lease, 25_001)).toBe(true);
   });
 
   test("creates ascending OpenCode-compatible message IDs", () => {

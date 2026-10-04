@@ -19,18 +19,6 @@ interface Call {
   init?: RequestInit;
 }
 
-// Suites below mock globalThis.fetch, so their tests are serialized by hand
-// through a shared promise chain.
-let serialQueue: Promise<unknown> = Promise.resolve();
-function serialTest(name: string, fn: () => Promise<void> | void) {
-  test(name, async () => {
-    // Run regardless of whether an earlier serialized test failed.
-    const result = serialQueue.then(fn, fn);
-    serialQueue = result.catch(() => {});
-    await result;
-  });
-}
-
 /** Mock global fetch and return captured calls. */
 function mockFetch(responder: (url: string) => Response | Promise<Response>): { calls: Call[]; restore: () => void } {
   const calls: Call[] = [];
@@ -55,7 +43,7 @@ function identityResponse(url: string): Response {
 }
 
 describe("resolveIdentity (login semantics)", () => {
-  serialTest("missing account block: recovers full identity from profile and roles", async () => {
+  test.serial("missing account block: recovers full identity from profile and roles", async () => {
     const { calls, restore } = mockFetch(identityResponse);
     try {
       const identity = await resolveIdentity({ ...TOKEN_BODY });
@@ -75,7 +63,7 @@ describe("resolveIdentity (login semantics)", () => {
     }
   });
 
-  serialTest("roles failure does not discard a valid profile identity", async () => {
+  test.serial("roles failure does not discard a valid profile identity", async () => {
     const { restore } = mockFetch((url) =>
       url.includes("/roles") ? Promise.reject(new Error("roles unavailable")) : jsonResponse(PROFILE_IDENTITY),
     );
@@ -91,7 +79,7 @@ describe("resolveIdentity (login semantics)", () => {
     }
   });
 
-  serialTest("partial token identity wins while profile and roles fill missing fields", async () => {
+  test.serial("partial token identity wins while profile and roles fill missing fields", async () => {
     const { restore } = mockFetch(identityResponse);
     try {
       const identity = await resolveIdentity(
@@ -112,7 +100,7 @@ describe("resolveIdentity (login semantics)", () => {
     }
   });
 
-  serialTest("full token identity short-circuits: no profile call at all", async () => {
+  test.serial("full token identity short-circuits: no profile call at all", async () => {
     const { calls, restore } = mockFetch(() => {
       throw new Error("profile must not be called");
     });
@@ -131,7 +119,7 @@ describe("resolveIdentity (login semantics)", () => {
     }
   });
 
-  serialTest("profile failure is best-effort and preserves token identity", async () => {
+  test.serial("profile failure is best-effort and preserves token identity", async () => {
     const { restore } = mockFetch(() => Promise.reject(new Error("ECONNREFUSED")));
     try {
       expect(await resolveIdentity(

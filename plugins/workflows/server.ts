@@ -1193,6 +1193,7 @@ export default Plugin.define({
       }
       if (heartbeatTimer) clearInterval(heartbeatTimer);
       await heartbeatQueue;
+      await Promise.allSettled(executions.values());
       await writeQueue;
       coordination.close();
     };

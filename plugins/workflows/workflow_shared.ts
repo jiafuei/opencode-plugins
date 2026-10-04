@@ -587,10 +587,6 @@ export function retryClassification(error: unknown): "transient" | "structured" 
   return /provider|runtime|timeout|timed out|network|fetch failed|econnreset|econnrefused|temporar|overload|rate limit|\b5\d\d\b/.test(message) ? "transient" : "none";
 }
 
-export function retryDelay(attemptNumber: number): number | undefined {
-  return RETRY_DELAYS_MS[attemptNumber - 1];
-}
-
 export type RetryDecision = { kind: "interrupt" | "fail" } | { kind: "retry"; delayMs: number };
 
 /**
@@ -600,7 +596,7 @@ export type RetryDecision = { kind: "interrupt" | "fail" } | { kind: "retry"; de
  */
 export function retryDecision(error: unknown, retriesSoFar: number, interrupted: boolean): RetryDecision {
   if (interrupted) return { kind: "interrupt" };
-  const delayMs = retryClassification(error) === "none" ? undefined : retryDelay(retriesSoFar + 1);
+  const delayMs = retryClassification(error) === "none" ? undefined : RETRY_DELAYS_MS[retriesSoFar];
   return delayMs === undefined ? { kind: "fail" } : { kind: "retry", delayMs };
 }
 

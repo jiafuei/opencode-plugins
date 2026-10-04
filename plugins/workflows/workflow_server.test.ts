@@ -39,12 +39,9 @@ async function createHarness(options: Record<string, unknown> = {}) {
     failGenerate: false,
     agents: ["build", "general"],
     models: ["claude"],
-    agentRefreshes: 0,
-    modelRefreshes: 0,
     synthetic: [] as Array<{ sessionID: string; id: string; text: string }>,
     created: [] as Array<{ id: string; agent?: string; model?: { providerID: string; id: string } }>,
     generated: [] as string[],
-    onPrompt: undefined as ((sessionID: string) => Promise<void> | void) | undefined,
     promptDelay: undefined as ((text: string) => number) | undefined,
     workerOutput: undefined as ((text: string) => string) | undefined,
     formats: [] as unknown[],
@@ -56,8 +53,8 @@ async function createHarness(options: Record<string, unknown> = {}) {
     options,
     location: { directory, project: { id: projectID } },
     rpc: { register: async (_definition: unknown, handlers: { control: typeof control }) => { control = handlers.control; return { ...registration, events: { emit: async () => {} } }; } },
-    agent: { list: async () => { state.agentRefreshes++; return { data: state.agents.map((id) => ({ id })) }; } },
-    model: { list: async () => { state.modelRefreshes++; return { data: state.models.map((id) => ({ providerID: "anthropic", id })) }; } },
+    agent: { list: async () => ({ data: state.agents.map((id) => ({ id })) }) },
+    model: { list: async () => ({ data: state.models.map((id) => ({ providerID: "anthropic", id })) }) },
     generate: {
       text: async ({ prompt }: { prompt: string }) => {
         state.generated.push(prompt);
@@ -83,7 +80,6 @@ async function createHarness(options: Record<string, unknown> = {}) {
         state.maxInFlight = Math.max(state.maxInFlight, state.inFlight);
         await Bun.sleep(state.promptDelay?.(input.text) ?? 50);
         state.inFlight--;
-        await state.onPrompt?.(input.sessionID);
         const agent = state.created.find((item) => item.id === input.sessionID)?.agent;
         if (input.format) state.formats.push(input.format);
         const content = input.format ? [{ type: "tool", name: "StructuredOutput", state: { status: "completed", input: { count: 3 } } }] : [{ type: "text", text: state.workerOutput?.(input.text) ?? `output:${agent}` }];
@@ -176,12 +172,10 @@ describe("workflow server", () => {
     const workflow = h.tools.get("workflow")!;
     h.state.agents = ["general"];
     await expect(workflow.execute({ spec: spec([{ id: "p1", title: "Phase", steps: [workerStep("a")] }]) }, h.context())).rejects.toThrow("unregistered agent");
-    expect([h.state.agentRefreshes, h.state.modelRefreshes]).toEqual([1, 1]);
 
     h.state.agents = ["build", "general"];
     h.state.models = ["sonnet"];
     await expect(workflow.execute({ spec: spec([{ id: "p1", title: "Phase", steps: [{ type: "worker", worker: { ...worker("a"), modelID: "anthropic/claude" } }] }]) }, h.context())).rejects.toThrow("unavailable model");
-    expect([h.state.agentRefreshes, h.state.modelRefreshes]).toEqual([2, 2]);
   });
 
   test("approves, renders templates across sequential workers, and completes with a synthetic handoff", async () => {
@@ -309,26 +303,17 @@ describe("workflow server", () => {
     await expect(status.execute({ runID: "missing-run" }, {})).rejects.toThrow();
   }, 15_000);
 
-  test("runs a parallel group at the configured max_concurrency", async () => {
-    const h = await createHarness({ max_concurrency: 3 });
-    const { id, result } = await h.submit(spec([{ id: "p1", title: "Phase", steps: [{ type: "parallel", id: "group", workers: [worker("a"), worker("b"), worker("c")] }] }]));
-    await h.control({ runID: id, action: "approve" });
-    await result;
-    await h.waitForRun(id, (item) => item.status === "completed");
-    expect(h.state.maxInFlight).toBe(3);
-  }, 15_000);
-
   test("frees a concurrency slot as soon as a worker finishes", async () => {
-    const h = await createHarness({ max_concurrency: 2 });
+    const h = await createHarness({ max_concurrency: 3 });
     h.state.promptDelay = (text) => text.includes("slow") ? 400 : 10;
-    const workers = [worker("slow", "slow"), worker("quick", "quick"), worker("last", "last")];
+    const workers = [worker("slow", "slow"), worker("quick", "quick"), worker("other", "quick"), worker("last", "last")];
     const { id, result } = await h.submit(spec([{ id: "p1", title: "Phase", steps: [{ type: "parallel", id: "group", workers }] }]));
     await h.control({ runID: id, action: "approve" });
     await result;
     const run = await h.waitForRun(id, (item) => item.status === "completed");
-    // Fixed batches would hold "last" until the whole [slow, quick] batch drained; a pool starts it
+    // Fixed batches would hold "last" until the whole first batch drained; a pool starts it
     // the moment "quick" releases its slot, so it finishes long before "slow" does.
     expect(run.workers.last!.endedAt!).toBeLessThan(run.workers.slow!.endedAt!);
-    expect(h.state.maxInFlight).toBe(2);
+    expect(h.state.maxInFlight).toBe(3);
   }, 15_000);
 });

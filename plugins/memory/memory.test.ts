@@ -30,8 +30,6 @@ async function fixture(
     reflect_model?: string;
     dream_model?: string;
     idle_delay_ms?: number;
-    dream_interval_hours?: number;
-    dream_min_additions?: number;
     dream_topic_limit?: number;
   } = {},
   storage = new Map<string, unknown>(),
@@ -891,7 +889,6 @@ async function tuiFixture(
   const claims: Array<{ append?: string; render: (input: unknown) => unknown }> = [];
   const commands: Array<{ slash?: { name: string }; run: () => void }> = [];
   const requests: Array<{ requestID: string; sessionID?: string }> = [];
-  const selections: Array<(value: unknown) => void> = [];
   const sessions = new Set(options.sessions ?? []);
   const ctx = {
     location: { directory },
@@ -914,7 +911,7 @@ async function tuiFixture(
     keymap: { layer: (layer: () => { commands: typeof commands }) => commands.push(...layer().commands) },
     ui: {
       toast: { show: (toast: Toast) => toasts.push(toast) },
-      dialog: { select: () => new Promise((resolve) => selections.push(resolve)), clear: () => {} },
+      dialog: { select: () => new Promise(() => {}), clear: () => {} },
       router: { current: () => options.route ?? { type: "home" } },
       slot: (claim: (typeof claims)[number]) => {
         claims.push(claim);
@@ -928,10 +925,6 @@ async function tuiFixture(
     toasts,
     requests,
     command: (name: string) => commands.find((command) => command.slash?.name === name)!.run(),
-    select: async (value: unknown) => {
-      await until(() => selections.length > 0);
-      selections.shift()!(value);
-    },
     emit: (name: string, data: Record<string, unknown>) => handlers.get(name)!({ data }),
     dispose: cleanup,
   };

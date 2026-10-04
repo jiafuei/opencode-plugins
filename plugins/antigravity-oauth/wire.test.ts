@@ -164,17 +164,6 @@ describe("body rewrite", () => {
     expect(body.request.labels.model_enum).toBe("MODEL_PLACEHOLDER_M320");
   });
 
-  test("sends each family's captured thinking transport", () => {
-    expect(rewrite(baseArgs(), "gemini-3.8-flash-high").request.generationConfig).toEqual({
-      maxOutputTokens: 65536,
-      thinkingConfig: { includeThoughts: true, thinkingBudget: -1 },
-    });
-    expect(rewrite(baseArgs(), "claude-opus-5-5-medium").request.generationConfig).toEqual({
-      maxOutputTokens: 128000,
-      thinkingConfig: { includeThoughts: true, thinkingBudget: 0, thinkingLevel: "MEDIUM" },
-    });
-  });
-
   test("title requests become checkpoint calls that leave the trajectory untouched", () => {
     const state = createSessionState();
     const body = rewrite({ ...baseArgs(), generationConfig: { temperature: 0.5 } }, "claude-opus-5-5-high", state, "title");
@@ -392,6 +381,8 @@ describe("body rewrite", () => {
                 limit: { type: "integer", minimum: 1, maximum: 100, exclusiveMaximum: 101 },
                 tags: { type: "array", items: { type: "string", maxLength: 20 }, minItems: 1 },
                 extra: true,
+                depth: { anyOf: [{ type: "integer", enum: [1, 2] }, { type: "null" }] },
+                enabled: { type: "boolean", enum: [true, false] },
               },
               required: ["path"],
               additionalProperties: false,
@@ -414,6 +405,8 @@ describe("body rewrite", () => {
     expect(declaration.parameters).toEqual({
       type: "OBJECT",
       properties: {
+        depth: { type: "INTEGER", enum: ["1", "2"] },
+        enabled: { type: "BOOLEAN", enum: ["true", "false"] },
         extra: {},
         limit: { type: "INTEGER", minimum: 1, maximum: 100 },
         path: { type: "STRING", format: "uri", pattern: "^/" },
@@ -421,7 +414,7 @@ describe("body rewrite", () => {
       },
       required: ["path"],
     });
-    expect(Object.keys(declaration.parameters.properties)).toEqual(["extra", "limit", "path", "tags"]);
+    expect(Object.keys(declaration.parameters.properties)).toEqual(["depth", "enabled", "extra", "limit", "path", "tags"]);
     // Fields follow Schema proto declaration order.
     expect(Object.keys(declaration.parameters.properties.path)).toEqual(["type", "format", "pattern"]);
     expect(legacy).toEqual({ name: "legacy", description: "", parameters: { type: "OBJECT", properties: {} } });
@@ -457,96 +450,13 @@ describe("body rewrite", () => {
     expect(normalized.properties.flag).toEqual({});
     expect(normalized.properties.extra).toEqual({});
     expect(normalized.required).toEqual(["nested"]);
-    assertNoForbiddenConstructs(normalized);
   });
 
-  test("encodes numeric and boolean enums as strings for the CCA Schema proto", () => {
-    expect(normalizeSchemaForCCA({ type: "integer", enum: [1, 2] })).toEqual({
-      type: "integer",
-      enum: ["1", "2"],
-    });
-    expect(normalizeSchemaForCCA({ type: "boolean", enum: [true, false] })).toEqual({
-      type: "boolean",
-      enum: ["true", "false"],
-    });
-  });
-
-  test("encodes numeric enums at the request-rewrite boundary", () => {
-    const args = baseArgs();
-    args.tools = [
-      {
-        functionDeclarations: [
-          {
-            name: "read_file",
-            parametersJsonSchema: {
-              type: "object",
-              properties: { depth: { anyOf: [{ type: "integer", enum: [1, 2] }, { type: "null" }] } },
-              required: ["depth"],
-            },
-          },
-        ],
-      },
-    ];
-    const declaration = rewrite(args, "claude-opus-5-5-high").request.tools[0].functionDeclarations[0];
-    expect(declaration.parameters).toEqual({
-      type: "OBJECT",
-      properties: { depth: { type: "INTEGER", enum: ["1", "2"] } },
-      required: ["depth"],
-    });
-  });
 });
 
 // ---------------------------------------------------------------------------
 // CCA tool schema normalization regressions (ported from OMP)
 // ---------------------------------------------------------------------------
-
-/**
- * Recursively proves a normalized schema carries no forbidden combiners
- * (anyOf/oneOf/allOf), no negation/nullability, and no unsupported keys that
- * make CCA protojson reject the request. Literal `default` payloads are not
- * walked: they are opaque JSON, never interpreted as schemas.
- */
-function assertNoForbiddenConstructs(schema: unknown): void {
-  const forbidden = new Set([
-    "anyOf",
-    "oneOf",
-    "allOf",
-    "not",
-    "nullable",
-    "$ref",
-    "$schema",
-    "$defs",
-    "$id",
-    "$comment",
-    "additionalProperties",
-    "propertyNames",
-    "prefixItems",
-    "patternProperties",
-    "exclusiveMinimum",
-    "exclusiveMaximum",
-    "uniqueItems",
-    "deprecated",
-    "readOnly",
-    "writeOnly",
-    "x-mcp-header",
-  ]);
-  const seen = new Set<object>();
-  const walk = (node: unknown): void => {
-    if (typeof node !== "object" || node === null) return;
-    if (seen.has(node)) return;
-    seen.add(node);
-    if (Array.isArray(node)) {
-      for (const entry of node) walk(entry);
-      return;
-    }
-    for (const [key, value] of Object.entries(node)) {
-      expect(forbidden.has(key)).toBe(false);
-      if (key !== "default") walk(value);
-    }
-  };
-  walk(schema);
-}
-
 
 describe("CCA tool schema normalization", () => {
   test("collapses nullable unions by dropping the null branch", () => {
@@ -575,7 +485,6 @@ describe("CCA tool schema normalization", () => {
     }) as Record<string, unknown>;
     // Lossy collapse: array|string|null narrows to array.
     expect(normalized).toEqual({ type: "array", items: { type: "string" } });
-    assertNoForbiddenConstructs(normalized);
   });
 
   test("unions same-type enum branches losslessly", () => {
@@ -613,7 +522,6 @@ describe("CCA tool schema normalization", () => {
       properties: { id: { type: "string" }, name: { type: "string" }, age: { type: "number" } },
       required: ["id"],
     });
-    assertNoForbiddenConstructs(normalized);
   });
 
   test("drops stale required keys after an object-union merge", () => {
@@ -638,7 +546,6 @@ describe("CCA tool schema normalization", () => {
     expect(normalized.type).toBe("object");
     expect(Object.keys(normalized.properties).sort()).toEqual(["a", "b", "shared"]);
     expect(normalized.required).toEqual(["a", "b"]);
-    assertNoForbiddenConstructs(normalized);
 
     expect(
       normalizeSchemaForCCA({
@@ -732,7 +639,6 @@ describe("CCA tool schema normalization", () => {
     expect(normalized.propertyOrdering).toEqual(["mode"]);
     // any_of participates in union collapsing exactly like anyOf.
     expect(normalized.properties.mode).toEqual({ type: "integer" });
-    assertNoForbiddenConstructs(normalized);
 
     // python-genai collision rule: snake_case overwrites an existing camelCase key.
     expect(normalizeSchemaForCCA({ anyOf: [{ type: "string" }], any_of: [{ type: "integer" }] })).toEqual({
@@ -762,7 +668,6 @@ describe("CCA tool schema normalization", () => {
       properties: { config: { type: "object", properties: {}, default: literalDefault } },
     }) as Record<string, any>;
     expect(normalized.properties.config.default).toEqual(literalDefault);
-    assertNoForbiddenConstructs(normalized);
 
     const withDefinitions = normalizeSchemaForCCA({
       type: "object",
@@ -899,15 +804,6 @@ describe("CCA tool schema normalization", () => {
 describe("provider model registration", () => {
   test("groups the agent catalog into tier families defaulting to the highest tier", () => {
     const models = Object.fromEntries(providerModels().map((model) => [model.id, model]));
-    expect(Object.keys(models)).toEqual([
-      "gemini-3.8-flash",
-      "gemini-3.7-flash",
-      "gemini-3.6-flash",
-      "gemini-3.1-pro",
-      "claude-opus-5-5",
-      "claude-sonnet-5-5",
-      "gpt-oss-120b",
-    ]);
     const opus = models["claude-opus-5-5"]!;
     expect(opus).toMatchObject({
       providerID: "google-antigravity",

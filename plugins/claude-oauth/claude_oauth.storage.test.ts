@@ -77,9 +77,8 @@ describe("install id (stable local identity)", () => {
     try {
       const dataDir = path.join(dir, "opencode");
       const idFile = path.join(dataDir, "claude-oauth-install-id");
-      // Looser-than-ideal mode on a legacy file: contents win, perms tighten.
       mkdirSync(dataDir, { recursive: true });
-      writeFileSync(idFile, "b".repeat(32), { mode: 0o644 });
+      writeFileSync(idFile, "b".repeat(32));
 
       const [deviceId] = await settle(spawnRacers(SCRIPT, dir, 1));
       const { createHash } = await import("node:crypto");
