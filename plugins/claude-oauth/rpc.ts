@@ -4,6 +4,7 @@ import { Schema } from "effect";
 // The TUI's /anthropic-usage command reads plan limits through the server, which holds the OAuth credential.
 export const ClaudeOAuthRpc = Rpc.define({
   id: "claude-oauth",
+  events: {},
   methods: {
     usage: {
       input: Schema.toStandardSchemaV1(Schema.Struct({})),

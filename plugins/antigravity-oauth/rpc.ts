@@ -4,6 +4,7 @@ import { Schema } from "effect";
 // The TUI's /antigravity-usage command reads quota through the server, which holds the OAuth credential.
 export const AntigravityRpc = Rpc.define({
   id: "antigravity-oauth",
+  events: {},
   methods: {
     usage: {
       input: Schema.toStandardSchemaV1(Schema.Struct({})),
