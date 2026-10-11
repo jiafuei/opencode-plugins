@@ -31,8 +31,8 @@ export const ROLES_URL = `${API_ORIGIN}${rot18("/ncv/bnhgu/pynhqr_pyv/ebyrf")}`;
 const USAGE_URL = `${API_ORIGIN}${rot18("/ncv/bnhgu/hfntr")}`;
 export const REDIRECT_URI = rot18("uggcf://cyngsbez.pynhqr.pbz/bnhgu/pbqr/pnyyonpx");
 const SCOPES =
-  rot18("bet:perngr_ncv_xrl hfre:cebsvyr hfre:vasrerapr hfre:frffvbaf:pynhqr_pbqr hfre:zpc_freiref hfre:svyr_hcybnq");
-const REFRESH_SCOPES = rot18("hfre:cebsvyr hfre:vasrerapr hfre:frffvbaf:pynhqr_pbqr hfre:zpc_freiref hfre:svyr_hcybnq");
+  rot18("bet:perngr_ncv_xrl hfre:cebsvyr hfre:vasrerapr hfre:frffvbaf:pynhqr_pbqr hfre:zpc_freiref hfre:svyr_hcybnq hfre:cyhtvaf");
+const REFRESH_SCOPES = rot18("hfre:cebsvyr hfre:vasrerapr hfre:frffvbaf:pynhqr_pbqr hfre:zpc_freiref hfre:svyr_hcybnq hfre:cyhtvaf");
 
 const AXIOS_USER_AGENT = "axios/1.15.2";
 const AXIOS_ACCEPT = "application/json, text/plain, */*";

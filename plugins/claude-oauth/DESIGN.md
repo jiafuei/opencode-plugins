@@ -10,15 +10,15 @@ When the active Anthropic connection is the Claude Pro/Max OAuth credential, the
 
 ### Profiles
 
-Both profiles follow Linux x64 Claude Code 2.1.284. The interactive CLI reference is a 2.1.284 capture; `sdk-cli`
-applies the same 2.1.284 changes to a 2.1.280 SDK capture.
+Both profiles follow Linux x64 Claude Code 2.1.296. The interactive CLI reference is a 2.1.296 capture; `sdk-cli`
+applies the same 2.1.296 changes to a 2.1.280 SDK capture.
 
 | Wire behavior | `cli` | `sdk-cli` |
 | --- | --- | --- |
 | Main system identity | Official Claude Code CLI | Claude Agent SDK |
 | Billing entrypoint | `cli` | `sdk-cli` |
 | Turn origin | `human` / `task_notification` | `sdk` |
-| Modern Opus/Sonnet thinking display | `updates` | `omitted` |
+| Claude 5 thinking display | `updates` | `omitted` |
 | Fallback-credit beta | Auxiliary and compaction requests | Absent |
 | Thinking-display-updates beta | Present with updates | Absent |
 
@@ -34,6 +34,9 @@ Device identity is derived from the plugin's install ID and the OAuth account. N
   are kept and deduplicated after the profile's list, except `fine-grained-tool-streaming-2025-05-14` (absent from the
   profile), the SDK's obsolete `structured-outputs-2025-11-13` tool beta, and `context-1m-2025-08-07` (hard-429'd for
   subscription credentials).
+- Beta lists also vary by model: tool-less utility requests to Claude 5 models add the mid-conversation and effort betas
+  that older small models omit, and Haiku main requests list `claude-code-20250219` after
+  `mid-conversation-system-2026-04-07`.
 - The model's output limit is kept, including 128000-token Opus requests.
 
 ### Body

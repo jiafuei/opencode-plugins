@@ -47,7 +47,7 @@ subscription.
 }
 ```
 
-Both profiles imitate Claude Code 2.1.284: its headers, beta flags, system prompt identity, billing header, and tool
+Both profiles imitate Claude Code 2.1.296: its headers, beta flags, system prompt identity, billing header, and tool
 naming. See [DESIGN.md](DESIGN.md) for exactly what each request carries.
 
 ## Usage limits

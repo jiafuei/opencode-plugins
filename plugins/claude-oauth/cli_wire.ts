@@ -3,8 +3,8 @@ import { deriveDeviceId } from "./local_storage.ts";
 
 export const CLI_PROFILE = {
   id: "cli",
-  version: "2.1.284",
-  userAgent: "claude-cli/2.1.284 (external, cli)",
+  version: "2.1.296",
+  userAgent: "claude-cli/2.1.296 (external, cli)",
   billingEntrypoint: "cli",
   systemInstruction: "You are Claude Code, Anthropic's official CLI for Claude.",
   toolPrefix: "mcp__oc__",
@@ -13,7 +13,7 @@ export const CLI_PROFILE = {
 export const SDK_CLI_PROFILE = {
   ...CLI_PROFILE,
   id: "sdk-cli",
-  userAgent: "claude-cli/2.1.284 (external, sdk-cli)",
+  userAgent: "claude-cli/2.1.296 (external, sdk-cli)",
   billingEntrypoint: "sdk-cli",
   systemInstruction: "You are a Claude agent, built on Anthropic's Claude Agent SDK.",
 } as const;
@@ -43,8 +43,9 @@ const AGENT_IDENTITY = SDK_CLI_PROFILE.systemInstruction;
 const PREAMBLE = "You are an interactive agent that helps users with software engineering tasks. " +
   "Workspace tools are provided by the oc MCP server. Use the available tool schemas and follow the user's instructions.";
 const BILLING = "x-anthropic-billing-header:";
+const CLAUDE_5 = /^claude-(?:opus|sonnet|haiku)-5(?:-|$)/;
 
-/** Native byte-marker normalization, verified against the 61 2.1.280 and 176 2.1.284 requests captured September 29–30. */
+/** Native byte-marker normalization, verified against 2.1.280 and 2.1.284 captures (September 29–30) and 48 2.1.296 requests (October 11). */
 export function patchCliCch(body: string): string {
   const anchor = body.indexOf('"system":[');
   const placeholder = body.indexOf("cch=00000", anchor);
@@ -156,7 +157,7 @@ export function rewriteCliBody(body: string, attribution: CliAttribution, attrib
 
   const thinking = params.thinking ? { ...params.thinking } : undefined;
   const activeThinking = ["enabled", "adaptive"].includes(thinking?.type);
-  if (activeThinking && /^claude-(?:opus|sonnet)-5(?:-|$)/.test(params.model)) {
+  if (activeThinking && CLAUDE_5.test(params.model)) {
     thinking.display = profile.id === "sdk-cli" ? "omitted" : "updates";
     delete thinking.block_binding;
   }
@@ -175,7 +176,7 @@ export function rewriteCliBody(body: string, attribution: CliAttribution, attrib
     tools: params.tools ?? [],
     metadata: { user_id: JSON.stringify({ device_id: deriveDeviceId(attribution.accountId),
       ...(attribution.accountId ? { account_uuid: attribution.accountId } : {}), session_id: attribution.sessionId }) },
-    max_tokens: params.max_tokens ?? (/^claude-opus-5/.test(params.model) ? 128000 : 64000),
+    max_tokens: params.max_tokens ?? (/^claude-(?:opus-5|(?:sonnet|haiku)-5-5)/.test(params.model) ? 128000 : 64000),
     ...(thinking ? { thinking } : {}),
     ...(context ? { context_management: context } : {}),
     ...(params.temperature !== undefined ? { temperature: params.temperature } : {}),
@@ -184,7 +185,7 @@ export function rewriteCliBody(body: string, attribution: CliAttribution, attrib
     ...(params.stream !== undefined ? { stream: params.stream } : {}),
   };
   for (const [key, value] of Object.entries(params)) if (!(key in rewritten)) rewritten[key] = value;
-  return { json: patchCliCch(JSON.stringify(rewritten)), utility, thinking };
+  return { json: patchCliCch(JSON.stringify(rewritten)), model: params.model as string, utility, thinking };
 }
 
 export function cliHeaders(
@@ -195,15 +196,21 @@ export function cliHeaders(
   retry: number,
   profile: CliProfile = CLI_PROFILE,
 ): Record<string, string> {
+  const haiku = body.model.startsWith("claude-haiku-");
+  // Utility requests to Claude 5 models carry the mid-conversation and effort betas that older small models omit.
+  const full = !body.utility || CLAUDE_5.test(body.model);
   const betas = [
-    ...(!body.utility ? ["claude-code-20250219"] : []),
+    ...(!body.utility && !haiku ? ["claude-code-20250219"] : []),
     "oauth-2025-04-20", "interleaved-thinking-2025-05-14",
     ...(body.utility ? ["redact-thinking-2026-02-12"] : []),
     "thinking-token-count-2026-05-13", "context-management-2025-06-27", "prompt-caching-scope-2026-01-05",
+    ...(full ? ["mid-conversation-system-2026-04-07"] : []),
+    // Haiku main requests move the Claude Code beta behind the mid-conversation system beta.
+    ...(!body.utility && haiku ? ["claude-code-20250219"] : []),
+    ...(full && !attribution.agentId ? ["per-turn-control-2026-07-01", "mid-conversation-tool-changes-2026-07-01"] : []),
+    ...(!body.utility ? ["advanced-tool-use-2025-11-20"] : []),
+    ...(full ? ["mid-conversation-system-clear-at-2026-08-21", "effort-2025-11-24"] : []),
     ...(body.utility ? ["structured-outputs-2025-12-15"] : [
-      "mid-conversation-system-2026-04-07",
-      ...(!attribution.agentId ? ["per-turn-control-2026-07-01", "mid-conversation-tool-changes-2026-07-01"] : []),
-      "advanced-tool-use-2025-11-20", "mid-conversation-system-clear-at-2026-08-21", "effort-2025-11-24",
       ...(profile.id === "cli" && ["auxiliary", "compaction"].includes(attribution.requestClass) ? ["fallback-credit-2026-06-01"] : []),
       "thinking-binding-controls-2026-08-01",
       ...(body.thinking?.display === "updates" ? ["thinking-display-updates-2026-08-18"] : []),
@@ -226,7 +233,7 @@ export function cliHeaders(
     "X-Stainless-Arch": "x64",
     "X-Stainless-Lang": "js",
     "X-Stainless-OS": "Linux",
-    "X-Stainless-Package-Version": "0.112.1",
+    "X-Stainless-Package-Version": "0.128.0",
     "X-Stainless-Retry-Count": String(retry),
     "X-Stainless-Runtime": "node",
     "X-Stainless-Runtime-Version": "v26.3.0",

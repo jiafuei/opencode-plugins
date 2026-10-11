@@ -91,8 +91,26 @@ test("SDK billing skips leading reminders and retains legacy model thinking opti
     thinking: { type: "adaptive", display: "summarized", budget_tokens: 2048 },
   };
   const body = JSON.parse(rewriteCliBody(JSON.stringify(input), { sessionId: "s", requestClass: "main" }, true, SDK_CLI_PROFILE).json);
-  expect(body.system[0].text).toContain("cc_version=2.1.284.bdd;");
+  expect(body.system[0].text).toContain("cc_version=2.1.296.c66;");
   expect(body.thinking).toEqual(input.thinking);
+});
+
+test("Haiku 5 main and utility requests use the captured 2.1.296 beta lists", () => {
+  const attribution = { sessionId: "s", requestClass: "main" } as const;
+  const main = rewriteCliBody(JSON.stringify({ ...BODY, model: "claude-haiku-5-5" }), attribution);
+  expect(cliHeaders(new Headers({ authorization: "t" }), attribution, main, "id", 0)["anthropic-beta"]).toBe(
+    "oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27," +
+    "prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,claude-code-20250219,per-turn-control-2026-07-01," +
+    "mid-conversation-tool-changes-2026-07-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21," +
+    "effort-2025-11-24,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11," +
+    "cache-diagnosis-2026-04-07");
+  const auxiliary = { sessionId: "s", requestClass: "auxiliary" } as const;
+  const utility = rewriteCliBody(JSON.stringify({ model: "claude-haiku-5-5", messages: BODY.messages, stream: true }), auxiliary);
+  expect(cliHeaders(new Headers({ authorization: "t" }), auxiliary, utility, "id", 0)["anthropic-beta"]).toBe(
+    "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13," +
+    "context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07," +
+    "per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,mid-conversation-system-clear-at-2026-08-21," +
+    "effort-2025-11-24,structured-outputs-2025-12-15,cache-diagnosis-2026-04-07");
 });
 
 test("relay controls actual header order/casing, drops late trace headers, and decompresses responses", async () => {
@@ -181,7 +199,7 @@ test.each(["cli", "sdk-cli"] as const)("%s selects its captured identity and tra
   try {
     f.plugin.state.sessions.ses_child = { parentID: "ses_root" };
     const first = await f.send();
-    expect(first.capture.headers.get("user-agent")).toBe(`claude-cli/2.1.284 (external, ${profile})`);
+    expect(first.capture.headers.get("user-agent")).toBe(`claude-cli/2.1.296 (external, ${profile})`);
     expect(first.capture.body.system[0].text).toContain(`cc_entrypoint=${profile};`);
     expect(first.capture.body.system[0].text).toContain(`cc_turn_origin=${profile === "sdk-cli" ? "sdk" : "human"};`);
     expect(first.capture.body.system[1].text).toBe(profile === "sdk-cli"
