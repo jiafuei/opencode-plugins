@@ -15,7 +15,8 @@ for things that are expensive to re-derive, not a changelog or source of truth.
 - **Updates.** Memories saved or edited in one session reach other open sessions on their next user message.
 - **Dreaming.** As memory grows, a periodic cleanup merges related topics and removes stale ones. Removed topics are
   quarantined first, not deleted outright. The sidebar shows `Dreaming...` while it runs.
-- **Subagents** get your preferences and instructions, but no `memory` tool.
+- **Subagents** get your preferences and instructions inline, an index of other topics, and a read-only `memory` tool.
+  They cannot save or delete memories.
 
 Memory is designed to keep the provider's prompt cache warm: what the model sees doesn't change mid-session, and new
 memories arrive as small additions instead.
@@ -41,11 +42,20 @@ ${XDG_DATA_HOME:-~/.local/share}/opencode/memory/-home-alice-project-a1b2c3d4/
 `-- <short-title>-<random>.md
 ```
 
-`index.md` has one line per topic, and the model sees the same lines:
+`index.md` has one line per topic:
 
 ```markdown
 - [Short title](short-title-a1b2c3d4.md) - [preference|2026-08-23] One-line summary
 ```
+
+The model sees topic identifiers rather than file links:
+
+```text
+- Short title [id: short-title-a1b2c3d4.md] - [preference|2026-08-23] One-line summary
+```
+
+Agents retrieve topics with `memory` (`action: "read"`, `target: "short-title-a1b2c3d4.md"`), not filesystem paths.
+If a topic was merged or removed, the tool returns the current index so the agent can select a relevant replacement.
 
 Topic files hold the body alone, with no frontmatter; the title, summary, type, and write date live only in the index
 line. Edits to a topic apply the next time it is read, and edits to the index reach sessions on their next user

@@ -10,8 +10,15 @@ cached for the rest of the session so the provider prompt cache stays warm. `pre
 followed unless the conversation says otherwise; `recap`, `reference`, `insight`, and legacy `feedback`/`project`
 entries are hints the model reads (with the `memory` tool's `read` action) and verifies before relying on them.
 
-Child sessions (with a `parentID`) and workflow workers (metadata `workflowWorkerID`) get a compact block with the full
-content of `preference` and `instruction` topics inline, no `memory` tool, no updates, and no reflection.
+Child sessions (with a `parentID`) and workflow workers (metadata `workflowWorkerID`) get the full content of
+`preference` and `instruction` topics inline and an index of the remaining hint topics. Their `memory` tool exposes
+only `read`; the executor independently refuses save/delete, including before the first context hook. Their snapshots
+remain cached, with no updates or reflection.
+
+Model-facing index lines use `[id: topic.md]`, not file links; the on-disk index format is unchanged. Agents copy exact
+topic identifiers into the memory tool instead of constructing filesystem paths. Each read consults the current index
+and topic body. An unavailable topic returns the current index to recover from stale references after dreaming, without
+aliases or fuzzy matching.
 
 ## Updates
 

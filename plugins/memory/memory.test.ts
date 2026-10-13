@@ -218,7 +218,7 @@ describe("memory persistence", () => {
 
     const other = await app.message("ses_other", "Next.");
     const otherRequest = await app.context("ses_other", [userMessage(other)]);
-    expect(otherRequest.messages[0]!.content[1]!.text).toContain(`- [Focused tests first](${file})`);
+    expect(otherRequest.messages[0]!.content[1]!.text).toContain(`Focused tests first [id: ${file}]`);
 
     const origin = await app.message("ses_origin", "Next.");
     const originRequest = await app.context("ses_origin", [userMessage(origin)]);
@@ -227,13 +227,16 @@ describe("memory persistence", () => {
     await app.dispose();
   });
 
-  test.serial("memory tool reads a topic body with its header", async () => {
+  test.serial("memory tool reads topics and returns the current index for stale ids", async () => {
     const directory = "/tmp/memory-read-project";
     const storage = new Map<string, unknown>();
-    store(storage, directory, [{ file: "rule.md", title: "Rule", content: "Always run the focused suite.", type: "instruction" }]);
+    const project = store(storage, directory, [{ file: "rule.md", title: "Rule", content: "Always run the focused suite.", type: "instruction" }]);
     const app = await fixture(directory, noMemories, {}, storage);
     expect((await app.read("ses_read", "rule.md")).content)
       .toBe("Rule\ntype: instruction | updated: 2026-08-01\n\nAlways run the focused suite.");
+    project.setIndex([{ file: "replacement.md", title: "Replacement", summary: "Current topic", type: "recap", updated: "2026-10-13" }]);
+    const stale = (await app.read("ses_read", "rule.md")).content;
+    expect(stale).toContain("Replacement [id: replacement.md]");
     await app.dispose();
   });
 
@@ -252,7 +255,7 @@ describe("memory persistence", () => {
       expect((await app.delete("ses_origin", "rule.md")).content).toBe("Deleted rule.md");
       expect(project.index()).toEqual([]);
       expect(project.topic("rule.md")).toBeUndefined();
-      await expect(app.read("ses_origin", "rule.md")).rejects.toThrow("Memory index does not contain rule.md");
+      expect((await app.read("ses_origin", "rule.md")).content).toContain("The current memory index is empty.");
 
       for (const sessionID of ["ses_live", "ses_dormant"]) {
         const next = await app.message(sessionID, "Next.");
@@ -290,7 +293,7 @@ describe("memory persistence", () => {
     expect(app.statuses().at(-1)!.counts).toEqual({ synthesize: 1, prune: 0 });
   });
 
-  test.serial("adds the index to primary context and user-stated topics inline to restricted sessions", async () => {
+  test.serial("gives restricted sessions inline rules and read-only access to hint topics", async () => {
     const directory = "/tmp/memory-system-context";
     const storage = new Map<string, unknown>();
     const project = store(storage, directory, [
@@ -304,26 +307,30 @@ describe("memory persistence", () => {
     const app = await fixture(directory, noMemories, {}, storage);
 
     const output = await app.context("ses_index");
-    expect(output.system[0]!.text).toContain("[First](first.md) - [recap|2026-08-01] First summary");
-    expect(output.system[0]!.text).toContain("[Typed](third.md) - [reference|2026-08-01] Typed reference summary");
+    expect(output.system[0]!.text).toContain("First [id: first.md] - [recap|2026-08-01] First summary");
     expect(output.system[0]!.text).not.toContain("FIRST_BODY");
     expect(output.tools.memory).toBeDefined();
 
-    for (const restricted of [await app.context("ses_sub"), await app.context("ses_worker_1")]) {
-      expect(restricted.system[0]!.text).toContain("[Second](second.md)");
+    for (const sessionID of ["ses_sub", "ses_worker_1"]) {
+      // Mutation denial also applies before the session's first context hook.
+      await expect(app.save(sessionID, memoryExtraction())).rejects.toThrow("cannot save or delete memories");
+      await expect(app.delete(sessionID, "first.md")).rejects.toThrow("cannot save or delete memories");
+      const restricted = await app.context(sessionID);
       expect(restricted.system[0]!.text).toContain("SECOND_BODY");
-      expect(restricted.system[0]!.text).not.toContain("(gone.md)");
-      expect(restricted.system[0]!.text).not.toContain("(first.md)");
-      expect(restricted.system[0]!.text).not.toContain("(third.md)");
-      expect(restricted.tools.memory).toBeUndefined();
+      expect(restricted.system[0]!.text).not.toContain("id: gone.md");
+      expect(restricted.system[0]!.text).toContain("First [id: first.md]");
+      expect(restricted.system[0]!.text).toContain("Typed [id: third.md]");
+      expect(restricted.system[0]!.text).not.toContain("FIRST_BODY");
+      expect(restricted.tools.memory).toMatchObject({ input: {
+        properties: { action: { enum: ["read"] } }, required: ["action", "target"],
+      } });
+      expect((await app.read(sessionID, "first.md")).content).toContain("FIRST_BODY");
     }
 
     project.setIndex([{ title: "Third", file: "third.md", summary: "Third summary", type: "recap", updated: "2026-08-01" }]);
     expect((await app.context("ses_index")).system).toEqual(output.system);
     expect((await app.context("ses_new")).system[0]!.text).toContain("Third summary");
 
-    project.set("settings", { enabled: false });
-    expect((await app.context("ses_index")).system).toEqual([]);
     await app.dispose();
   });
 
@@ -370,6 +377,9 @@ describe("memory persistence", () => {
       expect(disabled.system).toEqual([]);
       expect(disabled.tools.memory).toBeUndefined();
       expect(disabled.messages[0]!.content).toHaveLength(1);
+      const child = await app.context("ses_sub");
+      expect(child.tools.memory).toBeUndefined();
+      await expect(app.read("ses_sub", "missing.md")).rejects.toThrow("Project memory is disabled");
 
       project.set("settings", { enabled: true });
       expect((await app.context("ses_reader", [userMessage(disabledTurn)])).messages[0]!.content).toHaveLength(1);
@@ -838,7 +848,7 @@ describe("memory manual dreaming", () => {
 
     for (const [sessionID, messageID] of messages) {
       const part = (await app.context(sessionID, [userMessage(messageID)])).messages[0]!.content[1]!;
-      expect(part.text).toContain("- [Unified story](");
+      expect(part.text).toContain("- Unified story [id:");
       expect(part.text).toContain("Removed topics: x.md, y.md");
     }
   });

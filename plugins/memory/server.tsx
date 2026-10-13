@@ -186,6 +186,12 @@ export function indexLine(entry: IndexEntry): string {
   return `- [${title}](${entry.file}) - [${entry.type}|${entry.updated}] ${summary}`;
 }
 
+function topicLine(entry: IndexEntry): string {
+  const title = entry.title.replace(/[\[\]\r\n]/g, " ").trim();
+  const summary = entry.summary.replace(/[\r\n]/g, " ").trim();
+  return `- ${title} [id: ${entry.file}] - [${entry.type}|${entry.updated}] ${summary}`;
+}
+
 function isoDate(): string {
   return new Date().toISOString().slice(0, 10);
 }
@@ -275,7 +281,8 @@ function validatePruneVerdicts({ verdicts }: typeof DreamPruneSchema.Type, nomin
 
 // Shared by the system block and delta parts. It sits in the cached prompt
 // prefix, so it must stay byte-stable.
-const READ_GUIDANCE = `When an entry is relevant, read it with the memory tool (action read, target set to its topic id in parentheses); summaries only describe coverage.
+const READ_GUIDANCE = `When an entry is relevant, read it with the memory tool (action read, target copied exactly from its [id: ...] field); summaries only describe coverage.
+- Topic ids are identifiers, not file paths. Always use the memory tool to read topics; never construct memory directory paths or use filesystem tools to retrieve them.
 - preference and instruction entries were stated by the user: follow them unless the current conversation says otherwise.
 - recap, reference, insight, feedback, and project entries are hints that may be stale: read and verify them before relying on them.`;
 
@@ -283,7 +290,7 @@ function renderDelta(deltas: Iterable<[string, IndexEntry | null]>): string {
   const upserts: string[] = [];
   const removed: string[] = [];
   for (const [file, entry] of deltas) {
-    if (entry) upserts.push(indexLine(entry));
+    if (entry) upserts.push(topicLine(entry));
     else removed.push(file);
   }
   const sections = [
@@ -322,7 +329,9 @@ Skip anything already covered by <session_saves> or the index, one-off requests 
 
 One subject per memory. Each memory becomes a new topic; when an indexed topic already covers the subject, skip it. The summary is a one-line hook under about 100 characters describing what the topic covers; name the area first when it applies to only part of the project (for example "Testing: run the focused suite first"). The content is a few short sentences without frontmatter: the fact first, then why it matters or when it applies.`;
 
-const MEMORY_TOOL_DESCRIPTION = `Save, read, or delete a project memory: a durable note that future sessions see in the <memory> index.
+const MEMORY_TOOL_DESCRIPTION = `Read, save, or delete a project memory: a durable note that future sessions see in the <memory> index.
+
+Read relevant topics with action read and target copied exactly from the index's [id: ...] field. Summaries only describe coverage; read the full topic before relying on it. Topic ids are not file paths: use this tool, not filesystem tools. If a topic is missing, the result includes the current index so you can select a relevant replacement.
 
 Save when:
 - the user states a lasting preference or instruction, or asks you to remember something (type preference or instruction; these must be user-stated);
@@ -1119,10 +1128,16 @@ const setup = async (ctx: Plugin.Context) => {
     },
   });
 
+  // Child sessions and workflow workers may retrieve memories, but not mutate them.
+  const isRestricted = async (sessionID: string) => {
+    const session = await ctx.session.get({ sessionID });
+    return session.parentID !== undefined || session.metadata?.workflowWorkerID !== undefined;
+  };
+
   await ctx.tool.transform((editor) => {
     editor.add({
       name: "memory",
-      // Direct tool, so the context hook can remove it for restricted sessions.
+      // Direct tool, so the context hook can narrow it for restricted sessions.
       options: { codemode: false },
       description: MEMORY_TOOL_DESCRIPTION,
       input: {
@@ -1144,8 +1159,17 @@ const setup = async (ctx: Plugin.Context) => {
           if (!input.target) throw new Error("read requires target");
           if (!(await enabled())) throw new Error("Project memory is disabled");
           const entry = (await readIndex()).find((entry) => entry.file === input.target);
-          if (!entry) throw new Error(`Memory index does not contain ${input.target}`);
-          return { content: `${entry.title}\ntype: ${entry.type} | updated: ${entry.updated}\n\n${await readTopic(entry.file)}` };
+          const content = entry ? await readTopic(entry.file).catch((error) => {
+            if (error.code !== "ENOENT") throw error;
+          }) : undefined;
+          if (entry && content !== undefined) {
+            return { content: `${entry.title}\ntype: ${entry.type} | updated: ${entry.updated}\n\n${content}` };
+          }
+          const entries = await readIndex();
+          return { content: `Memory topic ${input.target} is unavailable. It may have been merged or removed. Select a relevant topic from the current index; do not guess file paths.\n\n${entries.length > 0 ? entries.map(topicLine).join("\n") : "The current memory index is empty."}` };
+        }
+        if (await isRestricted(context.sessionID)) {
+          throw new Error("Child sessions and workflow workers cannot save or delete memories.");
         }
         if (input.action === "delete") {
           if (!input.target) throw new Error("delete requires target");
@@ -1161,15 +1185,8 @@ const setup = async (ctx: Plugin.Context) => {
     });
   });
 
-  // Child sessions and workflow workers (top-level sessions tagged by the
-  // workflows plugin) are restricted; the result is cached in session state.
-  const isRestricted = async (sessionID: string) => {
-    const session = await ctx.session.get({ sessionID });
-    return session.parentID !== undefined || session.metadata?.workflowWorkerID !== undefined;
-  };
-
-  // Restricted sessions have no memory tool, so their block inlines the full
-  // content of the user-stated entries instead of index lines.
+  // Restricted sessions get user-stated entries inline and discover other topics
+  // through a cached index and the read-only memory tool.
   const snapshot = async (restricted: boolean, entries: IndexEntry[]) => {
     if (restricted) {
       const topics: string[] = [];
@@ -1178,13 +1195,17 @@ const setup = async (ctx: Plugin.Context) => {
         const content = await readTopic(entry.file).catch((error) => {
           if (error.code !== "ENOENT") throw error;
         });
-        if (content !== undefined) topics.push(`${indexLine(entry)}\n${content}`);
+        if (content !== undefined) topics.push(`${topicLine(entry)}\n${content}`);
       }
-      return topics.length > 0
-        ? `<memory>\nProject preferences and instructions stated by the user: follow them unless the current conversation says otherwise.\n\n${topics.join("\n\n")}\n</memory>`
-        : "";
+      const hints = entries.filter((entry) => entry.type !== "preference" && entry.type !== "instruction");
+      const sections = [
+        READ_GUIDANCE,
+        topics.length > 0 ? `Project preferences and instructions stated by the user (full contents):\n\n${topics.join("\n\n")}` : undefined,
+        hints.length > 0 ? `Other project memory topics (read when relevant):\n\n${hints.map(topicLine).join("\n")}` : undefined,
+      ].filter(Boolean);
+      return `<memory>\n${sections.join("\n\n")}\n</memory>`;
     }
-    return `<memory>\n${READ_GUIDANCE}\nSave durable memories with the memory tool.\n\n${entries.map(indexLine).join("\n")}\n</memory>`;
+    return `<memory>\n${READ_GUIDANCE}\nSave durable memories with the memory tool.\n\n${entries.map(topicLine).join("\n")}\n</memory>`;
   };
 
   await ctx.session.hook("context", async (event) => {
@@ -1196,7 +1217,22 @@ const setup = async (ctx: Plugin.Context) => {
         changed = true;
       }
       const on = await enabled();
-      if (state.restricted || !on) delete event.tools.memory;
+      if (!on) delete event.tools.memory;
+      else if (state.restricted && event.tools.memory) {
+        event.tools.memory = {
+          ...event.tools.memory,
+          description: `Read a project memory topic. This session cannot save or delete memories.\n\n${READ_GUIDANCE}\nIf a topic is missing, the result includes the current index.`,
+          input: {
+            type: "object",
+            properties: {
+              action: { type: "string", enum: ["read"] },
+              target: { type: "string", description: "Exact topic id copied from the memory index's [id: ...] field" },
+            },
+            required: ["action", "target"],
+            additionalProperties: false,
+          },
+        };
+      }
       if (on) {
         if (state.system === undefined) {
           const entries = await readIndex();
