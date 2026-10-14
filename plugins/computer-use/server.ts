@@ -168,9 +168,9 @@ export default Plugin.define({
       });
       tools.add({
         name: "computer_tree",
-        options: { codemode: false },
+        options: { codemode: true },
         description:
-          'Read the accessibility tree of the foreground window, or of any window by title (also one in the background), as text: one element per line as [id] role "name" value="…" @(x,y wxh) states, indented by nesting; bounds are in screenshot pixels and only on elements without listed children. For the foreground window, an open menu or popup outside it follows. Actions on elements of a window read by title bring that window to the front first. Use it to target small or crowded controls exactly by element ID with computer_click, computer_move, computer_scroll and computer_drag, or to read text with computer_read. Pass find with text you can see on screen (a button label, a link, a field name) to list only the elements that contain it; prefer that over the full tree when you know what to target. Apps that draw their own UI (games, canvas apps) expose little or nothing; use the screenshot there.',
+          'Read the accessibility tree of the foreground window, or of any window by title (also one in the background), as text: one element per line as [id] role "name" value="…" @(x,y wxh) states, indented by nesting; bounds are in screenshot pixels and only on elements without listed children. For the foreground window, an open menu or popup outside it follows. Pointer actions on elements of a window read by title bring that window to the front first; computer_click with invoke=true activates supported controls without explicitly raising the window. Use it to target small or crowded controls exactly by element ID with computer_click, computer_move, computer_scroll and computer_drag, or to read text with computer_read. Pass find with text you can see on screen (a button label, a link, a field name) to list only the elements that contain it; prefer that over the full tree when you know what to target. Apps that draw their own UI (games, canvas apps) expose little or nothing; use the screenshot there.',
         input: input({
           find: Schema.optional(
             Schema.String.annotate({ description: "Only list elements whose name or value contains this text (case-insensitive), each with its parent's name" }),
@@ -183,7 +183,7 @@ export default Plugin.define({
       });
       tools.add({
         name: "computer_read",
-        options: { codemode: false },
+        options: { codemode: true },
         description:
           'Read the full text of one element from the latest computer_tree: the whole page text of a browser Document, the buffer of a terminal or editor (elements with the "text" state), or the complete text of an item cut off with "…(truncated; computer_read [id])". Long text is paged: the result ends with the offset to pass for the next page. Does not act, and keeps the tree\'s IDs valid.',
         input: input({
@@ -196,13 +196,14 @@ export default Plugin.define({
       tools.add({
         name: "computer_click",
         options: { codemode: false },
-        description: `Move the pointer to an element or a coordinate and click. ${TARGET} ${COORDINATES} ${RESULT}`,
+        description: `Move the pointer to an element or a coordinate and click. ${TARGET} With invoke=true, activate the element through the app's accessibility API instead: no pointer movement or explicit window raising, though the app may bring itself forward. Unsupported elements return an error; there is no mouse-click fallback. ${COORDINATES} ${RESULT}`,
         input: input({
           element: id("Element ID to click at its center"),
           x: coordinate("x"),
           y: coordinate("y"),
           button: Schema.optional(Schema.Literals(["left", "right", "middle"])),
           count: Schema.optional(Schema.Literals([1, 2, 3]).annotate({ description: "1 = click, 2 = double, 3 = triple" })),
+          invoke: Schema.optional(Schema.Boolean.annotate({ description: "Activate through accessibility instead of a mouse click (default false). Requires element, no coordinates, and a single left-click activation. Does not explicitly bring the window forward; the app may do so itself." })),
         }),
         execute: (args, context) => call({ action: "click", ...args }, context),
       });

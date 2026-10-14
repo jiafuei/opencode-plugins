@@ -15,7 +15,7 @@ primary display is used.
 | `computer_zoom` | `x0`, `y0`, `x1`, `y1` — a region at full resolution, for reading small text |
 | `computer_tree` | `find?`, `window?` — accessibility tree of the foreground window, or of any window by title, as text with element IDs; `find` lists only matching elements |
 | `computer_read` | `element`, `offset?` — full text of one tree element, paged |
-| `computer_click` | `element` or `x`, `y`; `button?` (`left`/`right`/`middle`), `count?` (1–3) |
+| `computer_click` | `element` or `x`, `y`; `button?` (`left`/`right`/`middle`), `count?` (1–3), `invoke?` (default false) |
 | `computer_move` | `element` or `x`, `y` — hover |
 | `computer_drag` | `start_element` or `start_x`, `start_y`; `end_element` or `end_x`, `end_y` — left-button drag |
 | `computer_scroll` | `element` or `x`, `y`; `direction` (`up`/`down`/`left`/`right`), `amount` (wheel clicks) |
@@ -27,6 +27,13 @@ primary display is used.
 Actions return a fresh screenshot together with the frontmost window and the focused element, so input that went to
 the wrong app shows up right away. Coordinates are pixels in the latest screenshot; the plugin handles display
 scaling.
+
+To activate a control in a background window, read `computer_tree({ window: "App title" })`, then call
+`computer_click({ element: 42, invoke: true })` with its element ID. This uses Windows UI Automation's InvokePattern
+or macOS AXPress without raising the window or moving the pointer. The app may still bring itself forward. Invocation
+only supports a single left-click activation by element ID, without coordinates; unsupported controls return an error,
+never a foreground mouse-click fallback. The returned screenshot still shows the foreground desktop; read the target
+window's tree again to inspect background changes.
 
 Screenshots are the main way the model sees the screen. The accessibility tree (`computer_tree`) helps it target
 small or crowded controls exactly and read text: it lists the controls of a window with IDs that the click, move,

@@ -40,7 +40,7 @@ enum Action {
     /// Also lists the open windows; screenshots after actions only report the frontmost window and keyboard focus.
     Screenshot,
     /// `find` lists only elements whose name or value contains it. `window` reads that window instead of the
-    /// foreground one, which is then raised before actions on its elements.
+    /// foreground one, which is then raised before pointer actions on its elements (not accessibility invocation).
     Tree {
         find: Option<String>,
         window: Option<String>,
@@ -55,6 +55,7 @@ enum Action {
         y: Option<f64>,
         button: Option<ClickButton>,
         count: Option<u8>,
+        invoke: Option<bool>,
     },
     Move {
         element: Option<usize>,
@@ -337,6 +338,7 @@ fn describe(action: &Action) -> String {
         Action::Screenshot | Action::Zoom { .. } => "Looking at the screen".to_string(),
         Action::Tree { window: Some(title), .. } => format!("Reading {title}"),
         Action::Tree { .. } | Action::Read { .. } => "Reading the screen".to_string(),
+        Action::Click { invoke: Some(true), .. } => "Invoking a control".to_string(),
         Action::Click { .. } => "Clicking".to_string(),
         Action::Move { .. } => "Moving the pointer".to_string(),
         Action::Drag { .. } => "Dragging".to_string(),
@@ -366,7 +368,7 @@ fn act(state: &mut State, action: Action) -> Result<Option<serde_json::Value>, B
             let window = window.map(|title| find_window(&title)).transpose()?;
             let header = match &window {
                 Some(window) => format!(
-                    "Window \"{}\" ({}); actions on its elements bring it to the front first",
+                    "Window \"{}\" ({}); pointer actions on its elements bring it to the front first; computer_click with invoke=true does not",
                     window.title()?,
                     window.app_name().unwrap_or_default()
                 ),
@@ -401,16 +403,24 @@ fn act(state: &mut State, action: Action) -> Result<Option<serde_json::Value>, B
             let (x, y) = target(state, element, x, y)?;
             state.enigo.move_mouse(x, y, Coordinate::Abs)?;
         }
-        Action::Click { element, x, y, button, count } => {
-            let (x, y) = target(state, element, x, y)?;
-            state.enigo.move_mouse(x, y, Coordinate::Abs)?;
-            let button = match button {
-                None | Some(ClickButton::Left) => Button::Left,
-                Some(ClickButton::Right) => Button::Right,
-                Some(ClickButton::Middle) => Button::Middle,
-            };
-            for _ in 0..count.unwrap_or(1) {
-                state.enigo.button(button, Direction::Click)?;
+        Action::Click { element, x, y, button, count, invoke } => {
+            if invoke == Some(true) {
+                let id = element.ok_or("invoke requires an element ID")?;
+                if x.is_some() || y.is_some() || !matches!(button, None | Some(ClickButton::Left)) || count.unwrap_or(1) != 1 {
+                    return Err("invoke only supports a single left-click activation by element ID; omit coordinates".into());
+                }
+                state.backend.invoke(lookup(state, id)?).map_err(|error| format!("could not invoke element {id}: {error}"))?;
+            } else {
+                let (x, y) = target(state, element, x, y)?;
+                state.enigo.move_mouse(x, y, Coordinate::Abs)?;
+                let button = match button {
+                    None | Some(ClickButton::Left) => Button::Left,
+                    Some(ClickButton::Right) => Button::Right,
+                    Some(ClickButton::Middle) => Button::Middle,
+                };
+                for _ in 0..count.unwrap_or(1) {
+                    state.enigo.button(button, Direction::Click)?;
+                }
             }
         }
         Action::Drag { start_element, start_x, start_y, end_element, end_x, end_y } => {

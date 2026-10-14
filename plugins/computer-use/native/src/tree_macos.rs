@@ -2,7 +2,7 @@ use crate::tree::Node;
 use accessibility_sys::{
     kAXChildrenAttribute, kAXDescriptionAttribute, kAXEnabledAttribute, kAXErrorSuccess, kAXExpandedAttribute,
     kAXFocusedAttribute, kAXFocusedUIElementAttribute, kAXFocusedWindowAttribute, kAXFrontmostAttribute,
-    kAXMainAttribute, kAXMinimizedAttribute, kAXParentAttribute, kAXPositionAttribute, kAXRaiseAction,
+    kAXMainAttribute, kAXMinimizedAttribute, kAXParentAttribute, kAXPositionAttribute, kAXPressAction, kAXRaiseAction,
     kAXRoleAttribute, kAXSelectedAttribute, kAXSizeAttribute, kAXSubroleAttribute, kAXTitleAttribute,
     kAXValueAttribute, kAXValueTypeCGPoint, kAXValueTypeCGSize, kAXWindowsAttribute, AXUIElementCopyAttributeValue,
     AXUIElementCreateApplication, AXUIElementPerformAction, AXUIElementRef, AXUIElementSetAttributeValue,
@@ -76,6 +76,17 @@ impl Backend {
         let title = string(&element, kAXTitleAttribute);
         let name = if title.is_empty() { string(&element, kAXDescriptionAttribute) } else { title };
         Some((string(&element, kAXRoleAttribute).trim_start_matches("AX").to_string(), name))
+    }
+
+    /// Activate a control without raising its window or moving the pointer.
+    pub fn invoke(&self, element: &Element) -> Result<(), Box<dyn Error>> {
+        let error = unsafe {
+            AXUIElementPerformAction(element.as_CFTypeRef() as AXUIElementRef, CFString::new(kAXPressAction).as_concrete_TypeRef())
+        };
+        if error != kAXErrorSuccess {
+            return Err(format!("AXPress failed (AX error {error}); the element may not support invocation or may no longer exist").into());
+        }
+        Ok(())
     }
 
     /// Give the element keyboard focus.

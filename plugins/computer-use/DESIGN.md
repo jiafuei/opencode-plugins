@@ -53,7 +53,12 @@ again.
 - Element IDs come from the latest `computer_tree` and stay valid across actions until the next one. The helper acts
   at the element's current center. An element that no longer exists returns an error asking for `computer_tree`.
 - `computer_tree({ window })` reads any window by title (matched like `computer_focus`). Actions on its elements bring
-  that window to the front first, verified, so a click by ID cannot land in the covering window.
+  that window to the front first, verified, so a click by ID cannot land in the covering window. The exception is
+  `computer_click({ element, invoke: true })`: it uses UIA InvokePattern on Windows or AXPress on macOS without raising
+  the window, focusing the element, or moving the pointer. It accepts only a single left-click activation and no
+  coordinates, and errors if invocation fails or is unsupported; it never falls back to a mouse click. The app may
+  bring itself forward in response. Screenshots still capture the foreground desktop; use another tree of the target
+  window to observe background changes.
 - `computer_tree({ find })` lists only the elements whose name or value contains the text (case-insensitive), flat,
   each followed by `in "<parent name>"`.
 - `computer_read({ element, offset? })` returns the full text of one element without acting or resetting IDs: the
@@ -110,7 +115,7 @@ echo '{"id":1,"action":"screenshot"}' | bin/computer-use-helper.exe
 ```
 
 Actions: `screenshot`, `tree` (`find?`, `window?`), `zoom` (`region`), `click` (`element?` or `x`, `y`; `button?`,
-`count?`), `move` (`element?` or `x`, `y`), `drag` (`start_element?` or `start_x`, `start_y`; `end_element?` or
+`count?`, `invoke?`, default false), `move` (`element?` or `x`, `y`), `drag` (`start_element?` or `start_x`, `start_y`; `end_element?` or
 `end_x`, `end_y`), `scroll` (`element?` or `x`, `y`; `direction`, `amount`), `type` (`text`, `element?`, `window?`),
 `focus` (`title`), `key` (`keys`, `repeat?`, `window?`), `wait` (`seconds`), `hide` (hide the overlay; answers without
 an image), `read` (`element`, `offset?`; answers with `text`).

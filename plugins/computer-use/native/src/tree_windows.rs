@@ -1,7 +1,7 @@
 use crate::tree::Node;
 use std::error::Error;
 use uiautomation::core::UICacheRequest;
-use uiautomation::patterns::{UITextPattern, UIValuePattern};
+use uiautomation::patterns::{UIInvokePattern, UITextPattern, UIValuePattern};
 use uiautomation::types::{ControlType, Handle, TreeScope, UIProperty};
 use uiautomation::{UIAutomation, UIElement};
 use windows::Win32::Foundation::HWND;
@@ -89,6 +89,12 @@ impl Backend {
     pub fn focused(&self, _front: Option<&xcap::Window>) -> Option<(String, String)> {
         let element = self.automation.get_focused_element().ok()?;
         Some((format!("{:?}", element.get_control_type().ok()?), element.get_name().unwrap_or_default()))
+    }
+
+    /// Activate a control without raising its window or moving the pointer.
+    pub fn invoke(&self, element: &Element) -> Result<(), Box<dyn Error>> {
+        let pattern = element.get_pattern::<UIInvokePattern>().map_err(|error| format!("InvokePattern unavailable: {error}"))?;
+        Ok(pattern.invoke()?)
     }
 
     /// Give the element keyboard focus.
