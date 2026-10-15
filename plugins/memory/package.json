@@ -1,7 +1,7 @@
 {
   "name": "@jiafuei/opencode-memory",
   "version": "0.0.1",
-  "description": "Project-scoped automatic memory for OpenCode",
+  "description": "Global and project memory for OpenCode",
   "type": "module",
   "exports": {
     "./server": "./server.tsx",
@@ -12,6 +12,10 @@
     "server.tsx",
     "tui.tsx",
     "rpc.ts",
+    "store.ts",
+    "scope.ts",
+    "web.ts",
+    "web/",
     "DESIGN.md",
     "README.md"
   ],

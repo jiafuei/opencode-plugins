@@ -1,6 +1,5 @@
 /** @jsxImportSource @opentui/solid */
 import { Plugin } from "@opencode/plugin/tui";
-import { join } from "node:path";
 import { createSignal, Show } from "solid-js";
 import { MemoryRpc, type DreamStatus } from "./rpc.ts";
 
@@ -68,16 +67,23 @@ function DreamSidebar(props: { ctx: Plugin.Context; sessionID: string; status: (
   );
 }
 
-function Commands(props: { ctx: Plugin.Context; open: () => void; dream: () => void }) {
+function Commands(props: { ctx: Plugin.Context; open: () => void; dream: () => void; web: () => void }) {
   props.ctx.keymap.layer(() => ({
     mode: "global",
     commands: [{
       id: "memory.open",
-      title: "Project memory",
+      title: "Global and project memory",
       group: "Project",
       palette: true,
       slash: { name: "memory" },
       run: props.open,
+    }, {
+      id: "memory.web",
+      title: "Memory web dashboard",
+      group: "Project",
+      palette: true,
+      slash: { name: "memory-web" },
+      run: props.web,
     }, {
       id: "memory.dream",
       title: "Dream now",
@@ -109,6 +115,16 @@ export default Plugin.define({
       return route.type === "session" ? route.sessionID : undefined;
     };
 
+    const openDashboard = async () => {
+      const { url } = await memory.dashboard({}, location);
+      ctx.ui.toast.show({ variant: "info", title: "Memory dashboard", message: url, duration: 15_000 });
+      const command = process.platform === "darwin" ? ["open", url]
+        : process.platform === "win32" ? ["rundll32", "url.dll,FileProtocolHandler", url]
+        : ["xdg-open", url];
+      const child = Bun.spawn(command, { stdout: "ignore", stderr: "ignore" });
+      if (await child.exited !== 0) throw new Error(`Could not open a browser. Open this URL manually: ${url}`);
+    };
+
     // The current session, when the route has one, owns the sidebar indicator.
     const requestDream = async () => {
       const requestID = crypto.randomUUID();
@@ -122,7 +138,7 @@ export default Plugin.define({
       const topic = state.topics.find((entry) => entry.file === focus);
       const description = (entry: typeof state.topics[number]) => {
         const parent = state.topics.find((other) => other.file === entry.parent);
-        return `[${entry.status}] ${parent ? `In ${parent.title} · ` : ""}${entry.summary}`;
+        return `[${entry.scope} · ${entry.status}] ${parent ? `In ${parent.title} · ` : ""}${entry.summary}`;
       };
       const related = topic ? [
         ...topic.children.map((file) => ({ file, relation: "Source" })),
@@ -134,7 +150,7 @@ export default Plugin.define({
         return entry ? [{ title: `${relation}: ${entry.title}`, description: description(entry), value: { type: "topic" as const, file } }] : [];
       }) : [];
       const choice = await ctx.ui.dialog.select<Choice>({
-        title: topic ? topic.title : history ? "Project memory · retained history" : "Project memory · active topics",
+        title: topic ? topic.title : history ? "Memory · retained history" : "Memory · active topics",
         placeholder: topic ? "Navigate sources or edit this record" : "Filter topics",
         options: topic ? [
           { title: "Back to topics", value: { type: "back" } },
@@ -187,7 +203,8 @@ export default Plugin.define({
         await showMemory(choice.file, history);
         return;
       }
-      await openInEditor(ctx, join(state.directory, choice.file), workspace);
+      const entry = state.topics.find((entry) => entry.file === choice.file)!;
+      await openInEditor(ctx, entry.path, workspace);
       await showMemory(choice.file, history);
     };
 
@@ -223,6 +240,7 @@ export default Plugin.define({
             ctx={ctx}
             open={() => void showMemory().catch(toastError)}
             dream={() => void requestDream().catch(toastError)}
+            web={() => void openDashboard().catch(toastError)}
           />
         ),
       }),

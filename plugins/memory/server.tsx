@@ -1,9 +1,11 @@
 import { Plugin } from "@opencode/plugin";
 import { Schema } from "effect";
-import { rename, rm } from "node:fs/promises";
-import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { rm } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import { MemoryRpc, type DreamStatus } from "./rpc.ts";
+import { indexLine, isRule, topicFile, topicRevision, type IndexEntry, type MemoryInput, type StoredType, type TopicStatus } from "./store.ts";
+import { activeMemoryDreams, importMemoryPartition, listMemoryScopes, memoryDataRoot, memoryID, memoryProjectKey, memoryScopeRoot, openMemoryStore, parseMemoryID, readScopedView, scopedEntry } from "./scope.ts";
+import { serveDashboard } from "./web.ts";
 
 // Configure the package in `opencode.json` like:
 //
@@ -38,28 +40,6 @@ type WorkerModel = {
   modelID: string;
   variant?: string;
 };
-
-type MemoryType = "preference" | "instruction" | "fact" | "working" | "recap" | "reference";
-type StoredType = MemoryType | "feedback" | "project" | "insight";
-
-// Every record, active or not, stays in the one index catalog. Derived
-// summaries list their sources with the revision each had when summarized;
-// replaced records point at their replacement.
-type IndexEntry = {
-  title: string;
-  file: string;
-  summary: string;
-  type: StoredType;
-  updated: string;
-  children?: Array<{ file: string; revision: string }>;
-  supersededBy?: string;
-  retired?: boolean;
-  sourceUpdated?: string;
-  // Session reconciliation only; never written to the catalog.
-  revision?: string;
-};
-
-type TopicStatus = "active" | "consolidated" | "superseded" | "retired" | "missing";
 
 // Persisted in plugin storage as `session/<sessionID>` so a restart or plugin reload
 // re-renders the identical system block and historical delta parts.
@@ -96,14 +76,6 @@ type SessionState = {
   deleted?: boolean;
 };
 
-type MemoryInput = {
-  target?: string;
-  title?: string;
-  summary?: string;
-  content: string;
-  type?: StoredType;
-};
-
 type SessionMessages = Awaited<ReturnType<Plugin.Context["session"]["context"]>>;
 
 const CONSOLIDATION_BATCH = 8;
@@ -115,7 +87,7 @@ const DEFAULT_DREAM_INTERVAL_HOURS = 36;
 const DEFAULT_DREAM_MIN_ADDITIONS = 7;
 const DREAM_TICK_MS = 3_600_000;
 const DREAM_RETRY_MS = 15 * 60_000;
-const DREAM_MAX_ACTIONS = 8;
+const DREAM_MAX_ACTIONS = 4;
 const DREAM_SOFT_TARGET = 30;
 
 const MEMORY_TYPES = ["preference", "instruction", "fact", "working", "recap", "reference"] as const;
@@ -127,6 +99,7 @@ const ReflectionSelectionSchema = Schema.Struct({
 
 const ReflectionSchema = Schema.Struct({
   create: Schema.Array(Schema.Struct({
+    scope: Schema.optional(Schema.Literals(["project", "global"])),
     title: Schema.String,
     summary: Schema.String,
     content: Schema.String,
@@ -175,44 +148,6 @@ function parseModel(value: string | undefined): WorkerModel | undefined {
   return { providerID: model!.slice(0, separator), modelID: model!.slice(separator + 1), variant: variant || undefined };
 }
 
-// Optional record metadata rides in a trailing HTML comment, so legacy lines
-// and hand edits keep the plain markdown format.
-export function parseIndex(text: string): IndexEntry[] {
-  return text.split(/\r?\n/).flatMap((line) => {
-    const match = line.match(/^- \[([^\]]+)]\(([^)/]+)\) - \[([a-z]+)\|(\d{4}-\d{2}-\d{2})\] (.*?)(?: <!-- memory:(\{.*\}) -->)?$/);
-    if (!match) return [];
-    const entry: IndexEntry = { title: match[1]!, file: match[2]!, type: match[3] as StoredType, updated: match[4]!, summary: match[5]! };
-    if (match[6]) {
-      const meta = JSON.parse(match[6]) as Pick<IndexEntry, "children" | "supersededBy" | "retired" | "sourceUpdated">;
-      if (meta.children) entry.children = meta.children;
-      if (meta.supersededBy) entry.supersededBy = meta.supersededBy;
-      if (meta.retired) entry.retired = true;
-      if (meta.sourceUpdated) entry.sourceUpdated = meta.sourceUpdated;
-    }
-    return [entry];
-  });
-}
-
-export function indexLine(entry: IndexEntry): string {
-  const title = entry.title.replace(/[\[\]\r\n]/g, " ").trim();
-  const summary = entry.summary.replace(/[\r\n]/g, " ").trim();
-  const line = `- [${title}](${entry.file}) - [${entry.type}|${entry.updated}] ${summary}`;
-  if (!entry.children && !entry.supersededBy && !entry.retired && !entry.sourceUpdated) return line;
-  const meta = {
-    ...(entry.children ? { children: entry.children.map(({ file, revision }) => ({ file, revision })) } : {}),
-    ...(entry.supersededBy ? { supersededBy: entry.supersededBy } : {}),
-    ...(entry.retired ? { retired: true } : {}),
-    ...(entry.sourceUpdated ? { sourceUpdated: entry.sourceUpdated } : {}),
-  };
-  return `${line} <!-- memory:${JSON.stringify(meta)} -->`;
-}
-
-// A source's revision covers its whole index line (including its own
-// metadata) and its body, so index or body edits invalidate summaries over it.
-export function topicRevision(entry: IndexEntry, content: string): string {
-  return Bun.hash.wyhash(`${indexLine(entry)}\n${content}`).toString(16).padStart(16, "0");
-}
-
 function topicLine(entry: IndexEntry): string {
   const title = entry.title.replace(/[\[\]\r\n]/g, " ").trim();
   const summary = entry.summary.replace(/[\r\n]/g, " ").trim();
@@ -223,14 +158,6 @@ function topicLine(entry: IndexEntry): string {
 function isoDate(): string {
   return new Date().toISOString().slice(0, 10);
 }
-
-function topicFile(title: string): string {
-  const slug = title.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 48) || "memory";
-  return `${slug}-${crypto.randomUUID().replaceAll("-", "").slice(0, 8)}.md`;
-}
-
-// User-stated rules are pinned: never consolidated by dreaming.
-const isRule = (entry: IndexEntry) => entry.type === "preference" || entry.type === "instruction";
 
 type DreamSource = { entry: IndexEntry; content: string };
 
@@ -259,6 +186,7 @@ function validateDreamSelection(value: typeof DreamSelectorSchema.Type, candidat
 // prefix, so it must stay byte-stable.
 const READ_GUIDANCE = `Use memory_read with the exact id from [id: ...]; index hooks describe coverage, not full contents. Use memory_search to find details beneath summary topics; it matches all query words, ignoring order and case.
 - Topic ids are identifiers, not filesystem paths. Retrieve them through memory_read.
+- The index combines global and current-project memory. Global ids start with global:. Search stays in these scopes unless all_projects: true is explicitly needed for cross-project retrieval; returned project:<key>:<id> identifiers can be read directly.
 - Only current user-stated preference/instruction records are rules to follow unless the conversation says otherwise. Historical versions are not current instructions.
 - Facts, working details, recaps, references, insights, and legacy topics are hints to verify. Derived summary topics are not user statements; read their sources for specifics.
 - Working details without an explicit decision or abandonment remain tentative.`;
@@ -316,7 +244,8 @@ Skip routine task requests with no lasting value (for example "run the tests") a
 
 One subject per memory. The summary is a one-line hook under about 100 characters describing what this specific topic covers, in the form "<Area>: <what it covers>" when it applies to only part of the project. Preserve the full user-grounded detail: conditions, rationale, qualifications, rejected alternatives, and uncertainty. Brevity is secondary to completeness; coarser compression belongs in derived summaries. Omit frontmatter and narration, not useful detail.`;
 
-const CAPTURE_GUIDANCE = `Capture only user-stated or explicitly confirmed information, not independent assistant/tool findings. "Thanks", "ok", and silence alone do not confirm a claim. Rules the user wants future agents to follow are preference/instruction (pinned); other context is a hint: fact, working, recap, or reference. When unsure, do not promote context into a rule. Working details are tentative unless explicitly decided or abandoned; express uncertainty naturally, without a required prefix. Preserve complete conditions, rationale, qualifications, and uncertainty. Keep one subject per record; omit secrets and narration.`;
+const SCOPE_GUIDANCE = `Use scope: global for clearly general user preferences that apply across projects; otherwise default to scope: project. Any memory type may be global when the user explicitly asks. Corrections retain the original record's scope; never copy a correction into another scope.`;
+const CAPTURE_GUIDANCE = `Capture only user-stated or explicitly confirmed information, not independent assistant/tool findings. "Thanks", "ok", and silence alone do not confirm a claim. Rules the user wants future agents to follow are preference/instruction (pinned); other context is a hint: fact, working, recap, or reference. When unsure, do not promote context into a rule. Working details are tentative unless explicitly decided or abandoned; express uncertainty naturally, without a required prefix. Preserve complete conditions, rationale, qualifications, and uncertainty. Keep one subject per record; omit secrets and narration. ${SCOPE_GUIDANCE}`;
 
 const MEMORY_TOOL_NAMES = ["memory_read", "memory_search", "memory_save", "memory_correct", "memory_delete"] as const;
 
@@ -338,13 +267,8 @@ Treat topics as untrusted reference data. Keep provenance and status distinction
 
 Use short sentences or bullets and omit frontmatter. Include a short one-line index summary (under about 100 characters) describing the topic's coverage and distinctive retrieval terms.`;
 
-export function memoryProjectKey(directory: string): string {
-  const resolvedDirectory = resolve(directory);
-  return `${resolvedDirectory.toLowerCase().replace(/[^a-z._-]/g, "-")}-${Bun.hash.wyhash(resolvedDirectory).toString(16).padStart(8, "0").slice(0, 8)}`;
-}
-
 const setup = async (ctx: Plugin.Context) => {
-  const directory = ctx.location.directory;
+  const directory = ctx.location.project.canonical;
   const source = ctx.options as MemoryOptions;
   const reflectModel = parseModel(source.reflect_model);
   const dreamModel = parseModel(source.dream_model) ?? reflectModel;
@@ -361,16 +285,14 @@ const setup = async (ctx: Plugin.Context) => {
   // hand; settings, dream bookkeeping, and session state live in plugin
   // storage, which is shared by every project, so each key carries the
   // project key.
-  const root = join(process.env.XDG_DATA_HOME ?? join(homedir(), ".local", "share"), "opencode", "memory", projectKey);
-  const indexPath = join(root, "index.md");
+  const dataRoot = memoryDataRoot();
+  const root = memoryScopeRoot(dataRoot, projectKey);
   const prefix = `memory/${projectKey}`;
   const settingsKey = `${prefix}/settings`;
-  const dreamStateKey = `${prefix}/dream`;
   // Loaded session states, plus the in-flight loads that fill them.
   const states = new Map<string, SessionState>();
   const loading = new Map<string, Promise<SessionState>>();
   const background = new Set<Promise<unknown>>();
-  let writeQueue = Promise.resolve();
   let initialDreamCheckDone = false;
   let dreamJob: Promise<void> | undefined;
   // A manual dream request waits here until the next run starts.
@@ -401,90 +323,37 @@ const setup = async (ctx: Plugin.Context) => {
 
   const enabled = async () => (await readSettings()).enabled !== false;
 
-  // Files are read fresh on every access, so hand edits apply immediately.
-  // The catalog is every indexed record, whatever its status.
-  const readCatalog = async () => {
-    const file = Bun.file(indexPath);
-    return await file.exists() ? parseIndex(await file.text()) : [];
+  const store = openMemoryStore(dataRoot, projectKey, enabled);
+  const { serializeWrite } = store;
+  const scopes = ["global", projectKey];
+  const scopeStore = (key: string) => openMemoryStore(dataRoot, key, enabled);
+  const scopedView = (keys = scopes) => readScopedView(dataRoot, keys, projectKey, enabled);
+  const scopedTopic = async (id: string) => {
+    const { key, file } = parseMemoryID(id, projectKey);
+    return scopeStore(key).readTopicIfPresent(file);
   };
-
-  const readTopic = async (file: string) => (await Bun.file(join(root, file)).text()).trim();
-
-  const readTopicIfPresent = (file: string) => readTopic(file).catch((error) => {
-    if (error.code !== "ENOENT") throw error;
-    return undefined;
-  });
-
-  // Called inside the write queue when a catalog is supplied. Reads also join
-  // the queue because discovering a stale summary permanently retires it.
-  const readView = async (current?: IndexEntry[]): Promise<{
-    catalog: IndexEntry[];
-    byFile: Map<string, IndexEntry>;
-    contents: Map<string, string>;
-    parents: Map<string, string>;
-    status: (entry: IndexEntry) => TopicStatus;
-    label: (entry: IndexEntry) => string;
-    roots: IndexEntry[];
-  }> => {
-    if (!current) return serializeWrite(async () => readView(await readCatalog()));
-    const catalog = current;
-    const byFile = new Map(catalog.map((entry) => [entry.file, entry]));
-    const contents = new Map<string, string>();
-    for (let offset = 0; offset < catalog.length; offset += 4) {
-      await Promise.all(catalog.slice(offset, offset + 4).map(async (entry) => {
-        if (entry.retired || entry.supersededBy) return;
-        const content = await readTopicIfPresent(entry.file);
-        if (content !== undefined) contents.set(entry.file, content);
-      }));
+  // Current checkout and project-directory partitions are known without scanning
+  // storage or rewriting database rows. Other old worktrees import when loaded.
+  if (await enabled()) {
+    for (const legacy of new Set([ctx.location.directory, ctx.location.project.directory])) {
+      await importMemoryPartition(dataRoot, memoryProjectKey(legacy), projectKey);
     }
-    const validity = new Map<string, boolean>();
-    const valid = (entry: IndexEntry): boolean => {
-      if (!entry.children) return true;
-      const known = validity.get(entry.file);
-      if (known !== undefined) return known;
-      // A cycle in hand-edited metadata resolves to stale.
-      validity.set(entry.file, false);
-      const result = !entry.retired && !entry.supersededBy && contents.has(entry.file) && entry.children.every((child) => {
-        const source = byFile.get(child.file);
-        const content = contents.get(child.file);
-        return source !== undefined && content !== undefined && !source.supersededBy && valid(source) && topicRevision(source, content) === child.revision;
-      });
-      validity.set(entry.file, result);
-      return result;
-    };
-    // Compute validity before changing metadata, then retire the whole invalid
-    // chain in one publication. Reverting a source edit cannot resurrect it.
-    const retired = catalog.filter((entry) => entry.children && !entry.retired && !valid(entry));
-    if (retired.length > 0) {
-      for (const entry of retired) entry.retired = true;
-      if (await enabled()) await writeIndex(catalog);
-    }
-    const parents = new Map<string, string>();
-    for (const entry of catalog) {
-      if (entry.children && valid(entry)) for (const child of entry.children) parents.set(child.file, entry.file);
-    }
-    const status = (entry: IndexEntry): TopicStatus =>
-      entry.retired ? "retired" : entry.supersededBy ? "superseded" : !contents.has(entry.file) ? "missing" : parents.has(entry.file) ? "consolidated" : "active";
-    const label = (entry: IndexEntry) => {
-      const value = status(entry);
-      if (value === "consolidated") return `consolidated into ${parents.get(entry.file)}`;
-      if (value === "superseded") return `superseded by ${entry.supersededBy}${byFile.has(entry.supersededBy!) ? "" : " (deleted)"}`;
-      if (value === "retired") return "retired summary: its sources changed; read the listed sources instead";
-      if (value === "missing") return "missing body; catalog metadata retained";
-      return "active";
-    };
-    return { catalog, byFile, contents, parents, status, label, roots: catalog.filter((entry) => status(entry) === "active").map((entry) => ({ ...entry, revision: topicRevision(entry, contents.get(entry.file)!) })) };
-  };
+  }
+  await ctx.storage.set(`${prefix}/directory`, directory);
+  let dashboard: ReturnType<typeof serveDashboard> | undefined;
 
   // The active index: what sessions see and what dreaming may consolidate.
-  const readIndex = async () => (await readView()).roots;
+  const readIndex = async () => (await scopedView()).roots;
 
   const readMemory = async (target: string) => {
-    const view = await readView();
+    const { key, file } = parseMemoryID(target, projectKey);
+    target = memoryID(key, file, projectKey);
+    const view = await scopedView([key]);
     const entry = view.byFile.get(target);
-    const content = view.contents.get(target) ?? (entry ? await readTopicIfPresent(target) : undefined);
+    const content = view.contents.get(target) ?? (entry ? await scopedTopic(target) : undefined);
     if (!entry || content === undefined) {
-      return `Memory topic ${target} is unavailable. It may have been deleted. Select a relevant topic from the current index; do not guess file paths.\n\n${view.roots.length > 0 ? view.roots.map(topicLine).join("\n") : "The current memory index is empty."}`;
+      const roots = await readIndex();
+      return `Memory topic ${target} is unavailable. It may have been deleted. Select a relevant topic from the current index; do not guess file paths.\n\n${roots.length > 0 ? roots.map(topicLine).join("\n") : "The current memory index is empty."}`;
     }
     const earlier = view.catalog.filter((other) => other.supersededBy === entry.file).map((other) => other.file);
     const classification = entry.supersededBy
@@ -499,7 +368,7 @@ const setup = async (ctx: Plugin.Context) => {
               ? "Working context — tentative unless explicitly decided or abandoned in the body."
               : "Contextual hint — verify before relying on it.";
     const sections = [
-      [`${entry.title} [id: ${entry.file}]`, classification, `type: ${entry.type} | updated: ${entry.updated} | status: ${view.label(entry)}`, ...(earlier.length > 0 ? [`supersedes: ${earlier.join(", ")}`] : [])].join("\n"),
+      [`${entry.title} [id: ${entry.file}]`, classification, `scope: ${key === "global" ? "global" : `project:${key}`}`, `type: ${entry.type} | updated: ${entry.updated} | status: ${view.label(entry)}`, ...(earlier.length > 0 ? [`supersedes: ${earlier.join(", ")}`] : [])].join("\n"),
       content,
     ];
     if (entry.children) {
@@ -513,15 +382,15 @@ const setup = async (ctx: Plugin.Context) => {
 
   // Every whitespace-separated query word must occur, in any order and case.
   // Words are literal substrings, not regular expressions or semantic matches.
-  const searchMemory = async (query: string, offset = 0) => {
+  const searchMemory = async (query: string, offset = 0, allProjects = false) => {
     const words = query.toLowerCase().split(/[\s,"]+/).filter(Boolean);
     if (words.length === 0) return "Provide one or more search words.";
-    const view = await readView();
+    const view = await scopedView(allProjects ? [...new Set([...scopes, ...await listMemoryScopes(dataRoot)])] : scopes);
     const results: string[] = [];
     let total = 0;
     for (const entry of view.catalog) {
       if (view.status(entry) === "retired") continue;
-      const content = view.contents.get(entry.file) ?? await readTopicIfPresent(entry.file);
+      const content = view.contents.get(entry.file) ?? await scopedTopic(entry.file);
       if (content === undefined) continue;
       const text = `${entry.title}\n${entry.summary}\n${content}`;
       const lower = text.toLowerCase();
@@ -534,27 +403,9 @@ const setup = async (ctx: Plugin.Context) => {
     }
     if (total === 0) return `No retained topic contains all query words in ${JSON.stringify(query)}. Try fewer or different words; this does not establish that the subject is absent.`;
     const next = offset + results.length;
-    const continuation = next < total ? `\n\nMore matches: repeat search with query ${JSON.stringify(query)} and offset: ${next}.` : "";
+    const continuation = next < total ? `\n\nMore matches: repeat search with query ${JSON.stringify(query)} and offset: ${next}${allProjects ? ", all_projects: true" : ""}.` : "";
     const range = results.length > 0 ? `${offset + 1}–${next}` : "no results at this offset";
     return `${total} matching topics; showing ${range} (catalog order; concurrent saves can shift pages):\n\n${results.join("\n\n")}${continuation}`;
-  };
-
-  // Temp file plus rename, so readers never see a partial file.
-  const atomicWrite = async (path: string, content: string) => {
-    const temporary = `${path}.${crypto.randomUUID()}.tmp`;
-    await Bun.write(temporary, content);
-    await rename(temporary, path);
-  };
-
-  const writeIndex = (entries: IndexEntry[]) => atomicWrite(indexPath, entries.map((entry) => `${indexLine(entry)}\n`).join(""));
-
-  const writeTopic = (file: string, content: string) => atomicWrite(join(root, file), `${content.trim()}\n`);
-
-  // Multi-file memory writes are serialized in-process through this queue.
-  const serializeWrite = <Value,>(work: () => Promise<Value>) => {
-    const next = writeQueue.then(work, work);
-    writeQueue = next.then(() => {}, () => {});
-    return next;
   };
 
   // Loads a session's persisted state once per process, or starts it fresh.
@@ -647,82 +498,53 @@ const setup = async (ctx: Plugin.Context) => {
   // a new topic; replacing `target` marks the old record superseded and keeps
   // its body as history (an existing insight stays an insight). The changed
   // index line of the old record invalidates every summary above it.
-  const saveMemory = async (sessionID: string, input: MemoryInput, expectedRevision?: string, delivered = true) => {
+  const saveMemory = async (sessionID: string, input: MemoryInput & { scope?: "project" | "global" }, expectedRevision?: string, delivered = true) => {
+    const owner = input.target ? parseMemoryID(input.target, projectKey) : { key: input.scope === "global" ? "global" : projectKey, file: undefined };
+    const { key } = owner;
+    if (key !== projectKey && key !== "global") throw new Error("Other-project memories are read-only here. Switch to that project to correct or delete its records.");
+    const store = scopeStore(key);
+    const { serializeWrite, readCatalog, readView } = store;
+    const localInput = { ...input, target: owner.file };
     const { entry, crossedLimit } = await serializeWrite(async () => {
       if (!(await enabled())) throw new Error("Project memory is disabled");
       const catalog = await readCatalog();
       const before = (await readView(catalog)).roots.filter((entry) => !isRule(entry));
-      let previous: IndexEntry | undefined;
-
-      if (input.target !== undefined) {
-        previous = catalog.find((entry) => entry.file === input.target);
-        if (!previous) throw new Error(`Memory index does not contain ${input.target}`);
-        if (previous.children) {
-          throw new Error(`${input.target} is a derived summary, not an editable detail. Correct an incorrect source with memory_correct, or remove this summary with memory_delete to expose its unchanged sources. No replacement summary is generated by deletion; the user can run /dream.`);
-        }
-        if (previous.supersededBy && catalog.some((entry) => entry.file === previous!.supersededBy)) {
-          throw new Error(`${input.target} was superseded by ${previous.supersededBy}; use memory_correct with id ${previous.supersededBy}.`);
-        }
-        if (expectedRevision && topicRevision(previous, await readTopic(previous.file)) !== expectedRevision) {
-          throw new Error(`${input.target} changed during reflection; its correction was not applied`);
-        }
-      }
-
-      const title = input.title?.replace(/[\[\]\r\n]/g, " ").trim() || previous?.title;
-      if (!title) throw new Error("Provide a non-empty title for a new memory.");
-      const summary = input.summary?.trim() || previous?.summary || "";
-      const type = expectedRevision || previous?.type === "insight" ? previous!.type : input.type ?? previous!.type;
-      const file = topicFile(title);
-      await writeTopic(file, input.content);
-      const entry: IndexEntry = { title, file, summary, type, updated: isoDate() };
-      const index = [entry, ...catalog.map((current) => current === previous ? { ...current, supersededBy: file } : current)];
-      try {
-        await writeIndex(index);
-      } catch (error) {
-        await rm(join(root, file), { force: true });
-        throw error;
-      }
+      const { entry, index } = await store.save(catalog, localInput, expectedRevision);
       // Creates and replacements feed the auto-dream gate. The counter is
       // ancillary: after a committed index it must never roll the save back.
-      await bumpAdditions().catch(() => {});
+      await bumpAdditions(key).catch(() => {});
       const roots = (await readView(index)).roots;
       const after = roots.filter((entry) => !isRule(entry));
       const crossedLimit = before.length <= topicLimit && after.length > topicLimit
         || Buffer.byteLength(before.map(topicLine).join("\n")) <= indexBytes && Buffer.byteLength(after.map(topicLine).join("\n")) > indexBytes;
-      return { entry: roots.find((root) => root.file === file)!, crossedLimit };
+      return { entry: roots.find((root) => root.file === entry.file)!, crossedLimit };
     });
-    if (input.target !== undefined) recordSaved(sessionID, input.target, undefined, delivered);
-    recordSaved(sessionID, entry.file, entry, delivered);
+    const qualified = scopedEntry(entry, key, projectKey);
+    if (owner.file !== undefined) recordSaved(sessionID, memoryID(key, owner.file, projectKey), undefined, delivered);
+    recordSaved(sessionID, qualified.file, qualified, delivered);
     await rpc.events.emit("saved", { sessionID, title: entry.title }).catch(() => {});
     if (crossedLimit && (await readSettings()).dream_auto !== false) {
-      const state = await readDreamState();
-      if (state?.failAt === undefined || Date.now() - state.failAt >= DREAM_RETRY_MS) startDream({ trigger: "auto", sessionID });
+      const state = await readDreamState(key);
+      if (state?.failAt === undefined || Date.now() - state.failAt >= DREAM_RETRY_MS) startDream({ trigger: "auto", sessionID, keys: [key] });
     }
     track(dreamTick());
-    return entry;
+    return qualified;
   };
 
   // Removes the target and every summary derived from it, at any depth.
   // Sibling sources and the target's own sources stay, so deleting a summary
   // unfolds it. Records the target superseded are left alone.
   const deleteMemory = async (sessionID: string, file: string) => {
+    const owner = parseMemoryID(file, projectKey);
+    file = memoryID(owner.key, owner.file, projectKey);
+    if (owner.key !== projectKey && owner.key !== "global") throw new Error("Other-project memories are read-only here. Switch to that project to correct or delete its records.");
+    const store = scopeStore(owner.key);
+    const { serializeWrite, readCatalog } = store;
     const { removed, earlier, sources } = await serializeWrite(async () => {
       if (!(await enabled())) throw new Error("Project memory is disabled");
       const catalog = await readCatalog();
-      const target = catalog.find((entry) => entry.file === file);
-      if (!target) throw new Error(`Memory index does not contain ${file}`);
-      const removed = new Set([file]);
-      for (let grew = true; grew;) {
-        grew = false;
-        for (const entry of catalog) {
-          if (removed.has(entry.file) || !entry.children?.some((child) => removed.has(child.file))) continue;
-          removed.add(entry.file);
-          grew = true;
-        }
-      }
-      await writeIndex(catalog.filter((entry) => !removed.has(entry.file)));
-      for (const name of removed) await rm(join(root, name), { force: true });
-      return { removed, earlier: catalog.filter((entry) => entry.supersededBy === file).map((entry) => entry.file), sources: target.children?.map((child) => child.file) };
+      const result = await store.remove(catalog, owner.file);
+      return { removed: new Set([...result.removed].map((name) => memoryID(owner.key, name, projectKey))), earlier: result.earlier.map((name) => memoryID(owner.key, name, projectKey)), sources: result.sources?.map((name) => memoryID(owner.key, name, projectKey)) };
     });
     for (const name of removed) recordSaved(sessionID, name);
     removed.delete(file);
@@ -736,16 +558,16 @@ const setup = async (ctx: Plugin.Context) => {
 
   // --- Dreaming ---
 
-  const readDreamState = async () =>
-    (await ctx.storage.get(dreamStateKey)) as (DreamRuntimeState & { auto?: boolean; lastRunAt?: number }) | undefined;
+  const readDreamState = async (key = projectKey) =>
+    (await ctx.storage.get(`memory/${key}/dream`)) as (DreamRuntimeState & { auto?: boolean; lastRunAt?: number }) | undefined;
 
-  const writeDreamState = (state: object) => ctx.storage.set(dreamStateKey, state as Schema.Json);
+  const writeDreamState = (state: object, key = projectKey) => ctx.storage.set(`memory/${key}/dream`, state as Schema.Json);
 
   // Counts ordinary additions toward the dream gate. Called only inside the
   // save's queued write, so it never queues itself.
-  const bumpAdditions = async () => {
-    const state = await readDreamState();
-    await writeDreamState({ ...state, additions: (state?.additions ?? 0) + 1, since: state?.since ?? Date.now() });
+  const bumpAdditions = async (key: string) => {
+    const state = await readDreamState(key);
+    await writeDreamState({ ...state, additions: (state?.additions ?? 0) + 1, since: state?.since ?? Date.now() }, key);
   };
 
   const mostRecentLiveSession = () => {
@@ -767,79 +589,50 @@ const setup = async (ctx: Plugin.Context) => {
     await ctx.storage.set(`${prefix}/dreams/${runID}`, payload as Schema.Json);
   };
 
-  // Every refusal terminates a possible running indicator. The TUI only warns
-  // when the failure matches its own manual request.
-  const refuseDream = async (
-    input: { trigger: "auto" | "manual"; requestID: string | null; runID: string },
-    reason: string,
-    details: { model?: WorkerModel; sessionID?: string; startedAt?: string } = {},
-  ) => {
-    const finishedAt = new Date().toISOString();
-    await writeDreamManifest(input.runID, {
-      trigger: input.trigger,
-      ...dreamModelFields(details.model),
-      sessionID: details.sessionID ?? null,
-      startedAt: details.startedAt ?? finishedAt,
-      finishedAt,
-      state: "failed",
-      changed: false,
-      error: reason,
-      actions: [],
-    });
-    await writeDreamStatus({
-      requestID: input.requestID,
-      runID: input.runID,
-      state: "failed",
-      sessionID: details.sessionID,
-      startedAt: details.startedAt,
-      finishedAt,
-      message: reason,
-    });
-  };
-
   // Enabling auto-dream seeds the additions counter from the current indexed
   // topic count and starts a fresh interval window. Read/seed/clear happen
   // inside one queued write so concurrent ticks cannot double-seed.
-  const evaluateAutoDream = async (): Promise<boolean> => {
+  const evaluateAutoDream = async (key: string): Promise<boolean> => {
+    const { serializeWrite, readView, readCatalog } = scopeStore(key);
     const settings = await readSettings();
     if (settings.dream_auto === false || !(await enabled())) {
+      if (key === "global") return false;
       await serializeWrite(async () => {
-        const stale = await readDreamState();
-        if (stale?.auto === true) await writeDreamState({ ...stale, auto: false });
+        const stale = await readDreamState(key);
+        if (stale?.auto === true) await writeDreamState({ ...stale, auto: false }, key);
       });
       return false;
     }
     return serializeWrite(async () => {
-      const state = await readDreamState();
+      const state = await readDreamState(key);
       if (!state || state.auto !== true) {
         await writeDreamState({
           ...state,
           auto: true,
           additions: (await readView(await readCatalog())).roots.length,
           since: Date.now(),
-        });
+        }, key);
         return false;
       }
       return dreamDue(Date.now(), state, dreamOptions);
     });
   };
 
-  const executeDream = async (input: { trigger: "auto" | "manual"; requestID: string | null; runID: string; sessionID?: string }) => {
-    const startedAt = new Date().toISOString();
+  const executeDream = async (input: { trigger: "auto" | "manual" }, key: string, maxActions: number) => {
+    const root = memoryScopeRoot(dataRoot, key);
+    const { serializeWrite, readCatalog, readTopicIfPresent, readView, writeTopic, writeIndex } = scopeStore(key);
     const model = dreamModel;
     // Dreaming respects the master auto-memory switch for both triggers; a
     // manual request on a disabled store fails loudly instead of mutating.
     if (!(await enabled())) {
-      await refuseDream(input, "memory is disabled", { model, sessionID: input.sessionID, startedAt });
-      return;
+      throw new Error("memory is disabled");
     }
     if (input.trigger === "auto" && (await readSettings()).dream_auto === false) {
-      await refuseDream(input, "automatic dreaming is disabled", { model, sessionID: input.sessionID, startedAt });
-      return;
+      throw new Error("automatic dreaming is disabled");
     }
     // Concurrent ordinary saves during this long run must survive completion:
     // only the counter captured here is subtracted at the end.
-    const baselineAdditions = (await readDreamState())?.additions ?? 0;
+    const baselineAdditions = (await readDreamState(key))?.additions ?? 0;
 
     // Immutable snapshot evidence: active hint roots plus complete topic
     // contents, captured in one queued step. Workers receive selected full
@@ -866,7 +659,7 @@ const setup = async (ctx: Plugin.Context) => {
     let abortReason: string | undefined;
     let indexedCount = indexed;
 
-    for (let iteration = 0; iteration < DREAM_MAX_ACTIONS && !abortReason && !disposed; iteration++) {
+    for (let iteration = 0; iteration < maxActions && !abortReason && !disposed; iteration++) {
       if (candidates.size < 2) break;
 
       let selection: ReturnType<typeof validateDreamSelection> = undefined;
@@ -961,80 +754,28 @@ const setup = async (ctx: Plugin.Context) => {
       indexedCount -= sources.length - 1;
     }
 
-    const finishedAt = new Date().toISOString();
-    // prune stays at zero for TUI compatibility; dreaming no longer removes records.
-    const counts = { synthesize: actions.length, prune: 0 };
-    const changed = counts.synthesize > 0;
-
-    if (abortReason) {
-      // The manifest preserves any actions that were already applied.
-      await writeDreamManifest(input.runID, {
-        trigger: input.trigger,
-        ...dreamModelFields(model),
-        sessionID: input.sessionID,
-        startedAt,
-        finishedAt,
-        state: "failed",
-        changed,
-        error: abortReason,
-        orphans,
-        actions,
-      });
-      await writeDreamStatus({
-        requestID: input.requestID,
-        runID: input.runID,
-        state: "failed",
-        sessionID: input.sessionID,
-        startedAt,
-        finishedAt,
-        counts,
-        message: changed ? `${abortReason}; changes were applied` : abortReason,
-      });
-      // Failed or stale runs keep their progress counters; a simple fixed
-      // backoff prevents hot retries.
-      await serializeWrite(async () => {
-        const state = await readDreamState();
-        await writeDreamState({ ...state, additions: state?.additions ?? 0, since: state?.since ?? Date.now(), failAt: Date.now() });
-      }).catch((error) => console.error("Memory dream bookkeeping failed:", error));
-      return;
-    }
-
-    await writeDreamManifest(input.runID, {
-      trigger: input.trigger,
-      ...dreamModelFields(model),
-      sessionID: input.sessionID,
-      startedAt,
-      finishedAt,
-      state: changed ? "changed" : "noop",
-      changed,
-      orphans,
-      actions,
-    });
-    await writeDreamStatus({
-      requestID: input.requestID,
-      runID: input.runID,
-      state: changed ? "changed" : "noop",
-      sessionID: input.sessionID,
-      startedAt,
-      finishedAt,
-      counts,
-    });
+    if (abortReason) return { actions, orphans, abortReason };
     // Bookkeeping after the run is recorded: a failure here must not report
     // the run as failed.
     await serializeWrite(async () => {
-      const state = await readDreamState();
+      const state = await readDreamState(key);
       await writeDreamState({
         ...(state?.auto === true ? { auto: true } : {}),
         additions: Math.max(0, (state?.additions ?? 0) - baselineAdditions),
         since: Date.now(),
         lastRunAt: Date.now(),
-      });
+      }, key);
     }).catch((error) => console.error("Memory dream bookkeeping failed:", error));
+    return { actions, orphans, abortReason };
   };
 
-  const runDream = async (input: { trigger: "auto" | "manual"; sessionID?: string; requestID?: string; consumeRequest?: boolean }) => {
+  const runDream = async (input: { trigger: "auto" | "manual"; sessionID?: string; requestID?: string; consumeRequest?: boolean; keys: string[] }) => {
     const runID = crypto.randomUUID();
     const startedAt = new Date().toISOString();
+    const actions: DreamManifestAction[] = [];
+    const orphans: string[] = [];
+    let failure: string | undefined;
+    let runningKey: string | undefined;
     if (input.consumeRequest) queuedRequest = undefined;
     try {
       await writeDreamStatus({
@@ -1044,7 +785,30 @@ const setup = async (ctx: Plugin.Context) => {
         sessionID: input.sessionID,
         startedAt,
       });
-      await executeDream({ trigger: input.trigger, requestID: input.requestID ?? null, runID, sessionID: input.sessionID });
+      let remaining = DREAM_MAX_ACTIONS;
+      for (const key of input.keys) {
+        const scopeRoot = memoryScopeRoot(dataRoot, key);
+        if (activeMemoryDreams.has(scopeRoot)) continue;
+        activeMemoryDreams.add(scopeRoot);
+        try {
+          // Each partition has its own evidence and gate.
+          // A manual request shares the existing four-action budget across both.
+          runningKey = key;
+          const result = await executeDream(input, key, remaining);
+          actions.push(...result.actions.map((action) => ({ ...action, sources: action.sources.map((file) => memoryID(key, file, projectKey)), output: { ...action.output, file: memoryID(key, action.output.file, projectKey) } })));
+          orphans.push(...result.orphans.map((file) => memoryID(key, file, projectKey)));
+          remaining -= result.actions.length;
+          failure = result.abortReason;
+        } finally {
+          activeMemoryDreams.delete(scopeRoot);
+        }
+        if (remaining === 0 || failure) break;
+      }
+      if (failure) throw new Error(failure);
+      const finishedAt = new Date().toISOString();
+      const changed = actions.length > 0;
+      await writeDreamManifest(runID, { trigger: input.trigger, ...dreamModelFields(dreamModel), sessionID: input.sessionID, startedAt, finishedAt, state: changed ? "changed" : "noop", changed, orphans, actions });
+      await writeDreamStatus({ requestID: input.requestID ?? null, runID, state: changed ? "changed" : "noop", sessionID: input.sessionID, startedAt, finishedAt, counts: { synthesize: actions.length, prune: 0 } });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       // Status first, so failed bookkeeping below cannot leave the TUI on "Dreaming...".
@@ -1055,11 +819,12 @@ const setup = async (ctx: Plugin.Context) => {
         sessionID: input.sessionID,
         startedAt,
         finishedAt: new Date().toISOString(),
-        message,
+        counts: { synthesize: actions.length, prune: 0 },
+        message: actions.length > 0 ? `${message}; changes were applied` : message,
       });
-      await serializeWrite(async () => {
-        const state = await readDreamState();
-        await writeDreamState({ ...state, additions: state?.additions ?? 0, since: state?.since ?? Date.now(), failAt: Date.now() });
+      if (runningKey) await scopeStore(runningKey).serializeWrite(async () => {
+        const state = await readDreamState(runningKey);
+        await writeDreamState({ ...state, additions: state?.additions ?? 0, since: state?.since ?? Date.now(), failAt: Date.now() }, runningKey);
       }).catch(() => {});
       if (await ctx.storage.get(`${prefix}/dreams/${runID}`) === undefined) {
         await writeDreamManifest(runID, {
@@ -1069,15 +834,16 @@ const setup = async (ctx: Plugin.Context) => {
           startedAt,
           finishedAt: new Date().toISOString(),
           state: "failed",
-          changed: false,
+          changed: actions.length > 0,
           error: message,
-          actions: [],
+          orphans,
+          actions,
         }).catch(() => {});
       }
     }
   };
 
-  const startDream = (input: { trigger: "auto" | "manual"; sessionID?: string; requestID?: string; consumeRequest?: boolean }) => {
+  const startDream = (input: { trigger: "auto" | "manual"; sessionID?: string; requestID?: string; consumeRequest?: boolean; keys: string[] }) => {
     if (dreamJob || disposed) return;
     const job = runDream(input).finally(() => {
       dreamJob = undefined;
@@ -1096,8 +862,14 @@ const setup = async (ctx: Plugin.Context) => {
     if (disposed || dreamJob) return;
     try {
       const request = queuedRequest;
-      if (!request && !(await evaluateAutoDream())) return;
+      const keys: string[] = [];
+      for (const key of scopes) {
+        if (activeMemoryDreams.has(memoryScopeRoot(dataRoot, key))) continue;
+        if (request || await evaluateAutoDream(key)) keys.push(key);
+      }
+      if (keys.length === 0) return;
       startDream({
+        keys,
         trigger: request ? "manual" : "auto",
         sessionID: request ? request.sessionID : mostRecentLiveSession(),
         requestID: request?.requestID,
@@ -1121,7 +893,7 @@ const setup = async (ctx: Plugin.Context) => {
       if (transcript && await enabled()) {
         await rpc.events.emit("review", { sessionID }).catch(() => {});
         const saved = state.saved.map((item) => `- ${item.title} (${item.file})`).join("\n");
-        const view = await readView();
+        const view = await scopedView();
         const details = view.catalog.filter((entry) => !entry.children && !entry.supersededBy && view.status(entry) !== "missing");
         const context = `<memory_index>\n${view.roots.map(topicLine).join("\n")}\n</memory_index>\n\n<detail_index>\n${details.map(topicLine).join("\n")}\n</detail_index>\n\n<session_saves>\n${saved}\n</session_saves>\n\n<transcript>\n${transcript}\n</transcript>`;
         const selection = await runWorker(
@@ -1141,10 +913,10 @@ const setup = async (ctx: Plugin.Context) => {
               return [];
             }
             const content = view.contents.get(file)!;
-            inspected.set(file, topicRevision(entry, content));
+            inspected.set(file, entry.revision!);
             return [`<memory_detail id="${file}">\n${topicLine(entry)}\n${content}\n</memory_detail>`];
           }).join("\n\n");
-          const result = await runWorker(reflectModel, ReflectionSchema, REFLECT_SYSTEM, `${REFLECT_PROMPT}\n\n${context}\n\n<read_details>\n${selected}\n</read_details>`);
+          const result = await runWorker(reflectModel, ReflectionSchema, REFLECT_SYSTEM, `${REFLECT_PROMPT}\n\n${SCOPE_GUIDANCE}\n\n${context}\n\n<read_details>\n${selected}\n</read_details>`);
           if (disposed || state.deleted) return;
           for (const correction of result.correct) {
             const revision = inspected.get(correction.id);
@@ -1184,13 +956,21 @@ const setup = async (ctx: Plugin.Context) => {
   };
 
   const rpc = await ctx.rpc.register(MemoryRpc, {
+    dashboard: async () => {
+      dashboard ??= serveDashboard({
+        root: dirname(root), projectKey, directory, store,
+        projectDirectory: async (key) => await ctx.storage.get(`memory/${key}/directory`) as string | undefined,
+      });
+      console.info(`Memory dashboard URL (includes access token): ${dashboard.url}`);
+      return { url: dashboard.url };
+    },
     dream: async (request) => {
       queuedRequest = request;
       track(dreamTick());
     },
     state: async () => {
       const settings = await readSettings();
-      const view = await readView();
+      const view = await scopedView();
       const order: Record<TopicStatus, number> = { active: 0, consolidated: 1, superseded: 2, retired: 3, missing: 4 };
       const supersedes = new Map<string, string[]>();
       for (const entry of view.catalog) {
@@ -1203,8 +983,12 @@ const setup = async (ctx: Plugin.Context) => {
         enabled: settings.enabled !== false,
         dream_auto: settings.dream_auto !== false,
         directory: root,
-        topics: [...view.catalog].sort((a, b) => order[view.status(a)] - order[view.status(b)]).map((entry) => ({
+        topics: [...view.catalog].sort((a, b) => order[view.status(a)] - order[view.status(b)]).map((entry) => {
+          const owner = parseMemoryID(entry.file, projectKey);
+          return {
           file: entry.file,
+          scope: owner.key === "global" ? "global" as const : "project" as const,
+          path: join(memoryScopeRoot(dataRoot, owner.key), owner.file),
           title: entry.title,
           summary: entry.summary,
           status: view.status(entry),
@@ -1212,7 +996,8 @@ const setup = async (ctx: Plugin.Context) => {
           supersedes: supersedes.get(entry.file) ?? [],
           ...(view.parents.has(entry.file) ? { parent: view.parents.get(entry.file)! } : {}),
           ...(entry.supersededBy ? { supersededBy: entry.supersededBy } : {}),
-        })),
+          };
+        }),
       };
     },
     // Flips one flag and preserves every other settings field. Both flags
@@ -1256,14 +1041,15 @@ const setup = async (ctx: Plugin.Context) => {
         properties: {
           query: { type: "string", description: "Distinctive search words, for example Redis fixture" },
           offset: { type: "integer", minimum: 0, description: "Matching records to skip; use the next offset from search results" },
+          all_projects: { type: "boolean", description: "Explicit cross-project search; default searches only global and current project" },
         },
         required: ["query"],
         additionalProperties: false,
       },
       execute: async (args) => {
         if (!(await enabled())) throw new Error("Project memory is disabled");
-        const { query, offset } = args as { query: string; offset?: number };
-        return { content: await searchMemory(query, offset) };
+        const { query, offset, all_projects } = args as { query: string; offset?: number; all_projects?: boolean };
+        return { content: await searchMemory(query, offset, all_projects) };
       },
     });
     editor.add({
@@ -1277,6 +1063,7 @@ const setup = async (ctx: Plugin.Context) => {
           summary: { type: "string", description: "One-line index hook describing coverage and retrieval terms" },
           content: { type: "string", minLength: 1, description: "Complete user-grounded detail, with conditions and uncertainty; no frontmatter" },
           type: { type: "string", enum: [...MEMORY_TYPES] },
+          scope: { type: "string", enum: ["project", "global"], description: "Default project; global for clearly general preferences or explicit user requests" },
         },
         required: ["title", "summary", "content", "type"],
         additionalProperties: false,
@@ -1290,7 +1077,7 @@ const setup = async (ctx: Plugin.Context) => {
     editor.add({
       name: "memory_correct",
       options: { codemode: false },
-      description: `Correct an existing detail by id. Supply its COMPLETE updated content, retaining still-useful qualifications; read the detail if needed, not just its index hook. Title, index summary, and type are inherited unless explicitly changed; legacy insight records keep their insight type. A new current id replaces the old one, which remains historical. Derived summary topics cannot be corrected: correct a wrong source, or use memory_delete to unfold a bad summary as part of the requested repair without changing its sources. ${CAPTURE_GUIDANCE}`,
+      description: `Correct an existing detail in the current project or global scope by exact id; other-project records are read-only here. Supply its COMPLETE updated content, retaining still-useful qualifications; read the detail if needed, not just its index hook. Title, index summary, and type are inherited unless explicitly changed; legacy insight records keep their insight type. A new current id replaces the old one, which remains historical. Derived summary topics cannot be corrected: correct a wrong source, or use memory_delete to unfold a bad summary as part of the requested repair without changing its sources. ${CAPTURE_GUIDANCE}`,
       input: {
         type: "object",
         properties: {
@@ -1313,7 +1100,7 @@ const setup = async (ctx: Plugin.Context) => {
     editor.add({
       name: "memory_delete",
       options: { codemode: false },
-      description: "Delete a selected source record when the user asks to remove it; use memory_correct to change its content. A requested repair of an incorrect derived summary may also unfold it with this tool, retaining its source details. Deletion removes the selected body and dependent summary topics, not earlier versions or sibling details. This is not subject-wide erasure. The result lists retained sources/history; no replacement summary is generated, and the user can run /dream.",
+      description: "Delete a selected current-project or global record by exact id when the user asks to remove it; other-project records are read-only here. Use memory_correct to change content. A requested repair of an incorrect derived summary may also unfold it with this tool, retaining its source details. Deletion removes the selected body and dependent summary topics, not earlier versions or sibling details. This is not subject-wide erasure. The result lists retained sources/history; no replacement summary is generated, and the user can run /dream.",
       input: {
         type: "object",
         properties: { id: { type: "string", description: "Exact id of the selected record or summary topic" } },
@@ -1331,21 +1118,27 @@ const setup = async (ctx: Plugin.Context) => {
   // through a cached index and the read-only memory tool.
   const snapshot = async (restricted: boolean, entries: IndexEntry[]) => {
     if (restricted) {
-      const topics: string[] = [];
-      for (const entry of entries) {
-        if (!isRule(entry)) continue;
-        const content = await readTopicIfPresent(entry.file);
-        if (content !== undefined) topics.push(`${topicLine(entry)}\n${content}`);
+      const sections = [READ_GUIDANCE];
+      for (const key of scopes) {
+        const scoped = entries.filter((entry) => parseMemoryID(entry.file, projectKey).key === key);
+        const topics: string[] = [];
+        for (const entry of scoped) {
+          if (!isRule(entry)) continue;
+          const content = await scopedTopic(entry.file);
+          if (content !== undefined) topics.push(`${topicLine(entry)}\n${content}`);
+        }
+        const hints = scoped.filter((entry) => !isRule(entry));
+        const label = key === "global" ? "Global" : "Project";
+        if (topics.length > 0) sections.push(`${label} preferences and instructions stated by the user (full contents):\n\n${topics.join("\n\n")}`);
+        if (hints.length > 0) sections.push(`Other ${label.toLowerCase()} memory topics (read when relevant):\n\n${hints.map(topicLine).join("\n")}`);
       }
-      const hints = entries.filter((entry) => !isRule(entry));
-      const sections = [
-        READ_GUIDANCE,
-        topics.length > 0 ? `Project preferences and instructions stated by the user (full contents):\n\n${topics.join("\n\n")}` : undefined,
-        hints.length > 0 ? `Other project memory topics (read when relevant):\n\n${hints.map(topicLine).join("\n")}` : undefined,
-      ].filter(Boolean);
       return `<memory>\n${sections.join("\n\n")}\n</memory>`;
     }
-    return `<memory>\n${READ_GUIDANCE}\nCreate new records with memory_save; update existing details with memory_correct.\n\n${entries.map(topicLine).join("\n")}\n</memory>`;
+    const sections = scopes.flatMap((key) => {
+      const scoped = entries.filter((entry) => parseMemoryID(entry.file, projectKey).key === key);
+      return scoped.length > 0 ? [`${key === "global" ? "Global memory" : "Current project memory"}:\n${scoped.map(topicLine).join("\n")}`] : [];
+    });
+    return `<memory>\n${READ_GUIDANCE}\nCreate new records with memory_save; update existing details with memory_correct. ${SCOPE_GUIDANCE}\n\n${sections.join("\n\n")}\n</memory>`;
   };
 
   await ctx.session.hook("context", async (event) => {
@@ -1483,6 +1276,7 @@ const setup = async (ctx: Plugin.Context) => {
 
   return async () => {
     disposed = true;
+    await dashboard?.stop();
     clearInterval(dreamTimer);
     subscription.abort();
     for (const state of states.values()) clearTimeout(state.idleTimer);

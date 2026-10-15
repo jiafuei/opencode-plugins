@@ -1,12 +1,12 @@
 # Memory
 
-Project-scoped memory for OpenCode, with a Claude Code-like `/memory` browser. The model remembers your preferences,
+Global and project memory for OpenCode, with a Claude Code-like `/memory` browser. The model remembers your preferences,
 instructions, facts, and working details across sessions, so you don't have to repeat them. Detailed records remain
 available beneath progressively coarser summaries. Memory is a hint layer, not a source of truth.
 
 ## How it works
 
-- **Recall.** Each session starts with the project's memory index in context. Preferences and instructions you gave
+- **Recall.** Each session starts with the global and current-project indexes in context, labeled by scope. Preferences and instructions you gave
   are followed; other entries are hints the model reads in full and verifies before relying on them.
 - **Saving.** The model saves user-stated or explicitly confirmed preferences, instructions, facts, and working
   details with `memory_save`, and updates existing details with `memory_correct`. Conditions, qualifications, and uncertainty are preserved before summarization.
@@ -25,6 +25,23 @@ available beneath progressively coarser summaries. Memory is a hint layer, not a
 
 Memory is designed to keep the provider's prompt cache warm: what the model sees doesn't change mid-session, and new
 memories arrive as small additions instead.
+
+## Scopes
+
+All memories live in one central store, partitioned into **global** and **project** scopes. A repository's main checkout
+and linked worktrees share project memory. Separate clones remain separate projects.
+
+New memories default to the current project. Clearly general preferences can be saved globally, including by background
+reflection; project-specific choices stay local. Scope is separate from type: an instruction is not automatically global,
+and an explicit global memory can hold any supported type. Existing records are not automatically promoted to global.
+
+Sessions receive only global and current-project memory. Agents may explicitly search other projects, then read the
+returned IDs; those projects are not automatically injected. Corrections retain the original record's scope. Conflicting
+project choices are not global contradictions, and summaries never combine records from different scopes.
+
+Current-project IDs keep their existing bare filenames. Global IDs use `global:<filename>`; other-project search results
+use `project:<key>:<filename>`. Copy the returned ID into `memory_read`. Other-project records are read-only from the
+current project; switch to their project to correct or delete them.
 
 ## Memory types
 
@@ -49,8 +66,8 @@ Each operation is a separate tool with a plain object input:
 | Tool | Inputs | Behavior |
 | --- | --- | --- |
 | `memory_read` | `id` | Read a detail, summary topic, or explicitly labeled historical version |
-| `memory_search` | `query`, optional `offset` | Find records containing every query word, in any order and case |
-| `memory_save` | `title`, `summary`, `content`, `type` | Create a new record; `summary` is its short index hook |
+| `memory_search` | `query`, optional `offset`, `all_projects` | Search current/global records; explicitly opt into other projects |
+| `memory_save` | `title`, `summary`, `content`, `type`, optional `scope` | Create in `project` (default) or `global`; `summary` is its index hook |
 | `memory_correct` | `id`, `content`; optional `title`, `summary`, `type` | Replace a detail's complete content; omitted metadata is inherited |
 | `memory_delete` | `id` | Remove a selected record; deleting a summary topic preserves its sources |
 
@@ -66,14 +83,27 @@ and session snapshots are retained; a current API guide supersedes action-based 
 
 ## Storage
 
-Memories are plain markdown files outside the repository, easy to read and edit by hand. Each project (including each
-Git worktree) gets its own directory:
+Memories are plain markdown files outside the repository, easy to read and edit by hand. The central store has a global
+partition and one partition per canonical project checkout, shared by its linked worktrees:
 
 ```text
-${XDG_DATA_HOME:-~/.local/share}/opencode/memory/-home-alice-project-a1b2c3d4/
-|-- index.md
-`-- <short-title>-<random>.md
+${XDG_DATA_HOME:-~/.local/share}/opencode/memory/
+|-- global/
+|   |-- index.md
+|   `-- <short-title>-<random>.md
+`-- -home-alice-project-a1b2c3d4/
+    |-- index.md
+    `-- <short-title>-<random>.md
 ```
+
+Existing main-checkout partitions keep their keys. When an enabled project loads in an old worktree or subdirectory,
+its known directory partitions are imported into the canonical project partition. Original files, IDs, source links,
+and history are preserved. A `.scope-import.json` marker hides the old partition and prevents reimport, including after
+a migrated record is deleted. Other old worktrees migrate when opened. Conflicting IDs or bodies stop the import with
+an error rather than overwrite either copy. Migration does not promote existing preferences to global scope.
+
+Worktrees also share the canonical project's memory and Auto-dream toggles. Old per-worktree toggles are not merged;
+a worktree that previously disabled memory follows the canonical project's setting after this upgrade.
 
 `index.md` catalogs retained records, with one line per topic:
 
@@ -169,6 +199,39 @@ configuration.
   `$EDITOR`). Editing a consolidated record warns that its summaries will retire. Toggling
   memory can invalidate the provider's prompt cache.
 - `/dream` starts a dream without adding a conversation message.
+- `/memory-web` opens a central browser dashboard for global and project memories. It starts a localhost listener on an
+  OS-assigned port on first use, reuses it on later calls, and stops it when the server plugin unloads. It lives with the
+  OpenCode background service, not the terminal client. The command also shows the URL if you need to open it manually.
+
+## Web dashboard
+
+Browse and search global and project scopes, create records, correct their titles, types, summaries and bodies, or delete them.
+The scope selector includes Global; new records default to the current project unless another scope is selected.
+The default view is a left-to-right node graph: root summaries link to their immediate sources, which can be expanded
+one layer at a time down to facts and working details. Selecting a node opens its full content beside the graph and
+highlights its ancestry. Scroll to pan and use the zoom controls for deeper hierarchies. Search keeps matching branches
+and their ancestors connected rather than displaying isolated hits. Rules and uncompacted details remain standalone
+roots; older insights without retained source links cannot show a reconstructed hierarchy.
+
+History is a separate list for superseded versions, retired summaries, and unavailable bodies. Version links are not
+mixed into the source graph. Related-record links still connect sources, parents, replacements, and earlier versions;
+following one opens the appropriate view. Bodies are plain markdown text. The graph uses native SVG links and HTML
+cards, with no web dependencies, build step, or external assets.
+
+Corrections create a new ID and keep the original as history. Derived summaries are read-only: correct a source, or
+delete/unfold the summary to expose its sources. Deletion removes the selected record and dependent summaries, not its
+sources, siblings, or earlier versions. The dashboard does not provide dreaming or settings controls, and manual edits
+are available even when automatic memory is disabled. Changes reach sessions through the existing next-prompt notices.
+
+The dashboard discovers existing memory directories, including projects not currently open in OpenCode. Project paths
+are remembered as each project loads with this version; older, unvisited projects are labeled with their storage key.
+Dashboard and worker writes to the same partition share an in-process queue, including across plugin instances.
+Separate OpenCode service processes writing the same store are not coordinated.
+
+Access is restricted to `127.0.0.1` and API requests require the token in the launch URL. The browser keeps that token in
+tab-local session storage and removes it from the address bar. Treat the launch URL as access to all your memories.
+For a remote OpenCode service, forward the dashboard port and open the URL through that tunnel; it is not exposed on the
+network or routed through OpenCode's HTTP API.
 
 ## Data disclosure
 

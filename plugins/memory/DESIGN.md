@@ -5,11 +5,12 @@ How memory reaches the model, how it is kept consistent, and how dreaming works.
 
 ## Recall
 
-The first request of a session (the `context` hook) adds a `<memory>` system block with the root index. The block is
+The first request of a session (the `context` hook) adds a `<memory>` system block with global and current-project root indexes, labeled by scope. The block is
 cached for the rest of the session so the provider prompt cache stays warm. Only current hierarchy roots appear in
 this view. `preference` and `instruction` entries are followed unless the conversation says otherwise; `fact`,
 `working`, `recap`, `reference`, `insight`, and legacy `feedback`/`project` entries are hints the model reads (with the
-`memory_read` tool) and verifies before relying on them.
+`memory_read` tool) and verifies before relying on them. Other projects are available only through explicit cross-project
+search and reads of the returned IDs, not automatic context injection.
 
 Child sessions (with a `parentID`) and workflow workers (metadata `workflowWorkerID`) get the full content of
 `preference` and `instruction` topics inline and an index of the remaining hint topics. Only `memory_read` and
@@ -46,8 +47,12 @@ updates. The entry is removed when the session is deleted.
 
 ## Saving
 
-Primary agents get five flat-schema tools: `memory_read(id)`, `memory_search(query, offset?)`,
-`memory_save(title, summary, content, type)`, `memory_correct(id, content, optional metadata)`, and `memory_delete(id)`.
+Primary agents get five flat-schema tools: `memory_read(id)`, `memory_search(query, offset?, all_projects?)`,
+`memory_save(title, summary, content, type, scope?)`, `memory_correct(id, content, optional metadata)`, and `memory_delete(id)`.
+Saves default to project scope; clearly general preferences may be global. Explicit global saves can use any supported
+type. Corrections preserve their target's scope; cross-project search does not implicitly permit cross-project writes.
+Global IDs use `global:<file>` and other-project IDs use `project:<key>:<file>`. Current-project IDs stay bare for
+compatibility. Stored filenames and source links remain local; qualification happens at the tool and RPC boundaries.
 Creation and correction are separate operations; omitting an optional target can no longer accidentally create a
 competing current record. Corrections inherit omitted or empty title/hook metadata and create a new record, retaining the previous body
 as superseded history. Their responses explicitly name the new current ID. There is no mandatory read tracking or
@@ -65,7 +70,7 @@ may be explicitly corrected again without automatically restoring it. Legacy `fe
 
 When a primary session goes idle for `idle_delay_ms` after an execution finishes, reflection reviews the messages
 since the last reflection (user and assistant text only) together with the index and the topics already saved in the
-session. It sees the root index and an index of current detailed records, including consolidated ones, to avoid
+session. It sees global and current-project root/detail indexes with scope labels, including consolidated records, to avoid
 duplicate capture. Superseded history stays out of reflection, even if its replacement was deleted; recovering it
 requires an explicit foreground `memory_correct` call. Reflection is asked to read up to eight details in one lookup round and
 propose up to three changes. A selection-only schema returns whether extraction is needed and IDs to inspect; a no-op
@@ -75,7 +80,8 @@ metadata and retaining history. Optional title/hook updates keep an old index cl
 body; classification remains inherited. The commit rechecks the inspected revision so concurrent changes cannot be overwritten.
 Summaries may not be corrected. Unknown selection IDs and unsupplied correction IDs are reported as unresolved while
 valid siblings continue. Valid replies are not rejected solely for exceeding suggested counts.
-Working details and facts are not forced into instruction types. Most reviews save nothing. Worker failures are
+Reflection chooses global scope only for clearly general preferences or instructions; project-specific and uncertain
+scope stays project-local. Existing records are not bulk-classified or promoted. Working details and facts are not forced into instruction types. Most reviews save nothing. Worker failures are
 logged and surfaced in the TUI; a successful review advances the cursor, with individual failed commits reported too.
 
 ## Dreaming
@@ -86,7 +92,8 @@ while already over budget. Dreams also run from
 `/dream`, **Dream now** in `/memory`, or the automatic gate (`dream_interval_hours` elapsed and `dream_min_additions`
 creates/replacements since the last successful run).
 
-A run consolidates eligible hint roots in at most eight actions. Each synthesis adds an `insight` above 2–8 related
+A run consolidates eligible hint roots in at most four actions. Candidates are partitioned by scope: no summary mixes
+global and project sources or different projects. Each synthesis adds an `insight` above 2–8 related
 roots and retains every source. A summary can become a child of another summary, creating progressively coarser
 layers. The selector favors keeping recent working details fine-grained; elapsed time and accumulation trigger
 maintenance, not deletion. Preferences and instructions remain roots and are excluded from dreaming.
@@ -122,12 +129,20 @@ changes made meanwhile arrive on the next enabled user turn.
 
 ## Storage
 
-The project directory name is derived from the lowercase absolute project path, with characters outside `a-z`, `.`,
-`_`, and `-` replaced by `-`, followed by an 8-character hash of the resolved path.
+The central store has a `global` partition and project partitions shared by linked worktrees. The project directory name
+is derived from OpenCode's canonical checkout path, with characters outside `a-z`, `.`,
+`_`, and `-` replaced by `-`, followed by an 8-character hash of the resolved path. This keeps existing main-checkout
+keys stable and treats separate clones as separate projects. Scope is represented by the partition.
 
 Topic bodies and the full retained-record catalog live in Markdown. Optional hierarchy/correction metadata is encoded
 in trailing HTML comments on index lines. Existing lines are level-zero records without a migration. The root view is
 derived from valid parent-child links; it is not a separate source of truth.
+
+On activation, an enabled instance imports its old checkout and project-directory partitions into the canonical
+partition. The import copies bodies and merges unchanged catalog entries, retaining the original partition. A durable
+`.scope-import.json` alias prevents later reimport and excludes the old partition from scope discovery. Imports reject
+filename or body collisions before publishing a merged catalog. Other worktree partitions migrate when those worktrees
+load; there is no bulk classification or promotion of existing memories into global scope.
 
 Settings, dream bookkeeping, and per-session state live in the server plugin's key-value storage (`ctx.storage`):
 
@@ -135,10 +150,11 @@ Settings, dream bookkeeping, and per-session state live in the server plugin's k
 memory/<project-key>/settings              { enabled?, dream_auto? }
 memory/<project-key>/dream                 automatic-dream counters
 memory/<project-key>/dreams/<run-id>       decision-only manifest
+memory/global/dream                       global automatic-dream counters
 session/<session-id>                       snapshot, known index, and frozen updates
 ```
 
-Writes are serialized in-process only; concurrent writes from separate OpenCode processes on the same project are not
+Writes to a partition share an in-process queue across plugin instances and the dashboard; concurrent writes from separate OpenCode processes are not
 coordinated. Every file write goes through a temporary file and a rename. New bodies are published before the catalog;
 explicit deletion publishes the catalog before removing bodies. Consolidation retains its sources. Existing legacy
 quarantine data is not the hierarchy and is not automatically purged.

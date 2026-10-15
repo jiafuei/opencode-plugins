@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Memory · OpenCode</title>
+  <link rel="stylesheet" href="/style.css">
+  <script type="module" src="/app.js"></script>
+</head>
+<body>
+  <header>
+    <div><h1>Memory</h1><span class="muted">OpenCode · Local dashboard</span></div>
+    <div class="actions"><button id="refresh">Refresh</button><button id="create" class="primary">New memory</button></div>
+  </header>
+  <p id="notice" role="status" aria-live="polite" hidden></p>
+  <main>
+    <aside aria-label="Memory browser">
+      <div class="filters">
+        <label>Scope<select id="project"><option value="">All scopes</option></select></label>
+        <label>Search<input id="search" type="search" placeholder="Search titles, summaries, and bodies…"></label>
+        <label>View<select id="status"><option value="current">Current hierarchy</option><option value="history">History &amp; unavailable records</option></select></label>
+        <span id="count" class="muted" role="status">Loading memories…</span>
+      </div>
+      <div id="graph-toolbar" class="graph-toolbar">
+        <div><strong>Summary → sources → details</strong><p id="graph-help" class="muted">Expand sources to go deeper. Scroll to pan; select a node to read it.</p></div>
+        <div class="actions" aria-label="Graph zoom"><button id="zoom-out" aria-label="Zoom out">−</button><button id="zoom-reset" aria-label="Reset graph zoom">100%</button><button id="zoom-in" aria-label="Zoom in">+</button></div>
+      </div>
+      <nav id="topics" aria-label="Memories"></nav>
+    </aside>
+    <section id="detail" aria-label="Selected memory">
+      <div id="empty"><h2>From the overview to the facts.</h2><p class="muted">Select a node to read its full content. Expand summary topics to follow their sources down through each layer. Rules and unsummarized details are standalone roots.</p></div>
+      <article id="record" hidden>
+        <div class="record-heading"><div><p id="record-project" class="muted"></p><h2 id="record-title" tabindex="-1"></h2><p id="record-meta" class="muted"></p></div><div class="actions"><button id="edit">Edit</button><button id="delete" class="danger">Delete</button></div></div>
+        <p id="explanation" class="explanation" hidden></p>
+        <p id="summary"></p>
+        <pre id="body"></pre>
+        <form id="editor" hidden>
+          <label>Scope<select id="edit-project" required></select></label>
+          <label>Title<input id="title" required></label>
+          <label>Type<select id="type"><option>preference</option><option>instruction</option><option>fact</option><option>working</option><option>recap</option><option>reference</option></select></label>
+          <label>Index summary<input id="edit-summary" placeholder="A short hook for finding this memory"></label>
+          <label>Content<textarea id="content" rows="16" required spellcheck="false"></textarea></label>
+          <p class="muted">Global memories apply across projects; project memories are shared by its worktrees. Corrections stay in their original scope, keep the previous version, and retire dependent summaries.</p>
+          <div class="actions"><button type="submit" id="save" class="primary">Save correction</button><button type="button" id="cancel">Cancel</button></div>
+        </form>
+        <section id="relations" aria-label="Related memories"></section>
+      </article>
+    </section>
+  </main>
+  <dialog id="confirmation" aria-labelledby="delete-title">
+    <h2 id="delete-title">Delete this record?</h2>
+    <p id="delete-description"></p>
+    <p class="muted">Dependent summaries will also be removed. Sibling records, source details, and earlier versions are preserved. This cannot be undone here.</p>
+    <form method="dialog" class="actions"><button value="cancel" autofocus>Cancel</button><button value="delete" class="danger">Delete record</button></form>
+  </dialog>
+</body>
+</html>

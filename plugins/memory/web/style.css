@@ -1,0 +1,126 @@
+:root {
+  color-scheme: light dark;
+  font-family: system-ui, sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  --bg: light-dark(#f7f7f5, #171716);
+  --surface: light-dark(#fff, #1e1e1c);
+  --text: light-dark(#20201e, #efefeb);
+  --muted: light-dark(#62625c, #aaa99e);
+  --line: light-dark(#deded7, #393933);
+  --hover: light-dark(#edede7, #2c2c27);
+  --accent: light-dark(#345b35, #b1d4a3);
+  --danger: light-dark(#a32b2b, #f5a49a);
+  background: var(--bg);
+  color: var(--text);
+}
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+body { margin: 0; }
+header { min-height: 90px; padding: 20px 28px; display: flex; gap: 16px; align-items: center; justify-content: space-between; box-shadow: 0 1px var(--line); }
+header > div:first-child { display: flex; gap: 20px; align-items: baseline; }
+h1, h2, p { margin: 0; }
+h1 { font-size: 22px; letter-spacing: -.025em; line-height: 1.1; }
+h2 { font-size: 20px; line-height: 1.2; letter-spacing: -.015em; text-wrap: balance; }
+.muted { color: var(--muted); font-size: 13px; }
+.actions { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+button, input, select, textarea { font: inherit; color: inherit; }
+button { min-height: 40px; padding: 8px 14px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface); cursor: pointer; user-select: none; transition: background-color 120ms, scale 120ms; }
+button:hover { background: var(--hover); }
+button:active { scale: .96; }
+button:disabled { opacity: .5; cursor: default; }
+button.primary { background: var(--accent); color: var(--bg); border-color: transparent; }
+button.danger { color: var(--danger); }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+main { display: grid; grid-template-columns: minmax(0, 1fr) minmax(320px, 420px); height: calc(100dvh - 90px); }
+aside { display: flex; flex-direction: column; min-height: 0; min-width: 0; box-shadow: 1px 0 var(--line); }
+.filters { padding: 20px; display: grid; grid-template-columns: minmax(120px, 1fr) minmax(150px, 1.3fr) minmax(140px, 1fr); gap: 12px; }
+label { display: grid; gap: 6px; font-size: 13px; font-weight: 550; }
+input, select, textarea { width: 100%; min-width: 0; padding: 9px 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); font-weight: 400; }
+select { min-height: 40px; }
+textarea { resize: vertical; line-height: 1.6; font-family: ui-monospace, monospace; }
+#count { font-variant-numeric: tabular-nums; grid-column: 1 / -1; }
+#topics { overflow: auto; min-height: 0; flex: 1; padding: 4px 10px 24px; }
+.graph-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 0 20px 16px; box-shadow: 0 1px var(--line); }
+.graph-toolbar strong { font-size: 13px; font-weight: 600; }
+.graph-toolbar p { margin-block-start: 4px; max-width: 65ch; }
+.graph-toolbar .actions { flex-wrap: nowrap; gap: 4px; }
+.graph-toolbar button { padding-inline: 10px; }
+#zoom-reset { min-width: 64px; font-variant-numeric: tabular-nums; }
+#topics.graph-view { padding: 0; background: var(--bg); overscroll-behavior: contain; }
+.graph-frame { position: relative; }
+.graph-surface { position: relative; transform-origin: top left; }
+.graph-project { position: absolute; inset-inline-start: 24px; width: min(560px, calc(100% - 48px)); font-size: 14px; line-height: 1.35; letter-spacing: 0; color: var(--muted); overflow-wrap: anywhere; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.graph-edges { position: absolute; inset: 0; pointer-events: none; }
+.graph-edge { fill: none; stroke: var(--line); stroke-width: 2; }
+.graph-edge.selected { stroke: var(--accent); }
+.graph-node { position: absolute; width: 256px; height: 176px; background: var(--surface); border: 1px solid var(--line); border-radius: 10px; box-shadow: 0 2px 5px #00000008; overflow: clip; }
+.graph-node.in-lineage { border-color: var(--muted); }
+.graph-node.selected { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+.graph-node .graph-select { margin: 0; padding: 12px 14px; height: 176px; border: 0; border-radius: 0; align-content: start; gap: 6px; }
+.summary-node .graph-select:not(:only-child) { height: 136px; padding-block: 10px; gap: 4px; }
+.graph-select strong { font-size: 14px; line-height: 1.3; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.graph-select .preview { line-height: 1.4; }
+.graph-select .node-kind { font-size: 12px; line-height: 1.3; }
+.summary-node .node-kind { color: var(--accent); }
+.graph-toggle { width: 100%; height: 40px; padding: 8px 14px; border: 0; border-radius: 0; box-shadow: 0 -1px var(--line); text-align: start; font-size: 13px; color: var(--muted); background: transparent; }
+.graph-node button:active { scale: 1; }
+.graph-node button:focus-visible { outline-offset: -3px; }
+.topic { width: 100%; display: grid; gap: 5px; text-align: start; margin-block: 2px; padding: 12px 10px; border-color: transparent; background: transparent; }
+.topic[aria-current="true"] { background: var(--hover); border-color: var(--line); }
+.topic strong { font-weight: 600; overflow-wrap: anywhere; }
+.topic .preview { color: var(--muted); font-size: 13px; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.topic small { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+#detail { overflow-y: auto; padding: 28px 24px; min-width: 0; }
+#empty { max-width: 55ch; margin-block-start: 12vh; }
+#empty p { margin-block-start: 14px; font-size: 16px; }
+#record { max-width: 900px; margin-inline: auto; }
+.record-heading { display: flex; flex-direction: column; align-items: start; gap: 20px; margin-block-end: 24px; }
+#record-project { overflow-wrap: anywhere; margin-block-end: 10px; }
+#record-title { overflow-wrap: anywhere; }
+#record-meta { margin-block-start: 10px; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
+#summary { font-size: 16px; color: var(--muted); max-width: 70ch; text-wrap: pretty; margin-block-end: 24px; }
+#body { font: 16px/1.7 system-ui, sans-serif; white-space: pre-wrap; overflow-wrap: anywhere; max-width: 75ch; }
+.explanation { padding: 12px 16px; background: var(--hover); border-radius: 7px; margin-block-end: 24px; max-width: 75ch; }
+#editor { display: grid; gap: 18px; }
+#relations { display: grid; gap: 8px; margin-block-start: 36px; padding-block-start: 20px; box-shadow: 0 -1px var(--line); }
+#relations h3 { font-size: 14px; margin: 0 0 4px; }
+#relations button { text-align: start; overflow-wrap: anywhere; }
+#notice { padding: 12px 28px; background: var(--hover); overflow-wrap: anywhere; }
+#notice.error { color: var(--danger); }
+dialog { max-width: min(520px, calc(100% - 32px)); padding: 28px; background: var(--surface); color: var(--text); border: 1px solid var(--line); border-radius: 12px; box-shadow: 0 16px 48px #0003; }
+dialog::backdrop { background: #0006; }
+dialog p { margin-block: 16px; }
+dialog .actions { justify-content: end; }
+::selection { background: var(--accent); color: var(--bg); }
+@media (max-width: 1100px) {
+  main { grid-template-columns: minmax(0, 1fr) 340px; }
+  .filters { grid-template-columns: 1fr 1fr; }
+  .filters label:nth-child(2) { grid-column: 2; grid-row: 1 / 3; align-content: start; }
+}
+@media (max-width: 800px) {
+  main { display: block; height: auto; }
+  aside { height: 70dvh; min-height: 440px; }
+  #detail { overflow: visible; }
+  header > div:first-child { display: grid; gap: 8px; }
+  .filters { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+  .graph-toolbar { gap: 8px; }
+  #empty { margin-block-start: 0; }
+}
+@media (max-width: 600px) {
+  header { padding: 18px 16px; }
+  header .muted { display: none; }
+  #detail { overflow: visible; padding: 28px 20px; }
+  input, select, textarea { font-size: 16px; }
+  button { min-height: 44px; }
+  .summary-node .graph-select:not(:only-child) { height: 132px; }
+  .graph-toggle { height: 44px; }
+  .graph-toolbar { align-items: start; padding-inline: 16px; }
+  .filters { padding: 16px; }
+  #empty { margin-block-start: 0; }
+}
+@media (prefers-reduced-motion: reduce) {
+  button { transition: none; }
+  button:active { scale: 1; }
+}

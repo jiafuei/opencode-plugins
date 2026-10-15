@@ -2,13 +2,10 @@ import { afterAll, describe, expect, jest, test } from "bun:test";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { join } from "node:path";
-import MemoryModule, {
-  dreamDue,
-  indexLine,
-  memoryProjectKey,
-  parseIndex,
-} from "./server.tsx";
+import MemoryModule, { dreamDue } from "./server.tsx";
+import { indexLine, parseIndex } from "./store.ts";
 import MemoryTui from "./tui.tsx";
+import { importMemoryPartition, memoryProjectKey, memoryScopeRoot, openMemoryStore } from "./scope.ts";
 
 // Keeps memory files away from the real data directory.
 const dataHome = `/tmp/opencode/memory-test-${crypto.randomUUID()}`;
@@ -39,6 +36,7 @@ async function fixture(
     dream_model?: string;
     idle_delay_ms?: number;
     dream_topic_limit?: number;
+    canonical?: string;
   } = {},
   storage = new Map<string, unknown>(),
 ) {
@@ -51,7 +49,7 @@ async function fixture(
   let handlers: Handlers = {};
   const tools: Record<string, MemoryTool> = {};
   const ctx = {
-    location: { directory },
+    location: { directory, project: { id: "test-project", directory, canonical: options.canonical ?? directory } },
     options,
     generate: {
       text: async (input: WorkerCall) => {
@@ -105,7 +103,7 @@ async function fixture(
     save: (sessionID: string, input: Record<string, unknown>) => tools.memory_save!.execute(input, { sessionID, agent: "build" }),
     correct: (sessionID: string, id: string, input: Record<string, unknown>) => tools.memory_correct!.execute({ id, ...input }, { sessionID, agent: "build" }),
     read: (sessionID: string, id: string) => tools.memory_read!.execute({ id }, { sessionID, agent: "build" }),
-    search: (sessionID: string, query: string, offset?: number) => tools.memory_search!.execute({ query, ...(offset === undefined ? {} : { offset }) }, { sessionID, agent: "build" }),
+    search: (sessionID: string, query: string, offset?: number, all_projects?: boolean) => tools.memory_search!.execute({ query, ...(offset === undefined ? {} : { offset }), all_projects }, { sessionID, agent: "build" }),
     delete: (sessionID: string, id: string) => tools.memory_delete!.execute({ id }, { sessionID, agent: "build" }),
     history: (sessionID: string, messages: unknown[]) => histories.set(sessionID, messages),
     message: async (sessionID: string, text: string) => {
@@ -188,6 +186,169 @@ const isReflection = (call: WorkerCall) => call.prompt.startsWith("You are a pro
 const isReflectionSelector = (call: WorkerCall) => call.prompt.startsWith("You are a project-memory reflection selector");
 const isDreamSelector = (call: WorkerCall) => call.prompt.startsWith("You are a project-memory consolidation selector");
 const isDreamCurator = (call: WorkerCall) => call.prompt.startsWith("You are a project-memory curator");
+
+describe("memory scopes", () => {
+  test.serial("manual dreaming visits both scopes without combining their sources", async () => {
+    const directory = "/tmp/scoped-memory-dream";
+    const storage = new Map<string, unknown>();
+    const project = store(storage, directory, [{ file: "one.md", content: "project evidence one" }, { file: "two.md", content: "project evidence two" }]);
+    const central = join(dataHome, "opencode", "memory");
+    const global = openMemoryStore(central, "global");
+    await global.writeTopic("one.md", "global evidence one");
+    await global.writeTopic("two.md", "global evidence two");
+    await global.writeIndex(["one.md", "two.md"].map((file) => ({ title: file, file, summary: "Global evidence", type: "reference" as const, updated: "2026-10-16" })));
+    const app = await fixture(directory, (call) => {
+      if (isDreamSelector(call)) return { action: "synthesize", files: ["one.md", "two.md"], reason: "Related evidence" };
+      const globalScope = call.prompt.includes("global evidence one");
+      expect(call.prompt.includes("project evidence one")).toBe(!globalScope);
+      return { title: globalScope ? "Global summary" : "Project summary", summary: "Evidence", content: globalScope ? "global evidence" : "project evidence" };
+    }, {}, storage);
+    try {
+      await app.dream("req-scoped-dream");
+      await until(() => app.statuses().some((status) => status.state !== "running"));
+      const status = app.statuses().at(-1)!;
+      expect(status.state).toBe("changed");
+      expect(status.counts!.synthesize).toBe(2);
+      const globalSummary = (await global.readCatalog()).find((entry) => entry.children)!;
+      const projectSummary = project.index().find((entry) => entry.children)!;
+      expect(globalSummary.title).toBe("Global summary");
+      expect(projectSummary.title).toBe("Project summary");
+      expect(globalSummary.children!.map((child) => child.file)).toEqual(["one.md", "two.md"]);
+      expect(projectSummary.children!.map((child) => child.file)).toEqual(["one.md", "two.md"]);
+      const state = await app.rpc.state!({} as never) as { topics: Array<{ file: string; scope: string; path: string; children: string[]; parent?: string }> };
+      const globalTopic = state.topics.find((entry) => entry.file === `global:${globalSummary.file}`)!;
+      expect(globalTopic).toMatchObject({ scope: "global", path: join(memoryScopeRoot(central, "global"), globalSummary.file), children: ["global:one.md", "global:two.md"] });
+      expect(state.topics.find((entry) => entry.file === "global:one.md")!.parent).toBe(`global:${globalSummary.file}`);
+      expect(state.topics.find((entry) => entry.file === projectSummary.file)!.scope).toBe("project");
+    } finally {
+      await app.dispose();
+      await rm(memoryScopeRoot(central, "global"), { recursive: true, force: true });
+    }
+  });
+
+  test.serial("worktrees share canonical memory while global and explicit cross-project IDs stay distinct", async () => {
+    const storage = new Map<string, unknown>();
+    const canonical = "/tmp/scoped-memory-main";
+    const otherDirectory = "/tmp/scoped-memory-other";
+    const project = store(storage, canonical, [{ file: "shared.md", content: "scopeprobe project" }]);
+    const other = store(storage, otherDirectory, [{ file: "shared.md", content: "scopeprobe other" }]);
+    const central = join(dataHome, "opencode", "memory");
+    const global = openMemoryStore(central, "global");
+    await global.writeTopic("shared.md", "scopeprobe global");
+    await global.writeIndex([{ title: "General", file: "shared.md", summary: "General preference", type: "preference", updated: "2026-10-16" }]);
+    const main = await fixture(canonical, noMemories, {}, storage);
+    const worktree = await fixture("/tmp/scoped-memory-worktree", noMemories, { canonical }, storage);
+    try {
+      const injected = (await worktree.context("ses_sub_scopes")).system[0]!.text;
+      expect(injected).toContain("scopeprobe global");
+      expect(injected).toContain("[id: shared.md]");
+      expect(injected).not.toContain("scopeprobe other");
+      const local = (await main.search("ses_scopes", "scopeprobe")).content;
+      expect(local).toContain("[id: global:shared.md]");
+      expect(local).toContain("[id: shared.md]");
+      expect(local).not.toContain("project:");
+      const remoteID = `project:${memoryProjectKey(otherDirectory)}:shared.md`;
+      expect((await main.search("ses_scopes", "scopeprobe", 0, true)).content).toContain(`[id: ${remoteID}]`);
+      expect((await main.read("ses_scopes", remoteID)).content).toContain("scopeprobe other");
+      await expect(main.correct("ses_scopes", remoteID, { content: "Wrong project" })).rejects.toThrow("read-only");
+      await expect(main.delete("ses_scopes", remoteID)).rejects.toThrow("read-only");
+      await worktree.correct("ses_scopes", "shared.md", { content: "canonical correction" });
+      expect((await main.read("ses_scopes", "shared.md")).content).toContain("Historical version");
+      expect(project.index().find((entry) => entry.file === "shared.md")!.supersededBy).toBeDefined();
+      expect(other.topic("shared.md")).toBe("scopeprobe other");
+      await main.delete("ses_scopes", "global:shared.md");
+      expect(project.topic("shared.md")).toBe("scopeprobe project");
+      expect(await global.readCatalog()).toHaveLength(0);
+      await expect(main.read("ses_scopes", "../shared.md")).rejects.toThrow("exact memory id");
+    } finally {
+      await main.dispose();
+      await worktree.dispose();
+      await rm(memoryScopeRoot(central, "global"), { recursive: true, force: true });
+    }
+  });
+
+  test.serial("reflection creates requested global context and corrects its original scope", async () => {
+    const directory = "/tmp/scoped-memory-reflection";
+    const storage = new Map<string, unknown>();
+    const central = join(dataHome, "opencode", "memory");
+    const global = openMemoryStore(central, "global");
+    await global.writeTopic("rule.md", "Use the old style.");
+    await global.writeIndex([{ title: "Style", file: "rule.md", summary: "Style preference", type: "preference", updated: "2026-10-16" }]);
+    const app = await fixture(directory, (call) => isReflectionSelector(call)
+      ? { needed: true, ids: ["global:rule.md"] }
+      : { create: [{ ...memoryExtraction({ title: "Shared reference", type: "reference" }), scope: "global" }], correct: [{ id: "global:rule.md", content: "Use the new style." }] }, { idle_delay_ms: 1000 }, storage);
+    try {
+      await app.context("ses_scope_reflect");
+      app.history("ses_scope_reflect", [{ id: "msg_1", type: "user", text: "Use the new style everywhere, and save this reference globally." }]);
+      jest.useFakeTimers();
+      await app.emit("session.execution.succeeded", "ses_scope_reflect");
+      jest.advanceTimersByTime(1000);
+      await until(() => app.saved().length === 2 || app.errors().length > 0);
+      expect(app.errors()).toHaveLength(0);
+      const catalog = await global.readCatalog();
+      const original = catalog.find((entry) => entry.file === "rule.md")!;
+      expect(await global.readTopic(original.supersededBy!)).toBe("Use the new style.");
+      expect(catalog.find((entry) => entry.title === "Shared reference")!.type).toBe("reference");
+      expect(memory(storage, directory).index()).toHaveLength(0);
+    } finally {
+      jest.useRealTimers();
+      await app.dispose();
+      await rm(memoryScopeRoot(central, "global"), { recursive: true, force: true });
+    }
+  });
+
+  test.serial("lazy imports preserve history and do not resurrect deletes or overwrite collisions", async () => {
+    const central = join(dataHome, "migration");
+    const source = openMemoryStore(central, "old-worktree");
+    const target = openMemoryStore(central, "canonical");
+    await source.writeTopic("original.md", "original");
+    await source.writeTopic("replacement.md", "replacement");
+    await source.writeIndex([
+      { title: "Original", file: "original.md", summary: "History", type: "fact", updated: "2026-10-16", supersededBy: "replacement.md" },
+      { title: "Replacement", file: "replacement.md", summary: "Current", type: "fact", updated: "2026-10-16" },
+    ]);
+    await importMemoryPartition(central, "old-worktree", "canonical");
+    expect(await target.readCatalog()).toEqual(await source.readCatalog());
+    expect(await target.readTopic("original.md")).toBe("original");
+    await target.serializeWrite(async () => target.remove(await target.readCatalog(), "replacement.md"));
+    await importMemoryPartition(central, "old-worktree", "canonical");
+    expect((await target.readCatalog()).map((entry) => entry.file)).toEqual(["original.md"]);
+    expect(await source.readTopic("replacement.md")).toBe("replacement");
+    const collision = openMemoryStore(central, "collision");
+    await collision.writeTopic("original.md", "unknown destination body");
+    await expect(importMemoryPartition(central, "canonical", "collision")).rejects.toThrow("collision");
+    expect(await collision.readTopic("original.md")).toBe("unknown destination body");
+    expect(await target.readTopic("original.md")).toBe("original");
+  });
+
+  test.serial("independent store views serialize writes without sharing their enabled policy", async () => {
+    const central = join(dataHome, "queues");
+    const first = openMemoryStore(central, "shared", async () => false);
+    const second = openMemoryStore(central, "shared", async () => true);
+    let release!: () => void;
+    let entered!: () => void;
+    const started = new Promise<void>((resolve) => { entered = resolve; });
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const one = first.serializeWrite(async () => {
+      const catalog = await first.readCatalog();
+      entered();
+      await gate;
+      return first.save(catalog, memoryExtraction({ title: "First" }) as never);
+    });
+    await started;
+    const two = second.serializeWrite(async () => second.save(await second.readCatalog(), memoryExtraction({ title: "Second" }) as never));
+    release();
+    await Promise.all([one, two]);
+    expect((await first.readCatalog()).map((entry) => entry.title).sort()).toEqual(["First", "Second"]);
+    const stale = { title: "Summary", file: "summary.md", summary: "Stale", type: "insight" as const, updated: "2026-10-16", children: [{ file: "missing.md", revision: "missing" }] };
+    await first.writeTopic(stale.file, "Derived content");
+    await first.writeIndex([stale, ...await first.readCatalog()]);
+    await first.readView();
+    expect((await first.readCatalog())[0]!.retired).not.toBe(true);
+    await second.readView();
+    expect((await first.readCatalog())[0]!.retired).toBe(true);
+  });
+});
 
 async function until(condition: () => boolean | Promise<boolean>) {
   while (!(await condition())) await new Promise<void>((resolve) => setImmediate(resolve));
