@@ -7,7 +7,10 @@ import { MemoryRpc, type DreamStatus } from "./rpc.ts";
 type Choice =
   | { type: "toggle"; key: "enabled" | "dream_auto" }
   | { type: "dreamNow" }
-  | { type: "topic"; file: string };
+  | { type: "topic"; file: string }
+  | { type: "edit"; file: string }
+  | { type: "history" }
+  | { type: "back" };
 
 // Concise operation counts for the dream completion toast.
 export function dreamCountsMessage(counts: Record<string, unknown> | undefined): string {
@@ -114,13 +117,30 @@ export default Plugin.define({
       ctx.ui.toast.show({ variant: "info", title: "Memory", message: "Dreaming..." });
     };
 
-    // Choosing a topic opens its markdown file directly in the editor.
-    const showMemory = async (): Promise<void> => {
+    const showMemory = async (focus?: string, history = false): Promise<void> => {
       const state = await memory.state({}, location);
+      const topic = state.topics.find((entry) => entry.file === focus);
+      const description = (entry: typeof state.topics[number]) => {
+        const parent = state.topics.find((other) => other.file === entry.parent);
+        return `[${entry.status}] ${parent ? `In ${parent.title} · ` : ""}${entry.summary}`;
+      };
+      const related = topic ? [
+        ...topic.children.map((file) => ({ file, relation: "Source" })),
+        ...(topic.parent ? [{ file: topic.parent, relation: "Parent summary" }] : []),
+        ...(topic.supersededBy ? [{ file: topic.supersededBy, relation: "Replacement" }] : []),
+        ...topic.supersedes.map((file) => ({ file, relation: "Earlier version" })),
+      ].flatMap(({ file, relation }) => {
+        const entry = state.topics.find((other) => other.file === file);
+        return entry ? [{ title: `${relation}: ${entry.title}`, description: description(entry), value: { type: "topic" as const, file } }] : [];
+      }) : [];
       const choice = await ctx.ui.dialog.select<Choice>({
-        title: "Project memory",
-        placeholder: "Search memory",
-        options: [
+        title: topic ? topic.title : history ? "Project memory · retained history" : "Project memory · active topics",
+        placeholder: topic ? "Navigate sources or edit this record" : "Filter topics",
+        options: topic ? [
+          { title: "Back to topics", value: { type: "back" } },
+          { title: "Open in editor", description: `${description(topic)}${topic.parent ? " · Saving changes retires the summaries above this record" : ""}`, value: { type: "edit", file: topic.file } },
+          ...related,
+        ] : [
           {
             title: `Auto-memory: ${state.enabled ? "enabled" : "disabled"}`,
             description: state.enabled ? "Disable recall and learning" : "Enable recall and learning",
@@ -128,7 +148,7 @@ export default Plugin.define({
           },
           {
             title: `Auto-dream: ${state.dream_auto ? "enabled" : "disabled"}`,
-            description: state.dream_auto ? "Disable periodic memory dreaming" : "Enable periodic memory dreaming",
+            description: state.dream_auto ? "Disable all automatic dreaming" : "Enable automatic dreaming",
             value: { type: "toggle", key: "dream_auto" },
           },
           {
@@ -136,31 +156,46 @@ export default Plugin.define({
             description: "Run one memory dreaming pass now",
             value: { type: "dreamNow" },
           },
-          ...state.topics.map((topic) => ({
-            title: topic.title,
-            description: topic.summary,
-            value: { type: "topic" as const, file: topic.file },
+          {
+            title: history ? "Show active topics only" : "Show retained history",
+            description: "Consolidated details, superseded versions, and retired summaries",
+            value: { type: "history" },
+          },
+          ...state.topics.filter((entry) => history || entry.status === "active").map((entry) => ({
+            title: entry.title,
+            description: description(entry),
+            value: { type: "topic" as const, file: entry.file },
           })),
         ],
       });
       if (!choice) return;
+      if (choice.type === "back" || choice.type === "history") {
+        await showMemory(undefined, choice.type === "history" ? !history : history);
+        return;
+      }
       if (choice.type === "toggle") {
         await memory.toggle({ key: choice.key }, location);
-        await showMemory();
+        await showMemory(undefined, history);
         return;
       }
       if (choice.type === "dreamNow") {
         await requestDream();
-        await showMemory();
+        await showMemory(undefined, history);
+        return;
+      }
+      if (choice.type === "topic") {
+        await showMemory(choice.file, history);
         return;
       }
       await openInEditor(ctx, join(state.directory, choice.file), workspace);
+      await showMemory(choice.file, history);
     };
 
     // Review and save notifications only surface for sessions this TUI knows.
     const known = (sessionID: string) => ctx.data.session.get(sessionID) !== undefined;
 
     const unsubscribers = [
+      memory.events.on("error", (event) => toastError(event.data.message)),
       memory.events.on("review", (event) => {
         if (known(event.data.sessionID)) ctx.ui.toast.show({ variant: "info", title: "Memory", message: "Reviewing conversation..." });
       }),

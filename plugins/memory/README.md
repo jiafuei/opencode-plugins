@@ -1,21 +1,26 @@
 # Memory
 
 Project-scoped memory for OpenCode, with a Claude Code-like `/memory` browser. The model remembers your preferences,
-instructions, and hard-won context across sessions, so you don't have to repeat them. Memory is a compact hint layer
-for things that are expensive to re-derive, not a changelog or source of truth.
+instructions, facts, and working details across sessions, so you don't have to repeat them. Detailed records remain
+available beneath progressively coarser summaries. Memory is a hint layer, not a source of truth.
 
 ## How it works
 
 - **Recall.** Each session starts with the project's memory index in context. Preferences and instructions you gave
   are followed; other entries are hints the model reads in full and verifies before relying on them.
-- **Saving.** The model saves memories with a `memory` tool when you state a preference or instruction, correct it, or
-  settle a hard question. A `Saved: <title>` toast shows each save.
-- **Reflection.** When a session goes idle, a background review saves preferences and instructions you stated that
-  the model missed. The TUI shows `Reviewing conversation...` while it runs.
-- **Updates.** Memories saved or edited in one session reach other open sessions on their next user message.
-- **Dreaming.** As memory grows, a periodic cleanup merges related topics and removes stale ones. Removed topics are
-  quarantined first, not deleted outright. The sidebar shows `Dreaming...` while it runs.
-- **Subagents** get your preferences and instructions inline, an index of other topics, and a read-only `memory` tool.
+- **Saving.** The model saves user-stated or explicitly confirmed preferences, instructions, facts, and working
+  details with a `memory` tool. Conditions, qualifications, and uncertainty are preserved before summarization.
+  Tentative ideas stay labeled as tentative. A `Saved: <title>` toast shows each save.
+- **Reflection.** When a session goes idle, a background review catches user-grounded memories the model missed.
+  It can read existing details and apply explicit user corrections while retaining the previous version. The TUI
+  shows `Reviewing conversation...` while it runs.
+- **Updates.** Saves and index/body edits reach primary sessions on their next user message as reread notices.
+- **Dreaming.** As memory grows, background consolidation adds summaries over related topics without deleting their
+  sources. Summaries can themselves be summarized, building multiple layers. Preferences and instructions are never
+  folded into summaries. The sidebar shows `Dreaming...` while it runs.
+- **Retrieval.** Read a summary to discover its source IDs, then read those IDs for more detail. Literal search reaches
+  retained records directly, including details omitted from summaries.
+- **Subagents** get your preferences and instructions inline, an index of other topics, and read/search access to memory.
   They cannot save or delete memories.
 
 Memory is designed to keep the provider's prompt cache warm: what the model sees doesn't change mid-session, and new
@@ -27,9 +32,14 @@ memories arrive as small additions instead.
 | --- | --- |
 | `preference` | Durable general preferences you stated |
 | `instruction` | Scoped instructions that apply to future work |
+| `fact` | A granular fact you stated or explicitly confirmed |
+| `working` | User-grounded working details, including clearly labeled tentative ideas |
 | `recap` | Context from a completed hard task, to avoid re-deriving it |
 | `reference` | Lasting external material |
-| `insight` | A conclusion merged from several memories by dreaming; a hint, not a fact you stated |
+| `insight` | A derived summary with links to its source records; a hint, not a fact you stated |
+
+Assistant conclusions and tool results alone do not establish memories. Assistant text may explain what your explicit
+confirmation refers to; silence does not count as confirmation. Secrets should not be saved.
 
 ## Storage
 
@@ -42,12 +52,14 @@ ${XDG_DATA_HOME:-~/.local/share}/opencode/memory/-home-alice-project-a1b2c3d4/
 `-- <short-title>-<random>.md
 ```
 
-`index.md` has one line per topic:
+`index.md` catalogs retained records, with one line per topic:
 
 ```markdown
 - [Short title](short-title-a1b2c3d4.md) - [preference|2026-08-23] One-line summary
 ```
 
+Hierarchy and correction metadata are stored in trailing HTML comments on index lines. Existing flat indexes work
+without migration. The session index shows only current roots: summaries, uncompacted details, and pinned rules.
 The model sees topic identifiers rather than file links:
 
 ```text
@@ -55,11 +67,24 @@ The model sees topic identifiers rather than file links:
 ```
 
 Agents retrieve topics with `memory` (`action: "read"`, `target: "short-title-a1b2c3d4.md"`), not filesystem paths.
-If a topic was merged or removed, the tool returns the current index so the agent can select a relevant replacement.
+Consolidated source IDs remain readable. Search retained details with `memory` (`action: "search"`,
+`query: "Redis fixture"`). Queries match a literal phrase or substring, not a list of keywords. Results provide a
+next `offset` when there are more than 20 matches; repeat the same query with that offset. Concurrent saves can shift
+pages. Retired summaries are excluded from search but remain browsable. Missing IDs return the current root index.
 
-Topic files hold the body alone, with no frontmatter; the title, summary, type, and write date live only in the index
-line. Edits to a topic apply the next time it is read, and edits to the index reach sessions on their next user
-message. Index lines not in this format are dropped the next time the plugin writes the index.
+Topic files hold the body alone, with no frontmatter; metadata lives in the index. Edits to source content or metadata
+permanently retire dependent summaries when detected, exposing finer details again. Retired bodies remain as history;
+reverting an edit does not reactivate an observed stale summary. Missing-body records keep their metadata and are
+hidden from active context until restored; their retired ancestor summaries do not reactivate when files return.
+Preserve hierarchy comments when editing metadata; malformed metadata is
+reported through logs and an error toast rather than silently discarded. Lines outside the index format are dropped
+the next time the plugin writes the index.
+
+Replacing a detailed record creates a new ID and retains the old record as superseded. Correct an incorrect source
+detail; if only the summary is wrong, delete/unfold it and run dreaming again. Explicit deletion removes the selected
+record and dependent summaries, not earlier versions or sibling details. Deleting a summary unfolds its sources.
+Deleting a replacement does not restore its predecessor automatically, but that retained predecessor can be explicitly
+corrected again. Consolidation never expires original records automatically.
 
 ## Installation
 
@@ -95,23 +120,31 @@ The package includes both the server and TUI sides. To customize it, replace its
 | `reflect_model` | OpenCode's default model | Idle reflection model |
 | `dream_model` | `reflect_model` | Dreaming model |
 | `idle_delay_ms` | `300000` | Idle time after an execution before reflection |
-| `dream_interval_hours` | `36` | Minimum hours between automatic dreams |
-| `dream_min_additions` | `7` | Minimum new or replaced topics before an automatic dream |
-| `dream_index_bytes` | `8192` | Index size in bytes that starts a dream after a save |
-| `dream_topic_limit` | `200` | Topic count that starts a dream after a save |
+| `dream_interval_hours` | `36` | Minimum interval for periodic automatic dreams |
+| `dream_min_additions` | `7` | Minimum additions/replacements for periodic automatic dreams |
+| `dream_index_bytes` | `8192` | Dreamable root-index byte threshold; crossing it starts a dream |
+| `dream_topic_limit` | `200` | Dreamable root-count threshold; crossing it starts a dream |
+
+Auto-dream controls both periodic and threshold-triggered runs. Thresholds exclude pinned rules, trigger only on a
+crossing, and respect the failure retry backoff. An already-running dream may finish after Auto-dream is disabled;
+manual `/dream` remains available while automatic dreaming is off. Thresholds are maintenance triggers, not hard caps.
 
 Models use `provider/model` or `provider/model#variant`. Quit and restart OpenCode after installing or changing the
 configuration.
 
 ## Commands
 
-- `/memory` turns memory and automatic dreaming on or off for the project, starts a dream, and lists topics; choosing
-  one opens its markdown file in `$VISUAL` or `$EDITOR`. Toggling memory can invalidate the provider's prompt cache.
+- `/memory` controls memory and automatic dreaming and lists active topics first. **Show retained history** includes
+  consolidated details, superseded versions, retired summaries, and missing records. Choosing a topic opens navigation
+  to its sources, parent summary, replacement, or earlier versions by title, plus **Open in editor** (`$VISUAL` or
+  `$EDITOR`). Editing a consolidated record warns that its summaries will retire. Toggling
+  memory can invalidate the provider's prompt cache.
 - `/dream` starts a dream without adding a conversation message.
 
 ## Data disclosure
 
-Reflection sends the session's user and assistant text to `reflect_model`, along with the memory index. Dreaming sends
-the index and selected topics to `dream_model`. Choose both within your intended data-disclosure boundary.
+Reflection sends the session's user and assistant text, root/detail indexes, and any selected detail bodies to
+`reflect_model`. Dreaming sends the index and selected topics to `dream_model`. Choose both within your intended
+data-disclosure boundary.
 
 See [DESIGN.md](DESIGN.md) for how recall, updates, reflection, and dreaming work in detail.

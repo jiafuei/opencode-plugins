@@ -17,7 +17,16 @@ export const MemoryRpc = Rpc.define({
         enabled: Schema.Boolean,
         dream_auto: Schema.Boolean,
         directory: Schema.String,
-        topics: Schema.Array(Schema.Struct({ file: Schema.String, title: Schema.String, summary: Schema.String })),
+        topics: Schema.Array(Schema.Struct({
+          file: Schema.String,
+          title: Schema.String,
+          summary: Schema.String,
+          status: Schema.String,
+          children: Schema.Array(Schema.String),
+          supersedes: Schema.Array(Schema.String),
+          parent: Schema.optional(Schema.String),
+          supersededBy: Schema.optional(Schema.String),
+        })),
       })),
     },
     toggle: {
@@ -26,6 +35,7 @@ export const MemoryRpc = Rpc.define({
     },
   },
   events: {
+    error: { schema: Schema.toStandardSchemaV1(Schema.Struct({ message: Schema.String })) },
     review: { schema: Schema.toStandardSchemaV1(Schema.Struct({ sessionID: Schema.String })) },
     saved: { schema: Schema.toStandardSchemaV1(Schema.Struct({ sessionID: Schema.String, title: Schema.String })) },
     dream: {
