@@ -15,6 +15,12 @@ Standalone plugins for [OpenCode](https://opencode.ai), maintained as independen
 - [OpenRouter](plugins/openrouter/README.md): routing and privacy settings with global, folder, and session overrides and a local web UI.
 - [Workflows](plugins/workflows/README.md): declarative child-agent workflows with steering and a native TUI inspector.
 
+## Skills
+
+- [OpenCode sessions](skills/opencode-sessions/SKILL.md): search V2 sessions and message bodies, and dump JSONL transcripts with optional tool output. Includes a standalone Bun CLI for other harnesses.
+
+Add this repository's `skills/` directory to OpenCode's `skills` configuration, or copy an individual skill directory into `~/.config/opencode/skills/`.
+
 ## Installation
 
 Install a plugin into the global OpenCode configuration:
