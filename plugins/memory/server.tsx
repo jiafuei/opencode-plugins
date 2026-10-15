@@ -98,10 +98,10 @@ type SessionState = {
 
 type MemoryInput = {
   target?: string;
-  title: string;
-  summary: string;
+  title?: string;
+  summary?: string;
   content: string;
-  type: StoredType;
+  type?: StoredType;
 };
 
 type SessionMessages = Awaited<ReturnType<Plugin.Context["session"]["context"]>>;
@@ -120,14 +120,23 @@ const DREAM_SOFT_TARGET = 30;
 
 const MEMORY_TYPES = ["preference", "instruction", "fact", "working", "recap", "reference"] as const;
 
+const ReflectionSelectionSchema = Schema.Struct({
+  needed: Schema.Boolean,
+  ids: Schema.Array(Schema.String),
+});
+
 const ReflectionSchema = Schema.Struct({
-  read: Schema.optional(Schema.Array(Schema.String)),
-  memories: Schema.Array(Schema.Struct({
-    target: Schema.optional(Schema.String),
+  create: Schema.Array(Schema.Struct({
     title: Schema.String,
     summary: Schema.String,
     content: Schema.String,
     type: Schema.Literals(MEMORY_TYPES),
+  })),
+  correct: Schema.Array(Schema.Struct({
+    id: Schema.String,
+    content: Schema.String,
+    title: Schema.optional(Schema.String),
+    summary: Schema.optional(Schema.String),
   })),
 });
 
@@ -248,11 +257,11 @@ function validateDreamSelection(value: typeof DreamSelectorSchema.Type, candidat
 
 // Shared by the system block and delta parts. It sits in the cached prompt
 // prefix, so it must stay byte-stable.
-const READ_GUIDANCE = `When an entry is relevant, read it with the memory tool (action read, target copied exactly from its [id: ...] field); summaries only describe coverage. A summary topic lists the topic ids it consolidates; read those for detail, or use action search to find exact text across all retained topics.
-- Topic ids are identifiers, not file paths. Always use the memory tool to read topics; never construct memory directory paths or use filesystem tools to retrieve them.
-- preference and instruction entries were stated by the user: follow them unless the current conversation says otherwise.
-- fact and working entries come from what the user stated or confirmed; a working entry's body says whether it is tentative, decided, or abandoned. They may be stale: verify before relying on them.
-- recap, reference, insight, feedback, and project entries are hints that may be stale: read and verify them before relying on them.`;
+const READ_GUIDANCE = `Use memory_read with the exact id from [id: ...]; index hooks describe coverage, not full contents. Use memory_search to find details beneath summary topics; it matches all query words, ignoring order and case.
+- Topic ids are identifiers, not filesystem paths. Retrieve them through memory_read.
+- Only current user-stated preference/instruction records are rules to follow unless the conversation says otherwise. Historical versions are not current instructions.
+- Facts, working details, recaps, references, insights, and legacy topics are hints to verify. Derived summary topics are not user statements; read their sources for specifics.
+- Working details without an explicit decision or abandonment remain tentative.`;
 
 function renderDelta(deltas: Iterable<[string, IndexEntry | null]>): string {
   const upserts: string[] = [];
@@ -285,44 +294,31 @@ function renderTranscript(messages: SessionMessages): string {
 }
 
 const REFLECT_SYSTEM = "You are a project-memory reviewer. Return only the requested JSON result.";
+const REFLECT_SELECTOR_SYSTEM = "You are a project-memory reflection selector. Return only the requested JSON result.";
 
-const REFLECT_PROMPT = `Review this stretch of a coding conversation and catch durable memories the user stated that the agent missed saving with its memory tool. Most stretches need none: return an empty memories array unless something clearly qualifies. Return at most ${MAX_REFLECTIONS}.
+const REFLECT_SELECTOR_PROMPT = `Decide whether this conversation contains user-grounded memories worth capturing or explicit corrections the agent missed. Most reviews need nothing: return needed: false and ids: []. Otherwise return needed: true and the exact ids of existing details to inspect before extraction (usually at most ${CONSOLIDATION_BATCH}). New subjects may need no ids. The detail index includes records beneath summaries. Select related details to avoid duplicate captures and to preserve their qualifications when correcting them. Do not propose memories in this selection phase. "Thanks", "ok", and silence alone do not confirm an assistant claim.`;
 
-Capture only what the user wrote or explicitly confirmed. Use assistant turns only to interpret what a user confirmation refers to (for example what "yes, always do that" or "go with that plan" means). Never capture findings, conclusions, or suggestions from the assistant or its tools that the user did not confirm.
+const REFLECT_PROMPT = `Extract user-grounded memories the agent missed. Return create and correct arrays; both may be empty. Aim for at most ${MAX_REFLECTIONS} changes. Existing detail bodies have already been supplied; there is no lookup phase in this response.
+
+Capture only what the user wrote or explicitly confirmed. Use assistant turns only to interpret what a user confirmation refers to (for example what "yes, always do that" or "go with that plan" means). "Thanks", "ok", and silence alone do not confirm an assistant claim. Never capture independent findings from the assistant or its tools. Rules the user wants future agents to follow are preference/instruction; other context is a hint. When unsure, do not promote context into a rule.
 
 Types:
 - preference: a lasting general preference the user stated or confirmed.
 - instruction: a scoped rule for future work the user stated or confirmed.
 - fact: a project fact the user stated or confirmed, such as a constraint, decision, or piece of context.
-- working: a working detail the user stated, such as a plan, idea, open question, or in-progress decision. Begin its content with "Status: tentative", "Status: decided", or "Status: abandoned", and keep tentative ideas labeled as tentative.
-- recap or reference: preserve these types when correcting an existing supplied detail; do not reclassify it as a fact or working entry.
+- working: a user-stated plan, idea, open question, or working decision. State its uncertainty naturally; it is tentative unless the user decided or abandoned it.
+- recap: a settled conclusion the user confirmed, with useful rationale and rejected alternatives.
+- reference: lasting external material the user pointed to or confirmed is worth returning to.
 
-The detail index includes records folded beneath summaries. Before creating a record on an existing subject, request up to ${CONSOLIDATION_BATCH} exact detail ids in the read array and return an empty memories array. A second call will supply their full contents; there is only one lookup round. In that second call, omit read and use target only for a supplied detail that the user explicitly corrected or moved from tentative to decided/abandoned. Write its complete corrected body; the previous version will remain as history. Do not replace a summary, infer a correction from silence, or duplicate an unchanged detail. Ignore subjects already covered by <session_saves> unless the user explicitly corrected them.
+Use create for new subjects. Use correct with a supplied detail's exact id and its complete updated content only when the user explicitly corrected or changed it. Title and index hook are inherited; optionally update title or summary when the old wording would be misleading after the correction. Type is always inherited. The previous version remains historical. Do not correct a summary, infer a correction from silence, or duplicate an unchanged detail. Ignore subjects covered by <session_saves> unless the user explicitly corrected them.
 
 Skip routine task requests with no lasting value (for example "run the tests") and secrets.
 
 One subject per memory. The summary is a one-line hook under about 100 characters describing what this specific topic covers, in the form "<Area>: <what it covers>" when it applies to only part of the project. Preserve the full user-grounded detail: conditions, rationale, qualifications, rejected alternatives, and uncertainty. Brevity is secondary to completeness; coarser compression belongs in derived summaries. Omit frontmatter and narration, not useful detail.`;
 
-const MEMORY_TOOL_DESCRIPTION = `Read, search, save, or delete a project memory: a durable note that future sessions see in the <memory> index.
+const CAPTURE_GUIDANCE = `Capture only user-stated or explicitly confirmed information, not independent assistant/tool findings. "Thanks", "ok", and silence alone do not confirm a claim. Rules the user wants future agents to follow are preference/instruction (pinned); other context is a hint: fact, working, recap, or reference. When unsure, do not promote context into a rule. Working details are tentative unless explicitly decided or abandoned; express uncertainty naturally, without a required prefix. Preserve complete conditions, rationale, qualifications, and uncertainty. Keep one subject per record; omit secrets and narration.`;
 
-Read relevant topics with action read and target copied exactly from an [id: ...] field. Summaries only describe coverage; read the full topic before relying on it. A summary topic lists the topic ids it consolidates; read those for exact detail. Use action search with a literal phrase or substring (not a list of keywords) to find text across retained topics, including ones consolidated into summaries or superseded. Results include a next offset when more matches exist; repeat the same query with that offset. Search before saving a new fact or working detail, then read and correct an existing detail instead of duplicating it. Topic ids are not file paths: use this tool, not filesystem tools. If a topic is missing, the result includes the current index so you can select a relevant replacement.
-
-Save only what the user stated or confirmed, never independent findings from you or your tools:
-- preference or instruction: a lasting preference or scoped rule the user stated or confirmed, or asked you to remember;
-- fact: a project fact the user stated or confirmed;
-- working: a working detail the user stated, such as a plan, idea, open question, or in-progress decision. Begin the content with "Status: tentative", "Status: decided", or "Status: abandoned", and keep tentative ideas labeled as tentative;
-- recap: the conclusion of a hard question the user confirmed is settled, with rejected alternatives; save the conclusion, not the path to it;
-- reference: lasting external material the user pointed to or confirmed is worth returning to.
-Use assistant text only to understand what a user confirmation refers to.
-
-Examples:
-- "Always run the focused bun test before the full suite" -> instruction.
-- "Let's try caching the parsed index per request, but I'm not sure yet" -> working, content starting "Status: tentative".
-- After a long debug the user confirms: "Yes, the flaky login test comes from the shared Redis fixture; per-test databases are too slow" -> recap.
-
-Keep one subject per topic. To correct a topic, pass its id as target: read it first (action read) and write the complete updated content. This saves a new topic that supersedes the old one; the old one stays readable as history. Summary topics are derived and cannot be replaced; replace an incorrect source topic, or delete/unfold an incorrect summary and run dreaming again when its sources are correct. The summary is a one-line hook under about 100 characters describing the topic's coverage. Preserve complete user-grounded conditions, working details, rationale, qualifications, and uncertainty, even when also visible in code. Brevity is secondary to completeness; summarize only in derived layers. Omit narration and frontmatter, not useful detail.
-
-Delete removes a topic and any summaries derived from it; earlier versions it superseded stay until deleted separately. Deleting a summary only unfolds it: its sources remain. Secrets never belong in memory. Most turns need no memory; saving nothing is fine.`;
+const MEMORY_TOOL_NAMES = ["memory_read", "memory_search", "memory_save", "memory_correct", "memory_delete"] as const;
 
 const DREAM_SELECTOR_SYSTEM = "You are a project-memory consolidation selector. Return only the requested JSON result.";
 const DREAM_CURATOR_SYSTEM = "You are a project-memory curator. Return only the requested JSON result.";
@@ -491,8 +487,19 @@ const setup = async (ctx: Plugin.Context) => {
       return `Memory topic ${target} is unavailable. It may have been deleted. Select a relevant topic from the current index; do not guess file paths.\n\n${view.roots.length > 0 ? view.roots.map(topicLine).join("\n") : "The current memory index is empty."}`;
     }
     const earlier = view.catalog.filter((other) => other.supersededBy === entry.file).map((other) => other.file);
+    const classification = entry.supersededBy
+      ? `Historical version — not current instructions or current facts. ${view.byFile.has(entry.supersededBy) ? "Read the replacement for current guidance." : "Its replacement was deleted; this version has not been restored."}`
+      : entry.retired
+        ? "Retired derived summary — not current guidance. Read its sources."
+        : entry.children
+          ? "Derived summary — not user-stated. Read its sources before relying on specifics."
+          : isRule(entry)
+            ? "Current user-stated rule. Follow only within its stated scope."
+            : entry.type === "working"
+              ? "Working context — tentative unless explicitly decided or abandoned in the body."
+              : "Contextual hint — verify before relying on it.";
     const sections = [
-      [entry.title, `type: ${entry.type} | updated: ${entry.updated} | status: ${view.label(entry)}`, ...(earlier.length > 0 ? [`supersedes: ${earlier.join(", ")}`] : [])].join("\n"),
+      [`${entry.title} [id: ${entry.file}]`, classification, `type: ${entry.type} | updated: ${entry.updated} | status: ${view.label(entry)}`, ...(earlier.length > 0 ? [`supersedes: ${earlier.join(", ")}`] : [])].join("\n"),
       content,
     ];
     if (entry.children) {
@@ -504,10 +511,11 @@ const setup = async (ctx: Plugin.Context) => {
     return sections.join("\n\n");
   };
 
-  // Literal, case-insensitive search over every retained record except stale
-  // summaries, independent of which records are active roots.
+  // Every whitespace-separated query word must occur, in any order and case.
+  // Words are literal substrings, not regular expressions or semantic matches.
   const searchMemory = async (query: string, offset = 0) => {
-    const needle = query.toLowerCase();
+    const words = query.toLowerCase().split(/[\s,"]+/).filter(Boolean);
+    if (words.length === 0) return "Provide one or more search words.";
     const view = await readView();
     const results: string[] = [];
     let total = 0;
@@ -516,14 +524,15 @@ const setup = async (ctx: Plugin.Context) => {
       const content = view.contents.get(entry.file) ?? await readTopicIfPresent(entry.file);
       if (content === undefined) continue;
       const text = `${entry.title}\n${entry.summary}\n${content}`;
-      const at = text.toLowerCase().indexOf(needle);
-      if (at < 0) continue;
+      const lower = text.toLowerCase();
+      if (!words.every((word) => lower.includes(word))) continue;
+      const at = lower.indexOf(words[0]!);
       total += 1;
       if (total <= offset || results.length >= SEARCH_LIMIT) continue;
-      const snippet = text.slice(Math.max(0, at - 80), at + needle.length + 80).replace(/\s+/g, " ").trim();
+      const snippet = text.slice(Math.max(0, at - 80), at + words[0]!.length + 80).replace(/\s+/g, " ").trim();
       results.push(`${topicLine(entry)}\n  status: ${view.label(entry)}\n  match: ...${snippet}...`);
     }
-    if (total === 0) return `No retained memory topic contains "${query}".`;
+    if (total === 0) return `No retained topic contains all query words in ${JSON.stringify(query)}. Try fewer or different words; this does not establish that the subject is absent.`;
     const next = offset + results.length;
     const continuation = next < total ? `\n\nMore matches: repeat search with query ${JSON.stringify(query)} and offset: ${next}.` : "";
     const range = results.length > 0 ? `${offset + 1}–${next}` : "no results at this offset";
@@ -644,26 +653,28 @@ const setup = async (ctx: Plugin.Context) => {
       const catalog = await readCatalog();
       const before = (await readView(catalog)).roots.filter((entry) => !isRule(entry));
       let previous: IndexEntry | undefined;
-      let type: StoredType = input.type;
 
       if (input.target !== undefined) {
         previous = catalog.find((entry) => entry.file === input.target);
         if (!previous) throw new Error(`Memory index does not contain ${input.target}`);
         if (previous.children) {
-          throw new Error(`${input.target} is a derived summary and cannot be replaced; correct an incorrect source, or delete this summary to unfold it and run dreaming again if its sources are correct`);
+          throw new Error(`${input.target} is a derived summary, not an editable detail. Correct an incorrect source with memory_correct, or remove this summary with memory_delete to expose its unchanged sources. No replacement summary is generated by deletion; the user can run /dream.`);
         }
         if (previous.supersededBy && catalog.some((entry) => entry.file === previous!.supersededBy)) {
-          throw new Error(`${input.target} was superseded by ${previous.supersededBy}; replace the current version instead`);
+          throw new Error(`${input.target} was superseded by ${previous.supersededBy}; use memory_correct with id ${previous.supersededBy}.`);
         }
         if (expectedRevision && topicRevision(previous, await readTopic(previous.file)) !== expectedRevision) {
           throw new Error(`${input.target} changed during reflection; its correction was not applied`);
         }
-        if (expectedRevision || previous.type === "insight") type = previous.type;
       }
 
-      const file = topicFile(input.title);
+      const title = input.title?.replace(/[\[\]\r\n]/g, " ").trim() || previous?.title;
+      if (!title) throw new Error("Provide a non-empty title for a new memory.");
+      const summary = input.summary?.trim() || previous?.summary || "";
+      const type = expectedRevision || previous?.type === "insight" ? previous!.type : input.type ?? previous!.type;
+      const file = topicFile(title);
       await writeTopic(file, input.content);
-      const entry: IndexEntry = { title: input.title, file, summary: input.summary, type, updated: isoDate() };
+      const entry: IndexEntry = { title, file, summary, type, updated: isoDate() };
       const index = [entry, ...catalog.map((current) => current === previous ? { ...current, supersededBy: file } : current)];
       try {
         await writeIndex(index);
@@ -695,10 +706,11 @@ const setup = async (ctx: Plugin.Context) => {
   // Sibling sources and the target's own sources stay, so deleting a summary
   // unfolds it. Records the target superseded are left alone.
   const deleteMemory = async (sessionID: string, file: string) => {
-    const { removed, earlier } = await serializeWrite(async () => {
+    const { removed, earlier, sources } = await serializeWrite(async () => {
       if (!(await enabled())) throw new Error("Project memory is disabled");
       const catalog = await readCatalog();
-      if (!catalog.some((entry) => entry.file === file)) throw new Error(`Memory index does not contain ${file}`);
+      const target = catalog.find((entry) => entry.file === file);
+      if (!target) throw new Error(`Memory index does not contain ${file}`);
       const removed = new Set([file]);
       for (let grew = true; grew;) {
         grew = false;
@@ -710,12 +722,13 @@ const setup = async (ctx: Plugin.Context) => {
       }
       await writeIndex(catalog.filter((entry) => !removed.has(entry.file)));
       for (const name of removed) await rm(join(root, name), { force: true });
-      return { removed, earlier: catalog.filter((entry) => entry.supersededBy === file).map((entry) => entry.file) };
+      return { removed, earlier: catalog.filter((entry) => entry.supersededBy === file).map((entry) => entry.file), sources: target.children?.map((child) => child.file) };
     });
     for (const name of removed) recordSaved(sessionID, name);
     removed.delete(file);
     return [
       `Deleted ${file}.`,
+      sources ? `This unfolded a derived summary; its sources were not deleted: ${sources.join(", ")}. They are exposed where eligible. No replacement summary was generated; the user can run /dream.` : undefined,
       removed.size > 0 ? `Also removed summaries derived from it: ${[...removed].join(", ")}; their other sources remain.` : undefined,
       earlier.length > 0 ? `Earlier versions it superseded remain: ${earlier.join(", ")}; delete them separately to forget them.` : undefined,
     ].filter(Boolean).join(" ");
@@ -1095,9 +1108,8 @@ const setup = async (ctx: Plugin.Context) => {
     }
   };
 
-  // One worker call over the messages since the session's reflection cursor,
-  // catching durable memories the agent did not save itself. The cursor
-  // advances only after the worker succeeds.
+  // Selection either finishes a no-op review or supplies details to extraction.
+  // Each phase has its own schema, with no lookup requests in extraction.
   const reflect = async (sessionID: string, state: SessionState) => {
     if (disposed || state.deleted || state.reflecting) return;
     state.reflecting = true;
@@ -1111,17 +1123,18 @@ const setup = async (ctx: Plugin.Context) => {
         const saved = state.saved.map((item) => `- ${item.title} (${item.file})`).join("\n");
         const view = await readView();
         const details = view.catalog.filter((entry) => !entry.children && !entry.supersededBy && view.status(entry) !== "missing");
-        const prompt = `${REFLECT_PROMPT}\n\n<memory_index>\n${view.roots.map(topicLine).join("\n")}\n</memory_index>\n\n<detail_index>\n${details.map(topicLine).join("\n")}\n</detail_index>\n\n<session_saves>\n${saved}\n</session_saves>\n\n<transcript>\n${transcript}\n</transcript>`;
-        let result = await runWorker(
+        const context = `<memory_index>\n${view.roots.map(topicLine).join("\n")}\n</memory_index>\n\n<detail_index>\n${details.map(topicLine).join("\n")}\n</detail_index>\n\n<session_saves>\n${saved}\n</session_saves>\n\n<transcript>\n${transcript}\n</transcript>`;
+        const selection = await runWorker(
           reflectModel,
-          ReflectionSchema,
-          REFLECT_SYSTEM,
-          prompt,
+          ReflectionSelectionSchema,
+          REFLECT_SELECTOR_SYSTEM,
+          `${REFLECT_SELECTOR_PROMPT}\n\n${context}`,
         );
-        const inspected = new Map<string, string>();
+        if (disposed || state.deleted) return;
         const warnings: string[] = [];
-        if (result.read?.length) {
-          const selected = [...new Set(result.read)].flatMap((file) => {
+        if (selection.needed) {
+          const inspected = new Map<string, string>();
+          const selected = [...new Set(selection.ids)].flatMap((file) => {
             const entry = details.find((entry) => entry.file === file);
             if (!entry) {
               warnings.push(`Skipped unavailable detail lookup: ${file}`);
@@ -1131,30 +1144,31 @@ const setup = async (ctx: Plugin.Context) => {
             inspected.set(file, topicRevision(entry, content));
             return [`<memory_detail id="${file}">\n${topicLine(entry)}\n${content}\n</memory_detail>`];
           }).join("\n\n");
-          if (selected) {
-            const proposed = result.memories;
-            result = await runWorker(reflectModel, ReflectionSchema, REFLECT_SYSTEM, `${prompt}\n\n<read_details>\n${selected}\n</read_details>\n<provisional_memories>\n${JSON.stringify(proposed)}\n</provisional_memories>\nThe lookup is complete. Return final memories only; omit read. Keep valid provisional proposals, without duplication. Use target only for a supplied detail explicitly corrected by the user; preserve its original type.`);
-            if (result.read?.length) warnings.push("Ignored an additional detail lookup request; only one lookup round is supported");
+          const result = await runWorker(reflectModel, ReflectionSchema, REFLECT_SYSTEM, `${REFLECT_PROMPT}\n\n${context}\n\n<read_details>\n${selected}\n</read_details>`);
+          if (disposed || state.deleted) return;
+          for (const correction of result.correct) {
+            const revision = inspected.get(correction.id);
+            if (!revision) {
+              warnings.push(`Unresolved correction: ${correction.id} was not among the supplied details`);
+              continue;
+            }
+            await saveMemory(sessionID, { target: correction.id, content: correction.content, title: correction.title, summary: correction.summary }, revision, false)
+              .catch((error) => {
+                console.error("Memory reflection correction failed:", error);
+                warnings.push(`Could not correct ${correction.id}: ${error instanceof Error ? error.message : String(error)}`);
+              });
           }
-        }
-        if (disposed || state.deleted) return;
-        // A failed commit (disabled store) must not replay the
-        // other memories, so it is logged and the cursor still advances.
-        for (const memory of result.memories) {
-          if (memory.target && !inspected.has(memory.target)) {
-            warnings.push(`Skipped unread correction target: ${memory.target}`);
-            continue;
+          for (const memory of result.create) {
+            // Background saves remain pending for normal next-turn delivery.
+            await saveMemory(sessionID, memory, undefined, false)
+              .catch((error) => {
+                console.error("Memory reflection save failed:", error);
+                warnings.push(`Could not save ${memory.title}: ${error instanceof Error ? error.message : String(error)}`);
+              });
           }
-          // Background saves have not been seen by the primary model; keep
-          // them pending for its normal next-turn index reconciliation.
-          await saveMemory(sessionID, memory, memory.target ? inspected.get(memory.target) : undefined, false)
-            .catch((error) => {
-              console.error("Memory reflection save failed:", error);
-              warnings.push(`Could not save ${memory.title}: ${error instanceof Error ? error.message : String(error)}`);
-            });
         }
         if (warnings.length > 0) {
-          const message = `Memory reflection repaired its reply: ${warnings.join("; ")}`;
+          const message = `Memory reflection left unresolved changes: ${warnings.join("; ")}`;
           console.error(message);
           await rpc.events.emit("error", { message }).catch(() => {});
         }
@@ -1219,52 +1233,96 @@ const setup = async (ctx: Plugin.Context) => {
 
   await ctx.tool.transform((editor) => {
     editor.add({
-      name: "memory",
-      // Direct tool, so the context hook can narrow it for restricted sessions.
+      name: "memory_read",
       options: { codemode: false },
-      description: MEMORY_TOOL_DESCRIPTION,
+      description: "Read a retained memory by exact id from [id: ...], not a filesystem path. Index hooks are not full contents. Results distinguish current rules, contextual hints, derived summaries, and history; summary topics list their source ids. Missing ids return the current index.",
+      input: {
+        type: "object",
+        properties: { id: { type: "string", description: "Exact memory id" } },
+        required: ["id"],
+        additionalProperties: false,
+      },
+      execute: async (args) => {
+        if (!(await enabled())) throw new Error("Project memory is disabled");
+        return { content: await readMemory((args as { id: string }).id) };
+      },
+    });
+    editor.add({
+      name: "memory_search",
+      options: { codemode: false },
+      description: "Find retained memories, including folded details and historical versions. All query words must occur, in any order and case; spaces, commas, and double quotes separate words. Words match literal substrings, not meanings or regexes. A miss is not proof a subject is absent: try fewer words. Results include a next offset; repeat the same query with it for more matches.",
       input: {
         type: "object",
         properties: {
-          action: { type: "string", enum: ["save", "read", "search", "delete"] },
-          target: { type: "string", description: "Exact indexed topic id to read, replace (save), or remove (delete); omit to create a new topic" },
-          query: { type: "string", description: "Literal text to search for across all retained topics (search)" },
+          query: { type: "string", description: "Distinctive search words, for example Redis fixture" },
           offset: { type: "integer", minimum: 0, description: "Matching records to skip; use the next offset from search results" },
-          title: { type: "string", description: "Short topic title" },
-          summary: { type: "string", description: "One-line hook under about 100 characters; lead with the area when it applies to only part of the project" },
-          content: { type: "string", description: "Complete topic body with conditions, exceptions, and rationale; no frontmatter" },
+        },
+        required: ["query"],
+        additionalProperties: false,
+      },
+      execute: async (args) => {
+        if (!(await enabled())) throw new Error("Project memory is disabled");
+        const { query, offset } = args as { query: string; offset?: number };
+        return { content: await searchMemory(query, offset) };
+      },
+    });
+    editor.add({
+      name: "memory_save",
+      options: { codemode: false },
+      description: `Create a NEW memory, not a correction. Search related subjects first; use memory_correct for an existing detail. The summary is a short index hook, not a derived summary topic. ${CAPTURE_GUIDANCE}`,
+      input: {
+        type: "object",
+        properties: {
+          title: { type: "string", minLength: 1, description: "Short topic title" },
+          summary: { type: "string", description: "One-line index hook describing coverage and retrieval terms" },
+          content: { type: "string", minLength: 1, description: "Complete user-grounded detail, with conditions and uncertainty; no frontmatter" },
           type: { type: "string", enum: [...MEMORY_TYPES] },
         },
-        required: ["action"],
+        required: ["title", "summary", "content", "type"],
         additionalProperties: false,
       },
       execute: async (args, context) => {
-        const input = { ...(args as { action: "save" | "read" | "search" | "delete"; query?: string; offset?: number } & Partial<MemoryInput>) };
-        if (input.action === "read") {
-          if (!input.target) throw new Error("read requires target");
-          if (!(await enabled())) throw new Error("Project memory is disabled");
-          return { content: await readMemory(input.target) };
-        }
-        if (input.action === "search") {
-          if (!input.query) throw new Error("search requires query");
-          if (!(await enabled())) throw new Error("Project memory is disabled");
-          const offset = input.offset ?? 0;
-          if (!Number.isInteger(offset) || offset < 0) throw new Error("search offset must be a non-negative integer");
-          return { content: await searchMemory(input.query, offset) };
-        }
-        // Only read and search are allowed past this point for restricted sessions.
-        if (await isRestricted(context.sessionID)) {
-          throw new Error("Child sessions and workflow workers cannot save or delete memories.");
-        }
-        if (input.action === "delete") {
-          if (!input.target) throw new Error("delete requires target");
-          return { content: await deleteMemory(context.sessionID, input.target) };
-        }
-        if (!input.title || !input.summary || !input.content || !input.type) {
-          throw new Error("save requires title, summary, content, and type");
-        }
-        const entry = await saveMemory(context.sessionID, input as MemoryInput);
-        return { content: `Saved ${entry.file}` };
+        if (await isRestricted(context.sessionID)) throw new Error("Child sessions and workflow workers have read/search-only memory access.");
+        const entry = await saveMemory(context.sessionID, args as MemoryInput);
+        return { content: `Created ${topicLine(entry)}` };
+      },
+    });
+    editor.add({
+      name: "memory_correct",
+      options: { codemode: false },
+      description: `Correct an existing detail by id. Supply its COMPLETE updated content, retaining still-useful qualifications; read the detail if needed, not just its index hook. Title, index summary, and type are inherited unless explicitly changed; legacy insight records keep their insight type. A new current id replaces the old one, which remains historical. Derived summary topics cannot be corrected: correct a wrong source, or use memory_delete to unfold a bad summary as part of the requested repair without changing its sources. ${CAPTURE_GUIDANCE}`,
+      input: {
+        type: "object",
+        properties: {
+          id: { type: "string", description: "Exact id of the detail being corrected" },
+          content: { type: "string", minLength: 1, description: "Complete replacement content, not a patch or addendum" },
+          title: { type: "string", description: "New title, only when intentionally changing it" },
+          summary: { type: "string", description: "New index hook, only when intentionally changing it" },
+          type: { type: "string", enum: [...MEMORY_TYPES], description: "New classification, only when intentionally changing it" },
+        },
+        required: ["id", "content"],
+        additionalProperties: false,
+      },
+      execute: async (args, context) => {
+        if (await isRestricted(context.sessionID)) throw new Error("Child sessions and workflow workers have read/search-only memory access.");
+        const { id, ...changes } = args as { id: string } & MemoryInput;
+        const entry = await saveMemory(context.sessionID, { ...changes, target: id });
+        return { content: `Corrected ${id}.\nCurrent: ${topicLine(entry)}\nUse ${entry.file} from now on; ${id} remains historical, not current guidance.` };
+      },
+    });
+    editor.add({
+      name: "memory_delete",
+      options: { codemode: false },
+      description: "Delete a selected source record when the user asks to remove it; use memory_correct to change its content. A requested repair of an incorrect derived summary may also unfold it with this tool, retaining its source details. Deletion removes the selected body and dependent summary topics, not earlier versions or sibling details. This is not subject-wide erasure. The result lists retained sources/history; no replacement summary is generated, and the user can run /dream.",
+      input: {
+        type: "object",
+        properties: { id: { type: "string", description: "Exact id of the selected record or summary topic" } },
+        required: ["id"],
+        additionalProperties: false,
+      },
+      execute: async (args, context) => {
+        if (await isRestricted(context.sessionID)) throw new Error("Child sessions and workflow workers have read/search-only memory access.");
+        return { content: await deleteMemory(context.sessionID, (args as { id: string }).id) };
       },
     });
   });
@@ -1287,7 +1345,7 @@ const setup = async (ctx: Plugin.Context) => {
       ].filter(Boolean);
       return `<memory>\n${sections.join("\n\n")}\n</memory>`;
     }
-    return `<memory>\n${READ_GUIDANCE}\nSave durable memories with the memory tool.\n\n${entries.map(topicLine).join("\n")}\n</memory>`;
+    return `<memory>\n${READ_GUIDANCE}\nCreate new records with memory_save; update existing details with memory_correct.\n\n${entries.map(topicLine).join("\n")}\n</memory>`;
   };
 
   await ctx.session.hook("context", async (event) => {
@@ -1299,23 +1357,8 @@ const setup = async (ctx: Plugin.Context) => {
         changed = true;
       }
       const on = await enabled();
-      if (!on) delete event.tools.memory;
-      else if (state.restricted && event.tools.memory) {
-        event.tools.memory = {
-          ...event.tools.memory,
-          description: `Read or search project memory topics. This session cannot save or delete memories.\n\n${READ_GUIDANCE}\nIf a topic is missing, the result includes the current index.`,
-          input: {
-            type: "object",
-            properties: {
-              action: { type: "string", enum: ["read", "search"] },
-              target: { type: "string", description: "Exact topic id copied from the memory index's [id: ...] field (read)" },
-              query: { type: "string", description: "Literal text to search for across all retained topics (search)" },
-              offset: { type: "integer", minimum: 0, description: "Matching records to skip; use the next offset from search results" },
-            },
-            required: ["action"],
-            additionalProperties: false,
-          },
-        };
+      for (const name of MEMORY_TOOL_NAMES) {
+        if (!on || state.restricted && name !== "memory_read" && name !== "memory_search") delete event.tools[name];
       }
       if (on) {
         if (state.system === undefined) {
@@ -1325,6 +1368,13 @@ const setup = async (ctx: Plugin.Context) => {
           changed = true;
         }
         if (state.system) event.system.push({ type: "text", text: state.system });
+        // Only legacy snapshots need migration guidance; keep their cached
+        // memory block intact until compaction takes a fresh snapshot.
+        if (state.system?.includes("memory tool (action")) {
+          event.system.push({ type: "text", text: state.restricted
+            ? "Current memory API: memory_read(id) and memory_search(query, offset). This session has read/search-only access; older action-based memory instructions are superseded."
+            : "Current memory API: memory_read(id), memory_search(query, offset), memory_save(title, summary, content, type), memory_correct(id, content, optional title/summary/type), memory_delete(id). memory_save creates; memory_correct inherits metadata and retains history. Older action-based memory instructions are superseded." });
+        }
       }
 
       const latestUserID = event.messages.findLast((message) => message.role === "user")?.id;

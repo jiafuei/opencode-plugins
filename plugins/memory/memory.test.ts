@@ -19,7 +19,7 @@ type WorkerCall = { prompt: string; model?: { providerID: string; id: string; va
 type FakeMessage = { id: string; role: string; content: Array<{ type: string; text: string }> };
 type DreamStatus = { requestID: string | null; runID: string; state: string; sessionID?: string; counts?: Record<string, number>; message?: string };
 type Hook = (event: never) => Promise<void> | void;
-type MemoryTool = { execute: (input: unknown, context: { sessionID: string; agent: string }) => Promise<{ content: string }> };
+type MemoryTool = { name: string; execute: (input: unknown, context: { sessionID: string; agent: string }) => Promise<{ content: string }> };
 type Handlers = Record<string, (input: never) => Promise<unknown>>;
 type Entry = {
   title: string;
@@ -49,7 +49,7 @@ async function fixture(
   const histories = new Map<string, unknown[]>();
   let wake: (() => void) | undefined;
   let handlers: Handlers = {};
-  let tool: MemoryTool | undefined;
+  const tools: Record<string, MemoryTool> = {};
   const ctx = {
     location: { directory },
     options,
@@ -75,7 +75,7 @@ async function fixture(
         return { entries: page.map((key) => ({ key, value: storage.get(key) })), next: keys.length > limit ? page.at(-1) : undefined };
       },
     },
-    tool: { transform: async (callback: (editor: { add: (value: MemoryTool) => void }) => void) => callback({ add: (value) => { tool = value; } }) },
+    tool: { transform: async (callback: (editor: { add: (value: MemoryTool) => void }) => void) => callback({ add: (value) => { tools[value.name] = value; } }) },
     session: {
       hook: async (name: string, callback: Hook) => { hooks.set(name, callback); },
       get: async ({ sessionID }: { sessionID: string }) => ({
@@ -102,10 +102,11 @@ async function fixture(
     statuses: () => emitted.flatMap((event) => event.name === "dream" ? [event.data as DreamStatus] : []),
     saved: () => emitted.flatMap((event) => event.name === "saved" ? [event.data] : []),
     errors: () => emitted.flatMap((event) => event.name === "error" ? [event.data] : []),
-    save: (sessionID: string, input: Record<string, unknown>) => tool!.execute({ action: "save", ...input }, { sessionID, agent: "build" }),
-    read: (sessionID: string, target: string) => tool!.execute({ action: "read", target }, { sessionID, agent: "build" }),
-    search: (sessionID: string, query: string, offset?: number) => tool!.execute({ action: "search", query, ...(offset === undefined ? {} : { offset }) }, { sessionID, agent: "build" }),
-    delete: (sessionID: string, target: string) => tool!.execute({ action: "delete", target }, { sessionID, agent: "build" }),
+    save: (sessionID: string, input: Record<string, unknown>) => tools.memory_save!.execute(input, { sessionID, agent: "build" }),
+    correct: (sessionID: string, id: string, input: Record<string, unknown>) => tools.memory_correct!.execute({ id, ...input }, { sessionID, agent: "build" }),
+    read: (sessionID: string, id: string) => tools.memory_read!.execute({ id }, { sessionID, agent: "build" }),
+    search: (sessionID: string, query: string, offset?: number) => tools.memory_search!.execute({ query, ...(offset === undefined ? {} : { offset }) }, { sessionID, agent: "build" }),
+    delete: (sessionID: string, id: string) => tools.memory_delete!.execute({ id }, { sessionID, agent: "build" }),
     history: (sessionID: string, messages: unknown[]) => histories.set(sessionID, messages),
     message: async (sessionID: string, text: string) => {
       const messageID = `msg_${crypto.randomUUID()}`;
@@ -113,7 +114,7 @@ async function fixture(
       return messageID;
     },
     context: async (sessionID: string, messages: FakeMessage[] = []) => {
-      const event = { sessionID, agent: "build", tools: { memory: {} } as Record<string, unknown>, system: [] as Array<{ type: string; text: string }>, messages };
+      const event = { sessionID, agent: "build", tools: { ...tools } as Record<string, unknown>, system: [] as Array<{ type: string; text: string }>, messages };
       await hooks.get("context")!(event as never);
       return event;
     },
@@ -181,9 +182,10 @@ const memoryExtraction = (overrides: Partial<Extraction> = {}): Extraction => ({
   ...overrides,
 });
 
-const noMemories = () => ({ memories: [] });
+const noMemories = () => ({ create: [], correct: [] });
 
 const isReflection = (call: WorkerCall) => call.prompt.startsWith("You are a project-memory reviewer");
+const isReflectionSelector = (call: WorkerCall) => call.prompt.startsWith("You are a project-memory reflection selector");
 const isDreamSelector = (call: WorkerCall) => call.prompt.startsWith("You are a project-memory consolidation selector");
 const isDreamCurator = (call: WorkerCall) => call.prompt.startsWith("You are a project-memory curator");
 
@@ -215,13 +217,14 @@ describe("memory persistence", () => {
     // Both sessions snapshot the index before the save.
     const before = await app.context("ses_origin");
     await app.context("ses_other");
+    await expect(app.save("ses_origin", memoryExtraction({ title: "" }))).rejects.toThrow("non-empty title");
     const result = await app.save("ses_origin", {
       title: "Focused tests first",
       summary: "Run the focused Bun test before the full suite.",
       content: "Run the affected plugin's focused Bun test before the full suite.",
       type: "instruction",
     });
-    const file = result.content.replace("Saved ", "");
+    const file = result.content.match(/\[id: ([^\]]+)\]/)![1]!;
     expect(project.topic(file)).toBe("Run the affected plugin's focused Bun test before the full suite.");
     expect(indexLine(project.index()[0]!)).toStartWith(`- [Focused tests first](${file}) - [instruction|`);
     expect(app.saved()).toEqual([{ sessionID: "ses_origin", title: "Focused tests first" }]);
@@ -348,21 +351,23 @@ describe("memory persistence", () => {
     const output = await app.context("ses_index");
     expect(output.system[0]!.text).toContain("First [id: first.md] - [recap|2026-08-01] First summary");
     expect(output.system[0]!.text).not.toContain("FIRST_BODY");
-    expect(output.tools.memory).toBeDefined();
+    expect(output.tools.memory_save).toBeDefined();
+    expect(output.tools.memory_correct).toMatchObject({ input: { required: ["id", "content"] } });
+    expect(output.tools.memory).toBeUndefined();
 
     for (const sessionID of ["ses_sub", "ses_worker_1"]) {
       // Mutation denial also applies before the session's first context hook.
-      await expect(app.save(sessionID, memoryExtraction())).rejects.toThrow("cannot save or delete memories");
-      await expect(app.delete(sessionID, "first.md")).rejects.toThrow("cannot save or delete memories");
+      await expect(app.save(sessionID, memoryExtraction())).rejects.toThrow("read/search-only");
+      await expect(app.correct(sessionID, "first.md", { content: "Changed" })).rejects.toThrow("read/search-only");
+      await expect(app.delete(sessionID, "first.md")).rejects.toThrow("read/search-only");
       const restricted = await app.context(sessionID);
       expect(restricted.system[0]!.text).toContain("SECOND_BODY");
       expect(restricted.system[0]!.text).not.toContain("id: gone.md");
       expect(restricted.system[0]!.text).toContain("First [id: first.md]");
       expect(restricted.system[0]!.text).toContain("Typed [id: third.md]");
       expect(restricted.system[0]!.text).not.toContain("FIRST_BODY");
-      expect(restricted.tools.memory).toMatchObject({ input: {
-        properties: { action: { enum: ["read", "search"] } }, required: ["action"],
-      } });
+      expect(Object.keys(restricted.tools).sort()).toEqual(["memory_read", "memory_search"]);
+      expect(restricted.tools.memory_read).toMatchObject({ input: { required: ["id"] } });
       expect((await app.read(sessionID, "first.md")).content).toContain("FIRST_BODY");
       expect((await app.search(sessionID, "FIRST_BODY")).content).toContain("first.md");
     }
@@ -415,10 +420,10 @@ describe("memory persistence", () => {
       const disabledTurn = await app.message("ses_reader", "Next.");
       const disabled = await app.context("ses_reader", [userMessage(disabledTurn)]);
       expect(disabled.system).toEqual([]);
-      expect(disabled.tools.memory).toBeUndefined();
+      expect(disabled.tools).toEqual({});
       expect(disabled.messages[0]!.content).toHaveLength(1);
       const child = await app.context("ses_sub");
-      expect(child.tools.memory).toBeUndefined();
+      expect(child.tools).toEqual({});
       await expect(app.read("ses_sub", "missing.md")).rejects.toThrow("Project memory is disabled");
       await expect(app.search("ses_sub", "Pending")).rejects.toThrow("Project memory is disabled");
 
@@ -469,9 +474,12 @@ describe("memory persistence", () => {
   test.serial("reflection commits a returned memory and advances its cursor", async () => {
     const directory = "/tmp/memory-reflect-project";
     const storage = new Map<string, unknown>();
-    const app = await fixture(directory, (call) => isReflection(call)
-      ? { memories: [{ ...memoryExtraction({ title: "Login investigation", type: "working", content: "Status: tentative. The user suspects the shared Redis fixture; this is not confirmed." }) }] }
-      : noMemories(), { idle_delay_ms: 1000, reflect_model: "test/small#low" }, storage);
+    const app = await fixture(directory, (call) => {
+      if (isReflectionSelector(call)) return { needed: !call.prompt.includes("Thanks, now rename the helper."), ids: [] };
+      return isReflection(call)
+        ? { create: [memoryExtraction({ title: "Login investigation", type: "working", content: "The user suspects the shared Redis fixture; this is not confirmed." })], correct: [] }
+        : noMemories();
+    }, { idle_delay_ms: 1000, reflect_model: "test/small#low" }, storage);
     const assistant = (id: string, text: string) => ({
       id, type: "assistant", content: [
         { type: "text", text },
@@ -490,7 +498,7 @@ describe("memory persistence", () => {
       jest.advanceTimersByTime(1000);
       await until(() => app.saved().length === 1);
       await settle();
-      expect(app.calls).toHaveLength(1);
+      expect(app.calls).toHaveLength(2);
       expect(app.calls[0]!.model).toEqual({ providerID: "test", id: "small", variant: "low" });
       expect(app.calls[0]!.prompt).toContain("I suspect the shared Redis fixture");
       expect(app.calls[0]!.prompt).toContain("I will investigate fixture isolation.");
@@ -506,11 +514,11 @@ describe("memory persistence", () => {
       ]);
       await app.emit("session.execution.succeeded", "ses_reflect");
       jest.advanceTimersByTime(1000);
-      await until(() => app.calls.length === 2);
+      await until(() => app.calls.length === 3);
       await settle();
-      expect(app.calls[1]!.prompt).toContain("Thanks, now rename the helper.");
-      expect(app.calls[1]!.prompt).not.toContain("I suspect the shared Redis fixture");
-      expect(app.calls[1]!.prompt).toContain("- Login investigation (login-investigation-");
+      expect(app.calls[2]!.prompt).toContain("Thanks, now rename the helper.");
+      expect(app.calls[2]!.prompt).not.toContain("I suspect the shared Redis fixture");
+      expect(app.calls[2]!.prompt).toContain("- Login investigation (login-investigation-");
     } finally {
       jest.useRealTimers();
     }
@@ -544,10 +552,14 @@ describe("memory persistence", () => {
     const project = store(storage, directory, [{ file: "original.md", content: "Original fact", type: "fact" }]);
     const app = await fixture(directory, noMemories, {}, storage);
     try {
-      const replacement = (await app.save("ses_editor", { target: "original.md", ...memoryExtraction({ title: "Replacement", type: "fact" }) })).content.replace("Saved ", "");
+      const result = await app.correct("ses_editor", "original.md", { content: "Replacement fact", title: "", summary: "" });
+      const replacement = result.content.match(/\[id: ([^\]]+)\]/)![1]!;
+      expect(result.content).toContain("original.md remains historical");
+      expect(project.index().find((entry) => entry.file === replacement)!).toMatchObject({ title: "original.md", summary: "Stored topic", type: "fact" });
+      expect((await app.read("ses_reader", "original.md")).content).toContain("Historical version — not current instructions or current facts");
       await app.delete("ses_editor", replacement);
       expect((await app.context("ses_before_recovery")).system[0]!.text).not.toContain("[id: original.md]");
-      const recovered = (await app.save("ses_editor", { target: "original.md", ...memoryExtraction({ title: "Recovered fact", type: "fact", content: "Explicitly corrected fact" }) })).content.replace("Saved ", "");
+      const recovered = (await app.correct("ses_editor", "original.md", { content: "Explicitly corrected fact" })).content.match(/\[id: ([^\]]+)\]/)![1]!;
       expect(project.topic("original.md")).toBe("Original fact");
       expect(project.index().find((entry) => entry.file === "original.md")!.supersededBy).toBe(recovered);
       expect((await app.context("ses_recovered")).system[0]!.text).toContain(`[id: ${recovered}]`);
@@ -556,19 +568,20 @@ describe("memory persistence", () => {
     }
   });
 
-  test.serial("paginates literal search so retained details beyond the first page remain reachable", async () => {
+  test.serial("paginates all-words search without depending on word order or treating terms as regexes", async () => {
     const directory = "/tmp/memory-search-pages-project";
     const storage = new Map<string, unknown>();
     store(storage, directory, Array.from({ length: 25 }, (_, index) => ({ file: `detail-${index}.md`, content: "A literal [shared] detail" })));
     const app = await fixture(directory, noMemories, {}, storage);
     try {
-      const first = (await app.search("ses_sub", "literal [shared]")).content;
+      const first = (await app.search("ses_sub", '"[shared]", LITERAL')).content;
       expect(first).toContain("[id: detail-19.md]");
       expect(first).not.toContain("[id: detail-24.md]");
       expect(first).toContain("offset: 20");
-      const second = (await app.search("ses_sub", "literal [shared]", 20)).content;
+      const second = (await app.search("ses_sub", '"[shared]", LITERAL', 20)).content;
       expect(second).toContain("[id: detail-24.md]");
       expect(second).not.toContain("[id: detail-0.md]");
+      expect((await app.search("ses_sub", "literal missing-word")).content).toContain("Try fewer or different words");
     } finally {
       await app.dispose();
     }
@@ -578,18 +591,18 @@ describe("memory persistence", () => {
     const directory = "/tmp/memory-reflection-correction-project";
     const storage = new Map<string, unknown>();
     const project = store(storage, directory, [
-      { file: "plan.md", type: "working", content: "Status: tentative. Use shared Redis fixtures." },
+      { file: "plan.md", title: "Fixture plan", summary: "Fixtures: use shared Redis", type: "working", content: "Status: tentative. Use shared Redis fixtures." },
       { file: "context.md", content: "The user needs isolated test runs." },
     ]);
     const app = await fixture(directory, (call) => {
       if (isDreamSelector(call)) return { action: "synthesize", files: ["plan.md", "context.md"], reason: "Fixture context" };
       if (isDreamCurator(call)) return memoryExtraction({ title: "Fixture context summary" });
+      if (isReflectionSelector(call)) return { needed: true, ids: ["missing.md", "plan.md"] };
       if (!isReflection(call)) return noMemories();
-      if (!call.prompt.includes("<read_details>")) return { read: ["missing.md", "plan.md"], memories: [] };
       expect(call.prompt).toContain("Status: tentative. Use shared Redis fixtures.");
-      return { read: ["another-round.md"], memories: [
-        { target: "unread.md", ...memoryExtraction({ title: "Unread correction", type: "fact" }) },
-        { target: "plan.md", ...memoryExtraction({ title: "Fixture plan", type: "fact", content: "Status: decided. Use isolated Redis fixtures." }) },
+      return { create: [], correct: [
+        { id: "unread.md", content: "An unread correction" },
+        { id: "plan.md", content: "The user decided to use isolated Redis fixtures.", summary: "Fixtures: use isolated Redis" },
       ] };
     }, { idle_delay_ms: 1000 }, storage);
     try {
@@ -603,10 +616,10 @@ describe("memory persistence", () => {
       await until(() => app.saved().length === 1);
       const original = project.index().find((entry) => entry.file === "plan.md")!;
       expect(project.topic("plan.md")).toContain("Status: tentative");
-      expect(project.topic(original.supersededBy!)).toContain("Status: decided");
-      expect(project.index().find((entry) => entry.file === original.supersededBy)!.type).toBe("working");
+      expect(project.topic(original.supersededBy!)).toContain("decided to use isolated Redis fixtures");
+      expect(project.index().find((entry) => entry.file === original.supersededBy)!).toMatchObject({ type: "working", summary: "Fixtures: use isolated Redis" });
       await until(() => app.errors().length === 1);
-      expect(app.errors()[0]!.message).toContain("Skipped unread correction target");
+      expect(app.errors()[0]!.message).toContain("Unresolved correction: unread.md");
       await until(() => (storage.get("session/ses_reflection_correction") as { cursor?: string }).cursor === "msg_1");
       const next = await app.message("ses_reflection_correction", "Continue.");
       expect((await app.context("ses_reflection_correction", [userMessage(next)])).messages[0]!.content[1]!.text).toContain(`Fixture plan [id: ${original.supersededBy}]`);
@@ -805,7 +818,9 @@ describe("memory manual dreaming", () => {
     expect(roots).toContain(`[id: ${insight}]`);
     expect(roots).not.toContain(`[id: ${merged}]`);
     expect(roots).not.toContain("[id: a.md]");
-    expect((await reader.read("ses_reader", insight)).content).toContain(superseded);
+    const summary = (await reader.read("ses_reader", insight)).content;
+    expect(summary).toContain(superseded);
+    expect(summary).toContain("Derived summary — not user-stated");
     expect((await reader.read("ses_reader", superseded)).content).toContain(merged);
     expect((await reader.read("ses_reader", merged)).content).toContain("a.md");
     expect((await reader.read("ses_reader", "a.md")).content).toContain("ALPHA_BODY_ONE");
@@ -846,10 +861,10 @@ describe("memory manual dreaming", () => {
       await finished(app, "changed");
       const first = project.index().find((entry) => entry.title === "Layer 1")!;
       const second = project.index().find((entry) => entry.title === "Layer 2")!;
-      await expect(app.save("ses_editor", { target: first.file, ...memoryExtraction() })).rejects.toThrow();
+      await expect(app.correct("ses_editor", first.file, { content: "Wrong summary correction" })).rejects.toThrow("derived summary");
       let replacement: string | undefined;
       if (change === "correction") {
-        replacement = (await app.save("ses_editor", { target: "a.md", ...memoryExtraction({ title: "Corrected alpha", content: "Corrected alpha detail", type: "fact" }) })).content.replace("Saved ", "");
+        replacement = (await app.correct("ses_editor", "a.md", { content: "Corrected alpha detail" })).content.match(/\[id: ([^\]]+)\]/)![1]!;
         expect(project.topic("a.md")).toBe("Original alpha detail");
         expect((await app.read("ses_reader", "a.md")).content).toContain(replacement);
       } else if (change === "body edit") {
@@ -860,7 +875,13 @@ describe("memory manual dreaming", () => {
         project.set("settings", { enabled: true });
       }
       else if (change === "metadata edit") project.setIndex(project.index().map((entry) => entry.file === "a.md" ? { ...entry, summary: "Changed alpha metadata" } : entry));
-      else await app.delete("ses_editor", change === "delete" ? "a.md" : first.file);
+      else {
+        const removed = (await app.delete("ses_editor", change === "delete" ? "a.md" : first.file)).content;
+        if (change === "unfold") {
+          expect(removed).toContain("sources were not deleted: a.md, b.md");
+          expect(removed).toContain("No replacement summary was generated");
+        }
+      }
 
       const roots = (await app.context("ses_roots")).system[0]!.text;
       expect(roots).not.toContain(`[id: ${first.file}]`);
@@ -914,7 +935,7 @@ describe("memory manual dreaming", () => {
     await started.promise;
     // Metadata-only edits must invalidate the snapshot just like body edits.
     if (change === "body") project.setTopic("x.md", "X_MUTATED_BODY");
-    else await app.save("ses_editor", { target: "x.md", ...memoryExtraction({ title: "New instruction", type: "instruction", content: "X_SHARED_BODY" }) });
+    else await app.correct("ses_editor", "x.md", { title: "New instruction", type: "instruction", content: "X_SHARED_BODY" });
     gate.resolve(memoryExtraction({ title: "Merged xy" }));
     await until(() => app.statuses().some((status) => status.state !== "running"));
     await app.dispose();

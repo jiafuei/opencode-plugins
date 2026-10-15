@@ -9,7 +9,7 @@ available beneath progressively coarser summaries. Memory is a hint layer, not a
 - **Recall.** Each session starts with the project's memory index in context. Preferences and instructions you gave
   are followed; other entries are hints the model reads in full and verifies before relying on them.
 - **Saving.** The model saves user-stated or explicitly confirmed preferences, instructions, facts, and working
-  details with a `memory` tool. Conditions, qualifications, and uncertainty are preserved before summarization.
+  details with `memory_save`, and updates existing details with `memory_correct`. Conditions, qualifications, and uncertainty are preserved before summarization.
   Tentative ideas stay labeled as tentative. A `Saved: <title>` toast shows each save.
 - **Reflection.** When a session goes idle, a background review catches user-grounded memories the model missed.
   It can read existing details and apply explicit user corrections while retaining the previous version. The TUI
@@ -18,7 +18,7 @@ available beneath progressively coarser summaries. Memory is a hint layer, not a
 - **Dreaming.** As memory grows, background consolidation adds summaries over related topics without deleting their
   sources. Summaries can themselves be summarized, building multiple layers. Preferences and instructions are never
   folded into summaries. The sidebar shows `Dreaming...` while it runs.
-- **Retrieval.** Read a summary to discover its source IDs, then read those IDs for more detail. Literal search reaches
+- **Retrieval.** Read a summary to discover its source IDs, then read those IDs for more detail. All-words search reaches
   retained records directly, including details omitted from summaries.
 - **Subagents** get your preferences and instructions inline, an index of other topics, and read/search access to memory.
   They cannot save or delete memories.
@@ -39,7 +39,30 @@ memories arrive as small additions instead.
 | `insight` | A derived summary with links to its source records; a hint, not a fact you stated |
 
 Assistant conclusions and tool results alone do not establish memories. Assistant text may explain what your explicit
-confirmation refers to; silence does not count as confirmation. Secrets should not be saved.
+confirmation refers to; "thanks", "ok", and silence alone do not confirm a claim. Working details are tentative unless
+you explicitly decide or abandon them; no exact `Status:` prefix is required. Secrets should not be saved.
+
+## Agent tools
+
+Each operation is a separate tool with a plain object input:
+
+| Tool | Inputs | Behavior |
+| --- | --- | --- |
+| `memory_read` | `id` | Read a detail, summary topic, or explicitly labeled historical version |
+| `memory_search` | `query`, optional `offset` | Find records containing every query word, in any order and case |
+| `memory_save` | `title`, `summary`, `content`, `type` | Create a new record; `summary` is its short index hook |
+| `memory_correct` | `id`, `content`; optional `title`, `summary`, `type` | Replace a detail's complete content; omitted metadata is inherited |
+| `memory_delete` | `id` | Remove a selected record; deleting a summary topic preserves its sources |
+
+For example, `memory_correct({ id: "fixture-plan-a1b2c3d4.md", content: "The user decided to use isolated Redis fixtures." })`
+retains the record's title, index hook, and classification. Empty optional titles/hooks also keep their existing values;
+new records need a non-empty title. Legacy non-derived insights keep their `insight` type rather than becoming rules.
+The result names the new current ID and marks the previous
+ID historical. Read details when needed to preserve their qualifications; there is no mandatory read or confirmation gate.
+Workers receive only `memory_read` and `memory_search`.
+
+These named tools replace the former `memory({ action, target, ... })` API, without aliases. Existing stored records
+and session snapshots are retained; a current API guide supersedes action-based instructions in cached snapshots.
 
 ## Storage
 
@@ -66,9 +89,13 @@ The model sees topic identifiers rather than file links:
 - Short title [id: short-title-a1b2c3d4.md] - [preference|2026-08-23] One-line summary
 ```
 
-Agents retrieve topics with `memory` (`action: "read"`, `target: "short-title-a1b2c3d4.md"`), not filesystem paths.
-Consolidated source IDs remain readable. Search retained details with `memory` (`action: "search"`,
-`query: "Redis fixture"`). Queries match a literal phrase or substring, not a list of keywords. Results provide a
+Agents retrieve topics with `memory_read({ id: "short-title-a1b2c3d4.md" })`, not filesystem paths. Successful reads name
+the requested ID and distinguish current rules, hints, derived summary topics, and historical versions. Historical
+instructions are not current guidance; derived summaries are not user statements. Consolidated source IDs remain
+readable. Search with `memory_search({ query: "Redis fixture" })`. Every whitespace-separated word must occur, ignoring
+order and case; commas and double quotes also separate words rather than requiring literal punctuation. Each word is
+a literal substring, not a regex, semantic match, or ordered phrase. A miss is not proof a subject is absent.
+Try fewer or different words. Results provide a
 next `offset` when there are more than 20 matches; repeat the same query with that offset. Concurrent saves can shift
 pages. Retired summaries are excluded from search but remain browsable. Missing IDs return the current root index.
 
@@ -80,9 +107,11 @@ Preserve hierarchy comments when editing metadata; malformed metadata is
 reported through logs and an error toast rather than silently discarded. Lines outside the index format are dropped
 the next time the plugin writes the index.
 
-Replacing a detailed record creates a new ID and retains the old record as superseded. Correct an incorrect source
+Correcting a detailed record creates a new ID and retains the old record as superseded. Metadata is inherited unless
+explicitly changed. Correct an incorrect source
 detail; if only the summary is wrong, delete/unfold it and run dreaming again. Explicit deletion removes the selected
-record and dependent summaries, not earlier versions or sibling details. Deleting a summary unfolds its sources.
+record and dependent summaries, not earlier versions or sibling details. Deleting a summary lists its preserved source
+IDs and does not generate a replacement summary; the user can run `/dream` to rebuild layers.
 Deleting a replacement does not restore its predecessor automatically, but that retained predecessor can be explicitly
 corrected again. Consolidation never expires original records automatically.
 
@@ -143,8 +172,9 @@ configuration.
 
 ## Data disclosure
 
-Reflection sends the session's user and assistant text, root/detail indexes, and any selected detail bodies to
-`reflect_model`. Dreaming sends the index and selected topics to `dream_model`. Choose both within your intended
+Reflection sends the session's user and assistant text and root/detail indexes to `reflect_model` for selection; when
+capture is needed, a separate extraction call receives the selected detail bodies as well. Dreaming sends the index
+and selected topics to `dream_model`. Choose both within your intended
 data-disclosure boundary.
 
 See [DESIGN.md](DESIGN.md) for how recall, updates, reflection, and dreaming work in detail.

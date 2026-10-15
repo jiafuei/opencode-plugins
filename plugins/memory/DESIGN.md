@@ -9,18 +9,20 @@ The first request of a session (the `context` hook) adds a `<memory>` system blo
 cached for the rest of the session so the provider prompt cache stays warm. Only current hierarchy roots appear in
 this view. `preference` and `instruction` entries are followed unless the conversation says otherwise; `fact`,
 `working`, `recap`, `reference`, `insight`, and legacy `feedback`/`project` entries are hints the model reads (with the
-`memory` tool's `read` action) and verifies before relying on them.
+`memory_read` tool) and verifies before relying on them.
 
 Child sessions (with a `parentID`) and workflow workers (metadata `workflowWorkerID`) get the full content of
-`preference` and `instruction` topics inline and an index of the remaining hint topics. Their `memory` tool exposes
-only `read` and `search`; the executor independently refuses save/delete, including before the first context hook.
+`preference` and `instruction` topics inline and an index of the remaining hint topics. Only `memory_read` and
+`memory_search` are exposed; mutation executors independently refuse saves, corrections, and deletions, including before the first context hook.
 Their snapshots remain cached, with no updates or reflection.
 
 Model-facing index lines use `[id: topic.md]`, not file links; on-disk lines retain their Markdown link format. Agents copy exact
-topic identifiers into the memory tool instead of constructing filesystem paths. Each read consults the current index
+topic identifiers into `memory_read` instead of constructing filesystem paths. Each read consults the current index
 and topic body. Reading a summary also lists its immediate children as topic IDs; repeated reads descend through any
-number of layers. Literal search scans retained records independently of the root view, so summary omissions do not
-make details unreachable. Superseded records remain identifiable as history. An unavailable topic returns the current
+number of layers. Search matches all query words (separated by whitespace, commas, or double quotes) as case-insensitive literal substrings, in any
+order, across retained records independently of the root view. It is not semantic matching; misses suggest trying fewer
+terms, not assuming absence. Superseded rules are explicitly marked not current instructions, and generated summary
+topics are labeled not user-stated. An unavailable topic returns the current
 root index, without aliases or fuzzy matching.
 
 ## Updates
@@ -37,14 +39,19 @@ re-listing every unchanged topic.
 
 Each session's snapshot, known index, frozen update text, reflection cursor, and saved-topic list persist in plugin
 storage (`ctx.storage`, key `session/<sessionID>`), so a restart or plugin reload renders byte-identical context.
+The cached memory block stays unchanged when upgrading from the action-based API; a separate current-tool guide is
+added only for legacy snapshots and supersedes their old instructions without rewriting snapshots or frozen updates.
 After a compaction the next request takes a fresh snapshot (which includes every committed update) and drops old
 updates. The entry is removed when the session is deleted.
 
 ## Saving
 
-Primary agents get a `memory` tool: `save` creates a detailed record; a `target` correction creates a new record and
-marks the old one superseded, retaining its body. `read` retrieves details or summary children; `search` finds retained
-records. The authoring contract permits user-stated or explicitly confirmed preferences, instructions, facts, working
+Primary agents get five flat-schema tools: `memory_read(id)`, `memory_search(query, offset?)`,
+`memory_save(title, summary, content, type)`, `memory_correct(id, content, optional metadata)`, and `memory_delete(id)`.
+Creation and correction are separate operations; omitting an optional target can no longer accidentally create a
+competing current record. Corrections inherit omitted or empty title/hook metadata and create a new record, retaining the previous body
+as superseded history. Their responses explicitly name the new current ID. There is no mandatory read tracking or
+confirmation gate; reading full details is recommended when needed to preserve qualifications. The authoring contract permits user-stated or explicitly confirmed preferences, instructions, facts, working
 details, recaps, and references. Tentative ideas retain their uncertainty. Assistant output and tool results alone do
 not establish memories. Saves emit a `Saved: <title>` toast and count toward automatic dreaming.
 
@@ -56,15 +63,18 @@ may be explicitly corrected again without automatically restoring it. Legacy `fe
 
 ## Reflection
 
-When a primary session goes idle for `idle_delay_ms` after an execution finishes, one worker call reviews the messages
+When a primary session goes idle for `idle_delay_ms` after an execution finishes, reflection reviews the messages
 since the last reflection (user and assistant text only) together with the index and the topics already saved in the
 session. It sees the root index and an index of current detailed records, including consolidated ones, to avoid
 duplicate capture. Superseded history stays out of reflection, even if its replacement was deleted; recovering it
-requires an explicit foreground tool save. Reflection is asked to read up to eight details in one lookup round and
-propose up to three saves. Explicit user corrections may target a supplied detail, creating a superseding record
-while preserving its type. The commit rechecks that detail's revision so concurrent changes cannot be overwritten.
-Summaries may not be targeted. Unknown read IDs, extra lookup requests, and unread corrections are skipped with
-visible warnings while valid siblings continue. Valid replies are not rejected solely for exceeding suggested counts.
+requires an explicit foreground `memory_correct` call. Reflection is asked to read up to eight details in one lookup round and
+propose up to three changes. A selection-only schema returns whether extraction is needed and IDs to inspect; a no-op
+review ends there. A separate extraction schema returns `create` and `correct` arrays, with no lookup field or
+optional-target switch. Explicit user corrections refer to supplied details by ID and complete content, inheriting
+metadata and retaining history. Optional title/hook updates keep an old index claim from contradicting the corrected
+body; classification remains inherited. The commit rechecks the inspected revision so concurrent changes cannot be overwritten.
+Summaries may not be corrected. Unknown selection IDs and unsupplied correction IDs are reported as unresolved while
+valid siblings continue. Valid replies are not rejected solely for exceeding suggested counts.
 Working details and facts are not forced into instruction types. Most reviews save nothing. Worker failures are
 logged and surfaced in the TUI; a successful review advances the cursor, with individual failed commits reported too.
 
@@ -106,7 +116,7 @@ JSON matching the worker's schema.
 
 ## Disabling
 
-Disabled memory adds no context, including past updates, hides the tool, skips reflection, and refuses reads and new
+Disabled memory adds no context, including past updates, hides all five tools, skips reflection, and refuses reads and new
 writes; a write already in progress finishes. Cached snapshots and frozen updates stay stored for re-enabling; index
 changes made meanwhile arrive on the next enabled user turn.
 
