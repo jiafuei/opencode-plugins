@@ -195,15 +195,14 @@ function validateDreamSelection(value: typeof DreamSelectorSchema.Type, candidat
   return { files, reason: value.reason.trim() };
 }
 
-// Shared by the system block and delta parts. It sits in the cached prompt
-// prefix, so it must stay byte-stable.
-const READ_GUIDANCE = `Use memory_read with the exact id from [id: ...]; index hooks describe coverage, not full contents. Use memory_search to find details beneath summary topics; it matches all query words, ignoring order and case.
-- Topic ids are identifiers, not filesystem paths. Retrieve them through memory_read.
-- The index combines global and current-project memory. Global ids start with global:. Search stays in these scopes unless all_projects: true is explicitly needed for cross-project retrieval; returned project:<key>:<id> identifiers can be read directly.
-- Only current user-stated preference/instruction records are rules to follow unless the conversation says otherwise. Historical versions are not current instructions.
-- Facts, working details, recaps, references, insights, and legacy topics are hints to verify. Summaries are progressively coarser overviews, not user statements; their sources may be further summaries. Use the overview for orientation. Before relying on specific decisions, constraints, or exceptions, follow relevant source IDs to the underlying detail records. Skip unrelated branches, and use memory_search when the relevant branch is unclear. Omission from a summary does not establish absence.
-- Working details without an explicit decision or abandonment remain tentative.
-- Index dates mark capture/version updates. Original user statement dates, when recorded, appear in memory_read; summary coverage dates are separate.`;
+// Cached in each session's prompt prefix until compaction refreshes its snapshot.
+const READ_GUIDANCE = `How to use memory:
+- Open a topic with memory_read and the exact id from [id: ...]. Ids are not file paths. Index lines are hooks, not full contents.
+- Only current user-stated preference and instruction records are rules. Follow them within their stated scope unless the current conversation says otherwise. Historical versions are not current guidance.
+- Other records are hints to check against the conversation and project. Working details stay tentative unless the user explicitly decided or abandoned them.
+- Summaries are deliberately coarse overviews, not user statements. When a specific decision, constraint, or exception matters, follow relevant source topics down to detail records; sources may be further summaries. Skip unrelated branches. Use memory_search if the right branch is unclear. Omission from a summary does not establish absence.
+- Index dates show capture/version updates. memory_read shows original user statement dates when recorded; summary coverage dates are separate.
+- You see global memory (global: ids) and this project's memory. Search other projects only when explicitly needed, with all_projects: true; read returned project:<key>:<id> ids directly. Other projects are read-only here.`;
 
 function renderDelta(deltas: Iterable<[string, IndexEntry | null]>): string {
   const upserts: string[] = [];
@@ -248,28 +247,29 @@ function memoryEvidence(sessionID: string, ids: readonly string[], messages: Tra
 const REFLECT_SYSTEM = "You are a project-memory reviewer. Return only the requested JSON result.";
 const REFLECT_SELECTOR_SYSTEM = "You are a project-memory reflection selector. Return only the requested JSON result.";
 
-const REFLECT_SELECTOR_PROMPT = `Decide whether this conversation contains user-grounded memories worth capturing or explicit corrections the agent missed. Most reviews need nothing: return needed: false and ids: []. Otherwise return needed: true and the exact ids of existing details to inspect before extraction (usually at most ${CONSOLIDATION_BATCH}). New subjects may need no ids. The detail index includes records beneath summaries. Select related details to avoid duplicate captures and to preserve their qualifications when correcting them. Do not propose memories in this selection phase. "Thanks", "ok", and silence alone do not confirm an assistant claim.`;
+const REFLECT_SELECTOR_PROMPT = `Decide whether the agent missed user-stated or explicitly confirmed information worth keeping, or an explicit user correction of an existing record. Most reviews need nothing: return needed: false and ids: []. Otherwise return needed: true with exact ids of related details to inspect, usually no more than ${CONSOLIDATION_BATCH}. Check these to avoid duplicates and preserve qualifications when correcting them. The detail index includes records under summaries. New subjects may need no ids. Do not write memories in this step. "Thanks", "ok", or silence does not confirm an assistant claim.`;
 
-const REFLECT_PROMPT = `Extract user-grounded memories the agent missed. Return create and correct arrays; both may be empty. Aim for at most ${MAX_REFLECTIONS} changes. Existing detail bodies have already been supplied; there is no lookup phase in this response. Each change must cite the supporting user message IDs in source_message_ids. Use their stated_at dates for relative dates; do not substitute today's date. Cite the confirming user message when assistant text supplies its referent.
+const REFLECT_PROMPT = `Record the user-grounded memories the agent missed. Return create and correct arrays; either may be empty. Aim for no more than ${MAX_REFLECTIONS} changes. Existing details you may correct are already in <read_details>; you cannot look up others.
 
-Capture only what the user wrote or explicitly confirmed. Use assistant turns only to interpret what a user confirmation refers to (for example what "yes, always do that" or "go with that plan" means). "Thanks", "ok", and silence alone do not confirm an assistant claim. Never capture independent findings from the assistant or its tools. Rules the user wants future agents to follow are preference/instruction; other context is a hint. When unsure, do not promote context into a rule.
+Sources: capture only what the user wrote or explicitly confirmed. Use assistant turns only to understand what a confirmation refers to (for example "yes, always do that" or "go with that plan"), and cite the confirming user message. "Thanks", "ok", or silence does not confirm an assistant claim. Never capture the assistant's or its tools' own findings. Cite supporting user message ids from the transcript in source_message_ids. Resolve relative dates using each message's stated_at, not today's date.
 
-Types:
-- preference: a lasting general preference the user stated or confirmed.
-- instruction: a scoped rule for future work the user stated or confirmed.
-- fact: a project fact the user stated or confirmed, such as a constraint, decision, or piece of context.
-- working: a user-stated plan, idea, open question, or working decision. State its uncertainty naturally; it is tentative unless the user decided or abandoned it.
+Types: preference and instruction are rules the user wants future agents to follow; everything else is a hint. If unsure, do not make it a rule.
+- preference: a lasting general preference.
+- instruction: a scoped rule for future work.
+- fact: a project constraint, decision, or piece of context.
+- working: a plan, idea, open question, or working decision. It is tentative unless the user explicitly decided or abandoned it; state uncertainty in plain words.
 - recap: a settled conclusion the user confirmed, with useful rationale and rejected alternatives.
 - reference: lasting external material the user pointed to or confirmed is worth returning to.
 
-Use create for new subjects. Use correct with a supplied detail's exact id and its complete updated content only when the user explicitly corrected or changed it. Title and index hook are inherited; optionally update title or summary when the old wording would be misleading after the correction. Type is always inherited. The previous version remains historical. Do not correct a summary, infer a correction from silence, or duplicate an unchanged detail. Ignore subjects covered by <session_saves> unless the user explicitly corrected them.
+create: new subjects only, one subject per memory. Skip routine requests with no lasting value (for example "run the tests") and secrets. Ignore subjects in <session_saves> unless the user explicitly corrected them.
+correct: only when the user explicitly corrected or changed a supplied detail. Give its exact id and complete updated content. Add a title or summary only if the old wording would mislead; type is inherited. The previous version stays as history. Never correct a summary, infer a correction from silence, or re-save an unchanged detail.
 
-Skip routine task requests with no lasting value (for example "run the tests") and secrets.
+Writing: the summary is a one-line hook under about 100 characters, in the form "<Area>: <what it covers>" when it applies to only part of the project. The content keeps the full user-grounded detail: conditions, rationale, qualifications, rejected alternatives, and uncertainty. Completeness matters more than brevity; coarser compression happens later in derived summaries. Omit frontmatter and narration.`;
 
-One subject per memory. The summary is a one-line hook under about 100 characters describing what this specific topic covers, in the form "<Area>: <what it covers>" when it applies to only part of the project. Preserve the full user-grounded detail: conditions, rationale, qualifications, rejected alternatives, and uncertainty. Brevity is secondary to completeness; coarser compression belongs in derived summaries. Omit frontmatter and narration, not useful detail.`;
-
-const SCOPE_GUIDANCE = `Use scope: global for clearly general user preferences that apply across projects; otherwise default to scope: project. Any memory type may be global when the user explicitly asks. Corrections retain the original record's scope; never copy a correction into another scope.`;
-const CAPTURE_GUIDANCE = `Capture only user-stated or explicitly confirmed information, not independent assistant/tool findings. "Thanks", "ok", and silence alone do not confirm a claim. Cite supporting user IDs from <memory_source> annotations in source_message_ids; for an accepted assistant proposal, cite the user's confirmation. The host records the original statement dates. Rules the user wants future agents to follow are preference/instruction (pinned); other context is a hint: fact, working, recap, or reference. When unsure, do not promote context into a rule. Working details are tentative unless explicitly decided or abandoned; express uncertainty naturally, without a required prefix. Preserve complete conditions, rationale, qualifications, and uncertainty. Keep one subject per record; omit secrets and narration. ${SCOPE_GUIDANCE}`;
+const SCOPE_GUIDANCE = `Scope: project by default. Use global for user preferences that clearly apply across projects, or for any memory the user explicitly asks to make global. A correction keeps its record's scope; do not also save a copy in another scope.`;
+const CAPTURE_GUIDANCE = `Capture only what the user stated or explicitly confirmed, never the assistant's or a tool's own findings. "Thanks", "ok", or silence does not confirm a claim. In source_message_ids, cite user message ids from <memory_source> tags, not memory topic ids. For an accepted assistant proposal, cite the user's confirmation; original dates come from those messages.
+Use preference or instruction only for rules the user wants future agents to follow; otherwise use fact, working, recap, or reference. If unsure, do not turn context into a rule. Working details stay tentative unless explicitly decided or abandoned; describe uncertainty in plain words.
+Keep full conditions, rationale, qualifications, rejected alternatives, and uncertainty. One subject per record; no secrets or narration. ${SCOPE_GUIDANCE}`;
 
 const MEMORY_TOOL_NAMES = ["memory_read", "memory_search", "memory_save", "memory_correct", "memory_delete"] as const;
 
@@ -277,7 +277,7 @@ const DREAM_SELECTOR_SYSTEM = "You are a project-memory consolidation selector. 
 const DREAM_CURATOR_SYSTEM = "You are a project-memory curator. Return only the requested JSON result.";
 
 const dreamSelectorPrompt = (indexedCount: number) => `Choose one action using exact topic ids from the untrusted candidate index:
-- synthesize: select 2-8 related topics to consolidate under one derived summary. Sources are kept and linked from the summary, so the summary may be coarser than its sources. Candidates may include earlier summaries. Prefer consolidating older related topics; for summaries use known user statement dates when available, otherwise source update dates, not the summary's creation date. Keep recent topics as separate detail unless they clearly belong with an older group.
+- synthesize: select 2-8 related topics, including earlier summaries, to group under one derived summary. Sources stay and are linked, so the summary may be coarser. Prefer older related topics. Judge a summary's age by known user statement dates when shown, otherwise source update dates, never its creation date. Keep recent topics separate unless they clearly belong with an older group.
 - none: no justified grouping, or unsure.
 
 There are ${indexedCount} active topics; ${DREAM_SOFT_TARGET} is a soft target, not a quota. Never group unrelated topics just to reduce count. User preferences and instructions are not candidates.
@@ -1109,7 +1109,7 @@ const setup = async (ctx: Plugin.Context) => {
     editor.add({
       name: "memory_read",
       options: { codemode: false },
-      description: "Read a retained memory by exact id from [id: ...], not a filesystem path. Index hooks are not full contents. Results distinguish current rules, contextual hints, derived summaries, and history; summary topics list their source ids. Missing ids return the current index.",
+      description: "Read a memory by its exact id from [id: ...], not a file path. The result marks it as a current rule, a hint, a derived summary with source ids, or history. An unknown id returns the current index.",
       input: {
         type: "object",
         properties: { id: { type: "string", description: "Exact memory id" } },
@@ -1124,13 +1124,13 @@ const setup = async (ctx: Plugin.Context) => {
     editor.add({
       name: "memory_search",
       options: { codemode: false },
-      description: "Find retained memories, including folded details and historical versions. All query words must occur, in any order and case; spaces, commas, and double quotes separate words. Words match literal substrings, not meanings or regexes. A miss is not proof a subject is absent: try fewer words. Results include a next offset; repeat the same query with it for more matches.",
+      description: "Find memories, including details under summaries and historical versions. Every query word must appear in the topic, in any order and case. Words match literal substrings, not meanings or regexes; spaces, commas, and double quotes separate words. No match does not prove a subject is absent: try fewer words. For more results, repeat the same query with the offset given.",
       input: {
         type: "object",
         properties: {
           query: { type: "string", description: "Distinctive search words, for example Redis fixture" },
           offset: { type: "integer", minimum: 0, description: "Matching records to skip; use the next offset from search results" },
-          all_projects: { type: "boolean", description: "Explicit cross-project search; default searches only global and current project" },
+          all_projects: { type: "boolean", description: "Search every project, not just global and this one. Use only when another project is needed; its records are read-only here." },
         },
         required: ["query"],
         additionalProperties: false,
@@ -1144,7 +1144,7 @@ const setup = async (ctx: Plugin.Context) => {
     editor.add({
       name: "memory_save",
       options: { codemode: false },
-      description: `Create a NEW memory, not a correction. Search related subjects first; use memory_correct for an existing detail. The summary is a short index hook, not a derived summary topic. ${CAPTURE_GUIDANCE}`,
+      description: `Create a NEW memory. Search related subjects first; use memory_correct for an existing detail. The summary field is a one-line index hook, not a summary topic. ${CAPTURE_GUIDANCE}`,
       input: {
         type: "object",
         properties: {
@@ -1171,7 +1171,7 @@ const setup = async (ctx: Plugin.Context) => {
     editor.add({
       name: "memory_correct",
       options: { codemode: false },
-      description: `Correct an existing detail in the current project or global scope by exact id; other-project records are read-only here. Supply its COMPLETE updated content, retaining still-useful qualifications; read the detail if needed, not just its index hook. Title, index summary, and type are inherited unless explicitly changed; legacy insight records keep their insight type. A new current id replaces the old one, which remains historical. Derived summary topics cannot be corrected: correct a wrong source, or use memory_delete to unfold a bad summary as part of the requested repair without changing its sources. ${CAPTURE_GUIDANCE}`,
+      description: `Correct an existing detail by exact id. Only this project's and global records can be changed; other projects are read-only here. Provide the COMPLETE updated content, keeping qualifications that still apply. Read the detail if needed: its index line is not the full body. Title, summary, and type carry over unless you pass new values; legacy insights keep their type. The correction gets a new current id; the old version stays as history. Summary topics cannot be corrected. Correct the wrong source detail instead, or use memory_delete to unfold a bad summary as part of its repair; its sources stay. ${CAPTURE_GUIDANCE}`,
       input: {
         type: "object",
         properties: {
@@ -1179,7 +1179,7 @@ const setup = async (ctx: Plugin.Context) => {
           content: { type: "string", minLength: 1, description: "Complete replacement content, not a patch or addendum" },
           title: { type: "string", description: "New title, only when intentionally changing it" },
           summary: { type: "string", description: "New index hook, only when intentionally changing it" },
-          type: { type: "string", enum: [...MEMORY_TYPES], description: "New classification, only when intentionally changing it" },
+          type: { type: "string", enum: [...MEMORY_TYPES], description: "New type, only when intentionally changing it" },
           source_message_ids: { type: "array", items: { type: "string" }, minItems: 1, description: "User message IDs supporting this correction; earlier source history is retained" },
         },
         required: ["id", "content", "source_message_ids"],
@@ -1198,7 +1198,7 @@ const setup = async (ctx: Plugin.Context) => {
     editor.add({
       name: "memory_delete",
       options: { codemode: false },
-      description: "Delete a selected current-project or global record by exact id when the user asks to remove it; other-project records are read-only here. Use memory_correct to change content. A requested repair of an incorrect derived summary may also unfold it with this tool, retaining its source details. Deletion removes the selected body and dependent summary topics, not earlier versions or sibling details. This is not subject-wide erasure. The result lists retained sources/history; no replacement summary is generated, and the user can run /dream.",
+      description: "Delete one record from this project or global by exact id when the user asks; other projects are read-only here. To change content, use memory_correct. Deletion removes that record and summaries built on it. Its sources, sibling details, and earlier versions stay; this is not subject-wide erasure. To repair a wrong summary, delete it to unfold its sources. No replacement summary is generated; the user can run /dream.",
       input: {
         type: "object",
         properties: { id: { type: "string", description: "Exact id of the selected record or summary topic" } },
@@ -1236,7 +1236,7 @@ const setup = async (ctx: Plugin.Context) => {
       const scoped = entries.filter((entry) => parseMemoryID(entry.file, projectKey).key === key);
       return scoped.length > 0 ? [`${key === "global" ? "Global memory" : "Current project memory"}:\n${scoped.map(topicLine).join("\n")}`] : [];
     });
-    return `<memory>\n${READ_GUIDANCE}\nCreate new records with memory_save; update existing details with memory_correct. ${SCOPE_GUIDANCE}\n\n${sections.join("\n\n")}\n</memory>`;
+    return `<memory>\n${READ_GUIDANCE}\nCreate new records with memory_save; change an existing detail with memory_correct.\n\n${sections.join("\n\n")}\n</memory>`;
   };
 
   await ctx.session.hook("context", async (event) => {

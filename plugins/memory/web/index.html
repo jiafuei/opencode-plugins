@@ -28,7 +28,7 @@
       <nav id="topics" aria-label="Memories"></nav>
     </aside>
     <section id="detail" aria-label="Selected memory">
-      <div id="empty"><h2>From the overview to the facts.</h2><p class="muted">Select a node to read its full content. Expand summary topics to follow their sources down through each layer. Rules and unsummarized details are standalone roots.</p></div>
+      <div id="empty"><h2>Select a memory</h2><p class="muted">Select a node to read it. Expand a summary to follow its sources down. Rules and details without a summary appear as top-level nodes.</p></div>
       <article id="record" hidden>
         <div class="record-heading"><div><p id="record-project" class="muted"></p><h2 id="record-title" tabindex="-1"></h2><p id="record-meta" class="muted"></p></div><div class="actions"><button id="edit">Edit</button><button id="delete" class="danger">Delete</button></div></div>
         <p id="explanation" class="explanation" hidden></p>
@@ -40,7 +40,7 @@
           <label>Type<select id="type"><option>preference</option><option>instruction</option><option>fact</option><option>working</option><option>recap</option><option>reference</option></select></label>
           <label>Index summary<input id="edit-summary" placeholder="A short hook for finding this memory"></label>
           <label>Content<textarea id="content" rows="16" required spellcheck="false"></textarea></label>
-          <p class="muted">Global memories apply across projects; project memories are shared by its worktrees. Corrections stay in their original scope, keep the previous version, and retire dependent summaries.</p>
+          <p class="muted">Global covers all projects; project covers this project and its worktrees. Corrections stay in scope, keep the previous version, and retire summaries built on it.</p>
           <div class="actions"><button type="submit" id="save" class="primary">Save correction</button><button type="button" id="cancel">Cancel</button></div>
         </form>
         <section id="relations" aria-label="Related memories"></section>
@@ -50,7 +50,7 @@
   <dialog id="confirmation" aria-labelledby="delete-title">
     <h2 id="delete-title">Delete this record?</h2>
     <p id="delete-description"></p>
-    <p class="muted">Dependent summaries will also be removed. Sibling records, source details, and earlier versions are preserved. This cannot be undone here.</p>
+    <p class="muted">Summaries built on this record are also removed. Its sources, sibling records, and earlier versions stay. This can't be undone here.</p>
     <form method="dialog" class="actions"><button value="cancel" autofocus>Cancel</button><button value="delete" class="danger">Delete record</button></form>
   </dialog>
 </body>
