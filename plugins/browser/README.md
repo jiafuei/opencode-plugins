@@ -103,7 +103,7 @@ A snapshot returns an overview of roughly 7,000 characters, not the full tree:
     [o1:e2] heading "Orders" [level=1]
     [o1:e3] textbox "Search orders"
     [o1:e4] button "Search"
-    [o1:n1] table "Orders" (240 children; expand)
+    [o1:n1] table "Orders" (240 hidden children; expand)
 ```
 
 Every ref includes its observation ID. Element refs such as `o1:e4` support actions. Structural refs such as `o1:n1` support reading, searching, and expansion, but do not identify an actionable DOM element. Treat refs as opaque; iframe refs have different forms.
@@ -120,6 +120,17 @@ return await tools.browse.snapshot({ tab: "t1", selector: "main" });
 
 Actions return small receipts with any newly opened tab IDs. They do not automatically capture snapshots or screenshots. Use a fresh observation at the next decision boundary.
 
+For asynchronous updates, wait for the expected UI before observing:
+
+```js
+await tools.browse.wait({ tab: "t1", text: "Loaded" });
+return await tools.browse.snapshot({ tab: "t1" });
+```
+
+`wait` accepts one criterion: exact `text`, a CSS/Playwright `selector`, or `loadState` (`domcontentloaded`, `load`, or `networkidle`). Text and selector waits target the first match, not all matches. Text waits support `visible` (default) or `hidden` state. Selector waits also support `attached` and `detached`. `timeoutMs` defaults to 10,000. Prefer text or selectors to `networkidle` for application readiness. Waits require only `browse` permission and do not refresh observations.
+
+`press` accepts an optional `ref` to focus an element before pressing a key. `scroll` accepts an optional `ref` to hover a nested scroll container before sending wheel events. Without a ref, they use the current keyboard focus or pointer position. Wheel events may finish scrolling after the call returns.
+
 ### Search, expand, and read
 
 These operations use the cached tree and do not replace Playwright's element-ref map:
@@ -132,13 +143,14 @@ return await tools.browse.expand({ tab: "t1", ref: "o1:n1", depth: 2 });
 return await tools.browse.read({ tab: "t1", ref: "o1:n1" });
 ```
 
-- `snapshot` captures the complete semantic tree of the requested scope. Its `selector` scopes browser work before capture; its `depth` limits only the returned overview, not acquisition cost.
-- `expand` returns another bounded view. For wide collections, pass `next` as `offset` with the same ref and depth.
+- `snapshot` captures the complete semantic tree of the requested scope. Use `ref` to capture a current element, or `selector` to scope by a CSS/Playwright selector; `ref` takes precedence. Even a scoped capture replaces the tab's previous observation refs.
+- `snapshot` and `expand` select nodes breadth-first within the output budget, then render them in tree order. Small trees include their full depth by default. Optional `depth` limits only the returned view, not acquisition cost. Hidden-child counts identify nodes you can expand.
+- `expand` returns another bounded view. Pass `next` as `offset` with the same ref and depth to continue breadth-first selection; ancestor context is repeated on each page.
 - `find` searches all cached descendants, including collapsed ones. It returns matches with ancestor context and a total match count. Continue with `next` as `offset`, preserving the same text and root.
-- `read` pages full snapshot-derived labels/text/values, preserving semantic nesting. Continue with `next` as `offset` and the same ref. It is not live `innerText` or a structured table extractor.
+- `read` pages full snapshot-derived labels, text, values, and link URLs, preserving semantic nesting. Continue with `next` as `offset` and the same ref. It is not live `innerText` or a structured table extractor.
 - `tabs` also supports `next`/`offset` pagination. Tab IDs remain stable while each tab exists; they are not array positions.
 
-A fresh snapshot replaces the previous observation. Navigation invalidates it. Ordinary actions leave the displayed observation historical; underlying DOM replacement can still make an element ref unusable. Re-observe rather than guessing a replacement. Canvas content, hidden DOM, and unrendered virtualized rows are not a complete part of the semantic tree.
+A fresh snapshot replaces the previous observation. Explicit navigation clears it immediately; other full-page navigations clear it when the main document commits, including back/forward-cache restores. History changes and iframe loads preserve the cached observation. Ordinary actions leave the displayed observation historical; document or element replacement can still make a ref unusable. Re-observe rather than guessing a replacement. Short structural leaves omit refs; actionable elements and nodes with hidden or truncated content retain them. Canvas content, hidden DOM, and unrendered virtualized rows are not a complete part of the semantic tree.
 
 ## Run code and extract data
 
@@ -186,7 +198,7 @@ The worker keeps the eight most recent code/network results, up to one million c
 return await tools.browse.network_list({ tab: "t1", url: "/api/orders", status: 500 });
 ```
 
-Listings contain request IDs, method, URL without query/credentials, HTTP status, completion state, and duration. They do not include headers or bodies. Capture starts when the worker sees a tab; it cannot reconstruct earlier traffic.
+Listings contain request IDs, method, URL without query/credentials, HTTP status, completion state, and duration. Data URLs show their media type and total length; blob URLs show their origin. Listings do not include headers or bodies. Capture starts when the worker sees a tab; it cannot reconstruct earlier traffic.
 
 ```js
 return await tools.browse.network_get({

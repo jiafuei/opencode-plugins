@@ -1,6 +1,6 @@
 import { homedir } from "node:os";
 import { resolve } from "node:path";
-import { chromium, type BrowserContext, type Page, type Request as BrowserRequest } from "playwright-core";
+import { chromium, type BrowserContext, type CDPSession, type Page, type Request as BrowserRequest } from "playwright-core";
 import { Observation, type SnapshotNode } from "./observations.ts";
 import type { Command, Result } from "./protocol.ts";
 
@@ -10,6 +10,7 @@ type Tab = {
   id: string;
   page: Page;
   observation?: Observation;
+  navigation?: CDPSession;
   network: NetworkEntry[];
   console: ConsoleEntry[];
   nextRequest: number;
@@ -26,6 +27,8 @@ function path(value: string) {
 
 function networkURL(value: string) {
   const url = new URL(value);
+  if (url.protocol === "data:") return `${value.slice(0, value.indexOf(",")).split(";", 1)[0].slice(0, 100)} (${value.length} chars)`;
+  if (url.protocol === "blob:") return `blob:${url.origin}`;
   url.username = "";
   url.password = "";
   url.search = "";
@@ -111,11 +114,22 @@ export class BrowserSession {
         await tab.page.goto(command.url, { waitUntil: "domcontentloaded" });
         break;
       case "snapshot": {
+        if (!tab.navigation) {
+          const navigation = await tab.page.context().newCDPSession(tab.page);
+          // CDP distinguishes document commits (including back/forward-cache restores)
+          // from same-document history updates and child-frame navigation.
+          navigation.on("Page.frameNavigated", ({ frame }) => {
+            if (!frame.parentId) tab.observation = undefined;
+          });
+          await navigation.send("Page.enable");
+          tab.navigation = navigation;
+        }
+        const scope = command.ref !== undefined
+          ? this.locator(tab, command.ref)
+          : command.selector !== undefined ? tab.page.locator(command.selector) : tab.page;
         // A capture replaces Playwright's frame ref maps even if serialization later fails.
         tab.observation = undefined;
-        const tree = command.selector === undefined
-          ? await tab.page.ariaSnapshotJSON({ mode: "ai" })
-          : await tab.page.locator(command.selector).ariaSnapshotJSON({ mode: "ai" });
+        const tree = await scope.ariaSnapshotJSON({ mode: "ai" });
         const observation = new Observation(`o${++this.nextObservation}`, tree as (SnapshotNode | string)[]);
         tab.observation = observation;
         return { data: { ...this.receipt(tab), ...observation.view(undefined, 0, command.depth) } };
@@ -142,11 +156,22 @@ export class BrowserSession {
         await this.locator(tab, command.ref).hover();
         break;
       case "press":
-        await tab.page.keyboard.press(command.key);
+        if (command.ref === undefined) await tab.page.keyboard.press(command.key);
+        else await this.locator(tab, command.ref).press(command.key);
         break;
       case "scroll":
+        if (command.ref !== undefined) await this.locator(tab, command.ref).hover();
         await tab.page.mouse.wheel(command.x ?? 0, command.y);
         break;
+      case "wait": {
+        const options = { timeout: command.timeoutMs ?? 10_000 };
+        if ("loadState" in command) await tab.page.waitForLoadState(command.loadState, options);
+        else {
+          const target = "text" in command ? tab.page.getByText(command.text, { exact: true }) : tab.page.locator(command.selector);
+          await target.first().waitFor({ ...options, state: command.state });
+        }
+        break;
+      }
       case "evaluate":
       case "run_code": {
         try {
@@ -225,7 +250,6 @@ export class BrowserSession {
     this.pages.set(page, tab);
     this.tabs.set(tab.id, tab);
     page.on("close", () => this.tabs.delete(tab.id));
-    page.on("framenavigated", () => { tab.observation = undefined; });
     const requests = new WeakMap<BrowserRequest, NetworkEntry>();
     page.on("request", (request) => {
       const entry: NetworkEntry = { id: ++tab.nextRequest, request, started: Date.now() };
@@ -293,7 +317,7 @@ export class BrowserSession {
   }
 
   private storeResult(value: unknown) {
-    const text = typeof value === "string" ? value : JSON.stringify(value === undefined ? null : value, null, 2);
+    const text = typeof value === "string" ? value : JSON.stringify(value === undefined ? null : value);
     if (text === undefined) throw new Error("Return a string or JSON-compatible value from browser code.");
     const id = `v${++this.nextResult}`;
     this.results.set(id, { text: text.slice(0, RESULT_CHARS), total: text.length, format: typeof value === "string" ? "text" : "json" });

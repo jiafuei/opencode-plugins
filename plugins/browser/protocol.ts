@@ -13,7 +13,7 @@ export type Command =
   | { method: "open"; url?: string }
   | { method: "close_tab"; tab: string }
   | { method: "navigate"; tab: string; url: string }
-  | { method: "snapshot"; tab: string; selector?: string; depth?: number }
+  | { method: "snapshot"; tab: string; selector?: string; ref?: string; depth?: number }
   | { method: "expand"; tab: string; ref: string; offset?: number; depth?: number }
   | { method: "find"; tab: string; text: string; root?: string; offset?: number }
   | { method: "read"; tab: string; ref?: string; offset?: number }
@@ -22,8 +22,13 @@ export type Command =
   | { method: "select"; tab: string; ref: string; values: string[] }
   | { method: "check"; tab: string; ref: string; checked: boolean }
   | { method: "hover"; tab: string; ref: string }
-  | { method: "press"; tab: string; key: string }
-  | { method: "scroll"; tab: string; x?: number; y: number }
+  | { method: "press"; tab: string; key: string; ref?: string }
+  | { method: "scroll"; tab: string; x?: number; y: number; ref?: string }
+  | ({ method: "wait"; tab: string; timeoutMs?: number } & (
+    | { text: string; state?: "visible" | "hidden" }
+    | { selector: string; state?: "attached" | "detached" | "visible" | "hidden" }
+    | { loadState: "domcontentloaded" | "load" | "networkidle" }
+  ))
   | { method: "evaluate"; tab: string; code: string; ref?: string }
   | { method: "run_code"; tab: string; code: string }
   | { method: "result"; id: string; offset?: number }

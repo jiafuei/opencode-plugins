@@ -20,10 +20,12 @@ const server = Bun.serve({
     if (url.pathname === "/api/orders") return Response.json({ orders: ["Acme", "Example"] }, { headers: { "x-fixture": "visible" } });
     if (url.pathname === "/frame") return new Response('<button onclick="this.textContent=\'Frame clicked\'">Frame action</button>', { headers: { "content-type": "text/html" } });
     return new Response(`<!doctype html><title>Browser fixture</title><main>
-      <h1>Orders</h1><label>Search orders<input></label>
+      <h1>Orders</h1><label>Search orders<input oninput="history.replaceState(null,'','?q='+encodeURIComponent(this.value))"></label>
       <button onclick="console.warn('fixture warning');fetch('/api/orders?token=secret',{headers:{Authorization:'Bearer fixture-token'}}).then(r=>r.json()).then(()=>document.querySelector('#state').textContent='Loaded')">Load orders</button>
       <output id="state">Idle</output><input type="checkbox" aria-label="Include archived">
       <iframe title="Cross-origin frame" src="http://localhost:${url.port}/frame"></iframe>
+      <button onclick="const frame=document.querySelector('iframe');frame.onload=()=>document.querySelector('#frame-state').textContent='Frame ready';frame.src='http://localhost:${url.port}/frame?reload'">Reload frame</button>
+      <output id="frame-state">Frame idle</output><a href="/next">Next page</a>
     </main>`, { headers: { "content-type": "text/html", "content-security-policy": "script-src 'self' 'unsafe-inline'" } });
   },
 });
@@ -55,15 +57,36 @@ function firstTab(data: Record<string, unknown>) {
 test("large observations remain searchable and pageable without lost or duplicated content", () => {
   const content = Array.from({ length: 800 }, (_, i) => `Full text ${i} with\nnewlines.\n`).join("");
   const names = Array.from({ length: 1000 }, (_, i) => `Order ${i}`);
-  const observation = new Observation("capture", [{ role: "main", name: "Orders", children: [
-    ...names.map((name) => ({ role: "button", name: `${name} ${"long label ".repeat(12)}` })),
-    { role: "paragraph", text: content },
-  ] }]);
+  const observation = new Observation("capture", [
+    { role: "navigation", name: "Primary", children: [
+      { role: "list", children: [
+        { role: "group", children: [
+          { role: "group", children: names.map((name, i) => ({ role: "button", ref: `e${i + 3}`, name: `${name} ${"long label ".repeat(12)}` })) },
+        ] },
+      ] },
+    ] },
+    { role: "main", name: "Orders", children: [
+      { role: "form", children: [{ role: "group", children: [
+        { role: "textbox", ref: "e1", name: "Search orders", text: "Acme", active: true, invalid: true },
+        { role: "link", ref: "e2", name: "Order help", url: "https://example.com/orders" },
+      ] }] },
+      { role: "paragraph", text: content },
+    ] },
+  ]);
+  const first = observation.view();
+  expect(first.outline).toContain('main "Orders"');
+  expect(first.outline).toContain('textbox "Search orders"');
+  expect(first.outline).toContain('value="Acme"');
+  expect(first.outline).toContain("active=true");
+  expect(first.outline.indexOf('navigation "Primary"')).toBeLessThan(first.outline.indexOf('main "Orders"'));
+  expect(observation.view(undefined, 0, 2).outline).not.toContain("Search orders");
+  expect(observation.find("example.com/orders").matches).toBe(1);
   let offset = 0;
   let pages = 0;
   const recovered: string[] = [];
   for (;;) {
-    const page = observation.view(undefined, offset, 2);
+    const page = observation.view(undefined, offset);
+    expect(page.outline.length).toBeLessThanOrEqual(7000);
     recovered.push(...(page.outline.match(/Order \d+/g) ?? []));
     pages++;
     if (page.next === undefined) break;
@@ -74,7 +97,7 @@ test("large observations remain searchable and pageable without lost or duplicat
   expect(recovered).toEqual(names);
   const found = observation.find("Order 999");
   expect(found.matches).toBe(1);
-  expect(found.outline).toContain("Orders");
+  expect(found.outline).toContain("Primary");
   let text = "";
   offset = 0;
   for (;;) {
@@ -86,6 +109,33 @@ test("large observations remain searchable and pageable without lost or duplicat
   }
   expect(text).toContain(content);
 });
+
+browserTest("history updates and iframe loads preserve refs; scoped snapshots replace them", async () => {
+  const runtime = new BrowserRuntime(import.meta.dir, () => {});
+  const signal = AbortSignal.timeout(30_000);
+  try {
+    const launched = await runtime.call({ method: "launch", url: server.url.href, launchOptions: { executablePath: executable, headless: true, args: ["--no-sandbox"] } }, signal);
+    const tab = firstTab(launched.data);
+    await runtime.call({ method: "wait", tab, selector: "button" }, signal);
+    const snapshot = await runtime.call({ method: "snapshot", tab }, signal);
+    const search = element(snapshot, 'textbox "Search orders"');
+    await runtime.call({ method: "fill", tab, ref: search, text: "Acme" }, signal);
+    await runtime.call({ method: "click", tab, ref: element(snapshot, "Reload frame") }, signal);
+    await runtime.call({ method: "wait", tab, text: "Frame ready" }, signal);
+    await runtime.call({ method: "press", tab, ref: search, key: "Backspace" }, signal);
+    const scoped = await runtime.call({ method: "snapshot", tab, ref: search }, signal);
+    expect(scoped.data.outline).toContain('value="Acm"');
+    expect(scoped.data.outline).not.toContain("Reload frame");
+    await expect(runtime.call({ method: "fill", tab, ref: search, text: "stale" }, signal)).rejects.toThrow("Stale observation ref");
+    await runtime.call({ method: "fill", tab, ref: element(scoped, 'textbox "Search orders"'), text: "Current" }, signal);
+    const refreshed = await runtime.call({ method: "snapshot", tab }, signal);
+    await runtime.call({ method: "click", tab, ref: element(refreshed, "Next page") }, signal);
+    await runtime.call({ method: "wait", tab, loadState: "domcontentloaded" }, signal);
+    await expect(runtime.call({ method: "find", tab, text: "Search orders" }, signal)).rejects.toThrow("no current observation");
+  } finally {
+    await runtime.close();
+  }
+}, 35_000);
 
 browserTest("real browser refs, cached search, iframe actions, evaluation, and diagnostics", async () => {
   const runtime = new BrowserRuntime(import.meta.dir, () => {});
@@ -106,7 +156,7 @@ browserTest("real browser refs, cached search, iframe actions, evaluation, and d
     const state = await runtime.call({ method: "run_code", tab, code: "async page => { await page.getByText('Loaded', {exact:true}).waitFor(); return {checked:await page.getByRole('checkbox').isChecked(),frame:await page.locator('iframe').contentFrame().getByRole('button').innerText()}; }" }, signal, 10_000);
     expect(JSON.parse(String(state.data.text))).toEqual({ checked: true, frame: "Frame clicked" });
     // Code can replace Playwright's ref map. Its previous observation must no longer be actionable.
-    await expect(runtime.call({ method: "click", tab, ref: target }, signal)).rejects.toThrow();
+    await expect(runtime.call({ method: "click", tab, ref: target }, signal)).rejects.toThrow("no current observation");
     const network = await runtime.call({ method: "network_list", tab, url: "/api/orders", status: 200 }, signal);
     const requests = network.data.entries as { id: number; url: string }[];
     const request = requests[0];
@@ -130,7 +180,7 @@ browserTest("real browser refs, cached search, iframe actions, evaluation, and d
     const streaming = await runtime.call({ method: "network_list", tab, url: "/stream" }, signal);
     const stream = (streaming.data.entries as { id: number }[])[0];
     if (!stream) throw new Error("Fixture stream was not captured");
-    await expect(runtime.call({ method: "network_get", tab, request: stream.id, part: "responseBody" }, signal)).rejects.toThrow();
+    await expect(runtime.call({ method: "network_get", tab, request: stream.id, part: "responseBody" }, signal)).rejects.toThrow("Response body is not complete");
     await runtime.call({ method: "tabs" }, signal); // Rejection must not come from a timeout that killed the worker.
   } finally {
     await runtime.close();
@@ -192,14 +242,14 @@ browserTest("plugin permissions, native option overrides, images, and close/rela
   };
   try {
     const overrides = { contextOptions: { locale: "fr-FR" } };
-    await expect(tool("launch").execute(overrides, context)).rejects.toThrow();
+    await expect(tool("launch").execute(overrides, context)).rejects.toThrow("Trusted code denied");
     allowCode = true;
     const launched = await tool("launch").execute(overrides, context);
     const tab = firstTab(launched.output as Record<string, unknown>);
-    await expect(tool("launch").execute({}, context)).rejects.toThrow();
+    await expect(tool("launch").execute({}, context)).rejects.toThrow("already launching or connected");
     allowCode = false;
     const input = { tab, code: "async page => ({pid:process.pid,language:await page.evaluate(()=>navigator.language)})" };
-    await expect(tool("run_code").execute(input, context)).rejects.toThrow();
+    await expect(tool("run_code").execute(input, context)).rejects.toThrow("Trusted code denied");
     allowCode = true;
     const output = await tool("run_code").execute(input, context);
     const value = JSON.parse(String((output.output as Record<string, unknown>).text));
@@ -208,7 +258,7 @@ browserTest("plugin permissions, native option overrides, images, and close/rela
     const screenshot = await tool("screenshot").execute({ tab }, context);
     const attachments = Array.isArray(screenshot.content) ? screenshot.content : [];
     expect(attachments.some((item) => item.type === "file" && item.mime.startsWith("image/") && item.uri.startsWith("data:image/"))).toBe(true);
-    await expect(tool("run_code").execute({ tab, code: "async page => { while (true) {} }", timeoutMs: 100 }, context)).rejects.toThrow();
+    await expect(tool("run_code").execute({ tab, code: "async page => { while (true) {} }", timeoutMs: 100 }, context)).rejects.toThrow("cancelled or timed out");
     allowCode = false;
     // Relaunch must release both the adapter entry and Chromium's profile lock, without host-code permission.
     await tool("launch").execute({}, context);

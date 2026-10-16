@@ -11,8 +11,11 @@ export type SnapshotNode = {
   selected?: boolean;
   pressed?: boolean | "mixed";
   level?: number;
-  value?: string;
   placeholder?: string;
+  url?: string;
+  active?: boolean;
+  invalid?: boolean | "grammar" | "spelling";
+  cursor?: "pointer";
 };
 
 type Entry = { id: string; node: SnapshotNode; parent?: Entry; children: Entry[]; depth: number };
@@ -55,15 +58,15 @@ export class Observation {
     return entry.node.ref;
   }
 
-  view(ref?: string, offset = 0, depth = 3) {
+  view(ref?: string, offset = 0, depth?: number) {
     const root = this.entry(ref);
-    const candidates: Entry[] = [];
-    const collect = (entry: Entry) => {
-      candidates.push(entry);
-      if (entry.depth - root.depth < depth) entry.children.forEach(collect);
-    };
-    collect(root);
-    return this.render(candidates, root, offset, depth);
+    const candidates = [root];
+    for (const entry of candidates) {
+      if (depth === undefined || entry.depth - root.depth < depth) {
+        for (const child of entry.children) candidates.push(child);
+      }
+    }
+    return this.render(candidates, root, offset);
   }
 
   find(text: string, ref?: string, offset = 0) {
@@ -71,8 +74,8 @@ export class Observation {
     const needle = text.toLocaleLowerCase();
     const matches: Entry[] = [];
     const visit = (entry: Entry) => {
-      const { name = "", text = "", value = "", placeholder = "" } = entry.node;
-      if (`${name}\n${text}\n${value}\n${placeholder}`.toLocaleLowerCase().includes(needle)) matches.push(entry);
+      const { name = "", text = "", placeholder = "", url = "" } = entry.node;
+      if (`${name}\n${text}\n${placeholder}\n${url}`.toLocaleLowerCase().includes(needle)) matches.push(entry);
       entry.children.forEach(visit);
     };
     visit(root);
@@ -83,8 +86,8 @@ export class Observation {
     const root = this.entry(ref);
     const lines: string[] = [];
     const visit = (entry: Entry) => {
-      const { role, name, text, value } = entry.node;
-      const content = [name, text, value].filter((part) => part !== undefined && part !== "").join("\n");
+      const { role, name, text, url } = entry.node;
+      const content = [name, text === name ? undefined : text, url].filter(Boolean).join("\n");
       if (content) lines.push(`${"  ".repeat(Math.min(entry.depth - root.depth, 12))}${role}: ${content}`);
       entry.children.forEach(visit);
     };
@@ -100,37 +103,37 @@ export class Observation {
     };
   }
 
-  private line(entry: Entry, root: Entry, collapsed: boolean) {
+  private line(entry: Entry, root: Entry, hidden: number) {
     const node = entry.node;
-    const label = [node.name, node.text].filter(Boolean).join(" ").replace(/\s+/g, " ");
+    const value = ["textbox", "searchbox", "combobox", "spinbutton"].includes(node.role) ? node.text : undefined;
+    const label = [node.name, value === undefined && node.text !== node.name ? node.text : undefined].filter(Boolean).join(" ").replace(/\s+/g, " ");
     const preview = label.length > 220 ? `${label.slice(0, 220)}… (read for full text)` : label;
-    const states = (["checked", "disabled", "expanded", "selected", "pressed", "level"] as const)
+    const states = (["checked", "disabled", "expanded", "selected", "pressed", "level", "active", "invalid", "cursor"] as const)
       .filter((key) => node[key] !== undefined)
       .map((key) => `${key}=${node[key]}`);
-    if (node.value !== undefined) states.push(`value=${JSON.stringify(node.value.slice(0, 120))}`);
+    if (value !== undefined) states.push(`value=${JSON.stringify(value.slice(0, 120))}`);
     if (node.placeholder) states.push(`placeholder=${JSON.stringify(node.placeholder.slice(0, 120))}`);
-    const suffix = collapsed ? ` (${entry.children.length} children; expand)` : "";
-    return `${"  ".repeat(Math.min(entry.depth - root.depth, 12))}[${this.id}:${entry.id}] ${node.role}${preview ? ` ${JSON.stringify(preview)}` : ""}${states.length ? ` [${states.join(" ")}]` : ""}${suffix}`;
+    if (node.url) states.push(`url=${JSON.stringify(node.url.slice(0, 200))}`);
+    const truncated = label.length > 220 || (value?.length ?? 0) > 120 || (node.placeholder?.length ?? 0) > 120 || (node.url?.length ?? 0) > 200;
+    const ref = node.ref || entry.children.length || truncated ? `[${this.id}:${entry.id}] ` : "";
+    const suffix = hidden ? ` (${hidden} hidden children; expand)` : "";
+    return `${"  ".repeat(Math.min(entry.depth - root.depth, 12))}${ref}${node.role}${preview ? ` ${JSON.stringify(preview)}` : ""}${states.length ? ` [${states.join(" ")}]` : ""}${suffix}`;
   }
 
-  private render(candidates: Entry[], root: Entry, offset: number, depth?: number) {
-    const lines: string[] = [];
+  private render(candidates: Entry[], root: Entry, offset: number) {
     const shown = new Set<Entry>();
     let chars = 0;
     let next = offset;
     for (const entry of candidates.slice(offset)) {
       const path: Entry[] = [];
       let ancestor: Entry | undefined = entry;
-      while (ancestor && ancestor.depth >= root.depth) {
-        if (!shown.has(ancestor)) path.unshift(ancestor);
+      while (ancestor && ancestor.depth >= root.depth && !shown.has(ancestor)) {
+        path.push(ancestor);
         ancestor = ancestor.parent;
       }
-      const block = path.map((item) => this.line(item, root, item.children.length > 0 && (
-        depth === undefined || item.depth - root.depth >= depth
-      )));
-      const size = block.reduce((sum, line) => sum + line.length + 1, 0);
+      // Reserve each node's full hidden-child suffix; the final rendering can only be shorter.
+      const size = path.reduce((sum, item) => sum + this.line(item, root, item.children.length).length + 1, 0);
       if (chars + size > BUDGET) break;
-      lines.push(...block);
       path.forEach((item) => shown.add(item));
       chars += size;
       next++;
@@ -139,6 +142,13 @@ export class Observation {
       const entry = candidates[offset];
       if (entry) throw new Error(`Ancestor context exceeds the output budget. Expand ${this.id}:${entry.id} as a narrower root.`);
     }
+    const lines: string[] = [];
+    const visit = (entry: Entry) => {
+      if (!shown.has(entry)) return;
+      lines.push(this.line(entry, root, entry.children.filter((child) => !shown.has(child)).length));
+      entry.children.forEach(visit);
+    };
+    visit(root);
     return {
       observation: this.id,
       root: `${this.id}:${root.id}`,
