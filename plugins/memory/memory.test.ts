@@ -45,6 +45,13 @@ async function fixture(
   const hooks = new Map<string, Hook>();
   const queue: unknown[] = [];
   const histories = new Map<string, unknown[]>();
+  let sourceID = 0;
+  const withSource = (sessionID: string, input: Record<string, unknown>) => {
+    if (input.source_message_ids) return input;
+    const id = `msg_source_${String(++sourceID).padStart(4, "0")}`;
+    histories.set(sessionID, [...(histories.get(sessionID) ?? []), { id, type: "user", text: input.content, time: { created: Date.UTC(2026, 7, 1) } }]);
+    return { ...input, source_message_ids: [id] };
+  };
   let wake: (() => void) | undefined;
   let handlers: Handlers = {};
   const tools: Record<string, MemoryTool> = {};
@@ -100,12 +107,12 @@ async function fixture(
     statuses: () => emitted.flatMap((event) => event.name === "dream" ? [event.data as DreamStatus] : []),
     saved: () => emitted.flatMap((event) => event.name === "saved" ? [event.data] : []),
     errors: () => emitted.flatMap((event) => event.name === "error" ? [event.data] : []),
-    save: (sessionID: string, input: Record<string, unknown>) => tools.memory_save!.execute(input, { sessionID, agent: "build" }),
-    correct: (sessionID: string, id: string, input: Record<string, unknown>) => tools.memory_correct!.execute({ id, ...input }, { sessionID, agent: "build" }),
+    save: (sessionID: string, input: Record<string, unknown>) => tools.memory_save!.execute(withSource(sessionID, input), { sessionID, agent: "build" }),
+    correct: (sessionID: string, id: string, input: Record<string, unknown>) => tools.memory_correct!.execute(withSource(sessionID, { id, ...input }), { sessionID, agent: "build" }),
     read: (sessionID: string, id: string) => tools.memory_read!.execute({ id }, { sessionID, agent: "build" }),
     search: (sessionID: string, query: string, offset?: number, all_projects?: boolean) => tools.memory_search!.execute({ query, ...(offset === undefined ? {} : { offset }), all_projects }, { sessionID, agent: "build" }),
     delete: (sessionID: string, id: string) => tools.memory_delete!.execute({ id }, { sessionID, agent: "build" }),
-    history: (sessionID: string, messages: unknown[]) => histories.set(sessionID, messages),
+    history: (sessionID: string, messages: Array<{ id: string; type: string; time?: { created: number } } & Record<string, unknown>>) => histories.set(sessionID, messages.map((message) => ({ time: { created: Date.UTC(2026, 7, 1) }, ...message }))),
     message: async (sessionID: string, text: string) => {
       const messageID = `msg_${crypto.randomUUID()}`;
       await hooks.get("prompt")!({ sessionID, messageID, prompt: { text }, delivery: "steer" } as never);
@@ -276,7 +283,7 @@ describe("memory scopes", () => {
     await global.writeIndex([{ title: "Style", file: "rule.md", summary: "Style preference", type: "preference", updated: "2026-10-16" }]);
     const app = await fixture(directory, (call) => isReflectionSelector(call)
       ? { needed: true, ids: ["global:rule.md"] }
-      : { create: [{ ...memoryExtraction({ title: "Shared reference", type: "reference" }), scope: "global" }], correct: [{ id: "global:rule.md", content: "Use the new style." }] }, { idle_delay_ms: 1000 }, storage);
+      : { create: [{ ...memoryExtraction({ title: "Shared reference", type: "reference" }), scope: "global", source_message_ids: ["msg_1"] }], correct: [{ id: "global:rule.md", content: "Use the new style.", source_message_ids: ["msg_1"] }] }, { idle_delay_ms: 1000 }, storage);
     try {
       await app.context("ses_scope_reflect");
       app.history("ses_scope_reflect", [{ id: "msg_1", type: "user", text: "Use the new style everywhere, and save this reference globally." }]);
@@ -513,7 +520,7 @@ describe("memory persistence", () => {
     expect(output.system[0]!.text).toContain("First [id: first.md] - [recap|2026-08-01] First summary");
     expect(output.system[0]!.text).not.toContain("FIRST_BODY");
     expect(output.tools.memory_save).toBeDefined();
-    expect(output.tools.memory_correct).toMatchObject({ input: { required: ["id", "content"] } });
+    expect(output.tools.memory_correct).toMatchObject({ input: { required: ["id", "content", "source_message_ids"] } });
     expect(output.tools.memory).toBeUndefined();
 
     for (const sessionID of ["ses_sub", "ses_worker_1"]) {
@@ -638,7 +645,7 @@ describe("memory persistence", () => {
     const app = await fixture(directory, (call) => {
       if (isReflectionSelector(call)) return { needed: !call.prompt.includes("Thanks, now rename the helper."), ids: [] };
       return isReflection(call)
-        ? { create: [memoryExtraction({ title: "Login investigation", type: "working", content: "The user suspects the shared Redis fixture; this is not confirmed." })], correct: [] }
+        ? { create: [{ ...memoryExtraction({ title: "Login investigation", type: "working", content: "The user suspects the shared Redis fixture; this is not confirmed." }), source_message_ids: ["msg_1"] }], correct: [] }
         : noMemories();
     }, { idle_delay_ms: 1000, reflect_model: "test/small#low" }, storage);
     const assistant = (id: string, text: string) => ({
@@ -685,6 +692,118 @@ describe("memory persistence", () => {
     }
     expect(memory(storage, directory).index()[0]!).toMatchObject({ title: "Login investigation", type: "working" });
     await app.dispose();
+  });
+
+  test.serial("reviews pre-compaction evidence after a restart without replacing its statement date", async () => {
+    const directory = "/tmp/memory-compaction-capture";
+    const storage = new Map<string, unknown>();
+    const statedAt = Date.UTC(2024, 1, 3, 12);
+    let app = await fixture(directory, noMemories, { idle_delay_ms: 1000 }, storage);
+    app.history("ses_capture", [
+      { id: "msg_1", type: "user", time: { created: statedAt }, text: `Always ask before deploying.\n${"Background context. ".repeat(3000)}` },
+      { id: "msg_2", type: "assistant", content: [{ type: "text", text: "I propose a staging-first workflow." }] },
+      { id: "msg_3", type: "user", time: { created: statedAt + 1000 }, text: "Yes, use that workflow." },
+    ]);
+    const context = await app.context("ses_capture", [userMessage("msg_1", "Always ask before deploying.")]);
+    expect(context.messages[0]!.content[1]!.text).toContain('memory_source id="msg_1"');
+    await app.compaction("ses_capture");
+    app.history("ses_capture", []);
+    await app.dispose();
+
+    app = await fixture(directory, (call) => {
+      if (isReflectionSelector(call)) return { needed: true, ids: [] };
+      if (call.prompt.includes('<user id="msg_3"')) {
+        return { create: [{ ...memoryExtraction({ title: "Deployment workflow", content: "The user accepted a staging-first workflow." }), source_message_ids: ["msg_3"] }], correct: [] };
+      }
+      return { create: [{ ...memoryExtraction({ title: "Deployment approval", type: "instruction", content: "Ask before deploying." }), source_message_ids: ["msg_1"] }], correct: [] };
+    }, { idle_delay_ms: 1000 }, storage);
+    try {
+      jest.useFakeTimers();
+      await app.context("ses_capture");
+      await app.emit("session.execution.succeeded", "ses_capture");
+      jest.advanceTimersByTime(1000);
+      await until(() => app.saved().length === 1);
+      await until(() => (storage.get("session/ses_capture") as { writes: unknown[] }).writes.length === 0);
+      await settle();
+      await app.compaction("ses_capture");
+      jest.advanceTimersByTime(1000);
+      await until(() => app.saved().length === 2);
+      await until(() => (storage.get("session/ses_capture") as { writes: unknown[] }).writes.length === 0);
+      const record = memory(storage, directory).index().find((entry) => entry.title === "Deployment approval")!;
+      expect(record.evidence).toEqual([{ sessionID: "ses_capture", messageID: "msg_1", createdAt: statedAt }]);
+      expect((await app.read("ses_capture", record.file)).content).toContain("2024-02-03T12:00:00.000Z");
+      expect(storage.get("session/ses_capture")).toMatchObject({ cursor: "msg_3", backlog: [], writes: [] });
+      expect(app.calls.filter(isReflection).at(-1)!.prompt).toContain("I propose a staging-first workflow.");
+      expect(JSON.stringify(storage.get("session/ses_capture"))).not.toContain("Always ask before deploying.");
+    } finally {
+      jest.useRealTimers();
+      await app.dispose();
+    }
+  });
+
+  test.serial("retries only failed reflection writes after a restart", async () => {
+    const directory = "/tmp/memory-reflection-retry";
+    const storage = new Map<string, unknown>();
+    const project = store(storage, directory, [{ file: "plan.md", type: "working", content: "Original plan." }]);
+    let fail = true;
+    const write = Bun.write;
+    const failingWrite = jest.spyOn(Bun, "write").mockImplementation((destination, content: Bun.BunFile | string, options) => {
+      if (fail && typeof content === "string" && content.startsWith("Retry this memory")) return Promise.reject(new Error("Temporary write failure"));
+      return write(destination, content, options);
+    });
+    let app = await fixture(directory, (call) => isReflectionSelector(call)
+      ? { needed: true, ids: ["plan.md"] }
+      : { create: [
+        { ...memoryExtraction({ title: "Successful sibling", content: "Keep this memory." }), source_message_ids: ["msg_1"] },
+        { ...memoryExtraction({ title: "Pending sibling", content: "Retry this memory." }), source_message_ids: ["msg_1"] },
+      ], correct: [{ id: "plan.md", content: "Retry this memory, replacing the plan.", source_message_ids: ["msg_1"] }] }, { idle_delay_ms: 1000 }, storage);
+    try {
+      app.history("ses_retry", [{ id: "msg_1", type: "user", text: "Keep both decisions for future work." }]);
+      await app.context("ses_retry");
+      jest.useFakeTimers();
+      await app.emit("session.execution.succeeded", "ses_retry");
+      jest.advanceTimersByTime(1000);
+      await until(() => app.errors().length > 0);
+      expect(storage.get("session/ses_retry")).toMatchObject({ cursor: "msg_1", backlog: [] });
+      expect((storage.get("session/ses_retry") as { writes: unknown[] }).writes).toHaveLength(2);
+      await app.dispose();
+      project.setTopic("plan.md", "User changed the plan meanwhile.");
+      fail = false;
+      app = await fixture(directory, () => { throw new Error("Retry must not re-extract reviewed text"); }, { idle_delay_ms: 1000 }, storage);
+      await app.context("ses_retry");
+      await app.emit("session.execution.succeeded", "ses_retry");
+      jest.advanceTimersByTime(1000);
+      await until(() => (storage.get("session/ses_retry") as { writes: unknown[] }).writes.length === 0);
+      expect(project.index().map((entry) => entry.title).sort()).toEqual(["Pending sibling", "Successful sibling", "plan.md"]);
+      expect(project.topic("plan.md")).toBe("User changed the plan meanwhile.");
+      await until(() => app.errors().length > 0);
+      expect(app.errors()[0]!.message).toContain("Outdated correction needs a fresh review");
+      expect(app.calls).toHaveLength(0);
+    } finally {
+      failingWrite.mockRestore();
+      jest.useRealTimers();
+      await app.dispose();
+    }
+  });
+
+  test.serial("accepts user evidence but refuses assistant and invented source IDs", async () => {
+    const directory = "/tmp/memory-source-admission";
+    const storage = new Map<string, unknown>();
+    const app = await fixture(directory, noMemories, {}, storage);
+    app.history("ses_sources", [
+      { id: "msg_1", type: "user", text: "Use Bun for this project." },
+      { id: "msg_2", type: "assistant", content: [{ type: "text", text: "Use npm instead." }] },
+    ]);
+    try {
+      for (const source of ["msg_2", "msg_missing"]) {
+        await expect(app.save("ses_sources", { ...memoryExtraction(), source_message_ids: [source] })).rejects.toThrow("not a supplied user message");
+      }
+      await app.save("ses_sources", { ...memoryExtraction({ title: "Runtime", content: "Use Bun." }), source_message_ids: ["msg_1"] });
+      expect(app.saved()).toHaveLength(1);
+      expect(memory(storage, directory).index()[0]!.evidence).toEqual([{ sessionID: "ses_sources", messageID: "msg_1", createdAt: Date.UTC(2026, 7, 1) }]);
+    } finally {
+      await app.dispose();
+    }
   });
 
   test.serial("notifies existing sessions of body-only edits without rewriting their cached snapshot", async () => {
@@ -762,8 +881,8 @@ describe("memory persistence", () => {
       if (!isReflection(call)) return noMemories();
       expect(call.prompt).toContain("Status: tentative. Use shared Redis fixtures.");
       return { create: [], correct: [
-        { id: "unread.md", content: "An unread correction" },
-        { id: "plan.md", content: "The user decided to use isolated Redis fixtures.", summary: "Fixtures: use isolated Redis" },
+        { id: "unread.md", content: "An unread correction", source_message_ids: ["msg_1"] },
+        { id: "plan.md", content: "The user decided to use isolated Redis fixtures.", summary: "Fixtures: use isolated Redis", source_message_ids: ["msg_1"] },
       ] };
     }, { idle_delay_ms: 1000 }, storage);
     try {

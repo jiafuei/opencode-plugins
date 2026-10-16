@@ -75,7 +75,9 @@ export function serveDashboard(options: {
             const catalog = await store.readCatalog();
             const previous = catalog.find((entry) => entry.file === input.target);
             if (previous && input.revision && topicRevision(previous, await store.readTopic(previous.file)) !== input.revision) throw new Error("This record changed. Refresh before saving.");
-            const { entry, index } = await store.save(catalog, input);
+            const { entry, index } = await store.save(catalog, {
+              target: input.target, title: input.title, summary: input.summary, content: input.content, type: input.type, origin: "dashboard",
+            });
             await store.readView(index);
             return { file: entry.file };
           });

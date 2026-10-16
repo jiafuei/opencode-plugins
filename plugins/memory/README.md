@@ -67,16 +67,37 @@ Each operation is a separate tool with a plain object input:
 | --- | --- | --- |
 | `memory_read` | `id` | Read a detail, summary topic, or explicitly labeled historical version |
 | `memory_search` | `query`, optional `offset`, `all_projects` | Search current/global records; explicitly opt into other projects |
-| `memory_save` | `title`, `summary`, `content`, `type`, optional `scope` | Create in `project` (default) or `global`; `summary` is its index hook |
-| `memory_correct` | `id`, `content`; optional `title`, `summary`, `type` | Replace a detail's complete content; omitted metadata is inherited |
+| `memory_save` | `title`, `summary`, `content`, `type`, `source_message_ids`, optional `scope` | Create in `project` (default) or `global`; `summary` is its index hook |
+| `memory_correct` | `id`, `content`, `source_message_ids`; optional `title`, `summary`, `type` | Replace a detail's complete content; omitted metadata is inherited |
 | `memory_delete` | `id` | Remove a selected record; deleting a summary topic preserves its sources |
 
-For example, `memory_correct({ id: "fixture-plan-a1b2c3d4.md", content: "The user decided to use isolated Redis fixtures." })`
+For example, `memory_correct({ id: "fixture-plan-a1b2c3d4.md", content: "The user decided to use isolated Redis fixtures.", source_message_ids: ["msg_confirmation"] })`
 retains the record's title, index hook, and classification. Empty optional titles/hooks also keep their existing values;
 new records need a non-empty title. Legacy non-derived insights keep their `insight` type rather than becoming rules.
 The result names the new current ID and marks the previous
 ID historical. Read details when needed to preserve their qualifications; there is no mandatory read or confirmation gate.
 Workers receive only `memory_read` and `memory_search`.
+
+Genuine user messages carry a `<memory_source>` annotation with their message ID and original timestamp. Cite the
+supporting user messages when saving or correcting a memory. The plugin supplies the session and verifies the selected
+messages; assistant messages cannot establish user provenance. An accepted proposal cites the user's confirmation.
+Corrections retain earlier source references as history and add the new evidence. Dashboard edits are labeled direct
+user edits rather than attributed to a chat.
+
+The index date is the capture or version-update date, not the date the user made the statement. `memory_read` and the
+dashboard show original source dates and IDs when available. New summaries separately track the latest known user
+statement date. Legacy records keep their existing dates and do not receive guessed provenance. Permanent records
+retain references and dates, not supporting conversation quotes. Source text may become unavailable if its session is deleted.
+
+Background review preserves pending user and assistant text across compaction in plugin session storage. That temporary
+buffer is removed after successful review or session deletion; tool output and reasoning are not included. Resumed
+sessions recover pending work after their next execution finishes. Large backlogs are reviewed in batches with a soft
+48,000-character target, keeping each user turn with its replies; remaining batches continue during idle time.
+Failed extracted writes remain pending for a later idle period
+or resumed session, without re-extracting successful siblings. A correction invalidated by a changed, superseded, or
+deleted target is reported for fresh review and removed from automatic retries, rather than overwriting newer edits.
+This is not an exactly-once transaction across the catalog
+and session storage: a crash between a successful create and its acknowledgment can repeat that create.
 
 These named tools replace the former `memory({ action, target, ... })` API, without aliases. Existing stored records
 and session snapshots are retained; a current API guide supersedes action-based instructions in cached snapshots.

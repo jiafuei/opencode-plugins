@@ -84,6 +84,27 @@ Reflection chooses global scope only for clearly general preferences or instruct
 scope stays project-local. Existing records are not bulk-classified or promoted. Working details and facts are not forced into instruction types. Most reviews save nothing. Worker failures are
 logged and surfaced in the TUI; a successful review advances the cursor, with individual failed commits reported too.
 
+Before compaction, unreviewed user and assistant text is staged in the existing session storage. Reflection merges this
+backlog with live context by message ID. Successful extraction persists the review cursor and proposed writes together,
+then commits each write and removes its acknowledged proposal. Failed writes remain for the next idle review; successful
+siblings are not extracted again. A changed, superseded, or deleted correction target invalidates its proposal: report it
+for fresh review and remove it from automatic retries. A failed extraction keeps its original backlog. The buffer is removed after review or
+session deletion. No retry daemon or attempt-based deletion is used. A crash between a successful catalog create and
+the acknowledgment in session storage can duplicate that create. Resumed sessions rearm pending review when their next
+execution finishes, so streaming assistant text is not treated as a complete response. Review batches have a soft
+48,000-character target and stop between user turns. Remaining text stays buffered and a successful batch schedules
+the next idle batch; failed extraction does not create a retry loop. A single oversized turn is kept intact. The previous
+assistant reply remains available as context for interpreting a user confirmation at the next batch boundary, not as
+independent user evidence.
+
+Foreground tools and reflection cite supporting user message IDs. Source timestamps and session identity come from the
+host; assistant IDs are not user evidence. New details store these references and their capture route in index metadata,
+and corrections inherit previous source history. User-facing reads distinguish statement dates from capture/version dates.
+The context hook adds deterministic ID/date annotations to genuine user messages and caches source dates per session.
+Permanent records retain no source quotes. Direct dashboard edits have a separate capture route and do not invent chat
+provenance. Legacy records remain unchanged. New summaries retain the existing source-update coverage date and also
+record the latest known user-statement date when available; no complete date coverage is inferred for undated sources.
+
 ## Dreaming
 
 A save crossing `dream_index_bytes` or `dream_topic_limit` for dreamable roots starts a dream. Pinned rules do not count

@@ -248,7 +248,13 @@ function renderRecord() {
   if (!selected && !creating) return;
   $("record-project").textContent = selected?.projectName ?? "New record";
   $("record-title").textContent = selected?.title ?? "Create memory";
-  $("record-meta").textContent = selected ? `${selected.type} · ${selected.status} · ${selected.updated}\n${selected.file}` : "One subject per memory.";
+  $("record-meta").textContent = selected ? [
+    `${selected.type} · ${selected.status} · captured/updated ${selected.updated}`,
+    selected.file,
+    ...(selected.origin ? [`Captured via ${selected.origin}${selected.origin === "dashboard" && selected.evidence?.length ? " · chat sources are inherited" : ""}`] : []),
+    ...(selected.evidenceThrough ? [`Known user statements through ${selected.evidenceThrough}`] : []),
+    ...(selected.evidence ?? []).map((source) => `User source: ${source.sessionID} / ${source.messageID} · ${new Date(source.createdAt).toISOString()}`),
+  ].join("\n") : "One subject per memory.";
   $("summary").textContent = selected?.summary ?? "";
   $("body").textContent = selected?.content ?? "";
   $("editor").hidden = !editing;

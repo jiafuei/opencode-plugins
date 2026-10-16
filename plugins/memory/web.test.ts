@@ -27,12 +27,17 @@ test("dashboard edits across projects preserve history and retire summaries, and
     expect(scopes.map((project: { id: string }) => project.id).sort()).toEqual(["current", "global", "other"]);
     expect(scopes.find((project: { id: string }) => project.id === "current")).toMatchObject({ scope: "project", current: true });
     const global = await request("topic", "POST", { project: "global", title: "Writing style", type: "preference", summary: "General style", content: "Keep explanations concise across projects." });
-    const original = await request("topic", "POST", { project: "current", title: "Deployment", type: "fact", summary: "Deployment target", content: "Deploy to staging." });
+    const original = await request("topic", "POST", {
+      project: "current", title: "Deployment", type: "fact", summary: "Deployment target", content: "Deploy to staging.",
+      origin: "reflection", evidence: [{ sessionID: "forged", messageID: "forged", createdAt: 0 }],
+    });
     await request("topic", "POST", { project: "other", title: "Database", type: "preference", summary: "Storage choice", content: "Use SQLite." });
 
     // A real derived record, as produced by dreaming; the HTTP correction must invalidate it.
     const catalog = await store.readCatalog();
     const source = catalog[0]!;
+    expect(source.origin).toBe("dashboard");
+    expect(source.evidence).toBeUndefined();
     const summary: IndexEntry = {
       file: "deployment-summary.md", title: "Deployment summary", summary: "Target", type: "insight", updated: "2026-10-15",
       children: [{ file: source.file, revision: topicRevision(source, await store.readTopic(source.file)) }],

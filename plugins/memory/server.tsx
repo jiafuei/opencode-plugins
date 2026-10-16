@@ -3,7 +3,7 @@ import { Schema } from "effect";
 import { rm } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { MemoryRpc, type DreamStatus } from "./rpc.ts";
-import { indexLine, isRule, topicFile, topicRevision, type IndexEntry, type MemoryInput, type StoredType, type TopicStatus } from "./store.ts";
+import { indexLine, isRule, MemoryConflictError, topicFile, topicRevision, type IndexEntry, type MemoryEvidence, type MemoryInput, type StoredType, type TopicStatus } from "./store.ts";
 import { activeMemoryDreams, importMemoryPartition, listMemoryScopes, memoryDataRoot, memoryID, memoryProjectKey, memoryScopeRoot, openMemoryStore, parseMemoryID, readScopedView, scopedEntry } from "./scope.ts";
 import { serveDashboard } from "./web.ts";
 
@@ -50,6 +50,9 @@ type PersistedSession = {
   frozen: Array<[messageID: string, update: string]>;
   cursor?: string;
   saved: Array<{ file: string; title: string }>;
+  pending?: string;
+  backlog?: TranscriptMessage[];
+  writes?: ReflectionWrite[];
 };
 
 type SessionState = {
@@ -61,25 +64,33 @@ type SessionState = {
   restricted?: boolean;
   // Genuine user prompt message IDs not yet seen by the context hook.
   prompts: Set<string>;
+  sourceDates: Map<string, number | undefined>;
   // The latest index this session knows, separate from its cached snapshot.
   knownIndex: Map<string, IndexEntry>;
   // Exact update text already shown on each user message.
   frozen: Map<string, string>;
   // Last session message ID covered by a successful reflection.
   cursor?: string;
+  pending?: string;
+  backlog: TranscriptMessage[];
+  writes: ReflectionWrite[];
   // Topics saved from this session, shown to reflection to avoid duplicates.
   saved: Array<{ file: string; title: string }>;
   idleTimer?: ReturnType<typeof setTimeout>;
   reflecting: boolean;
+  executing: boolean;
   lastActive: number;
   queue: Promise<void>;
   deleted?: boolean;
 };
 
 type SessionMessages = Awaited<ReturnType<Plugin.Context["session"]["context"]>>;
+type TranscriptMessage = { id: string; role: "user" | "assistant"; createdAt: number; text: string };
+type ReflectionWrite = { input: MemoryInput & { scope?: "project" | "global" }; revision?: string };
 
 const CONSOLIDATION_BATCH = 8;
 const MAX_REFLECTIONS = 3;
+const REFLECTION_BATCH_CHARS = 48_000;
 const SEARCH_LIMIT = 20;
 const WORKER_TIMEOUT_MS = 5 * 60_000;
 
@@ -104,12 +115,14 @@ const ReflectionSchema = Schema.Struct({
     summary: Schema.String,
     content: Schema.String,
     type: Schema.Literals(MEMORY_TYPES),
+    source_message_ids: Schema.Array(Schema.String).check(Schema.isMinLength(1)),
   })),
   correct: Schema.Array(Schema.Struct({
     id: Schema.String,
     content: Schema.String,
     title: Schema.optional(Schema.String),
     summary: Schema.optional(Schema.String),
+    source_message_ids: Schema.Array(Schema.String).check(Schema.isMinLength(1)),
   })),
 });
 
@@ -151,7 +164,7 @@ function parseModel(value: string | undefined): WorkerModel | undefined {
 function topicLine(entry: IndexEntry): string {
   const title = entry.title.replace(/[\[\]\r\n]/g, " ").trim();
   const summary = entry.summary.replace(/[\r\n]/g, " ").trim();
-  const coverage = entry.children ? ` (summary of ${entry.children.length} topics${entry.sourceUpdated ? `; sources through ${entry.sourceUpdated}` : ""})` : "";
+  const coverage = entry.children ? ` (summary of ${entry.children.length} topics${entry.evidenceThrough ? `; known user statements through ${entry.evidenceThrough}` : entry.sourceUpdated ? `; source updates through ${entry.sourceUpdated}` : ""})` : "";
   return `- ${title} [id: ${entry.file}] - [${entry.type}|${entry.updated}] ${summary}${coverage}`;
 }
 
@@ -188,8 +201,9 @@ const READ_GUIDANCE = `Use memory_read with the exact id from [id: ...]; index h
 - Topic ids are identifiers, not filesystem paths. Retrieve them through memory_read.
 - The index combines global and current-project memory. Global ids start with global:. Search stays in these scopes unless all_projects: true is explicitly needed for cross-project retrieval; returned project:<key>:<id> identifiers can be read directly.
 - Only current user-stated preference/instruction records are rules to follow unless the conversation says otherwise. Historical versions are not current instructions.
-- Facts, working details, recaps, references, insights, and legacy topics are hints to verify. Derived summary topics are not user statements; read their sources for specifics.
-- Working details without an explicit decision or abandonment remain tentative.`;
+- Facts, working details, recaps, references, insights, and legacy topics are hints to verify. Summaries are progressively coarser overviews, not user statements; their sources may be further summaries. Use the overview for orientation. Before relying on specific decisions, constraints, or exceptions, follow relevant source IDs to the underlying detail records. Skip unrelated branches, and use memory_search when the relevant branch is unclear. Omission from a summary does not establish absence.
+- Working details without an explicit decision or abandonment remain tentative.
+- Index dates mark capture/version updates. Original user statement dates, when recorded, appear in memory_read; summary coverage dates are separate.`;
 
 function renderDelta(deltas: Iterable<[string, IndexEntry | null]>): string {
   const upserts: string[] = [];
@@ -209,16 +223,26 @@ function renderDelta(deltas: Iterable<[string, IndexEntry | null]>): string {
 
 // User and assistant text only; tool calls, reasoning, and bookkeeping
 // messages are left out.
-function renderTranscript(messages: SessionMessages): string {
-  const blocks: string[] = [];
-  for (const message of messages) {
-    if (message.type === "user") blocks.push(`<user>\n${message.text}\n</user>`);
-    if (message.type !== "assistant") continue;
-    for (const part of message.content) {
-      if (part.type === "text" && part.text.trim()) blocks.push(`<assistant>\n${part.text}\n</assistant>`);
-    }
-  }
-  return blocks.join("\n");
+function transcriptMessages(messages: SessionMessages): TranscriptMessage[] {
+  return messages.flatMap((message) => {
+    if (message.type !== "user" && message.type !== "assistant") return [];
+    const text = message.type === "user" ? message.text : message.content.flatMap((part) => part.type === "text" ? [part.text] : []).join("\n");
+    return text.trim() ? [{ id: message.id, role: message.type, createdAt: message.time.created, text }] : [];
+  });
+}
+
+function renderTranscript(messages: TranscriptMessage[]): string {
+  return messages.map((message) => `<${message.role}${message.role === "user" ? ` id="${message.id}"` : ""} stated_at="${new Date(message.createdAt).toISOString()}">\n${message.text}\n</${message.role}>`).join("\n");
+}
+
+function memoryEvidence(sessionID: string, ids: readonly string[], messages: TranscriptMessage[]): MemoryEvidence[] {
+  if (ids.length === 0) throw new Error("Select at least one supporting user message in source_message_ids.");
+  const users = new Map(messages.filter((message) => message.role === "user").map((message) => [message.id, message]));
+  return [...new Set(ids)].map((messageID) => {
+    const message = users.get(messageID);
+    if (!message) throw new Error(`Source ${messageID} is not a supplied user message. Use IDs from <memory_source> annotations or the reflection transcript.`);
+    return { sessionID, messageID, createdAt: message.createdAt };
+  });
 }
 
 const REFLECT_SYSTEM = "You are a project-memory reviewer. Return only the requested JSON result.";
@@ -226,7 +250,7 @@ const REFLECT_SELECTOR_SYSTEM = "You are a project-memory reflection selector. R
 
 const REFLECT_SELECTOR_PROMPT = `Decide whether this conversation contains user-grounded memories worth capturing or explicit corrections the agent missed. Most reviews need nothing: return needed: false and ids: []. Otherwise return needed: true and the exact ids of existing details to inspect before extraction (usually at most ${CONSOLIDATION_BATCH}). New subjects may need no ids. The detail index includes records beneath summaries. Select related details to avoid duplicate captures and to preserve their qualifications when correcting them. Do not propose memories in this selection phase. "Thanks", "ok", and silence alone do not confirm an assistant claim.`;
 
-const REFLECT_PROMPT = `Extract user-grounded memories the agent missed. Return create and correct arrays; both may be empty. Aim for at most ${MAX_REFLECTIONS} changes. Existing detail bodies have already been supplied; there is no lookup phase in this response.
+const REFLECT_PROMPT = `Extract user-grounded memories the agent missed. Return create and correct arrays; both may be empty. Aim for at most ${MAX_REFLECTIONS} changes. Existing detail bodies have already been supplied; there is no lookup phase in this response. Each change must cite the supporting user message IDs in source_message_ids. Use their stated_at dates for relative dates; do not substitute today's date. Cite the confirming user message when assistant text supplies its referent.
 
 Capture only what the user wrote or explicitly confirmed. Use assistant turns only to interpret what a user confirmation refers to (for example what "yes, always do that" or "go with that plan" means). "Thanks", "ok", and silence alone do not confirm an assistant claim. Never capture independent findings from the assistant or its tools. Rules the user wants future agents to follow are preference/instruction; other context is a hint. When unsure, do not promote context into a rule.
 
@@ -245,7 +269,7 @@ Skip routine task requests with no lasting value (for example "run the tests") a
 One subject per memory. The summary is a one-line hook under about 100 characters describing what this specific topic covers, in the form "<Area>: <what it covers>" when it applies to only part of the project. Preserve the full user-grounded detail: conditions, rationale, qualifications, rejected alternatives, and uncertainty. Brevity is secondary to completeness; coarser compression belongs in derived summaries. Omit frontmatter and narration, not useful detail.`;
 
 const SCOPE_GUIDANCE = `Use scope: global for clearly general user preferences that apply across projects; otherwise default to scope: project. Any memory type may be global when the user explicitly asks. Corrections retain the original record's scope; never copy a correction into another scope.`;
-const CAPTURE_GUIDANCE = `Capture only user-stated or explicitly confirmed information, not independent assistant/tool findings. "Thanks", "ok", and silence alone do not confirm a claim. Rules the user wants future agents to follow are preference/instruction (pinned); other context is a hint: fact, working, recap, or reference. When unsure, do not promote context into a rule. Working details are tentative unless explicitly decided or abandoned; express uncertainty naturally, without a required prefix. Preserve complete conditions, rationale, qualifications, and uncertainty. Keep one subject per record; omit secrets and narration. ${SCOPE_GUIDANCE}`;
+const CAPTURE_GUIDANCE = `Capture only user-stated or explicitly confirmed information, not independent assistant/tool findings. "Thanks", "ok", and silence alone do not confirm a claim. Cite supporting user IDs from <memory_source> annotations in source_message_ids; for an accepted assistant proposal, cite the user's confirmation. The host records the original statement dates. Rules the user wants future agents to follow are preference/instruction (pinned); other context is a hint: fact, working, recap, or reference. When unsure, do not promote context into a rule. Working details are tentative unless explicitly decided or abandoned; express uncertainty naturally, without a required prefix. Preserve complete conditions, rationale, qualifications, and uncertainty. Keep one subject per record; omit secrets and narration. ${SCOPE_GUIDANCE}`;
 
 const MEMORY_TOOL_NAMES = ["memory_read", "memory_search", "memory_save", "memory_correct", "memory_delete"] as const;
 
@@ -253,7 +277,7 @@ const DREAM_SELECTOR_SYSTEM = "You are a project-memory consolidation selector. 
 const DREAM_CURATOR_SYSTEM = "You are a project-memory curator. Return only the requested JSON result.";
 
 const dreamSelectorPrompt = (indexedCount: number) => `Choose one action using exact topic ids from the untrusted candidate index:
-- synthesize: select 2-8 related topics to consolidate under one derived summary. Sources are kept and linked from the summary, so the summary may be coarser than its sources. Candidates may include earlier summaries. Prefer consolidating older related topics; for summaries use the sources-through date, not the summary's creation date. Keep recent topics as separate detail unless they clearly belong with an older group.
+- synthesize: select 2-8 related topics to consolidate under one derived summary. Sources are kept and linked from the summary, so the summary may be coarser than its sources. Candidates may include earlier summaries. Prefer consolidating older related topics; for summaries use known user statement dates when available, otherwise source update dates, not the summary's creation date. Keep recent topics as separate detail unless they clearly belong with an older group.
 - none: no justified grouping, or unsure.
 
 There are ${indexedCount} active topics; ${DREAM_SOFT_TARGET} is a soft target, not a quota. Never group unrelated topics just to reduce count. User preferences and instructions are not candidates.
@@ -361,7 +385,7 @@ const setup = async (ctx: Plugin.Context) => {
       : entry.retired
         ? "Retired derived summary — not current guidance. Read its sources."
         : entry.children
-          ? "Derived summary — not user-stated. Read its sources before relying on specifics."
+          ? "Derived summary — not user-stated. Open relevant sources before relying on specifics; sources may themselves be summaries."
           : isRule(entry)
             ? "Current user-stated rule. Follow only within its stated scope."
             : entry.type === "working"
@@ -369,10 +393,13 @@ const setup = async (ctx: Plugin.Context) => {
               : "Contextual hint — verify before relying on it.";
     const sections = [
       [`${entry.title} [id: ${entry.file}]`, classification, `scope: ${key === "global" ? "global" : `project:${key}`}`, `type: ${entry.type} | updated: ${entry.updated} | status: ${view.label(entry)}`, ...(earlier.length > 0 ? [`supersedes: ${earlier.join(", ")}`] : [])].join("\n"),
+      ...(entry.origin ? [`Captured via: ${entry.origin}`] : []),
+      ...(entry.origin === "dashboard" && entry.evidence?.length ? ["Chat source history below is inherited; this edit was made directly in the dashboard."] : []),
+      ...(entry.evidence?.length ? [`User source history (original statement dates, not capture dates):\n${entry.evidence.map((source) => `- ${source.sessionID} / ${source.messageID} | ${new Date(source.createdAt).toISOString()}`).join("\n")}`] : []),
       content,
     ];
     if (entry.children) {
-      sections.push(`Summarized topics (read them for exact detail):\n${entry.children.map((child) => {
+      sections.push(`Sources — open relevant entries for detail; summaries have further sources:\n${entry.children.map((child) => {
         const source = view.byFile.get(child.file);
         return source ? `${topicLine(source)} (${view.label(source)})` : `- ${child.file} (deleted)`;
       }).join("\n")}`);
@@ -418,11 +445,16 @@ const setup = async (ctx: Plugin.Context) => {
           system: saved.system,
           restricted: saved.restricted,
           prompts: new Set(),
+          sourceDates: new Map((saved.backlog ?? []).filter((message) => message.role === "user").map((message) => [message.id, message.createdAt])),
           knownIndex: new Map(saved.knownIndex.map((entry) => [entry.file, entry])),
           frozen: new Map(saved.frozen),
           cursor: saved.cursor,
+          pending: saved.pending,
+          backlog: saved.backlog ?? [],
+          writes: saved.writes ?? [],
           saved: saved.saved,
           reflecting: false,
+          executing: false,
           lastActive: Date.now(),
           queue: Promise.resolve(),
         };
@@ -453,6 +485,9 @@ const setup = async (ctx: Plugin.Context) => {
       frozen: [...state.frozen],
       cursor: state.cursor,
       saved: state.saved,
+      pending: state.pending,
+      backlog: state.backlog,
+      writes: state.writes,
     };
     await ctx.storage.set(`session/${sessionID}`, saved as Schema.Json);
   });
@@ -510,24 +545,27 @@ const setup = async (ctx: Plugin.Context) => {
       const catalog = await readCatalog();
       const before = (await readView(catalog)).roots.filter((entry) => !isRule(entry));
       const { entry, index } = await store.save(catalog, localInput, expectedRevision);
-      // Creates and replacements feed the auto-dream gate. The counter is
-      // ancillary: after a committed index it must never roll the save back.
-      await bumpAdditions(key).catch(() => {});
-      const roots = (await readView(index)).roots;
-      const after = roots.filter((entry) => !isRule(entry));
-      const crossedLimit = before.length <= topicLimit && after.length > topicLimit
-        || Buffer.byteLength(before.map(topicLine).join("\n")) <= indexBytes && Buffer.byteLength(after.map(topicLine).join("\n")) > indexBytes;
-      return { entry: roots.find((root) => root.file === entry.file)!, crossedLimit };
+      let crossedLimit = false;
+      // A committed save must not look retryable when maintenance fails.
+      await failOpen("Memory save maintenance failed", async () => {
+        await bumpAdditions(key);
+        const after = (await readView(index)).roots.filter((entry) => !isRule(entry));
+        crossedLimit = before.length <= topicLimit && after.length > topicLimit
+          || Buffer.byteLength(before.map(topicLine).join("\n")) <= indexBytes && Buffer.byteLength(after.map(topicLine).join("\n")) > indexBytes;
+      });
+      return { entry, crossedLimit };
     });
     const qualified = scopedEntry(entry, key, projectKey);
     if (owner.file !== undefined) recordSaved(sessionID, memoryID(key, owner.file, projectKey), undefined, delivered);
     recordSaved(sessionID, qualified.file, qualified, delivered);
     await rpc.events.emit("saved", { sessionID, title: entry.title }).catch(() => {});
-    if (crossedLimit && (await readSettings()).dream_auto !== false) {
-      const state = await readDreamState(key);
-      if (state?.failAt === undefined || Date.now() - state.failAt >= DREAM_RETRY_MS) startDream({ trigger: "auto", sessionID, keys: [key] });
-    }
-    track(dreamTick());
+    track(failOpen("Memory post-save dreaming failed", async () => {
+      if (crossedLimit && (await readSettings()).dream_auto !== false) {
+        const state = await readDreamState(key);
+        if (state?.failAt === undefined || Date.now() - state.failAt >= DREAM_RETRY_MS) startDream({ trigger: "auto", sessionID, keys: [key] });
+      }
+      await dreamTick();
+    }));
     return qualified;
   };
 
@@ -696,7 +734,7 @@ const setup = async (ctx: Plugin.Context) => {
       const chosen = selection;
 
       const sources = chosen.files.map((file) => candidates.get(file)!);
-      const topics = sources.map((source) => `<memory_file id="${source.entry.file}">\n${topicLine(source.entry)}\n\n${source.content}\n</memory_file>`).join("\n");
+      const topics = sources.map((source) => `<memory_file id="${source.entry.file}">\n${topicLine(source.entry)}${source.entry.evidence?.length ? `\nOriginal user statement dates: ${[...new Set(source.entry.evidence.map((evidence) => new Date(evidence.createdAt).toISOString()))].join(", ")}` : ""}\n\n${source.content}\n</memory_file>`).join("\n");
 
       let extracted: typeof DreamOutputSchema.Type;
       try {
@@ -724,7 +762,8 @@ const setup = async (ctx: Plugin.Context) => {
 
         // Child links come from the checked sources, never from the worker.
         const sourceUpdated = sources.map((source) => source.entry.sourceUpdated ?? source.entry.updated).sort().at(-1)!;
-        const entry: IndexEntry = { title: extracted.title, file: topicFile(extracted.title), summary: extracted.summary, type: "insight", updated: isoDate(), sourceUpdated, children };
+        const evidenceThrough = sources.flatMap((source) => source.entry.evidenceThrough ? [source.entry.evidenceThrough] : (source.entry.evidence ?? []).map((evidence) => new Date(evidence.createdAt).toISOString().slice(0, 10))).sort().at(-1);
+        const entry: IndexEntry = { title: extracted.title, file: topicFile(extracted.title), summary: extracted.summary, type: "insight", updated: isoDate(), sourceUpdated, ...(evidenceThrough ? { evidenceThrough } : {}), children };
         await writeTopic(entry.file, extracted.content);
         try {
           // Sources stay indexed; publishing the index last makes the summary
@@ -880,30 +919,60 @@ const setup = async (ctx: Plugin.Context) => {
     }
   };
 
-  // Selection either finishes a no-op review or supplies details to extraction.
-  // Each phase has its own schema, with no lookup requests in extraction.
+  const commitReflections = async (sessionID: string, state: SessionState, writes: ReflectionWrite[], warnings: string[]) => {
+    for (const write of writes) {
+      if (disposed || state.deleted || !(await enabled())) return;
+      try {
+        await saveMemory(sessionID, write.input, write.revision, false);
+      } catch (error) {
+        const conflict = error instanceof MemoryConflictError;
+        warnings.push(`${conflict ? "Outdated correction needs a fresh review" : "Could not save"} ${write.input.target ?? write.input.title}: ${error instanceof Error ? error.message : String(error)}`);
+        if (!conflict) continue;
+      }
+      state.writes = state.writes.filter((pending) => pending !== write);
+      await persist(sessionID, state);
+    }
+  };
+
   const reflect = async (sessionID: string, state: SessionState) => {
-    if (disposed || state.deleted || state.reflecting) return;
+    if (disposed || state.deleted || state.restricted !== false || state.executing || state.reflecting) return;
+    const pendingAtStart = state.pending;
+    let reviewed = false;
     state.reflecting = true;
     try {
-      const messages = (await ctx.session.context({ sessionID })).filter((message) => !state.cursor || message.id > state.cursor);
-      if (messages.length === 0) return;
-      const cursor = messages.at(-1)!.id;
-      const transcript = renderTranscript(messages);
-      if (transcript && await enabled()) {
+      const live = transcriptMessages(await ctx.session.context({ sessionID }));
+      const history = [...new Map([...state.backlog, ...live].map((message) => [message.id, message])).values()]
+        .sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+      const priorReply = history.findLast((message) => message.role === "assistant" && state.cursor !== undefined && message.id <= state.cursor);
+      const unreviewed = history.filter((message) => !state.cursor || message.id > state.cursor);
+      const messages: TranscriptMessage[] = [];
+      let characters = 0;
+      for (const message of unreviewed) {
+        // Stop between whole user turns; one oversized turn stays intact.
+        if (message.role === "user" && characters >= REFLECTION_BATCH_CHARS) break;
+        messages.push(message);
+        characters += message.text.length;
+      }
+      const cursor = messages.at(-1)?.id;
+      if (!(await enabled())) {
+        const latest = unreviewed.at(-1);
+        if (latest) state.cursor = latest.id;
+        state.backlog = [];
+        state.pending = undefined;
+        await persist(sessionID, state);
+        return;
+      }
+      const warnings: string[] = [];
+      await commitReflections(sessionID, state, [...state.writes], warnings);
+      const pendingWrites = state.writes.length;
+      if (cursor) {
         await rpc.events.emit("review", { sessionID }).catch(() => {});
         const saved = state.saved.map((item) => `- ${item.title} (${item.file})`).join("\n");
         const view = await scopedView();
         const details = view.catalog.filter((entry) => !entry.children && !entry.supersededBy && view.status(entry) !== "missing");
-        const context = `<memory_index>\n${view.roots.map(topicLine).join("\n")}\n</memory_index>\n\n<detail_index>\n${details.map(topicLine).join("\n")}\n</detail_index>\n\n<session_saves>\n${saved}\n</session_saves>\n\n<transcript>\n${transcript}\n</transcript>`;
-        const selection = await runWorker(
-          reflectModel,
-          ReflectionSelectionSchema,
-          REFLECT_SELECTOR_SYSTEM,
-          `${REFLECT_SELECTOR_PROMPT}\n\n${context}`,
-        );
+        const context = `<memory_index>\n${view.roots.map(topicLine).join("\n")}\n</memory_index>\n\n<detail_index>\n${details.map(topicLine).join("\n")}\n</detail_index>\n\n<session_saves>\n${saved}\n</session_saves>\n\n<transcript>\n${renderTranscript(priorReply ? [priorReply, ...messages] : messages)}\n</transcript>`;
+        const selection = await runWorker(reflectModel, ReflectionSelectionSchema, REFLECT_SELECTOR_SYSTEM, `${REFLECT_SELECTOR_PROMPT}\n\n${context}`);
         if (disposed || state.deleted) return;
-        const warnings: string[] = [];
         if (selection.needed) {
           const inspected = new Map<string, string>();
           const selected = [...new Set(selection.ids)].flatMap((file) => {
@@ -924,35 +993,55 @@ const setup = async (ctx: Plugin.Context) => {
               warnings.push(`Unresolved correction: ${correction.id} was not among the supplied details`);
               continue;
             }
-            await saveMemory(sessionID, { target: correction.id, content: correction.content, title: correction.title, summary: correction.summary }, revision, false)
-              .catch((error) => {
-                console.error("Memory reflection correction failed:", error);
-                warnings.push(`Could not correct ${correction.id}: ${error instanceof Error ? error.message : String(error)}`);
-              });
+            try {
+              const evidence = memoryEvidence(sessionID, correction.source_message_ids, messages);
+              state.writes.push({ input: { target: correction.id, content: correction.content, title: correction.title, summary: correction.summary, evidence, origin: "reflection" }, revision });
+            } catch (error) {
+              warnings.push(`Unresolved correction ${correction.id}: ${error instanceof Error ? error.message : String(error)}`);
+            }
           }
           for (const memory of result.create) {
-            // Background saves remain pending for normal next-turn delivery.
-            await saveMemory(sessionID, memory, undefined, false)
-              .catch((error) => {
-                console.error("Memory reflection save failed:", error);
-                warnings.push(`Could not save ${memory.title}: ${error instanceof Error ? error.message : String(error)}`);
-              });
+            try {
+              const { source_message_ids, ...input } = memory;
+              const evidence = memoryEvidence(sessionID, source_message_ids, messages);
+              state.writes.push({ input: { ...input, evidence, origin: "reflection" } });
+            } catch (error) {
+              warnings.push(`Unresolved memory ${memory.title}: ${error instanceof Error ? error.message : String(error)}`);
+            }
           }
         }
-        if (warnings.length > 0) {
-          const message = `Memory reflection left unresolved changes: ${warnings.join("; ")}`;
-          console.error(message);
-          await rpc.events.emit("error", { message }).catch(() => {});
-        }
+        // Persist extracted writes with the cursor before attempting commits.
+        state.cursor = cursor;
+        state.backlog = [...new Map([...unreviewed, ...state.backlog].map((message) => [message.id, message])).values()]
+          .filter((message) => message.id > cursor).sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+        const lastReply = messages.findLast((message) => message.role === "assistant") ?? priorReply;
+        if (state.backlog.length > 0 && lastReply) state.backlog.unshift(lastReply);
+        if (state.pending && state.pending <= cursor) state.pending = undefined;
+        await persist(sessionID, state);
+        reviewed = true;
+        await commitReflections(sessionID, state, state.writes.slice(pendingWrites), warnings);
       }
-      state.cursor = cursor;
-      await persist(sessionID, state);
+      if (warnings.length > 0) {
+        const message = `Memory reflection left unresolved changes: ${warnings.join("; ")}`;
+        console.error(message);
+        await rpc.events.emit("error", { message }).catch(() => {});
+      }
     } catch (error) {
       console.error("Memory reflection failed:", error);
       await rpc.events.emit("error", { message: `Memory reflection failed: ${error instanceof Error ? error.message : String(error)}` }).catch(() => {});
     } finally {
       state.reflecting = false;
+      const newEvidence = state.pending && (!pendingAtStart || state.pending > pendingAtStart);
+      if (!disposed && !state.deleted && !state.executing && (newEvidence || reviewed && state.backlog.length > 0)) scheduleReflection(sessionID, state);
     }
+  };
+
+  const scheduleReflection = (sessionID: string, state: SessionState) => {
+    clearTimeout(state.idleTimer);
+    state.idleTimer = setTimeout(() => {
+      state.idleTimer = undefined;
+      track(reflect(sessionID, state));
+    }, idleDelay);
   };
 
   const rpc = await ctx.rpc.register(MemoryRpc, {
@@ -1064,13 +1153,18 @@ const setup = async (ctx: Plugin.Context) => {
           content: { type: "string", minLength: 1, description: "Complete user-grounded detail, with conditions and uncertainty; no frontmatter" },
           type: { type: "string", enum: [...MEMORY_TYPES] },
           scope: { type: "string", enum: ["project", "global"], description: "Default project; global for clearly general preferences or explicit user requests" },
+          source_message_ids: { type: "array", items: { type: "string" }, minItems: 1, description: "Supporting user message IDs from <memory_source> annotations" },
         },
-        required: ["title", "summary", "content", "type"],
+        required: ["title", "summary", "content", "type", "source_message_ids"],
         additionalProperties: false,
       },
       execute: async (args, context) => {
         if (await isRestricted(context.sessionID)) throw new Error("Child sessions and workflow workers have read/search-only memory access.");
-        const entry = await saveMemory(context.sessionID, args as MemoryInput);
+        const { source_message_ids, ...input } = args as MemoryInput & { source_message_ids: string[] };
+        const state = await sessionState(context.sessionID);
+        const messages = [...state.backlog, ...transcriptMessages(await ctx.session.context({ sessionID: context.sessionID }))];
+        const evidence = memoryEvidence(context.sessionID, source_message_ids, messages);
+        const entry = await saveMemory(context.sessionID, { ...input, evidence, origin: "tool" });
         return { content: `Created ${topicLine(entry)}` };
       },
     });
@@ -1086,14 +1180,18 @@ const setup = async (ctx: Plugin.Context) => {
           title: { type: "string", description: "New title, only when intentionally changing it" },
           summary: { type: "string", description: "New index hook, only when intentionally changing it" },
           type: { type: "string", enum: [...MEMORY_TYPES], description: "New classification, only when intentionally changing it" },
+          source_message_ids: { type: "array", items: { type: "string" }, minItems: 1, description: "User message IDs supporting this correction; earlier source history is retained" },
         },
-        required: ["id", "content"],
+        required: ["id", "content", "source_message_ids"],
         additionalProperties: false,
       },
       execute: async (args, context) => {
         if (await isRestricted(context.sessionID)) throw new Error("Child sessions and workflow workers have read/search-only memory access.");
-        const { id, ...changes } = args as { id: string } & MemoryInput;
-        const entry = await saveMemory(context.sessionID, { ...changes, target: id });
+        const { id, source_message_ids, ...changes } = args as { id: string; source_message_ids: string[] } & MemoryInput;
+        const state = await sessionState(context.sessionID);
+        const messages = [...state.backlog, ...transcriptMessages(await ctx.session.context({ sessionID: context.sessionID }))];
+        const evidence = memoryEvidence(context.sessionID, source_message_ids, messages);
+        const entry = await saveMemory(context.sessionID, { ...changes, target: id, evidence, origin: "tool" });
         return { content: `Corrected ${id}.\nCurrent: ${topicLine(entry)}\nUse ${entry.file} from now on; ${id} remains historical, not current guidance.` };
       },
     });
@@ -1144,6 +1242,8 @@ const setup = async (ctx: Plugin.Context) => {
   await ctx.session.hook("context", async (event) => {
     await failOpen("Memory context failed", async () => {
       const state = await sessionState(event.sessionID);
+      state.executing = true;
+      clearTimeout(state.idleTimer);
       let changed = false;
       if (state.restricted === undefined) {
         state.restricted = await isRestricted(event.sessionID);
@@ -1166,14 +1266,30 @@ const setup = async (ctx: Plugin.Context) => {
         if (state.system?.includes("memory tool (action")) {
           event.system.push({ type: "text", text: state.restricted
             ? "Current memory API: memory_read(id) and memory_search(query, offset). This session has read/search-only access; older action-based memory instructions are superseded."
-            : "Current memory API: memory_read(id), memory_search(query, offset), memory_save(title, summary, content, type), memory_correct(id, content, optional title/summary/type), memory_delete(id). memory_save creates; memory_correct inherits metadata and retains history. Older action-based memory instructions are superseded." });
+            : "Current memory API: memory_read(id), memory_search(query, offset), memory_save(title, summary, content, type, source_message_ids), memory_correct(id, content, source_message_ids, optional title/summary/type), memory_delete(id). Cite user IDs from <memory_source> annotations. memory_save creates; memory_correct inherits metadata and retains history. Older action-based memory instructions are superseded." });
         }
       }
 
       const latestUserID = event.messages.findLast((message) => message.role === "user")?.id;
       const newTurn = latestUserID && state.prompts.delete(latestUserID);
       if (on && !state.restricted) {
-        const userIDs = new Set(event.messages.flatMap((message) => message.role === "user" && message.id ? [message.id] : []));
+        const sourceIDs = event.messages.flatMap((message) => message.role === "user" && message.id ? [message.id] : []);
+        if (sourceIDs.some((id) => !state.sourceDates.has(id))) {
+          const sources = await ctx.session.context({ sessionID: event.sessionID });
+          for (const source of sources) if (source.type === "user") state.sourceDates.set(source.id, source.time.created);
+          for (const id of sourceIDs) if (!state.sourceDates.has(id)) state.sourceDates.set(id, undefined);
+        }
+        const latestSource = sourceIDs.findLast((id) => state.sourceDates.get(id) !== undefined);
+        if (latestSource && (!state.cursor || latestSource > state.cursor) && (!state.pending || latestSource > state.pending)) {
+          state.pending = latestSource;
+          changed = true;
+        }
+        event.messages = event.messages.map((message) => {
+          const createdAt = message.id ? state.sourceDates.get(message.id) : undefined;
+          if (createdAt === undefined) return message;
+          return { ...message, content: [...message.content, { type: "text", text: `<memory_source id="${message.id}" stated_at="${new Date(createdAt).toISOString()}" />` }] } as typeof message;
+        });
+        const userIDs = new Set(sourceIDs);
 
         // Frozen assignments persist per user message so reconstructed history
         // re-injects every prior delta, keeping historical prefixes stable
@@ -1217,6 +1333,12 @@ const setup = async (ctx: Plugin.Context) => {
   await ctx.session.hook("compaction", async (event) => {
     await failOpen("Memory compaction handling failed", async () => {
       const state = await sessionState(event.sessionID);
+      if (state.restricted === undefined) state.restricted = await isRestricted(event.sessionID);
+      if (!state.restricted && await enabled()) {
+        const messages = transcriptMessages(await ctx.session.context({ sessionID: event.sessionID }));
+        state.backlog = [...new Map([...state.backlog, ...messages.filter((message) => !state.cursor || message.id > state.cursor)].map((message) => [message.id, message])).values()]
+          .sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+      }
       state.system = undefined;
       state.knownIndex.clear();
       state.frozen.clear();
@@ -1258,11 +1380,8 @@ const setup = async (ctx: Plugin.Context) => {
         const sessionID = event.data.sessionID;
         const state = states.get(sessionID);
         if (!state || state.restricted !== false || disposed) continue;
-        clearTimeout(state.idleTimer);
-        state.idleTimer = setTimeout(() => {
-          state.idleTimer = undefined;
-          track(reflect(sessionID, state));
-        }, idleDelay);
+        state.executing = false;
+        scheduleReflection(sessionID, state);
       }
     }
   })().catch((error) => {
