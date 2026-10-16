@@ -7,6 +7,10 @@ import { Schema } from "effect";
 export const MemoryRpc = Rpc.define({
   id: "memory",
   methods: {
+    read: {
+      input: Schema.toStandardSchemaV1(Schema.Struct({ id: Schema.String })),
+      output: Schema.toStandardSchemaV1(Schema.Struct({ content: Schema.NullOr(Schema.String) })),
+    },
     dashboard: {
       input: Schema.toStandardSchemaV1(Schema.Struct({})),
       output: Schema.toStandardSchemaV1(Schema.Struct({ url: Schema.String })),
@@ -23,7 +27,8 @@ export const MemoryRpc = Rpc.define({
         directory: Schema.String,
         topics: Schema.Array(Schema.Struct({
           file: Schema.String,
-          title: Schema.String,
+           title: Schema.String,
+           type: Schema.String,
           summary: Schema.String,
           status: Schema.String,
           scope: Schema.Literals(["project", "global"]),

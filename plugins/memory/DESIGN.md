@@ -5,9 +5,10 @@ How memory reaches the model, how it is kept consistent, and how dreaming works.
 
 ## Recall
 
-The first request of a session (the `context` hook) adds a `<memory>` system block with global and current-project root indexes, labeled by scope. The block is
+The first request of a session (the `context` hook) adds a `<memory>` system block with global and current-project root indexes, labeled by scope. Primary sessions have separate sections for rules and hints. The block is
 cached for the rest of the session so the provider prompt cache stays warm. Only current hierarchy roots appear in
-this view. `preference` and `instruction` entries are followed unless the conversation says otherwise; `fact`,
+this view. Index lines are retrieval hooks, not full instructions. Before doing work covered by a `preference` or
+`instruction`, the model reads its full record and follows its conditions unless the conversation says otherwise; `fact`,
 `working`, `recap`, `reference`, `insight`, and legacy `feedback`/`project` entries are hints the model reads (with the
 `memory_read` tool) and verifies before relying on them. Other projects are available only through explicit cross-project
 search and reads of the returned IDs, not automatic context injection.
@@ -48,7 +49,8 @@ updates. The entry is removed when the session is deleted.
 ## Saving
 
 Primary agents get five flat-schema tools: `memory_read(id)`, `memory_search(query, offset?, all_projects?)`,
-`memory_save(title, summary, content, type, scope?)`, `memory_correct(id, content, optional metadata)`, and `memory_delete(id)`.
+`memory_save(title, summary, content, type, source_message_ids, scope?)`,
+`memory_correct(id, content, source_message_ids, optional metadata)`, and `memory_delete(id)`.
 Saves default to project scope; clearly general preferences may be global. Explicit global saves can use any supported
 type. Corrections preserve their target's scope; cross-project search does not implicitly permit cross-project writes.
 Global IDs use `global:<file>` and other-project IDs use `project:<key>:<file>`. Current-project IDs stay bare for
@@ -70,8 +72,9 @@ may be explicitly corrected again without automatically restoring it. Legacy `fe
 
 When a primary session goes idle for `idle_delay_ms` after an execution finishes, reflection reviews the messages
 since the last reflection (user and assistant text only) together with the index and the topics already saved in the
-session. It sees global and current-project root/detail indexes with scope labels, including consolidated records, to avoid
-duplicate capture. Superseded history stays out of reflection, even if its replacement was deleted; recovering it
+session. The selector sees global and current-project roots plus a separate index of details beneath summaries, with no
+duplicate entries between the indexes. Both indexes have scope labels. The extractor receives selected detail bodies,
+the saved-topic list, and the transcript, without repeating the lookup indexes. Superseded history stays out of reflection, even if its replacement was deleted; recovering it
 requires an explicit foreground `memory_correct` call. Reflection is asked to read up to eight details in one lookup round and
 propose up to three changes. A selection-only schema returns whether extraction is needed and IDs to inspect; a no-op
 review ends there. A separate extraction schema returns `create` and `correct` arrays, with no lookup field or
@@ -80,8 +83,8 @@ metadata and retaining history. Optional title/hook updates keep an old index cl
 body; classification remains inherited. The commit rechecks the inspected revision so concurrent changes cannot be overwritten.
 Summaries may not be corrected. Unknown selection IDs and unsupplied correction IDs are reported as unresolved while
 valid siblings continue. Valid replies are not rejected solely for exceeding suggested counts.
-Reflection chooses global scope only for clearly general preferences or instructions; project-specific and uncertain
-scope stays project-local. Existing records are not bulk-classified or promoted. Working details and facts are not forced into instruction types. Most reviews save nothing. Worker failures are
+Reflection chooses global scope for clearly general user preferences, or for any memory the user explicitly asks to make
+global; project-specific and uncertain scope stays project-local. Existing records are not bulk-classified or promoted. Working details and facts are not forced into instruction types. Most reviews save nothing. Worker failures are
 logged and surfaced in the TUI; a successful review advances the cursor, with individual failed commits reported too.
 
 Before compaction, unreviewed user and assistant text is staged in the existing session storage. Reflection merges this
@@ -132,8 +135,11 @@ future dreams build replacement layers from the unfolded details. Summary creati
 separate sources-through date so old evidence does not look new after summarization. Missing bodies keep their
 catalog records but are not active or eligible for dreaming.
 
-The browser defaults to active topics and offers retained-history filtering and source/parent/replacement/earlier-version
-navigation by title. Editing a consolidated topic warns about retiring summaries. Malformed catalog metadata remains
+The TUI browser defaults to active topics, displays each record's scope, type, and status, and offers retained-history
+filtering and navigation to sources, parent summaries, replacements, and earlier versions by title. A scrollable read-only
+view loads the selected body through RPC, including historical bodies on demand, without requiring an external editor.
+Raw file editing is available only for active or consolidated details. Its label explains that no previous version is
+saved and dependent summaries retire; versioned corrections remain available through the dashboard. Malformed catalog metadata remains
 an error, surfaced through logs and a deduplicated TUI error event. Catalog/body reads are batched four at a time;
 ordinary views skip superseded and retired bodies, which are loaded on demand for explicit reads or history search.
 Revisions are not cached across turns, so cost still grows with current detailed records. Browsing while disabled

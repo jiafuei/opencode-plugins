@@ -6,8 +6,10 @@ available beneath progressively coarser summaries. Memory is a hint layer, not a
 
 ## How it works
 
-- **Recall.** Each session starts with the global and current-project indexes in context, labeled by scope. Preferences and instructions you gave
-  are followed; other entries are hints the model reads in full and verifies before relying on them.
+- **Recall.** Each primary session starts with separate indexes of user rules and contextual hints, labeled by global or project scope.
+  Index lines are retrieval hooks, not full instructions. Before doing work a rule covers, the model reads its full record
+  and follows its stated conditions unless the current conversation says otherwise. Other entries are hints the model
+  reads in full and verifies before relying on them.
 - **Saving.** The model saves user-stated or explicitly confirmed preferences, instructions, facts, and working
   details with `memory_save`, and updates existing details with `memory_correct`. Conditions, qualifications, and uncertainty are preserved before summarization.
   Tentative ideas stay labeled as tentative. A `Saved: <title>` toast shows each save.
@@ -47,12 +49,12 @@ current project; switch to their project to correct or delete them.
 
 | Type | What it holds |
 | --- | --- |
-| `preference` | Durable general preferences you stated |
-| `instruction` | Scoped instructions that apply to future work |
-| `fact` | A granular fact you stated or explicitly confirmed |
-| `working` | User-grounded working details, including clearly labeled tentative ideas |
-| `recap` | Context from a completed hard task, to avoid re-deriving it |
-| `reference` | Lasting external material |
+| `preference` | A lasting general preference |
+| `instruction` | A rule for specific future work, with its conditions stated |
+| `fact` | A user-stated or confirmed constraint, decision, or piece of context |
+| `working` | A plan, idea, open question, or working detail; tentative unless explicitly decided or abandoned |
+| `recap` | A user-confirmed conclusion with useful rationale and rejected alternatives |
+| `reference` | Lasting external material you pointed to or confirmed is worth returning to |
 | `insight` | A derived summary with links to its source records; a hint, not a fact you stated |
 
 Assistant conclusions and tool results alone do not establish memories. Assistant text may explain what your explicit
@@ -214,11 +216,14 @@ configuration.
 
 ## Commands
 
-- `/memory` controls memory and automatic dreaming and lists active topics first. **Show retained history** includes
-  consolidated details, superseded versions, retired summaries, and missing records. Choosing a topic opens navigation
-  to its sources, parent summary, replacement, or earlier versions by title, plus **Open in editor** (`$VISUAL` or
-  `$EDITOR`). Editing a consolidated record warns that its summaries will retire. Toggling
-  memory can invalidate the provider's prompt cache.
+- `/memory` controls memory and automatic dreaming for the current project and lists active topics first, with their
+  scope, type, and status. Disabling memory also removes global recall in this project. **Show retained history** includes
+  consolidated details, superseded versions, retired summaries, and missing records. Choosing a topic offers **View memory**,
+  a scrollable read-only view that needs no external editor, and navigation to related records by title. Enter or Escape
+  returns from the reader to the selected topic. **Edit file in place** (`$VISUAL` or `$EDITOR`) is available only for
+  current details, including consolidated details. It overwrites the body without keeping a previous version or updating
+  its capture metadata, and dependent summaries retire. Use `/memory-web` for versioned corrections. Derived summaries
+  and historical records cannot be edited through the TUI. Toggling memory can invalidate the provider's prompt cache.
 - `/dream` starts a dream without adding a conversation message.
 - `/memory-web` opens a central browser dashboard for global and project memories. It starts a localhost listener on an
   OS-assigned port on first use, reuses it on later calls, and stops it when the server plugin unloads. It lives with the

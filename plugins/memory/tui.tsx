@@ -7,6 +7,7 @@ type Choice =
   | { type: "toggle"; key: "enabled" | "dream_auto" }
   | { type: "dreamNow" }
   | { type: "topic"; file: string }
+  | { type: "view"; file: string }
   | { type: "edit"; file: string }
   | { type: "history" }
   | { type: "back" };
@@ -138,7 +139,7 @@ export default Plugin.define({
       const topic = state.topics.find((entry) => entry.file === focus);
       const description = (entry: typeof state.topics[number]) => {
         const parent = state.topics.find((other) => other.file === entry.parent);
-        return `[${entry.scope} · ${entry.status}] ${parent ? `In ${parent.title} · ` : ""}${entry.summary}`;
+        return `[${entry.scope} · ${entry.type} · ${entry.status}] ${parent ? `In ${parent.title} · ` : ""}${entry.summary}`;
       };
       const related = topic ? [
         ...topic.children.map((file) => ({ file, relation: "Source" })),
@@ -151,15 +152,20 @@ export default Plugin.define({
       }) : [];
       const choice = await ctx.ui.dialog.select<Choice>({
         title: topic ? topic.title : history ? "Memory · retained history" : "Memory · active topics",
-        placeholder: topic ? "Navigate sources or edit this record" : "Filter topics",
+        placeholder: topic ? "Read this memory or navigate related records" : "Filter topics",
         options: topic ? [
           { title: "Back to topics", value: { type: "back" } },
-          { title: "Open in editor", description: `${description(topic)}${topic.parent ? " · Saving changes retires the summaries above this record" : ""}`, value: { type: "edit", file: topic.file } },
+          { title: "View memory", description: description(topic), value: { type: "view", file: topic.file } },
+          ...(topic.children.length === 0 && (topic.status === "active" || topic.status === "consolidated") ? [{
+            title: "Edit file in place",
+            description: "No previous version is saved; dependent summaries retire. Use /memory-web for a versioned correction.",
+            value: { type: "edit" as const, file: topic.file },
+          }] : []),
           ...related,
         ] : [
           {
             title: `Auto-memory: ${state.enabled ? "enabled" : "disabled"}`,
-            description: state.enabled ? "Disable recall and learning" : "Enable recall and learning",
+            description: state.enabled ? "Disable memory in this project, including global recall here" : "Enable memory in this project, including global recall here",
             value: { type: "toggle", key: "enabled" },
           },
           {
@@ -204,6 +210,33 @@ export default Plugin.define({
         return;
       }
       const entry = state.topics.find((entry) => entry.file === choice.file)!;
+      if (choice.type === "view") {
+        const { content } = await memory.read({ id: entry.file }, location);
+        await new Promise<void>((resolve) => {
+          ctx.ui.dialog.set({ size: "large", centered: true });
+          ctx.ui.dialog.show(() => {
+            ctx.keymap.layer(() => ({
+              mode: "modal",
+              commands: [{ bind: "return", title: "Back to memory", run: () => ctx.ui.dialog.clear() }],
+            }));
+            return (
+              <box flexDirection="column" height={Math.max(8, Math.floor(ctx.renderer.height * 0.7))} paddingX={2} paddingBottom={1} gap={1}>
+                <box flexDirection="row" justifyContent="space-between" flexShrink={0}>
+                  <text fg={ctx.theme.text.base}><b>{entry.title}</b></text>
+                  <text fg={ctx.theme.text.muted} onMouseUp={() => ctx.ui.dialog.clear()}>esc</text>
+                </box>
+                <text fg={ctx.theme.text.muted} flexShrink={0}>{`${entry.scope} · ${entry.type} · ${entry.status} · read-only`}</text>
+                <scrollbox focused flexGrow={1} flexBasis={0} minHeight={0} verticalScrollbarOptions={{ visible: true }} horizontalScrollbarOptions={{ visible: false }}>
+                  <text fg={ctx.theme.text.base} wrapMode="word">{content ?? "The body file is missing."}</text>
+                </scrollbox>
+                <text fg={ctx.theme.text.muted} flexShrink={0}>↑/↓ scroll · Enter or Esc returns to this memory</text>
+              </box>
+            );
+          }, resolve);
+        });
+        await showMemory(choice.file, history);
+        return;
+      }
       await openInEditor(ctx, entry.path, workspace);
       await showMemory(choice.file, history);
     };

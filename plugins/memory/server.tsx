@@ -198,10 +198,10 @@ function validateDreamSelection(value: typeof DreamSelectorSchema.Type, candidat
 // Cached in each session's prompt prefix until compaction refreshes its snapshot.
 const READ_GUIDANCE = `How to use memory:
 - Open a topic with memory_read and the exact id from [id: ...]. Ids are not file paths. Index lines are hooks, not full contents.
-- Only current user-stated preference and instruction records are rules. Follow them within their stated scope unless the current conversation says otherwise. Historical versions are not current guidance.
+- Only current user-stated preference and instruction records are rules. Before doing work a rule covers, read its full record. Follow its stated conditions unless the current conversation says otherwise. Historical versions are not current guidance.
 - Other records are hints to check against the conversation and project. Working details stay tentative unless the user explicitly decided or abandoned them.
-- Summaries are deliberately coarse overviews, not user statements. When a specific decision, constraint, or exception matters, follow relevant source topics down to detail records; sources may be further summaries. Skip unrelated branches. Use memory_search if the right branch is unclear. Omission from a summary does not establish absence.
-- Index dates show capture/version updates. memory_read shows original user statement dates when recorded; summary coverage dates are separate.
+- Summaries are coarse overviews, not user statements. When a decision or exception matters, open relevant sources (which may be summaries too) or search. Omission from a summary does not establish absence.
+- Index dates are capture or version-update dates, not when the user made the statement.
 - You see global memory (global: ids) and this project's memory. Search other projects only when explicitly needed, with all_projects: true; read returned project:<key>:<id> ids directly. Other projects are read-only here.`;
 
 function renderDelta(deltas: Iterable<[string, IndexEntry | null]>): string {
@@ -247,29 +247,29 @@ function memoryEvidence(sessionID: string, ids: readonly string[], messages: Tra
 const REFLECT_SYSTEM = "You are a project-memory reviewer. Return only the requested JSON result.";
 const REFLECT_SELECTOR_SYSTEM = "You are a project-memory reflection selector. Return only the requested JSON result.";
 
-const REFLECT_SELECTOR_PROMPT = `Decide whether the agent missed user-stated or explicitly confirmed information worth keeping, or an explicit user correction of an existing record. Most reviews need nothing: return needed: false and ids: []. Otherwise return needed: true with exact ids of related details to inspect, usually no more than ${CONSOLIDATION_BATCH}. Check these to avoid duplicates and preserve qualifications when correcting them. The detail index includes records under summaries. New subjects may need no ids. Do not write memories in this step. "Thanks", "ok", or silence does not confirm an assistant claim.`;
+const REFLECT_SELECTOR_PROMPT = `Decide whether the agent missed user-stated or explicitly confirmed information worth keeping, or an explicit user correction of an existing record. Most reviews need nothing: return needed: false and ids: []. Otherwise return needed: true with exact ids of related details to inspect, usually no more than ${CONSOLIDATION_BATCH}. Check these to avoid duplicates and preserve qualifications when correcting them. The root index lists rules, summaries, and ungrouped details; the detail index adds details beneath summaries. New subjects may need no ids. Ignore subjects in <session_saves> unless the user later corrected them. Do not write memories in this step. "Thanks", "ok", or silence does not confirm an assistant claim.`;
+
+const TYPE_GUIDANCE = `preference: a lasting general preference.
+instruction: a rule for specific future work; state when it applies.
+fact: a user-stated or confirmed constraint, decision, or piece of context.
+working: a plan, idea, open question, or working detail; tentative unless explicitly decided or abandoned.
+recap: a user-confirmed conclusion with useful rationale and rejected alternatives.
+reference: lasting external material the user pointed to or confirmed is worth returning to.`;
 
 const REFLECT_PROMPT = `Record the user-grounded memories the agent missed. Return create and correct arrays; either may be empty. Aim for no more than ${MAX_REFLECTIONS} changes. Existing details you may correct are already in <read_details>; you cannot look up others.
 
 Sources: capture only what the user wrote or explicitly confirmed. Use assistant turns only to understand what a confirmation refers to (for example "yes, always do that" or "go with that plan"), and cite the confirming user message. "Thanks", "ok", or silence does not confirm an assistant claim. Never capture the assistant's or its tools' own findings. Cite supporting user message ids from the transcript in source_message_ids. Resolve relative dates using each message's stated_at, not today's date.
 
 Types: preference and instruction are rules the user wants future agents to follow; everything else is a hint. If unsure, do not make it a rule.
-- preference: a lasting general preference.
-- instruction: a scoped rule for future work.
-- fact: a project constraint, decision, or piece of context.
-- working: a plan, idea, open question, or working decision. It is tentative unless the user explicitly decided or abandoned it; state uncertainty in plain words.
-- recap: a settled conclusion the user confirmed, with useful rationale and rejected alternatives.
-- reference: lasting external material the user pointed to or confirmed is worth returning to.
+${TYPE_GUIDANCE}
 
 create: new subjects only, one subject per memory. Skip routine requests with no lasting value (for example "run the tests") and secrets. Ignore subjects in <session_saves> unless the user explicitly corrected them.
 correct: only when the user explicitly corrected or changed a supplied detail. Give its exact id and complete updated content. Add a title or summary only if the old wording would mislead; type is inherited. The previous version stays as history. Never correct a summary, infer a correction from silence, or re-save an unchanged detail.
 
 Writing: the summary is a one-line hook under about 100 characters, in the form "<Area>: <what it covers>" when it applies to only part of the project. The content keeps the full user-grounded detail: conditions, rationale, qualifications, rejected alternatives, and uncertainty. Completeness matters more than brevity; coarser compression happens later in derived summaries. Omit frontmatter and narration.`;
 
-const SCOPE_GUIDANCE = `Scope: project by default. Use global for user preferences that clearly apply across projects, or for any memory the user explicitly asks to make global. A correction keeps its record's scope; do not also save a copy in another scope.`;
-const CAPTURE_GUIDANCE = `Capture only what the user stated or explicitly confirmed, never the assistant's or a tool's own findings. "Thanks", "ok", or silence does not confirm a claim. In source_message_ids, cite user message ids from <memory_source> tags, not memory topic ids. For an accepted assistant proposal, cite the user's confirmation; original dates come from those messages.
-Use preference or instruction only for rules the user wants future agents to follow; otherwise use fact, working, recap, or reference. If unsure, do not turn context into a rule. Working details stay tentative unless explicitly decided or abandoned; describe uncertainty in plain words.
-Keep full conditions, rationale, qualifications, rejected alternatives, and uncertainty. One subject per record; no secrets or narration. ${SCOPE_GUIDANCE}`;
+const SCOPE_GUIDANCE = `New memories default to project scope. Use global for user preferences that clearly apply across projects, or for any memory the user explicitly asks to make global. Corrections keep their record's scope; do not save a copy in another scope.`;
+const CAPTURE_GUIDANCE = `Capture only user-stated or explicitly confirmed information, not assistant or tool findings. "Thanks", "ok", and silence do not confirm a claim. Cite supporting user message ids from <memory_source> tags in source_message_ids; for accepted proposals, cite the confirmation. Use preference or instruction only for rules the user wants future agents to follow; when unsure, use a hint type. Keep working details tentative unless explicitly decided or abandoned. Preserve full conditions, rationale, qualifications, rejected alternatives, and uncertainty. One subject per record; no secrets or narration.`;
 
 const MEMORY_TOOL_NAMES = ["memory_read", "memory_search", "memory_save", "memory_correct", "memory_delete"] as const;
 
@@ -387,7 +387,7 @@ const setup = async (ctx: Plugin.Context) => {
         : entry.children
           ? "Derived summary — not user-stated. Open relevant sources before relying on specifics; sources may themselves be summaries."
           : isRule(entry)
-            ? "Current user-stated rule. Follow only within its stated scope."
+             ? "Current user-stated rule. Follow it where its stated conditions apply unless the current conversation says otherwise."
             : entry.type === "working"
               ? "Working context — tentative unless explicitly decided or abandoned in the body."
               : "Contextual hint — verify before relying on it.";
@@ -970,8 +970,9 @@ const setup = async (ctx: Plugin.Context) => {
         const saved = state.saved.map((item) => `- ${item.title} (${item.file})`).join("\n");
         const view = await scopedView();
         const details = view.catalog.filter((entry) => !entry.children && !entry.supersededBy && view.status(entry) !== "missing");
-        const context = `<memory_index>\n${view.roots.map(topicLine).join("\n")}\n</memory_index>\n\n<detail_index>\n${details.map(topicLine).join("\n")}\n</detail_index>\n\n<session_saves>\n${saved}\n</session_saves>\n\n<transcript>\n${renderTranscript(priorReply ? [priorReply, ...messages] : messages)}\n</transcript>`;
-        const selection = await runWorker(reflectModel, ReflectionSelectionSchema, REFLECT_SELECTOR_SYSTEM, `${REFLECT_SELECTOR_PROMPT}\n\n${context}`);
+        const indexes = `<memory_index>\n${view.roots.map(topicLine).join("\n")}\n</memory_index>\n\n<detail_index>\n${details.filter((entry) => view.status(entry) === "consolidated").map(topicLine).join("\n")}\n</detail_index>`;
+        const context = `<session_saves>\n${saved}\n</session_saves>\n\n<transcript>\n${renderTranscript(priorReply ? [priorReply, ...messages] : messages)}\n</transcript>`;
+        const selection = await runWorker(reflectModel, ReflectionSelectionSchema, REFLECT_SELECTOR_SYSTEM, `${REFLECT_SELECTOR_PROMPT}\n\n${indexes}\n\n${context}`);
         if (disposed || state.deleted) return;
         if (selection.needed) {
           const inspected = new Map<string, string>();
@@ -1045,6 +1046,7 @@ const setup = async (ctx: Plugin.Context) => {
   };
 
   const rpc = await ctx.rpc.register(MemoryRpc, {
+    read: async ({ id }) => ({ content: await scopedTopic(id) ?? null }),
     dashboard: async () => {
       dashboard ??= serveDashboard({
         root: dirname(root), projectKey, directory, store,
@@ -1078,8 +1080,9 @@ const setup = async (ctx: Plugin.Context) => {
           file: entry.file,
           scope: owner.key === "global" ? "global" as const : "project" as const,
           path: join(memoryScopeRoot(dataRoot, owner.key), owner.file),
-          title: entry.title,
-          summary: entry.summary,
+           title: entry.title,
+           type: entry.type,
+           summary: entry.summary,
           status: view.status(entry),
           children: entry.children?.map((child) => child.file) ?? [],
           supersedes: supersedes.get(entry.file) ?? [],
@@ -1144,14 +1147,14 @@ const setup = async (ctx: Plugin.Context) => {
     editor.add({
       name: "memory_save",
       options: { codemode: false },
-      description: `Create a NEW memory. Search related subjects first; use memory_correct for an existing detail. The summary field is a one-line index hook, not a summary topic. ${CAPTURE_GUIDANCE}`,
+      description: `Create a NEW memory. Search related subjects first; use memory_correct for an existing detail. The summary field is a one-line index hook, not a summary topic. ${CAPTURE_GUIDANCE} ${SCOPE_GUIDANCE}`,
       input: {
         type: "object",
         properties: {
           title: { type: "string", minLength: 1, description: "Short topic title" },
           summary: { type: "string", description: "One-line index hook describing coverage and retrieval terms" },
           content: { type: "string", minLength: 1, description: "Complete user-grounded detail, with conditions and uncertainty; no frontmatter" },
-          type: { type: "string", enum: [...MEMORY_TYPES] },
+          type: { type: "string", enum: [...MEMORY_TYPES], description: TYPE_GUIDANCE },
           scope: { type: "string", enum: ["project", "global"], description: "Default project; global for clearly general preferences or explicit user requests" },
           source_message_ids: { type: "array", items: { type: "string" }, minItems: 1, description: "Supporting user message IDs from <memory_source> annotations" },
         },
@@ -1171,7 +1174,7 @@ const setup = async (ctx: Plugin.Context) => {
     editor.add({
       name: "memory_correct",
       options: { codemode: false },
-      description: `Correct an existing detail by exact id. Only this project's and global records can be changed; other projects are read-only here. Provide the COMPLETE updated content, keeping qualifications that still apply. Read the detail if needed: its index line is not the full body. Title, summary, and type carry over unless you pass new values; legacy insights keep their type. The correction gets a new current id; the old version stays as history. Summary topics cannot be corrected. Correct the wrong source detail instead, or use memory_delete to unfold a bad summary as part of its repair; its sources stay. ${CAPTURE_GUIDANCE}`,
+      description: "Correct an existing detail in this project or global by exact id; other projects are read-only here. Provide COMPLETE updated content, preserving applicable conditions, rationale, qualifications, rejected alternatives, and uncertainty; read the detail if needed, not just its index hook. Capture only user-stated or explicitly confirmed information, not assistant or tool findings. Cite supporting user message ids from <memory_source>; thanks, ok, and silence are not confirmation. Keep working details tentative unless explicitly decided or abandoned. Use preference or instruction only for user rules, not context. One subject per record; no secrets or narration. Title, summary, and type are inherited unless changed; scope always stays the same. Do not save a copy in another scope. Creates a new current id and keeps the old version as history. Summaries cannot be corrected. Correcting a source automatically retires dependent summaries. If only a summary is wrong, a user-requested repair can delete it while keeping its sources.",
       input: {
         type: "object",
         properties: {
@@ -1198,7 +1201,7 @@ const setup = async (ctx: Plugin.Context) => {
     editor.add({
       name: "memory_delete",
       options: { codemode: false },
-      description: "Delete one record from this project or global by exact id when the user asks; other projects are read-only here. To change content, use memory_correct. Deletion removes that record and summaries built on it. Its sources, sibling details, and earlier versions stay; this is not subject-wide erasure. To repair a wrong summary, delete it to unfold its sources. No replacement summary is generated; the user can run /dream.",
+      description: "Delete one record from this project or global by exact id when the user asks to remove it or repair an incorrect summary; other projects are read-only here. To change content, use memory_correct, which automatically retires summaries built on the changed source. Deletion removes the selected record and dependent summaries, not its sources, sibling details, or earlier versions. This is not subject-wide erasure. No replacement summary is generated; the user can run /dream.",
       input: {
         type: "object",
         properties: { id: { type: "string", description: "Exact id of the selected record or summary topic" } },
@@ -1228,15 +1231,21 @@ const setup = async (ctx: Plugin.Context) => {
         const hints = scoped.filter((entry) => !isRule(entry));
         const label = key === "global" ? "Global" : "Project";
         if (topics.length > 0) sections.push(`${label} preferences and instructions stated by the user (full contents):\n\n${topics.join("\n\n")}`);
-        if (hints.length > 0) sections.push(`Other ${label.toLowerCase()} memory topics (read when relevant):\n\n${hints.map(topicLine).join("\n")}`);
+        if (hints.length > 0) sections.push(`${label} hints (read when relevant):\n\n${hints.map(topicLine).join("\n")}`);
       }
       return `<memory>\n${sections.join("\n\n")}\n</memory>`;
     }
     const sections = scopes.flatMap((key) => {
       const scoped = entries.filter((entry) => parseMemoryID(entry.file, projectKey).key === key);
-      return scoped.length > 0 ? [`${key === "global" ? "Global memory" : "Current project memory"}:\n${scoped.map(topicLine).join("\n")}`] : [];
+      const rules = scoped.filter(isRule);
+      const hints = scoped.filter((entry) => !isRule(entry));
+      const label = key === "global" ? "Global" : "Current project";
+      return [
+        ...(rules.length > 0 ? [`${label} user rules (index hooks only; read relevant records before acting):\n${rules.map(topicLine).join("\n")}`] : []),
+        ...(hints.length > 0 ? [`${label} hints (read when relevant):\n${hints.map(topicLine).join("\n")}`] : []),
+      ];
     });
-    return `<memory>\n${READ_GUIDANCE}\nCreate new records with memory_save; change an existing detail with memory_correct.\n\n${sections.join("\n\n")}\n</memory>`;
+    return `<memory>\n${READ_GUIDANCE}\n\n${sections.join("\n\n")}\n</memory>`;
   };
 
   await ctx.session.hook("context", async (event) => {
