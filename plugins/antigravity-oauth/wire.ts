@@ -1,7 +1,7 @@
 /**
  * Antigravity wire-format helpers.
  *
- * Everything in this file mirrors the native Antigravity IDE language server
+ * Helpers mirror the native Antigravity language server
  * against the Cloud Code Assist (`daily-cloudcode-pa`) endpoints: user agent,
  * agent model catalog, per-session request identity, request envelope
  * construction, tool schema normalization, and SSE response unwrapping.
@@ -27,20 +27,21 @@ export const ANTIGRAVITY_DAILY_ENDPOINT = rot18("uggcf://qnvyl-pybhqpbqr-cn.tbbt
 export const ANTIGRAVITY_SANDBOX_ENDPOINT = rot18("uggcf://qnvyl-pybhqpbqr-cn.fnaqobk.tbbtyrncvf.pbz");
 export const ANTIGRAVITY_ENDPOINTS = [ANTIGRAVITY_DAILY_ENDPOINT, ANTIGRAVITY_SANDBOX_ENDPOINT] as const;
 
-/** Native IDE client version; override with OPENCODE_ANTIGRAVITY_VERSION. */
+/** IDE login/metrics version; kept separate from the CLI request identity. */
 export function getAntigravityVersion(): string {
   return process.env.OPENCODE_ANTIGRAVITY_VERSION || "2.5.5";
 }
 
 /**
- * User-Agent of the native IDE language server:
- * `antigravity/ide/2.5.5 (aidev_client; os_type=windows; arch=amd64)`.
+ * User-Agent of the captured CLI language server:
+ * `antigravity/cli/1.4.0 (aidev_client; os_type=linux; arch=amd64; cl=1000494485; auth_method=consumer)`.
  * Overrides: OPENCODE_ANTIGRAVITY_VERSION / _OS / _ARCH.
  */
 export function getAntigravityUserAgent(): string {
-  const os = process.env.OPENCODE_ANTIGRAVITY_OS || "windows";
+  const version = process.env.OPENCODE_ANTIGRAVITY_VERSION || "1.4.0";
+  const os = process.env.OPENCODE_ANTIGRAVITY_OS || "linux";
   const arch = process.env.OPENCODE_ANTIGRAVITY_ARCH || "amd64";
-  return `antigravity/ide/${getAntigravityVersion()} (aidev_client; os_type=${os}; arch=${arch})`;
+  return `antigravity/cli/${version} (aidev_client; os_type=${os}; arch=${arch}; cl=1000494485; auth_method=consumer)`;
 }
 
 /**
@@ -70,7 +71,7 @@ export function antigravityHeaders(accessToken: string): Record<string, string> 
   };
 }
 
-/** CCA bypass accepted only when a Gemini 3 turn's first function call is unsigned. */
+/** CCA bypass for the first unsigned function call in a Gemini 3 / Argon turn. */
 const SKIP_THOUGHT_SIGNATURE = "skip_thought_signature_validator";
 
 /** Title requests use this checkpoint model. */
@@ -148,7 +149,7 @@ export interface WireModel {
   apiProvider?: string;
   supportsImages?: boolean;
   thinkingBudget?: number;
-  /** Anthropic thinking tier: 1/2/3 → LOW/MEDIUM/HIGH. */
+  /** Thinking tier: 1/2/3 → LOW/MEDIUM/HIGH; takes precedence over the budget. */
   thinkingLevel?: number;
   maxTokens: number;
   maxOutputTokens: number;
@@ -419,8 +420,8 @@ export function rewriteBodyForAntigravity(options: BodyRewriteOptions): Record<s
   };
   // Only the catalog's thinking config; OpenCode's sampling settings are not
   // part of the native request.
-  const thinkingConfig = claude
-    ? { includeThoughts: true, thinkingBudget: 0, thinkingLevel: THINKING_LEVELS[model.thinkingLevel!] }
+  const thinkingConfig = model.thinkingLevel !== undefined
+    ? { includeThoughts: true, thinkingLevel: THINKING_LEVELS[model.thinkingLevel] }
     : model.thinkingBudget !== undefined
       ? { includeThoughts: true, thinkingBudget: model.thinkingBudget }
       : undefined;
@@ -476,10 +477,10 @@ function normalizeContentsForAntigravity(
   claude: boolean,
   agent?: { state: AntigravitySessionState; wireModelId: string; modelName: string; end: number },
 ): Record<string, any>[] {
-  const gemini3 = logicalModelId.startsWith("gemini-3");
+  const needsCallSignature = logicalModelId.startsWith("gemini-3") || logicalModelId.startsWith("gemini-4-argon");
   const now = Date.now();
   const occurrences = new Map<string, number>();
-  // Gemini 3 validates signatures only on calls after the latest user turn.
+  // Gemini 3 and Argon only need call signatures after the latest user turn.
   const turnStart = contents.findLastIndex(
     (content) => content.role === "user" && !content.parts.some((part: Record<string, any>) => part.functionResponse),
   );
@@ -580,9 +581,9 @@ function normalizeContentsForAntigravity(
       target.thoughtSignature = signature;
     }
 
-    // OpenCode marks unsigned Gemini 3 calls with the bypass. Native replays
+    // OpenCode marks unsigned Gemini calls with the bypass. Native replays
     // them bare; only a current-turn message needs it, on its first call.
-    let bypass = gemini3 && index > turnStart;
+    let bypass = needsCallSignature && index > turnStart;
     for (const part of parts) {
       if (!part.functionCall) continue;
       if (part.thoughtSignature === SKIP_THOUGHT_SIGNATURE) delete part.thoughtSignature;

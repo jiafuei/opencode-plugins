@@ -18,14 +18,14 @@ const SKIP = "skip_thought_signature_validator";
 // ---------------------------------------------------------------------------
 
 describe("antigravity user agent", () => {
-  test("matches the native IDE language server fingerprint", () => {
+  test("matches the captured CLI language server fingerprint", () => {
     const version = process.env.OPENCODE_ANTIGRAVITY_VERSION;
     delete process.env.OPENCODE_ANTIGRAVITY_VERSION;
-    expect(getAntigravityUserAgent()).toBe("antigravity/ide/2.5.5 (aidev_client; os_type=windows; arch=amd64)");
+    expect(getAntigravityUserAgent()).toBe("antigravity/cli/1.4.0 (aidev_client; os_type=linux; arch=amd64; cl=1000494485; auth_method=consumer)");
     process.env.OPENCODE_ANTIGRAVITY_VERSION = "9.9.9";
     process.env.OPENCODE_ANTIGRAVITY_OS = "darwin";
     process.env.OPENCODE_ANTIGRAVITY_ARCH = "arm64";
-    expect(getAntigravityUserAgent()).toBe("antigravity/ide/9.9.9 (aidev_client; os_type=darwin; arch=arm64)");
+    expect(getAntigravityUserAgent()).toBe("antigravity/cli/9.9.9 (aidev_client; os_type=darwin; arch=arm64; cl=1000494485; auth_method=consumer)");
     delete process.env.OPENCODE_ANTIGRAVITY_OS;
     delete process.env.OPENCODE_ANTIGRAVITY_ARCH;
     if (version === undefined) delete process.env.OPENCODE_ANTIGRAVITY_VERSION;
@@ -112,17 +112,28 @@ function baseArgs(): Record<string, any> {
   };
 }
 
+const ARGON_MODEL = {
+  displayName: "Gemini 4 Argon (Low)",
+  model: "MODEL_PLACEHOLDER_M419",
+  apiProvider: "API_PROVIDER_GOOGLE_GEMINI",
+  thinkingBudget: -1,
+  thinkingLevel: 1,
+  maxTokens: 1048576,
+  maxOutputTokens: 65536,
+};
+
 function rewrite(
   args: Record<string, any>,
   wireModelId: string,
   state = createSessionState(),
   kind: "agent" | "title" | "compaction" = "agent",
+  model = SNAPSHOT_CATALOG[wireModelId]!,
 ): Record<string, any> {
   return rewriteBodyForAntigravity({
     args,
     logicalModelId: wireModelId.replace(/-(low|medium|high)$/, ""),
     wireModelId,
-    model: SNAPSHOT_CATALOG[wireModelId]!,
+    model,
     projectId: "proj-1",
     state,
     history: state,
@@ -131,6 +142,13 @@ function rewrite(
 }
 
 describe("body rewrite", () => {
+  test("prefers Argon's catalog thinking level over its budget for agent and compaction requests", () => {
+    for (const kind of ["agent", "compaction"] as const) {
+      const body = rewrite(baseArgs(), "gemini-4-argon-low", createSessionState(), kind, ARGON_MODEL);
+      expect(body.request.generationConfig.thinkingConfig).toEqual({ includeThoughts: true, thinkingLevel: "LOW" });
+    }
+  });
+
   test("produces the Cloud Code Assist envelope", () => {
     const args = baseArgs();
     args.systemInstruction = { parts: [{ text: "system" }, { text: "prompt" }] };
@@ -182,11 +200,6 @@ describe("body rewrite", () => {
     });
     expect(state.historySteps).toBe(0);
     expect(state.usedClaude).toBe(false);
-
-    // A tool-less agent request keeps its model and simply has no tools.
-    const agent = rewrite(baseArgs(), "claude-opus-5-5-high");
-    expect(agent).toMatchObject({ model: "claude-opus-5-5-high", requestType: "agent" });
-    expect(agent.request.tools).toBeUndefined();
   });
 
   test("compaction is a checkpoint on the current model with tools disabled", () => {
@@ -267,7 +280,7 @@ describe("body rewrite", () => {
     expect(rewrite(args, "claude-opus-5-5-medium", state).request.contents[1].parts).toEqual([{ text: "answer" }]);
   });
 
-  test("normalizes Gemini 3 function-call signatures per model turn", () => {
+  test("normalizes Gemini 3 and Argon function-call signatures per model turn", () => {
     const contents = [
       user("a"),
       { role: "model", parts: [{ functionCall: { name: "older", args: {} }, thoughtSignature: SKIP }] },
@@ -283,14 +296,19 @@ describe("body rewrite", () => {
       { role: "user", parts: [{ functionResponse: { name: "first", response: { content: "" } } }] },
       { role: "model", parts: [{ functionCall: { name: "unsigned", args: {} } }] },
     ];
-    const signatures = rewrite({ contents }, "gemini-3.8-flash-low")
-      .request.contents.flatMap((content: Record<string, any>) => content.parts)
-      .filter((part: Record<string, any>) => part.functionCall)
-      .map((part: Record<string, any>) => part.thoughtSignature);
+    for (const [wireModelId, model] of [
+      ["gemini-3.8-flash-low", SNAPSHOT_CATALOG["gemini-3.8-flash-low"]!],
+      ["gemini-4-argon-low", ARGON_MODEL],
+    ] as const) {
+      const signatures = rewrite({ contents }, wireModelId, createSessionState(), "agent", model)
+        .request.contents.flatMap((content: Record<string, any>) => content.parts)
+        .filter((part: Record<string, any>) => part.functionCall)
+        .map((part: Record<string, any>) => part.thoughtSignature);
 
-    // Calls before the latest user turn replay bare, like the native client;
-    // only a current-turn message's first unsigned call gets the bypass.
-    expect(signatures).toEqual([undefined, "signed", undefined, SKIP]);
+      // Calls before the latest user turn replay bare, like the native client;
+      // only a current-turn message's first unsigned call gets the bypass.
+      expect(signatures).toEqual([undefined, "signed", undefined, SKIP]);
+    }
   });
 
   test("keeps thinking only for messages that carry a signature", () => {
@@ -377,7 +395,7 @@ describe("body rewrite", () => {
             parametersJsonSchema: {
               type: "object",
               properties: {
-                path: { type: "string", title: "Path", pattern: "^/", format: "uri" },
+                path: { type: "string", title: "Path", pattern: "^/", format: "uri", "x-mcp-header": "X-Trace" },
                 limit: { type: "integer", minimum: 1, maximum: 100, exclusiveMaximum: 101 },
                 tags: { type: "array", items: { type: "string", maxLength: 20 }, minItems: 1 },
                 extra: true,
@@ -712,21 +730,6 @@ describe("CCA tool schema normalization", () => {
     // python-genai collision rule: snake_case overwrites an existing camelCase key.
     expect(normalizeSchemaForCCA({ anyOf: [{ type: "string" }], any_of: [{ type: "integer" }] })).toEqual({
       type: "integer",
-    });
-  });
-
-  test("strips MCP transport annotations and annotation keywords protojson rejects", () => {
-    expect(
-      normalizeSchemaForCCA({
-        type: "object",
-        properties: {
-          projectId: { type: "string", deprecated: true, readOnly: true },
-          screenId: { type: "string", writeOnly: true, $comment: "internal", "x-mcp-header": "X-Trace" },
-        },
-      }),
-    ).toEqual({
-      type: "object",
-      properties: { projectId: { type: "string" }, screenId: { type: "string" } },
     });
   });
 

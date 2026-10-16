@@ -577,7 +577,7 @@ export default Plugin.define({
                 tools: [{ googleSearch: { enhancedContent: { imageSearch: { maxResultCount: 5 } } } }],
                 generationConfig: { candidateCount: 1 },
               },
-              model: "gemini-3.1-flash-lite",
+              model: "gemini-3.5-flash-lite",
               userAgent: "antigravity",
               requestType: "web_search",
             }),

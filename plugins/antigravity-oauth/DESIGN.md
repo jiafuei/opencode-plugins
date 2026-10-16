@@ -1,9 +1,9 @@
 # Antigravity OAuth design
 
-How the plugin imitates the native Antigravity IDE. For installation and usage, see the [README](README.md).
+How the plugin follows captured Antigravity clients. For installation and usage, see the [README](README.md).
 
-Requests mirror the Antigravity IDE language server (`antigravity/ide`) as captured from the Windows client: its
-request envelope, trajectory labels, user agent, model catalog, and control-plane calls.
+Inference and control-plane requests use the Linux CLI identity captured on October 16, 2026. OAuth login remains
+on the earlier Windows IDE identity. Request envelopes and trajectory bookkeeping still follow the earlier IDE capture.
 
 ## Login and provisioning
 
@@ -52,17 +52,17 @@ from the configured `baseURL`, so credentials only go to the two official endpoi
 - Headers are rebuilt from scratch with the language server's set: the bearer token (the OAuth access token OpenCode
   sends as `x-goog-api-key`), the IDE user agent, `Content-Type: application/json`, and `Accept-Encoding: gzip`. No
   OpenCode, Gemini-client, or plugin-private header reaches Cloud Code Assist.
-- The User-Agent is `antigravity/ide/<version> (aidev_client; os_type=<os>; arch=<arch>)`, pinned to the windows/amd64
-  client regardless of the host platform.
+- The User-Agent is `antigravity/cli/1.4.0 (aidev_client; os_type=linux; arch=amd64; cl=1000494485; auth_method=consumer)`,
+  regardless of the host platform. Environment overrides can change the version, OS, and architecture.
 
 ### Bodies
 
 Bodies use the native key order.
 
 - The system prompt is a single `role: "user"` text part.
-- `generationConfig` holds only the catalog's `maxOutputTokens` and thinking config: `thinkingBudget` for Gemini and
-  GPT-OSS, `thinkingLevel` (`LOW`/`MEDIUM`/`HIGH`) for Claude. OpenCode's sampling settings (temperature, topP, topK,
-  stop sequences, seed) are not sent.
+- `generationConfig` holds only the catalog's `maxOutputTokens` and thinking config. Catalog `thinkingLevel`
+  (`LOW`/`MEDIUM`/`HIGH`) takes precedence over `thinkingBudget` for every model, including Argon and Claude.
+  OpenCode's sampling settings (temperature, topP, topK, stop sequences, seed) are not sent.
 - Function calling is always `VALIDATED`, except OpenCode's step-limit `none`, which Claude gets as `NONE`. Cloud Code
   Assist ignores `NONE` and `ANY` on Gemini, GPT-OSS leaks raw harmony tokens under `NONE`, and Claude rejects `ANY`
   while thinking is on, so structured output relies on the model choosing the tool.
@@ -78,7 +78,7 @@ Bodies use the native key order.
   whitespace-only), then function calls, with the message signature on the first non-thought part. Empty or trailing
   `<tool_code>` wrappers are removed from the text. Thinking is kept only when the message carries a signature
   (thinking from another model has none), and for Claude only when the same wire model produced it, so switching
-  Claude tiers drops earlier thinking and signatures like the native client. Gemini 3's signature bypass is added only
+  Claude tiers drops earlier thinking and signatures like the native client. The Gemini 3 and Argon signature bypass is added only
   to unsigned calls after the latest user turn; older calls replay bare.
 - Tool results are sent as `functionResponse.response.output` in the provider's native role (`user` for Claude,
   `model` otherwise), prefixed with `Created At:` / `Completed At:` local timestamps (call streamed, result first
@@ -116,7 +116,7 @@ error events surface as stream errors with sanitized messages and count as endpo
 
 ## Web search and usage
 
-The `antigravity` web search provider sends the native client's dedicated `gemini-3.1-flash-lite` `web_search`
+The `antigravity` web search provider sends the native client's dedicated `gemini-3.5-flash-lite` `web_search`
 operation. `/antigravity-usage` sends the native `retrieveUserQuotaSummary` request for the connection's project to
 the first endpoint of the endpoint mode.
 

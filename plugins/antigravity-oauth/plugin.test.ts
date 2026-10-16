@@ -354,10 +354,10 @@ describe("web search provider", () => {
       expect(mock.calls[0]!.init.signal).toBe(signal);
       const headers = new Headers(mock.calls[0]!.init.headers);
       expect(headers.get("authorization")).toBe("Bearer at-live");
-      expect(headers.get("user-agent")).toBe("antigravity/ide/2.5.5 (aidev_client; os_type=windows; arch=amd64)");
+      expect(headers.get("user-agent")).toBe("antigravity/cli/1.4.0 (aidev_client; os_type=linux; arch=amd64; cl=1000494485; auth_method=consumer)");
       expect(JSON.parse(String(mock.calls[0]!.init.body))).toMatchObject({
         project: "proj-42",
-        model: "gemini-3.1-flash-lite",
+        model: "gemini-3.5-flash-lite",
         userAgent: "antigravity",
         requestType: "web_search",
         request: {
@@ -427,12 +427,12 @@ describe("session HTTP hooks", () => {
       expect([...headers.keys()].sort()).toEqual(["accept-encoding", "authorization", "content-type", "user-agent"]);
       expect(headers.get("accept-encoding")).toBe("gzip");
       expect(headers.get("authorization")).toBe("Bearer at-live");
-      expect(headers.get("user-agent")).toMatch(/^antigravity\/ide\/[\d.]+ \(aidev_client; os_type=windows; arch=amd64\)$/);
+      expect(headers.get("user-agent")).toBe("antigravity/cli/1.4.0 (aidev_client; os_type=linux; arch=amd64; cl=1000494485; auth_method=consumer)");
 
       const wireBody = JSON.parse(String(call.init.body));
       expect(wireBody).toMatchObject({ project: "proj-42", model: "claude-opus-5-5-high", userAgent: "antigravity", requestType: "agent" });
       expect(wireBody.requestId).toMatch(/^agent\/[0-9a-f-]{36}\/\d+\/[0-9a-f-]{36}\/2$/);
-      expect(wireBody.request.generationConfig.thinkingConfig).toEqual({ includeThoughts: true, thinkingBudget: 0, thinkingLevel: "HIGH" });
+      expect(wireBody.request.generationConfig.thinkingConfig).toEqual({ includeThoughts: true, thinkingLevel: "HIGH" });
       expect(wireBody.request.labels.model_enum).toBe("MODEL_PLACEHOLDER_M402");
       expect(JSON.parse(String(mock.calls[0]!.init.body))).toEqual({ trajectoryId: wireBody.request.labels.trajectory_id });
 

@@ -2,7 +2,7 @@
 
 Google [Antigravity](https://antigravity.google) OAuth for [OpenCode](https://opencode.ai). Sign in with a personal Google account and run **Gemini, Claude, and GPT-OSS models** through Google's Cloud Code Assist endpoints on the Antigravity free tier — no API key, no billing account.
 
-Requests imitate the native Antigravity IDE, so they look like the IDE's own traffic to Google's backend.
+Inference and control-plane requests use the captured Antigravity CLI identity. OAuth login still uses the earlier IDE identity.
 
 > This plugin is an unofficial client. Availability, quotas, and model access are controlled entirely by Google's backend and can change or break at any time. Use is subject to Google's terms of service.
 
@@ -75,11 +75,11 @@ With this setting the plugin compacts like the native client: it summarizes with
 
 | Variable | Meaning | Default |
 | --- | --- | --- |
-| `OPENCODE_ANTIGRAVITY_VERSION` | IDE version reported to Google | `2.5.5` |
-| `OPENCODE_ANTIGRAVITY_OS` | Reported `os_type` | `windows` |
+| `OPENCODE_ANTIGRAVITY_VERSION` | Reported client version | CLI `1.4.0`; IDE login and metrics `2.5.5` |
+| `OPENCODE_ANTIGRAVITY_OS` | Reported `os_type` | CLI `linux`; IDE login and metrics `windows` |
 | `OPENCODE_ANTIGRAVITY_ARCH` | Reported `arch` | `amd64` |
 
-The reported OS and architecture default to the Windows client the plugin imitates, regardless of your platform.
+The request User-Agent defaults to the captured Linux CLI build `1000494485` with `auth_method=consumer`, regardless of your platform. Explicit environment overrides also apply to the unchanged IDE login and metrics metadata.
 
 ## Web search
 
@@ -91,7 +91,7 @@ Run `/antigravity-usage` (or **Antigravity usage** in the command palette) to se
 
 ## Limitations
 
-- The pinned IDE version (`2.5.5`) and the snapshot model table age as Google ships new clients. If Google gates models behind newer versions, set `OPENCODE_ANTIGRAVITY_VERSION`.
+- The pinned client versions and snapshot model table age as Google ships new clients. `OPENCODE_ANTIGRAVITY_VERSION` overrides the version in both CLI and IDE identities, but does not change the CLI build number.
 - Requests match the native client's content, not its network-level details (header normalization by OpenCode's HTTP client, TLS handshake).
 
 See [DESIGN.md](DESIGN.md) for exactly what each request carries and the remaining differences from the native client.
