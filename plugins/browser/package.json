@@ -1,0 +1,27 @@
+{
+  "name": "@jiafuei/opencode-browser",
+  "version": "0.0.1",
+  "description": "Token-bounded browser tools for the OpenCode TUI",
+  "type": "module",
+  "private": true,
+  "exports": {
+    "./server": "./server.ts"
+  },
+  "files": [
+    "server.ts",
+    "runtime.ts",
+    "worker.ts",
+    "browser.ts",
+    "observations.ts",
+    "protocol.ts",
+    "README.md"
+  ],
+  "engines": {
+    "opencode": ">=2.0.30"
+  },
+  "dependencies": {
+    "@opencode/plugin": "2.0.30",
+    "effect": "4.0.1",
+    "playwright-core": "1.64.1"
+  }
+}

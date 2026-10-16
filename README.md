@@ -6,6 +6,7 @@ Standalone plugins for [OpenCode](https://opencode.ai), maintained as independen
 
 - [Anthropic compaction](plugins/anthropic-compaction/README.md): run OpenCode's native compaction through Anthropic's server-side compaction for Claude models.
 - [Antigravity OAuth](plugins/antigravity-oauth/README.md): sign in with Google Antigravity to run Gemini, Claude, and GPT-OSS on the free Cloud Code Assist tier with the native client fingerprint.
+- [Browser](plugins/browser/README.md): token-bounded Playwright tools for the TUI, with CDP attachment, trusted code, and network/console inspection. Not published; load it from a local checkout.
 - [Claude OAuth](plugins/claude-oauth/README.md): use a Claude Pro/Max subscription through the built-in Anthropic integration, with `/anthropic-usage` for plan limits.
 - [Codex usage](plugins/codex-usage/README.md): `/codex-usage` shows your ChatGPT plan's Codex rate-limit windows.
 - [Computer use](plugins/computer-use/README.md): screenshot-driven desktop control on Windows (OpenCode in WSL2) and macOS. Not published; load it from a local checkout.
