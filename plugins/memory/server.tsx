@@ -848,7 +848,7 @@ const setup = async (ctx: Plugin.Context) => {
       const finishedAt = new Date().toISOString();
       const changed = actions.length > 0;
       await writeDreamManifest(runID, { trigger: input.trigger, ...dreamModelFields(dreamModel), sessionID: input.sessionID, startedAt, finishedAt, state: changed ? "changed" : "noop", changed, orphans, actions });
-      await writeDreamStatus({ requestID: input.requestID ?? null, runID, state: changed ? "changed" : "noop", sessionID: input.sessionID, startedAt, finishedAt, counts: { synthesize: actions.length, prune: 0 } });
+      await writeDreamStatus({ requestID: input.requestID ?? null, runID, state: changed ? "changed" : "noop", sessionID: input.sessionID, startedAt, finishedAt, counts: { synthesize: actions.length } });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       // Status first, so failed bookkeeping below cannot leave the TUI on "Dreaming...".
@@ -859,7 +859,7 @@ const setup = async (ctx: Plugin.Context) => {
         sessionID: input.sessionID,
         startedAt,
         finishedAt: new Date().toISOString(),
-        counts: { synthesize: actions.length, prune: 0 },
+        counts: { synthesize: actions.length },
         message: actions.length > 0 ? `${message}; changes were applied` : message,
       });
       if (runningKey) await scopeStore(runningKey).serializeWrite(async () => {

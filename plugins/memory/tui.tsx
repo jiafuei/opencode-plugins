@@ -12,17 +12,6 @@ type Choice =
   | { type: "history" }
   | { type: "back" };
 
-// Concise operation counts for the dream completion toast.
-export function dreamCountsMessage(counts: Record<string, unknown> | undefined): string {
-  const parts: string[] = [];
-  const labels = [["synthesize", "synthesized"], ["prune", "pruned"]] as const;
-  for (const [key, label] of labels) {
-    const count = counts?.[key];
-    if (count) parts.push(`${count} ${label}`);
-  }
-  return parts.join(", ");
-}
-
 export function isDreamingForSession(status: DreamStatus | undefined, sessionID: string): boolean {
   return status?.state === "running" && status.sessionID === sessionID;
 }
@@ -261,7 +250,7 @@ export default Plugin.define({
         // Changed runs get one completion toast regardless of trigger; no-ops
         // stay silent; failures warn only for this instance's own request.
         if (status.state === "changed") {
-          ctx.ui.toast.show({ variant: "success", title: "Memory", message: `Dream complete: ${dreamCountsMessage(status.counts)}` });
+          ctx.ui.toast.show({ variant: "success", title: "Memory", message: `Dream complete: ${status.counts?.synthesize} synthesized` });
         } else if (status.state === "failed" && matchedRequest) {
           ctx.ui.toast.show({ variant: "warning", title: "Memory", message: status.message ? `Dream failed: ${status.message}` : "Dream failed" });
         }
