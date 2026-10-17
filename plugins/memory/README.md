@@ -226,8 +226,11 @@ configuration.
   and historical records cannot be edited through the TUI. Toggling memory can invalidate the provider's prompt cache.
 - `/dream` starts a dream without adding a conversation message.
 - `/memory-web` opens a central browser dashboard for global and project memories. It starts a localhost listener on an
-  OS-assigned port on first use, reuses it on later calls, and stops it when the server plugin unloads. It lives with the
-  OpenCode background service, not the terminal client. The command also shows the URL if you need to open it manually.
+  OS-assigned port on first use and reuses it while running. Tabs send heartbeats every 30 seconds, even in the background.
+  The listener stops after five minutes without a heartbeat or when the plugin unloads. Memory processing continues.
+  Suspended tabs can time out; run `/memory-web` again to restart the listener.
+  The listener lives with the OpenCode background service, not the terminal client. The command also shows the URL
+  if you need to open it manually.
 
 ## Web dashboard
 

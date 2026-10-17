@@ -10,6 +10,12 @@ export function serveDashboard(options: {
   projectDirectory: (key: string) => Promise<string | undefined>;
 }) {
   const token = crypto.randomUUID();
+  let stopped = false;
+  const stop = () => {
+    clearTimeout(idleTimer);
+    stopped = true;
+    return server.stop(true);
+  };
   const assets: Record<string, string> = { "/": "index.html", "/app.js": "app.js", "/style.css": "style.css" };
   const projects = async () => {
     const result = [];
@@ -43,6 +49,10 @@ export function serveDashboard(options: {
       }
       if (request.headers.get("x-memory-token") !== token || (request.headers.has("origin") && request.headers.get("origin") !== server.url.origin)) {
         return Response.json({ error: "Access denied. Reopen the dashboard with /memory-web." }, { status: 403 });
+      }
+      if (request.method === "POST" && url.pathname === "/api/heartbeat") {
+        idleTimer.refresh();
+        return Response.json({ ok: true });
       }
       try {
         let result: unknown;
@@ -97,5 +107,7 @@ export function serveDashboard(options: {
       }
     },
   });
-  return { url: `${server.url}#${token}`, stop: () => server.stop(true) };
+  const idleTimer = setTimeout(stop, 5 * 60_000);
+  idleTimer.unref();
+  return { url: `${server.url}#${token}`, stop, get stopped() { return stopped; } };
 }

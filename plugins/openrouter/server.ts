@@ -16,7 +16,14 @@ export default Plugin.define({
   id: "openrouter-settings",
   async setup(ctx) {
     let server: Bun.Server<undefined> | undefined;
+    let idleTimer: ReturnType<typeof setTimeout> | undefined;
     const token = crypto.randomUUID();
+
+    function stop() {
+      clearTimeout(idleTimer);
+      server?.stop(true);
+      server = undefined;
+    }
 
     async function context(sessionID?: string) {
       const sessions = [];
@@ -73,6 +80,10 @@ export default Plugin.define({
                 return new Response(Bun.file(new URL(`./web/${asset}`, import.meta.url)));
               }
               if (request.headers.get("authorization") !== `Bearer ${token}`) return Response.json({ error: "Unauthorized" }, { status: 401 });
+              if (url.pathname === "/api/heartbeat" && request.method === "POST") {
+                idleTimer!.refresh();
+                return Response.json({ ok: true });
+              }
               if (url.pathname === "/api/context" && request.method === "GET") {
                 const info = await context(url.searchParams.get("sessionID") ?? undefined);
                 const models = (await ctx.model.list()).filter((model) => model.providerID === "openrouter");
@@ -117,6 +128,9 @@ export default Plugin.define({
             },
           });
         }
+        clearTimeout(idleTimer);
+        idleTimer = setTimeout(stop, 5 * 60_000);
+        idleTimer.unref();
         const url = new URL(`http://127.0.0.1:${server.port}/`);
         if (sessionID) url.searchParams.set("sessionID", sessionID);
         url.hash = token;
@@ -124,6 +138,6 @@ export default Plugin.define({
       },
     });
 
-    return () => { server?.stop(true); };
+    return stop;
   },
 });

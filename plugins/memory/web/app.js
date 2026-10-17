@@ -30,6 +30,12 @@ async function api(path, method = "GET", data) {
   return result;
 }
 
+function heartbeat() {
+  api("heartbeat", "POST").catch(() => notice("Dashboard disconnected. Reopen it with /memory-web.", true));
+}
+heartbeat();
+setInterval(heartbeat, 30_000);
+
 function discard() {
   return !dirty || confirm("Discard your unsaved changes?");
 }

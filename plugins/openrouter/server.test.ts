@@ -92,6 +92,8 @@ test("local UI API previews unsaved settings without persisting them, validates 
     const page = await fetch(app.url);
     expect(page.status).toBe(200);
     expect(await page.text()).toContain("Effective settings");
+    expect((await fetch(new URL("/api/heartbeat", app.url), { method: "POST" })).status).toBe(401);
+    expect((await app.api("heartbeat", {})).status).toBe(200);
     expect((await fetch(new URL("/api/context", app.url))).status).toBe(401);
     const draft = await app.api("preview", {
       variant: "fast",

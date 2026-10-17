@@ -1049,7 +1049,7 @@ const setup = async (ctx: Plugin.Context) => {
   const rpc = await ctx.rpc.register(MemoryRpc, {
     read: async ({ id }) => ({ content: await scopedTopic(id) ?? null }),
     dashboard: async () => {
-      dashboard ??= serveDashboard({
+      if (!dashboard || dashboard.stopped) dashboard = serveDashboard({
         root: dirname(root), projectKey, directory, store,
         projectDirectory: async (key) => await ctx.storage.get(`memory/${key}/directory`) as string | undefined,
       });

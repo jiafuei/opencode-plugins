@@ -72,6 +72,8 @@ test("dashboard requires its token, rejects foreign origins and unknown projects
   const headers = { "x-memory-token": launch.hash.slice(1), "Content-Type": "application/json" };
   const input = { project: "current", title: "Rule", type: "instruction", summary: "Scope", content: "Use the local service." };
   try {
+    expect((await fetch(new URL("/api/heartbeat", launch), { method: "POST" })).status).toBe(403);
+    expect((await fetch(new URL("/api/heartbeat", launch), { method: "POST", headers })).status).toBe(200);
     expect((await fetch(new URL("/api/topics", launch))).status).toBe(403);
     expect((await fetch(new URL("/api/topic", launch), { method: "POST", headers: { ...headers, Origin: "https://example.com" }, body: JSON.stringify(input) })).status).toBe(403);
     expect((await fetch(new URL("/api/topic", launch), { method: "POST", headers, body: JSON.stringify({ ...input, project: "../outside" }) })).status).toBe(400);

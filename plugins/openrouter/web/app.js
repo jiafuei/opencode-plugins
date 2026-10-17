@@ -26,6 +26,12 @@ function showError(error) {
   $("error").hidden = !error;
 }
 
+function heartbeat() {
+  api("heartbeat", {}).catch(() => showError(new Error("Settings disconnected. Reopen them with /openrouter.")));
+}
+heartbeat();
+setInterval(heartbeat, 30_000);
+
 function inputData(patch) {
   return { ...selection, sessionID, previewModelID: $("preview-model").value.trim(), variant: $("variant").value, patch };
 }

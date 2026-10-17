@@ -10,6 +10,8 @@ opencode plugin add @jiafuei/opencode-openrouter
 
 Uses your existing OpenCode OpenRouter connection. Open **OpenRouter settings** in the command palette or run `/openrouter`. The plugin starts a loopback-only server on an available port and opens your browser. The launch URL grants access to the settings UI; no OpenRouter credential is sent to the browser. Reopen the command after restarting OpenCode.
 
+Tabs send heartbeats every 30 seconds, even in the background. After five minutes without a heartbeat, the listener stops but saved routing settings still apply. Suspended tabs can time out; run `/openrouter` again to restart the listener.
+
 ## Configuration
 
 Choose **Global**, **This folder**, or **This session**. Leave **Model override** empty to edit the scope's defaults, or enter an exact OpenCode OpenRouter model ID (for example `anthropic/claude-sonnet-4.5`). Model IDs are suggested from OpenCode's model registry. The preview model and variant select which settings to resolve.
