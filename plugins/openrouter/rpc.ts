@@ -9,4 +9,5 @@ export const OpenRouterRpc = Rpc.define({
       output: z.object({ url: z.string() }),
     },
   },
+  events: {},
 });
