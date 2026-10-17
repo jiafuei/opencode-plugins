@@ -51,6 +51,9 @@ interface TokenResponse {
   organization?: { uuid?: string; name?: string };
 }
 
+// Shared across project instances; successful refreshes bridge core's credential-save window.
+const refreshes = new Map<string, Promise<Pick<Credential.OAuth, "access" | "refresh" | "expires">>>();
+
 /**
  * Account + organization identity resolved from the token response and/or
  * the OAuth profile and Claude CLI roles endpoints. Stored
@@ -315,19 +318,28 @@ export default Plugin.define({
           };
         },
         refresh: async (credential) => {
-          const tokens = await postToken({
-            grant_type: "refresh_token",
-            client_id: CLIENT_ID,
-            refresh_token: credential.refresh,
-            scope: REFRESH_SCOPES,
-          });
-          // Rotation is optional; identity stays as captured at login.
-          return {
-            ...credential,
-            access: tokens.access_token,
-            refresh: tokens.refresh_token ?? credential.refresh,
-            expires: Date.now() + tokens.expires_in * 1000,
-          };
+          const key = credential.refresh;
+          let pending = refreshes.get(key);
+          if (!pending) {
+            pending = postToken({
+              grant_type: "refresh_token",
+              client_id: CLIENT_ID,
+              refresh_token: key,
+              scope: REFRESH_SCOPES,
+            }).then((tokens) => {
+              setTimeout(() => refreshes.delete(key), 30_000).unref();
+              return {
+                access: tokens.access_token,
+                refresh: tokens.refresh_token ?? key,
+                expires: Date.now() + tokens.expires_in * 1000,
+              };
+            }).catch((error) => {
+              refreshes.delete(key);
+              throw error;
+            });
+            refreshes.set(key, pending);
+          }
+          return { ...credential, ...(await pending) };
         },
       });
     });

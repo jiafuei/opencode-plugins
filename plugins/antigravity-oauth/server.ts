@@ -54,6 +54,25 @@ const PASTE_METHOD_ID = Integration.MethodID.make("paste");
 /** Login/browser-callback wait window. */
 export const FLOW_TIMEOUT_MS = 5 * 60 * 1000;
 
+// Shared across project instances; successful refreshes bridge core's credential-save window.
+const refreshes = new Map<string, ReturnType<typeof refreshToken>>();
+
+async function refreshCredential(credential: Credential.OAuth): Promise<Credential.OAuth> {
+  const key = credential.refresh;
+  let pending = refreshes.get(key);
+  if (!pending) {
+    pending = refreshToken(key).then((tokens) => {
+      setTimeout(() => refreshes.delete(key), 30_000).unref();
+      return tokens;
+    }).catch((error) => {
+      refreshes.delete(key);
+      throw error;
+    });
+    refreshes.set(key, pending);
+  }
+  return { ...credential, ...(await pending) };
+}
+
 type EndpointMode = "auto" | "production" | "sandbox";
 
 type TextMessage = {
@@ -261,7 +280,7 @@ export default Plugin.define({
               }),
           };
         },
-        refresh: async (credential) => ({ ...credential, ...(await refreshToken(credential.refresh)) }),
+        refresh: refreshCredential,
         label: (credential) => credential.metadata?.email as string | undefined,
       });
       editor.method.update({
@@ -287,7 +306,7 @@ export default Plugin.define({
             },
           };
         },
-        refresh: async (credential) => ({ ...credential, ...(await refreshToken(credential.refresh)) }),
+        refresh: refreshCredential,
         label: (credential) => credential.metadata?.email as string | undefined,
       });
     });

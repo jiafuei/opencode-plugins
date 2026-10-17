@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { AUTHORIZE_URL, REDIRECT_URI, TOKEN_URL } from "./server.ts";
-import { setupPlugin } from "./test_harness.ts";
+import { OAUTH_CREDENTIAL, setupPlugin } from "./test_harness.ts";
 
 // ---------------------------------------------------------------------------
 // Paste-code login: local state validation before token exchange, identity
@@ -113,22 +113,33 @@ describe("paste code flow", () => {
     }
   });
 
-  test("refresh rotates tokens and keeps login identity", async () => {
+  test("refresh is shared across plugin instances, stale callers, and retries after failure", async () => {
     const h = await makePasteHarness();
+    const tokenFetch = globalThis.fetch;
     try {
-      const credential = {
-        type: "oauth",
-        methodID: "claude-pro-max",
-        access: "old",
-        refresh: "old-refresh",
-        expires: 0,
-        metadata: { accountId: "kept" },
-      };
-      const refreshed = await h.method.refresh(credential);
+      const other = await setupPlugin({}, null);
+      const credential = { ...OAUTH_CREDENTIAL, refresh: "old-refresh", expires: 0, metadata: { accountId: "kept" } };
+
+      globalThis.fetch = (async () => Response.json({ error: "server_error" }, { status: 500 })) as typeof fetch;
+      await expect(h.method.refresh(credential)).rejects.toThrow("HTTP 500");
+      globalThis.fetch = tokenFetch;
+
+      const [refreshed, parallel] = await Promise.all([
+        h.method.refresh(credential),
+        other.method.refresh({ ...credential, metadata: { accountId: "other" } }),
+      ]);
+      expect(h.tokenCalls).toHaveLength(1);
       expect(h.tokenCalls[0]!.body).toMatchObject({ grant_type: "refresh_token", refresh_token: "old-refresh" });
       expect(h.tokenCalls[0]!.body.scope).not.toContain("org:create_api_key");
       expect(refreshed).toMatchObject({ access: "at-1", refresh: "rt-1", metadata: { accountId: "kept" } });
       expect(refreshed.expires).toBeGreaterThan(Date.now());
+      expect(parallel).toEqual({ ...refreshed, metadata: { accountId: "other" } });
+      expect(await other.method.refresh(credential)).toEqual(refreshed);
+      expect(h.tokenCalls).toHaveLength(1);
+
+      await h.method.refresh({ ...credential, refresh: "separate-refresh" });
+      expect(h.tokenCalls).toHaveLength(2);
+      expect(h.tokenCalls[1]!.body.refresh_token).toBe("separate-refresh");
     } finally {
       h.restore();
     }

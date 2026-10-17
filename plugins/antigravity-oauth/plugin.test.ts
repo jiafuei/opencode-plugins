@@ -295,17 +295,38 @@ describe("OAuth methods", () => {
     ).rejects.toThrow(/paste-code login failed: .*matching redirect URL from this login attempt/);
   });
 
-  test("refresh rotates tokens and keeps the project metadata", async () => {
+  test("refresh is shared across instances and login methods, including stale callers and retries after failure", async () => {
     const { browser } = await methods();
-    const mock = mockFetch(() => Response.json({ access_token: "fresh-at", refresh_token: "rt-new", expires_in: 3600 }));
+    const { paste } = await methods();
+    let attempt = 0;
+    const mock = mockFetch(() =>
+      ++attempt === 1
+        ? Response.json({ error: "server_error" }, { status: 500 })
+        : Response.json({ access_token: "fresh-at", refresh_token: "rt-new", expires_in: 3600 }),
+    );
     try {
-      await expect(browser.refresh({ ...OAUTH_AUTH, refresh: "rt-old" })).resolves.toMatchObject({
+      const credential = { ...OAUTH_AUTH, refresh: "rt-old" };
+      await expect(browser.refresh(credential)).rejects.toThrow("HTTP 500");
+
+      const [refreshed, parallel] = await Promise.all([
+        browser.refresh(credential),
+        paste.refresh({ ...credential, methodID: "paste", metadata: { projectId: "other-project" } }),
+      ]);
+      expect(mock.calls).toHaveLength(2);
+      expect(refreshed).toMatchObject({
         type: "oauth",
         methodID: "browser",
         access: "fresh-at",
         refresh: "rt-new",
         metadata: { projectId: "proj-42" },
       });
+      expect(parallel).toEqual({ ...refreshed, methodID: "paste", metadata: { projectId: "other-project" } });
+      expect(await browser.refresh(credential)).toEqual(refreshed);
+      expect(mock.calls).toHaveLength(2);
+
+      await browser.refresh({ ...credential, refresh: "separate-refresh" });
+      expect(mock.calls).toHaveLength(3);
+      expect(new URLSearchParams(String(mock.calls[2]!.init.body)).get("refresh_token")).toBe("separate-refresh");
     } finally {
       mock.restore();
     }
