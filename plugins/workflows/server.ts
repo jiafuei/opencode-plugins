@@ -1,4 +1,5 @@
 import { Plugin } from "@opencode/plugin";
+import type * as Tool from "@opencode/plugin/promise/tool";
 import { Schema } from "effect";
 import { mkdir, readdir, rm } from "node:fs/promises";
 import { appendFileSync, readFileSync, renameSync } from "node:fs";
@@ -1100,7 +1101,7 @@ export default Plugin.define({
           runs.set(id, run);
           await save(run, { type: "run.pending", spec });
           await context.progress({ workflowRunID: id });
-          return new Promise((resolve, reject) => {
+          return new Promise<Tool.Result>((resolve, reject) => {
             const abort = () => {
               const waiter = waiters.get(id);
               if (!waiter) return;

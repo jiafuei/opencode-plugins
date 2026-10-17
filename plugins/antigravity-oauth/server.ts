@@ -1,4 +1,4 @@
-import { Connection, Credential, Integration, Plugin } from "@opencode/plugin";
+import { Credential, Integration, Plugin } from "@opencode/plugin";
 import { discoverModels } from "./discovery.ts";
 import { goFetch } from "./transport.ts";
 import { AntigravityRpc } from "./rpc.ts";
@@ -217,7 +217,7 @@ export default Plugin.define({
       }
     >();
     /** Account-specific state loaded from the active connection. */
-    let loaded: { connection?: Connection.Info; projectId?: string; catalog?: WireCatalog } = {};
+    let loaded: { connection?: Awaited<ReturnType<typeof ctx.integration.connection.active>>; projectId?: string; catalog?: WireCatalog } = {};
 
     const load = async () => {
       const connection = await ctx.integration.connection.active(INTEGRATION_ID);
@@ -357,7 +357,7 @@ export default Plugin.define({
         const wireModelId = request.headers.get(WIRE_MODEL_HEADER)!;
         const model = (loaded.catalog ?? SNAPSHOT_CATALOG)[wireModelId];
         if (!model) throw new Error(`Antigravity model "${wireModelId}" is not in the current model catalog`);
-        const args = await request.json();
+        const args = await request.json() as Parameters<typeof rewriteBodyForAntigravity>[0]["args"];
         if (kind === "compaction" && nativeCompactions.has(evt.sessionID)) {
           args.contents.push({ role: "user", parts: [{ text: COMPACTION_PROMPT }] });
         }
@@ -425,10 +425,10 @@ export default Plugin.define({
 
         if (!response.ok) {
           failover();
-          const payload = await response.clone().json().catch(() => undefined);
+          const payload = await response.clone().json().catch(() => undefined) as { error?: Record<string, unknown> } | undefined;
           const verification = accountVerificationMessage(payload, "retry your request");
           if (!verification) return;
-          evt.response = new Response(JSON.stringify({ error: { ...payload.error, message: verification } }), {
+          evt.response = new Response(JSON.stringify({ error: { ...payload?.error, message: verification } }), {
             status: response.status,
             statusText: response.statusText,
             headers: unwrappedResponseHeaders(response),
@@ -438,7 +438,7 @@ export default Plugin.define({
         if (endpointMode === "auto") state.endpoint = url.origin;
 
         if (verb === "generateContent") {
-          evt.response = new Response(JSON.stringify(unwrapCcaJson(await response.json())), {
+          evt.response = new Response(JSON.stringify(unwrapCcaJson(await response.json() as Parameters<typeof unwrapCcaJson>[0])), {
             status: response.status,
             statusText: response.statusText,
             headers: unwrappedResponseHeaders(response),

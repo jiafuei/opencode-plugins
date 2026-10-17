@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import { Model, Plugin, Provider } from "@opencode/plugin";
 import OpenRouter from "./server.ts";
 
 async function instance(storage: Map<string, unknown>, directory = "/work/app") {
@@ -23,12 +24,13 @@ async function instance(storage: Map<string, unknown>, directory = "/work/app") 
         hook = callback;
       },
     },
-    model: { list: async () => [{
-      id: "vendor/model", providerID: "openrouter", name: "Model",
+    model: { list: async () => ({ location: { directory }, data: [{
+      ...Model.Info.default(Provider.ID.make("openrouter"), Model.ID.make("vendor/model")),
+      name: "Model",
       settings: { provider: { allow_fallbacks: true, max_price: { prompt: 3, completion: 4 } } },
       body: { provider: { require_parameters: true } },
       variants: [{ id: "fast", settings: { provider: { max_price: { completion: 2 } } } }],
-    }] },
+    }] }) } satisfies Pick<Plugin.Context["model"], "list">,
     rpc: { register: async (_definition: unknown, handlers: { open: typeof open }) => { open = handlers.open; } },
   } as never);
   const { url } = await open!({});
@@ -51,7 +53,7 @@ async function instance(storage: Map<string, unknown>, directory = "/work/app") 
       };
       await hook!(event);
       expect(event.request.headers.get("authorization")).toBe("Bearer existing-connection");
-      const body = await event.request.json();
+      const body = await event.request.json() as { provider: Record<string, unknown>; [key: string]: unknown };
       expect(body.messages).toEqual([{ role: "user", content: "Hello" }]);
       expect(body.stream).toBe(true);
       return body.provider;
@@ -92,6 +94,15 @@ test("local UI API previews unsaved settings without persisting them, validates 
     const page = await fetch(app.url);
     expect(page.status).toBe(200);
     expect(await page.text()).toContain("Effective settings");
+    const context = await fetch(new URL("/api/context?sessionID=child", app.url), {
+      headers: { authorization: `Bearer ${new URL(app.url).hash.slice(1)}` },
+    });
+    expect(context.status).toBe(200);
+    expect(await context.json()).toMatchObject({
+      directory: "/work/app",
+      session: { id: "child" },
+      models: [{ id: "vendor/model", name: "Model", variants: ["fast"] }],
+    });
     expect((await fetch(new URL("/api/heartbeat", app.url), { method: "POST" })).status).toBe(401);
     expect((await app.api("heartbeat", {})).status).toBe(200);
     expect((await fetch(new URL("/api/context", app.url))).status).toBe(401);
@@ -100,9 +111,9 @@ test("local UI API previews unsaved settings without persisting them, validates 
       patch: { max_price: { mode: "remove" }, allow_fallbacks: { mode: "set", value: false }, sort: { mode: "set", value: { by: "price", partition: "none" } } },
     });
     expect(draft.status).toBe(200);
-    expect((await draft.json()).provider).toEqual({ allow_fallbacks: false, require_parameters: true, sort: { by: "price", partition: "none" } });
+    expect((await draft.json() as { provider: unknown }).provider).toEqual({ allow_fallbacks: false, require_parameters: true, sort: { by: "price", partition: "none" } });
     expect(storage.size).toBe(0);
-    const baseline = await (await app.api("settings", { variant: "fast" })).json();
+    const baseline = await (await app.api("settings", { variant: "fast" })).json() as { provider: Record<string, unknown> };
     expect(baseline.provider.max_price).toEqual({ prompt: 3, completion: 2 });
     expect((await app.api("settings", { patch: { zdr: { mode: "set", value: "yes" } } })).status).toBe(400);
     expect(storage.size).toBe(0);

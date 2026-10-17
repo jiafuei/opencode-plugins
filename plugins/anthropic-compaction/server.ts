@@ -118,7 +118,7 @@ export default Plugin.define({
           "http.request",
           async (event) => {
             const request = event.request;
-            const body = await request.json();
+            const body = await request.json() as { anthropic_beta?: string[] };
             const betas = request.headers.get("anthropic-beta")?.split(",") ?? [];
             event.request = new Request(request.url, {
               method: request.method,

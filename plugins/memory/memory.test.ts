@@ -697,10 +697,11 @@ describe("memory persistence", () => {
     const project = store(storage, directory, [{ file: "plan.md", type: "working", content: "Original plan." }]);
     let fail = true;
     const write = Bun.write;
-    const failingWrite = jest.spyOn(Bun, "write").mockImplementation((destination, content: Bun.BunFile | string, options) => {
+    const failingWrite = jest.spyOn(Bun, "write").mockImplementation(((...args: Parameters<typeof write>) => {
+      const content: unknown = args[1];
       if (fail && typeof content === "string" && content.startsWith("Retry this memory")) return Promise.reject(new Error("Temporary write failure"));
-      return write(destination, content, options);
-    });
+      return write(...args);
+    }) as typeof Bun.write);
     let app = await fixture(directory, (call) => isReflectionSelector(call)
       ? { needed: true, ids: ["plan.md"] }
       : { create: [

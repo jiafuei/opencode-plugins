@@ -70,7 +70,7 @@ export default Plugin.define({
               baseURL: provider.settings?.baseURL,
               headers: provider.headers,
             };
-            const request = (() => {
+            const request = ((): Pick<Parameters<typeof streamText>[0], "model" | "tools" | "toolChoice" | "providerOptions" | "maxOutputTokens"> => {
               if (entry.type === "openai") {
                 // ChatGPT subscriptions (OAuth) go through the Codex backend; API keys use the provider's endpoint.
                 const openai =

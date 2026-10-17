@@ -22,7 +22,7 @@ interface Harness {
 async function makePasteHarness(): Promise<Harness> {
   const tokenCalls: TokenCall[] = [];
   const originalFetch = globalThis.fetch;
-  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+  globalThis.fetch = Object.assign(async (input: string | URL | Request, init?: RequestInit) => {
     const url = String(input instanceof Request ? input.url : input);
     if (url === TOKEN_URL) {
       tokenCalls.push({ body: JSON.parse(String(init?.body)) });
@@ -38,7 +38,7 @@ async function makePasteHarness(): Promise<Harness> {
       );
     }
     return originalFetch(input, init);
-  }) as typeof fetch;
+  }, { preconnect: originalFetch.preconnect });
   try {
     const { method } = await setupPlugin({}, null);
     const result = (await method.authorize({})) as Harness["result"];
@@ -120,7 +120,7 @@ describe("paste code flow", () => {
       const other = await setupPlugin({}, null);
       const credential = { ...OAUTH_CREDENTIAL, refresh: "old-refresh", expires: 0, metadata: { accountId: "kept" } };
 
-      globalThis.fetch = (async () => Response.json({ error: "server_error" }, { status: 500 })) as typeof fetch;
+      globalThis.fetch = Object.assign(async () => Response.json({ error: "server_error" }, { status: 500 }), { preconnect: tokenFetch.preconnect });
       await expect(h.method.refresh(credential)).rejects.toThrow("HTTP 500");
       globalThis.fetch = tokenFetch;
 

@@ -507,7 +507,7 @@ const setup = async (ctx: Plugin.Context) => {
   // JSON matching the schema and the reply is decoded strictly.
   // generate.text takes no abort signal, so a stalled request is abandoned
   // rather than cancelled; otherwise it would hold its reflection or dream forever.
-  const runWorker = async <S extends Schema.Top>(model: WorkerModel | undefined, schema: S, system: string, prompt: string): Promise<S["Type"]> => {
+  const runWorker = async <S extends Schema.Decoder<unknown>>(model: WorkerModel | undefined, schema: S, system: string, prompt: string): Promise<S["Type"]> => {
     let timer: ReturnType<typeof setTimeout> | undefined;
     const { text } = await Promise.race([
       ctx.generate.text({

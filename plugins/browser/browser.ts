@@ -27,7 +27,7 @@ function path(value: string) {
 
 function networkURL(value: string) {
   const url = new URL(value);
-  if (url.protocol === "data:") return `${value.slice(0, value.indexOf(",")).split(";", 1)[0].slice(0, 100)} (${value.length} chars)`;
+  if (url.protocol === "data:") return `${value.slice(0, value.search(/[;,]/)).slice(0, 100)} (${value.length} chars)`;
   if (url.protocol === "blob:") return `blob:${url.origin}`;
   url.username = "";
   url.password = "";

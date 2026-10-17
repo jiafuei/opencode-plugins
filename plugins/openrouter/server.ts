@@ -55,7 +55,7 @@ export default Plugin.define({
       const info = await context(event.sessionID);
       const applied = await layers(info, event.model.id);
       if (!applied.some((layer) => Object.keys(layer.patch).length)) return;
-      const body = await event.request.json();
+      const body = await event.request.json() as { provider?: Record<string, unknown> };
       const { provider } = resolveSettings(body.provider ?? {}, applied);
       if (Object.keys(provider).length) body.provider = provider;
       else delete body.provider;
@@ -86,7 +86,7 @@ export default Plugin.define({
               }
               if (url.pathname === "/api/context" && request.method === "GET") {
                 const info = await context(url.searchParams.get("sessionID") ?? undefined);
-                const models = (await ctx.model.list()).filter((model) => model.providerID === "openrouter");
+                const models = (await ctx.model.list()).data.filter((model) => model.providerID === "openrouter");
                 return Response.json({
                   directory: info.directory,
                   session: info.session ? { id: info.session.id, title: info.session.title, model: info.session.model } : null,
@@ -107,7 +107,7 @@ export default Plugin.define({
                   const edited = applied.find((layer) => layer.key === key);
                   if (edited) edited.patch = input.patch;
                 }
-                const models = await ctx.model.list();
+                const { data: models } = await ctx.model.list();
                 const model = models.find((model) => model.providerID === "openrouter" && model.id === input.previewModelID);
                 const variant = model?.variants.find((variant) => variant.id === input.variant);
                 // Model registry values already include provider defaults. Body overlays win over semantic settings.

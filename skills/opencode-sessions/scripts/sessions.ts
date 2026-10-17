@@ -50,7 +50,7 @@ if (values.help || !positionals.length) {
   process.exit(0)
 }
 
-const [command, argument] = positionals
+const [command = "", argument = ""] = positionals
 if (!["list", "search", "dump"].includes(command) ||
     positionals.length !== (command === "list" ? 1 : 2) ||
     (command !== "list" && !argument)) {
@@ -144,7 +144,7 @@ if (command === "dump") {
     process.stdout.write(JSON.stringify(message) + "\n")
   }
 } else {
-  const needle = argument?.toLowerCase()
+  const needle = argument.toLowerCase()
   let count = 0
   outer: for await (const session of sessions()) {
     if (session.time.updated < since || session.time.updated >= until) continue
@@ -177,7 +177,7 @@ if (command === "dump") {
         fields.push({ field: "output.output", text: message.output.output })
       }
       for (const { field, text } of fields) {
-        const offset = text.toLowerCase().indexOf(needle!)
+        const offset = text.toLowerCase().indexOf(needle)
         if (offset === -1) continue
         process.stdout.write(JSON.stringify({
           sessionID: session.id,

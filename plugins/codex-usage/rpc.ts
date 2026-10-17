@@ -17,4 +17,5 @@ export const CodexUsageRpc = Rpc.define({
       })),
     },
   },
+  events: {},
 });

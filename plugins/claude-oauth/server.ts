@@ -250,8 +250,8 @@ export default Plugin.define({
       if (state.parentId) return;
       const { wireId, turn, promptId, promptIndex, turnIndex, previousRequestId, previousMessageId } = state;
       const saved = Object.fromEntries(Object.entries({
-        accountId: oauth?.metadata?.accountId, wireId, turn, promptId, promptIndex, turnIndex, previousRequestId, previousMessageId,
-      }).filter(([, value]) => value !== undefined));
+        accountId: oauth?.metadata?.accountId as string | undefined, wireId, turn, promptId, promptIndex, turnIndex, previousRequestId, previousMessageId,
+      }).filter((entry): entry is [string, string | number] => entry[1] !== undefined));
       const { metadata } = await ctx.session.get({ sessionID });
       await ctx.session.update({ sessionID, metadata: { ...metadata, [SESSION_METADATA_KEY]: saved } });
     };
@@ -401,7 +401,7 @@ export default Plugin.define({
     await ctx.model.transform((editor) => {
       if (!oauth) return;
       for (const model of editor.list("anthropic")) {
-        editor.update(model.providerID, model.id, (draft) => {
+        editor.update(String(model.providerID), String(model.id), (draft) => {
           draft.cost = [];
         });
       }

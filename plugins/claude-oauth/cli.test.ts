@@ -119,7 +119,7 @@ test("relay controls actual header order/casing, drops late trace headers, and d
   const upstream = net.createServer((socket) => {
     let bytes = Buffer.alloc(0);
     socket.on("data", (chunk) => {
-      bytes = Buffer.concat([bytes, chunk]);
+      bytes = Buffer.concat([bytes, chunk as Buffer]);
       const end = bytes.indexOf("\r\n\r\n");
       if (end < 0) return;
       const length = Number(bytes.subarray(0, end).toString().match(/Content-Length: (\d+)/)?.[1]);

@@ -101,7 +101,7 @@ export async function setupPlugin(options: Record<string, unknown> = {}, credent
     };
     await hooks["http.request"]!(requestEvent);
     const request = requestEvent.request;
-    const responseEvent = { ...scope, request, response: respond(request.clone()) };
+    const responseEvent = { ...scope, request, response: respond(request.clone() as Request) };
     await hooks["http.response"]!(responseEvent);
     return { request, bodyText: await request.clone().text(), response: responseEvent.response as Response };
   };
