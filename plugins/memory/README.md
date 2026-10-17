@@ -18,10 +18,13 @@ available beneath progressively coarser summaries. Memory is a hint layer, not a
   shows `Reviewing conversation...` while it runs.
 - **Updates.** Saves and index/body edits reach primary sessions on their next user message as reread notices.
 - **Dreaming.** As memory grows, background consolidation adds summaries over related topics without deleting their
-  sources. Summaries can themselves be summarized, building multiple layers. Preferences and instructions are never
-  folded into summaries. The sidebar shows `Dreaming...` while it runs.
+  sources. Summaries can themselves be summarized, and each level is a coarser overview rather than a merge of the
+  details below it. A summary covers shared themes and major decisions; exact conditions and history stay in its linked
+  sources. The synthesis prompt targets 150 words or fewer, but nothing enforces or truncates that length. Preferences
+  and instructions are never folded into summaries. The sidebar shows `Dreaming...` while it runs.
 - **Retrieval.** Read a summary to discover its source IDs, then read those IDs for more detail. All-words search reaches
-  retained records directly, including details omitted from summaries.
+  current detailed records directly, including details omitted from summaries. Derived summaries are excluded from
+  search; superseded details are included only with `include_history: true`.
 - **Subagents** get your preferences and instructions inline, an index of other topics, and read/search access to memory.
   They cannot save or delete memories.
 
@@ -68,7 +71,7 @@ Each operation is a separate tool with a plain object input:
 | Tool | Inputs | Behavior |
 | --- | --- | --- |
 | `memory_read` | `id` | Read a detail, summary, or explicitly labeled historical version |
-| `memory_search` | `query`, optional `offset`, `all_projects` | Search current/global records; explicitly opt into other projects |
+| `memory_search` | `query`, optional `offset`, `all_projects`, `include_history` | Search current details in this project and global memory; opt into other projects or superseded details |
 | `memory_save` | `title`, `hook`, `content`, `type`, `source_message_ids`, optional `scope` | Create in `project` (default) or `global`; `hook` is its one-line index text |
 | `memory_correct` | `id`, `content`, `source_message_ids`; optional `title`, `hook`, `type` | Replace a detail's complete content; omitted metadata is inherited |
 | `memory_delete` | `id` | Remove a selected record; deleting a summary preserves its sources |
@@ -149,8 +152,11 @@ readable. Search with `memory_search({ query: "Redis fixture" })`. Every whitesp
 order and case; commas and double quotes also separate words rather than requiring literal punctuation. Each word is
 a literal substring, not a regex, semantic match, or ordered phrase. A miss is not proof a subject is absent.
 Try fewer or different words. Results provide a
-next `offset` when there are more than 20 matches; repeat the same query with that offset. Concurrent saves can shift
-pages. Retired summaries are excluded from search but remain browsable. Missing IDs return the current root index.
+next `offset` when there are more than 20 matches; repeat the same query and options with that offset. Concurrent saves
+can shift pages. Search excludes derived summaries at every level and defaults to current details, including details
+beneath summaries. Use `memory_search({ query: "Redis fixture", include_history: true })` to also find superseded
+details. Summaries and historical versions remain readable by exact ID with `memory_read`. Missing IDs return the
+current root index.
 
 Topic files hold the body alone, with no frontmatter; metadata lives in the index. Edits to source content or metadata
 permanently retire dependent summaries when detected, exposing finer details again. Retired bodies remain as history;

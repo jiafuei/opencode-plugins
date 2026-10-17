@@ -22,8 +22,10 @@ Model-facing index lines use `[id: topic.md]`, not file links; on-disk lines ret
 topic identifiers into `memory_read` instead of constructing filesystem paths. Each read consults the current index
 and topic body. Reading a summary also lists its immediate children as topic IDs; repeated reads descend through any
 number of layers. Search matches all query words (separated by whitespace, commas, or double quotes) as case-insensitive literal substrings, in any
-order, across retained records independently of the root view. It is not semantic matching; misses suggest trying fewer
-terms, not assuming absence. Superseded rules are explicitly marked not current instructions, and generated summary
+order, across current detailed records independently of the root view, including details beneath summaries. Derived
+summaries are excluded at every level; agents navigate them through the root index and `memory_read`. Search includes
+superseded details only with `include_history: true`. It is not semantic matching; misses suggest trying fewer terms,
+not assuming absence. Superseded rules are explicitly marked not current instructions, and generated summary
 topics are labeled not user-stated. An unavailable topic returns the current
 root index, without aliases or fuzzy matching.
 
@@ -48,7 +50,7 @@ updates. The entry is removed when the session is deleted.
 
 ## Saving
 
-Primary agents get five flat-schema tools: `memory_read(id)`, `memory_search(query, offset?, all_projects?)`,
+Primary agents get five flat-schema tools: `memory_read(id)`, `memory_search(query, offset?, all_projects?, include_history?)`,
 `memory_save(title, hook, content, type, source_message_ids, scope?)`,
 `memory_correct(id, content, source_message_ids, optional metadata)`, and `memory_delete(id)`.
 Tools and worker schemas call the index line text `hook` so it is not confused with summary records; it is stored as the
@@ -123,6 +125,15 @@ global and project sources or different projects. Each synthesis adds an `insigh
 roots and retains every source. A summary can become a child of another summary, creating progressively coarser
 layers. The selector favors keeping recent working details fine-grained; elapsed time and accumulation trigger
 maintenance, not deletion. Preferences and instructions remain roots and are excluded from dreaming.
+
+Summaries are navigation overviews, not replacements for their sources. The synthesis prompt asks for shared themes
+and major decisions in 150 words or fewer, usually 3-5 short bullets; no validator enforces or truncates the length.
+Exact conditions, implementation details, and history stay in the linked sources unless omitting them would make the
+overview misleading. A summary over other summaries names their shared themes instead of merging their bullets, so
+each level is coarser than the one below. Summaries do not recap each source's contribution or repeat source IDs,
+because `memory_read` lists immediate sources. Summaries keep brief provenance distinctions: user-stated or confirmed,
+tentative or abandoned, and derived. They note contradictions instead of resolving them by recency. This guidance
+affects future synthesis only; dreaming does not rewrite existing summaries.
 
 Grouping is topical rather than OptMem's chronological binary grouping. The LSM-like property is progressive
 consolidation, not sorted-key storage. Context thresholds trigger consolidation; they are not hard context caps when

@@ -110,7 +110,7 @@ async function fixture(
     save: (sessionID: string, input: Record<string, unknown>) => tools.memory_save!.execute(withSource(sessionID, input), { sessionID, agent: "build" }),
     correct: (sessionID: string, id: string, input: Record<string, unknown>) => tools.memory_correct!.execute(withSource(sessionID, { id, ...input }), { sessionID, agent: "build" }),
     read: (sessionID: string, id: string) => tools.memory_read!.execute({ id }, { sessionID, agent: "build" }),
-    search: (sessionID: string, query: string, offset?: number, all_projects?: boolean) => tools.memory_search!.execute({ query, ...(offset === undefined ? {} : { offset }), all_projects }, { sessionID, agent: "build" }),
+    search: (sessionID: string, query: string, offset?: number, all_projects?: boolean, include_history?: boolean) => tools.memory_search!.execute({ query, ...(offset === undefined ? {} : { offset }), all_projects, include_history }, { sessionID, agent: "build" }),
     delete: (sessionID: string, id: string) => tools.memory_delete!.execute({ id }, { sessionID, agent: "build" }),
     history: (sessionID: string, messages: Array<{ id: string; type: string; time?: { created: number } } & Record<string, unknown>>) => histories.set(sessionID, messages.map((message) => ({ time: { created: Date.UTC(2026, 7, 1) }, ...message }))),
     message: async (sessionID: string, text: string) => {
@@ -798,19 +798,31 @@ describe("memory persistence", () => {
     }
   });
 
-  test.serial("paginates all-words search without depending on word order or treating terms as regexes", async () => {
+  test.serial("paginates all-words detail search with superseded history opt-in", async () => {
     const directory = "/tmp/memory-search-pages-project";
     const storage = new Map<string, unknown>();
-    store(storage, directory, Array.from({ length: 25 }, (_, index) => ({ file: `detail-${index}.md`, content: "A literal [shared] detail" })));
+    const project = store(storage, directory, [
+      { file: "old.md", content: "An old literal [shared] detail" },
+      ...Array.from({ length: 25 }, (_, index) => ({ file: `detail-${index}.md`, content: "A literal [shared] detail", type: index === 24 ? "insight" : "fact" })),
+    ]);
+    project.setIndex(project.index().map((entry) => entry.file === "old.md" ? { ...entry, supersededBy: "detail-0.md" } : entry));
     const app = await fixture(directory, noMemories, {}, storage);
     try {
       const first = (await app.search("ses_sub", '"[shared]", LITERAL')).content;
+      expect(first).not.toContain("[id: old.md]");
       expect(first).toContain("[id: detail-19.md]");
       expect(first).not.toContain("[id: detail-24.md]");
       expect(first).toContain("offset: 20");
       const second = (await app.search("ses_sub", '"[shared]", LITERAL', 20)).content;
       expect(second).toContain("[id: detail-24.md]");
       expect(second).not.toContain("[id: detail-0.md]");
+      const history = (await app.search("ses_sub", '"[shared]", LITERAL', 0, false, true)).content;
+      expect(history).toContain("[id: old.md]");
+      expect(history).toContain("superseded by detail-0.md");
+      expect(history).toContain("offset: 20, include_history: true");
+      const historyNext = (await app.search("ses_sub", '"[shared]", LITERAL', 20, false, true)).content;
+      expect(historyNext).toContain("[id: detail-24.md]");
+      expect(historyNext).not.toContain("[id: old.md]");
       expect((await app.search("ses_sub", "literal missing-word")).content).toContain("Try fewer or different words");
     } finally {
       await app.dispose();
@@ -1021,6 +1033,10 @@ describe("memory manual dreaming", () => {
     expect((await reader.read("ses_reader", merged)).content).toContain("a.md");
     expect((await reader.read("ses_reader", "a.md")).content).toContain("ALPHA_BODY_ONE");
     expect((await reader.search("ses_sub", "ALPHA_BODY_ONE [shared]")).content).toContain("a.md");
+    for (const includeHistory of [false, true]) {
+      const matches = (await reader.search("ses_sub", "durable project outcome", 0, false, includeHistory)).content;
+      for (const file of [merged, superseded, insight]) expect(matches).not.toContain(`[id: ${file}]`);
+    }
 
     expect(project.index()[0]!.type).toBe("insight");
     expect(project.topic(insight)).toBe(synthesizedBody);
