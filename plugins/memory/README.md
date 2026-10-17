@@ -67,11 +67,11 @@ Each operation is a separate tool with a plain object input:
 
 | Tool | Inputs | Behavior |
 | --- | --- | --- |
-| `memory_read` | `id` | Read a detail, summary topic, or explicitly labeled historical version |
+| `memory_read` | `id` | Read a detail, summary, or explicitly labeled historical version |
 | `memory_search` | `query`, optional `offset`, `all_projects` | Search current/global records; explicitly opt into other projects |
-| `memory_save` | `title`, `summary`, `content`, `type`, `source_message_ids`, optional `scope` | Create in `project` (default) or `global`; `summary` is its index hook |
-| `memory_correct` | `id`, `content`, `source_message_ids`; optional `title`, `summary`, `type` | Replace a detail's complete content; omitted metadata is inherited |
-| `memory_delete` | `id` | Remove a selected record; deleting a summary topic preserves its sources |
+| `memory_save` | `title`, `hook`, `content`, `type`, `source_message_ids`, optional `scope` | Create in `project` (default) or `global`; `hook` is its one-line index text |
+| `memory_correct` | `id`, `content`, `source_message_ids`; optional `title`, `hook`, `type` | Replace a detail's complete content; omitted metadata is inherited |
+| `memory_delete` | `id` | Remove a selected record; deleting a summary preserves its sources |
 
 For example, `memory_correct({ id: "fixture-plan-a1b2c3d4.md", content: "The user decided to use isolated Redis fixtures.", source_message_ids: ["msg_confirmation"] })`
 retains the record's title, index hook, and classification. Empty optional titles/hooks also keep their existing values;

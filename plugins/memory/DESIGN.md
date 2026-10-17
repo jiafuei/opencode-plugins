@@ -49,8 +49,10 @@ updates. The entry is removed when the session is deleted.
 ## Saving
 
 Primary agents get five flat-schema tools: `memory_read(id)`, `memory_search(query, offset?, all_projects?)`,
-`memory_save(title, summary, content, type, source_message_ids, scope?)`,
+`memory_save(title, hook, content, type, source_message_ids, scope?)`,
 `memory_correct(id, content, source_message_ids, optional metadata)`, and `memory_delete(id)`.
+Tools and worker schemas call the index line text `hook` so it is not confused with summary records; it is stored as the
+entry's `summary`. Primary sessions' `<memory>` block also says when to save; reflection catches what the agent misses.
 Saves default to project scope; clearly general preferences may be global. Explicit global saves can use any supported
 type. Corrections preserve their target's scope; cross-project search does not implicitly permit cross-project writes.
 Global IDs use `global:<file>` and other-project IDs use `project:<key>:<file>`. Current-project IDs stay bare for

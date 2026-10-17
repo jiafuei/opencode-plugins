@@ -174,14 +174,14 @@ function store(
 
 type Extraction = {
   title: string;
-  summary: string;
+  hook: string;
   type: string;
   content: string;
 };
 
 const memoryExtraction = (overrides: Partial<Extraction> = {}): Extraction => ({
   title: "Stored progress",
-  summary: "A durable project outcome.",
+  hook: "A durable project outcome.",
   type: "recap",
   content: "The parser migration shipped and the focused suite passes.",
   ...overrides,
@@ -208,7 +208,7 @@ describe("memory scopes", () => {
       if (isDreamSelector(call)) return { action: "synthesize", files: ["one.md", "two.md"], reason: "Related evidence" };
       const globalScope = call.prompt.includes("global evidence one");
       expect(call.prompt.includes("project evidence one")).toBe(!globalScope);
-      return { title: globalScope ? "Global summary" : "Project summary", summary: "Evidence", content: globalScope ? "global evidence" : "project evidence" };
+      return { title: globalScope ? "Global summary" : "Project summary", hook: "Evidence", content: globalScope ? "global evidence" : "project evidence" };
     }, {}, storage);
     try {
       await app.dream("req-scoped-dream");
@@ -388,7 +388,7 @@ describe("memory persistence", () => {
     await expect(app.save("ses_origin", memoryExtraction({ title: "" }))).rejects.toThrow("non-empty title");
     const result = await app.save("ses_origin", {
       title: "Focused tests first",
-      summary: "Run the focused Bun test before the full suite.",
+      hook: "Run the focused Bun test before the full suite.",
       content: "Run the affected plugin's focused Bun test before the full suite.",
       type: "instruction",
     });
@@ -832,7 +832,7 @@ describe("memory persistence", () => {
     const project = store(storage, directory, [{ file: "original.md", content: "Original fact", type: "fact" }]);
     const app = await fixture(directory, noMemories, {}, storage);
     try {
-      const result = await app.correct("ses_editor", "original.md", { content: "Replacement fact", title: "", summary: "" });
+      const result = await app.correct("ses_editor", "original.md", { content: "Replacement fact", title: "", hook: "" });
       const replacement = result.content.match(/\[id: ([^\]]+)\]/)![1]!;
       expect(result.content).toContain("original.md remains historical");
       expect(project.index().find((entry) => entry.file === replacement)!).toMatchObject({ title: "original.md", summary: "Stored topic", type: "fact" });
@@ -882,7 +882,7 @@ describe("memory persistence", () => {
       expect(call.prompt).toContain("Status: tentative. Use shared Redis fixtures.");
       return { create: [], correct: [
         { id: "unread.md", content: "An unread correction", source_message_ids: ["msg_1"] },
-        { id: "plan.md", content: "The user decided to use isolated Redis fixtures.", summary: "Fixtures: use isolated Redis", source_message_ids: ["msg_1"] },
+        { id: "plan.md", content: "The user decided to use isolated Redis fixtures.", hook: "Fixtures: use isolated Redis", source_message_ids: ["msg_1"] },
       ] };
     }, { idle_delay_ms: 1000 }, storage);
     try {
