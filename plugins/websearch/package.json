@@ -31,8 +31,14 @@
     "@ai-sdk/anthropic": "3.0.125",
     "@ai-sdk/google": "3.0.129",
     "@ai-sdk/openai": "3.0.121",
+    "ai": "6.0.297"
+  },
+  "peerDependencies": {
+    "@opencode/plugin": ">=2.0.32",
+    "effect": "^4.0.1"
+  },
+  "devDependencies": {
     "@opencode/plugin": "2.0.32",
-    "ai": "6.0.297",
     "effect": "4.0.1"
   }
 }

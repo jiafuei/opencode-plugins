@@ -19,7 +19,11 @@
   "engines": {
     "opencode": ">=2.0.32"
   },
-  "dependencies": {
+  "peerDependencies": {
+    "@opencode/plugin": ">=2.0.32",
+    "effect": "^4.0.1"
+  },
+  "devDependencies": {
     "@opencode/plugin": "2.0.32",
     "effect": "4.0.1"
   }

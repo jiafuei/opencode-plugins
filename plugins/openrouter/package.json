@@ -12,8 +12,7 @@
   "keywords": ["opencode", "opencode-plugin", "openrouter"],
   "engines": { "opencode": ">=2.0.32" },
   "publishConfig": { "access": "public" },
-  "dependencies": {
-    "@opencode/plugin": "2.0.32",
-    "zod": "4.1.8"
-  }
+  "dependencies": { "zod": "4.1.8" },
+  "peerDependencies": { "@opencode/plugin": ">=2.0.32" },
+  "devDependencies": { "@opencode/plugin": "2.0.32" }
 }

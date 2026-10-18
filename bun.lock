@@ -15,56 +15,82 @@
     "plugins/anthropic-compaction": {
       "name": "@jiafuei/opencode-anthropic-compaction",
       "version": "0.0.1",
-      "dependencies": {
+      "devDependencies": {
         "@opencode/plugin": "2.0.32",
         "effect": "4.0.1",
+      },
+      "peerDependencies": {
+        "@opencode/plugin": ">=2.0.32",
+        "effect": "^4.0.1",
       },
     },
     "plugins/antigravity-oauth": {
       "name": "@jiafuei/opencode-antigravity-oauth",
       "version": "0.1.0",
-      "dependencies": {
+      "devDependencies": {
         "@opencode/plugin": "2.0.32",
         "effect": "4.0.1",
+      },
+      "peerDependencies": {
+        "@opencode/plugin": ">=2.0.32",
+        "effect": "^4.0.1",
       },
     },
     "plugins/browser": {
       "name": "@jiafuei/opencode-browser",
       "version": "0.0.1",
       "dependencies": {
+        "playwright-core": "1.64.1",
+      },
+      "devDependencies": {
         "@opencode/plugin": "2.0.32",
         "effect": "4.0.1",
-        "playwright-core": "1.64.1",
+      },
+      "peerDependencies": {
+        "@opencode/plugin": ">=2.0.32",
+        "effect": "^4.0.1",
       },
     },
     "plugins/claude-oauth": {
       "name": "@jiafuei/opencode-claude-oauth",
       "version": "0.0.1",
-      "dependencies": {
+      "devDependencies": {
         "@opencode/plugin": "2.0.32",
         "effect": "4.0.1",
+      },
+      "peerDependencies": {
+        "@opencode/plugin": ">=2.0.32",
+        "effect": "^4.0.1",
       },
     },
     "plugins/codex-usage": {
       "name": "@jiafuei/opencode-codex-usage",
       "version": "0.0.1",
-      "dependencies": {
+      "devDependencies": {
         "@opencode/plugin": "2.0.32",
         "effect": "4.0.1",
+      },
+      "peerDependencies": {
+        "@opencode/plugin": ">=2.0.32",
+        "effect": "^4.0.1",
       },
     },
     "plugins/computer-use": {
       "name": "@jiafuei/opencode-computer-use",
       "version": "0.0.1",
-      "dependencies": {
+      "devDependencies": {
         "@opencode/plugin": "2.0.32",
         "effect": "4.0.1",
+      },
+      "peerDependencies": {
+        "@opencode/plugin": ">=2.0.32",
+        "effect": "^4.0.1",
       },
     },
     "plugins/memory": {
       "name": "@jiafuei/opencode-memory",
       "version": "0.0.1",
-      "dependencies": {
+      "devDependencies": {
         "@opencode/plugin": "2.0.32",
         "@opencode/theme": "2.0.32",
         "@opentui/core": "0.5.17",
@@ -72,21 +98,37 @@
         "effect": "4.0.1",
         "solid-js": "1.9.15",
       },
+      "peerDependencies": {
+        "@opencode/plugin": ">=2.0.32",
+        "@opentui/core": ">=0.5.17",
+        "@opentui/solid": ">=0.5.17",
+        "effect": "^4.0.1",
+        "solid-js": "^1.9",
+      },
     },
     "plugins/openrouter": {
       "name": "@jiafuei/opencode-openrouter",
       "version": "0.0.1",
       "dependencies": {
-        "@opencode/plugin": "2.0.32",
         "zod": "4.1.8",
+      },
+      "devDependencies": {
+        "@opencode/plugin": "2.0.32",
+      },
+      "peerDependencies": {
+        "@opencode/plugin": ">=2.0.32",
       },
     },
     "plugins/redact-keys": {
       "name": "@jiafuei/opencode-redact-keys",
       "version": "0.0.1",
-      "dependencies": {
+      "devDependencies": {
         "@opencode/plugin": "2.0.32",
         "effect": "4.0.1",
+      },
+      "peerDependencies": {
+        "@opencode/plugin": ">=2.0.32",
+        "effect": "^4.0.1",
       },
     },
     "plugins/websearch": {
@@ -96,21 +138,34 @@
         "@ai-sdk/anthropic": "3.0.125",
         "@ai-sdk/google": "3.0.129",
         "@ai-sdk/openai": "3.0.121",
-        "@opencode/plugin": "2.0.32",
         "ai": "6.0.297",
+      },
+      "devDependencies": {
+        "@opencode/plugin": "2.0.32",
         "effect": "4.0.1",
+      },
+      "peerDependencies": {
+        "@opencode/plugin": ">=2.0.32",
+        "effect": "^4.0.1",
       },
     },
     "plugins/workflows": {
       "name": "@jiafuei/opencode-workflows",
       "version": "0.0.1",
-      "dependencies": {
+      "devDependencies": {
         "@opencode/plugin": "2.0.32",
         "@opencode/theme": "2.0.32",
         "@opentui/core": "0.5.17",
         "@opentui/solid": "0.5.17",
         "effect": "4.0.1",
         "solid-js": "1.9.15",
+      },
+      "peerDependencies": {
+        "@opencode/plugin": ">=2.0.32",
+        "@opentui/core": ">=0.5.17",
+        "@opentui/solid": ">=0.5.17",
+        "effect": "^4.0.1",
+        "solid-js": "^1.9",
       },
     },
   },
@@ -876,8 +931,6 @@
     "@npmcli/promise-spawn/which": ["which@6.0.1", "", { "dependencies": { "isexe": "^4.0.0" }, "bin": { "node-which": "bin/which.js" } }, "sha512-oGLe46MIrCRqX7ytPUf66EAYvdeMIZYn3WaocqqKZAxrBpkqHfL/qvTyJ/bTk5+AqHCjXmrv3CEWgy368zhRUg=="],
 
     "@opencode/plugin/@ai-sdk/provider": ["@ai-sdk/provider@3.0.8", "", { "dependencies": { "json-schema": "^0.4.0" } }, "sha512-oGMAgGoQdBXbZqNG0Ze56CHjDZ1IDYOwGYxYjO5KLSlz5HiNQ9udIXsPZ61VWaHGZ5XW/jyjmr6t2xz2jGVwbQ=="],
-
-    "@opentui/solid/solid-js": ["solid-js@1.9.12", "", { "dependencies": { "csstype": "^3.1.0", "seroval": "~1.5.0", "seroval-plugins": "~1.5.0" } }, "sha512-QzKaSJq2/iDrWR1As6MHZQ8fQkdOBf8GReYb7L5iKwMGceg7HxDcaOHk0at66tNgn9U2U7dXo8ZZpLIAmGMzgw=="],
 
     "ai/@ai-sdk/provider": ["@ai-sdk/provider@3.0.8", "", { "dependencies": { "json-schema": "^0.4.0" } }, "sha512-oGMAgGoQdBXbZqNG0Ze56CHjDZ1IDYOwGYxYjO5KLSlz5HiNQ9udIXsPZ61VWaHGZ5XW/jyjmr6t2xz2jGVwbQ=="],
 
