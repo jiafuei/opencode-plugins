@@ -119,6 +119,21 @@
         "@opencode/plugin": ">=2.0.32",
       },
     },
+    "plugins/pty": {
+      "name": "@jiafuei/opencode-pty",
+      "version": "0.0.1",
+      "dependencies": {
+        "@opencode-ai/pty": "0.2.0",
+      },
+      "devDependencies": {
+        "@opencode/plugin": "2.0.32",
+        "effect": "4.0.1",
+      },
+      "peerDependencies": {
+        "@opencode/plugin": ">=2.0.32",
+        "effect": "^4.0.1",
+      },
+    },
     "plugins/redact-keys": {
       "name": "@jiafuei/opencode-redact-keys",
       "version": "0.0.1",
@@ -316,6 +331,8 @@
 
     "@jiafuei/opencode-openrouter": ["@jiafuei/opencode-openrouter@workspace:plugins/openrouter"],
 
+    "@jiafuei/opencode-pty": ["@jiafuei/opencode-pty@workspace:plugins/pty"],
+
     "@jiafuei/opencode-redact-keys": ["@jiafuei/opencode-redact-keys@workspace:plugins/redact-keys"],
 
     "@jiafuei/opencode-websearch": ["@jiafuei/opencode-websearch@workspace:plugins/websearch"],
@@ -361,6 +378,20 @@
     "@npmcli/redact": ["@npmcli/redact@4.0.0", "", {}, "sha512-gOBg5YHMfZy+TfHArfVogwgfBeQnKbbGo3pSUyK/gSI0AVu+pEiDVcKlQb0D8Mg1LNRZILZ6XG8I5dJ4KuAd9Q=="],
 
     "@npmcli/run-script": ["@npmcli/run-script@10.0.4", "", { "dependencies": { "@npmcli/node-gyp": "^5.0.0", "@npmcli/package-json": "^7.0.0", "@npmcli/promise-spawn": "^9.0.0", "node-gyp": "^12.1.0", "proc-log": "^6.0.0" } }, "sha512-mGUWr1uMnf0le2TwfOZY4SFxZGXGfm4Jtay/nwAa2FLNAKXUoUwaGwBMNH36UHPtinWfTSJ3nqFQr0091CxVGg=="],
+
+    "@opencode-ai/pty": ["@opencode-ai/pty@0.2.0", "", { "optionalDependencies": { "@opencode-ai/pty-darwin-arm64": "0.2.0", "@opencode-ai/pty-darwin-x64": "0.2.0", "@opencode-ai/pty-linux-arm64-gnu": "0.2.0", "@opencode-ai/pty-linux-arm64-musl": "0.2.0", "@opencode-ai/pty-linux-x64-gnu": "0.2.0", "@opencode-ai/pty-linux-x64-musl": "0.2.0" }, "bin": { "opencode-pty": "bin/opencode-pty.js" } }, "sha512-pV86urAwinpwFXX8AJlOf8S9CVJhGsV+11I/J6TcxMW0c7u6LgeODzdj/BVBC6jUhsG2aKDxg8rACMcDCy3HiA=="],
+
+    "@opencode-ai/pty-darwin-arm64": ["@opencode-ai/pty-darwin-arm64@0.2.0", "", { "os": "darwin", "cpu": "arm64" }, "sha512-2y6xrktb2J7rRk+mzAJHA8cCbWhC4Lo2zJ66t9ad59qFhL5nzAPfpEOwnyvvFqhxebHNvL08Mp64M9IHnM0aiA=="],
+
+    "@opencode-ai/pty-darwin-x64": ["@opencode-ai/pty-darwin-x64@0.2.0", "", { "os": "darwin", "cpu": "x64" }, "sha512-XVQwK9+KgVGYunCYPCCBf1Or0z6zSkzjgfdJd7dEe/LOFg5vmMkOfSB9dCXnoRCWGviWYk7xd07iFIFOgyj5Ig=="],
+
+    "@opencode-ai/pty-linux-arm64-gnu": ["@opencode-ai/pty-linux-arm64-gnu@0.2.0", "", { "os": "linux", "cpu": "arm64" }, "sha512-TPVGCQk5E65IY3ipcpd17rwKehdvXcXEYRhhGzok/6Dske69ei2S+ERz7NXZ8cKFAvbiiT771HHM+XyVYAl+7A=="],
+
+    "@opencode-ai/pty-linux-arm64-musl": ["@opencode-ai/pty-linux-arm64-musl@0.2.0", "", { "os": "linux", "cpu": "arm64" }, "sha512-iH6/liY7xN1OXVD9eGzdH11BVGvnpPsH5Z1Unz0Pn9EzkPFf28oDNKNyeXV0xIAP53oiYp8gpRq2PADNwbVsTg=="],
+
+    "@opencode-ai/pty-linux-x64-gnu": ["@opencode-ai/pty-linux-x64-gnu@0.2.0", "", { "os": "linux", "cpu": "x64" }, "sha512-GhdrmbUzxGHRfWvt1qutgVD4HLb7aSBsgWGjFsc6k8HjO5ZbdaC3ScRyd512YAAG5KAROLKZ6+0SEBsm5xFYlA=="],
+
+    "@opencode-ai/pty-linux-x64-musl": ["@opencode-ai/pty-linux-x64-musl@0.2.0", "", { "os": "linux", "cpu": "x64" }, "sha512-EbHchDsMmL5aOReIoo8NvQkKnyhyKmoL2RleF2JYF76va3FKuksmwsOBgQJh54i+QA4Fd0+9x54Q+2fJOzPiRQ=="],
 
     "@opencode/ai": ["@opencode/ai@2.0.32", "", { "dependencies": { "@aws-sdk/credential-providers": "3.1057.0", "@opencode/schema": "2.0.32", "@smithy/eventstream-codec": "4.2.14", "@smithy/util-utf8": "4.2.2", "aws4fetch": "1.0.20", "effect": "4.0.1", "google-auth-library": "10.5.0" } }, "sha512-NMquAbwiFupqoXuRuvY8jPwNAiCVlQcKDQlOTbULWN283gTp4LI3NQJqrpSWpLporxomDJsjU7soN8TCPv3BKQ=="],
 

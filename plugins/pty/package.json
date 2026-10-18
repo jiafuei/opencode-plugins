@@ -1,0 +1,30 @@
+{
+  "name": "@jiafuei/opencode-pty",
+  "version": "0.0.1",
+  "description": "Session-owned interactive terminal tools for OpenCode",
+  "type": "module",
+  "private": true,
+  "exports": {
+    "./server": "./server.ts"
+  },
+  "files": [
+    "server.ts",
+    "terminal.ts",
+    "daemon.ts",
+    "README.md"
+  ],
+  "engines": {
+    "opencode": ">=2.0.32"
+  },
+  "dependencies": {
+    "@opencode-ai/pty": "0.2.0"
+  },
+  "peerDependencies": {
+    "@opencode/plugin": ">=2.0.32",
+    "effect": "^4.0.1"
+  },
+  "devDependencies": {
+    "@opencode/plugin": "2.0.32",
+    "effect": "4.0.1"
+  }
+}

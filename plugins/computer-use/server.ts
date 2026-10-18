@@ -33,19 +33,23 @@ const OVERLAY =
   process.platform === "darwin"
     ? ""
     : " The orange glow along the screen edges and the dark banner at the top center are OpenCode's own overlay, not part of any app; clicks pass through them to what is underneath.";
-const TARGET =
-  "Target an element by its [id] from the latest computer_tree, or pass x/y. Elements from a tree read with window bring that window to the front first.";
 const RESULT =
   "Returns a screenshot taken 300ms after the action, with the frontmost window and the element that has keyboard focus. If the UI was still animating (Start menu, Spotlight, menus or dialogs opening), call computer_wait before clicking positions taken from it.";
 const WINDOW =
   "Window title or part of it, matched like computer_focus: bring it to the front first (verified) so the input cannot land in another app";
 
 // Separate x/y instead of an [x, y] tuple: tuple-form array schemas are rejected by some providers.
-// Plain Number, not Int: schema checks fail inside opencode's effect copy even on integer input; the helper rounds.
+// Not Int: the helper rounds. Required numbers use Finite because Number's JSON Schema is a union that drops
+// descriptions; optional numbers carry the description on the optional wrapper for the same reason.
 // x/y are optional because an element ID can replace them.
 const coordinate = (name: string) =>
-  Schema.optional(Schema.Number.annotate({ description: `${name} in screenshot pixels; omit when passing an element ID` }));
-const id = (description: string) => Schema.optional(Schema.Number.annotate({ description }));
+  Schema.optional(Schema.Number).annotate({
+    description: `${name} in pixels of the most recent computer_screenshot image, not native display pixels; omit when passing an element ID`,
+  });
+const id = (description: string) =>
+  Schema.optional(Schema.Number).annotate({
+    description: `Element ID from the latest computer_tree ${description}, instead of coordinates. If that tree was read with window, the window comes to the front first.`,
+  });
 
 const input = <Fields extends Record<string, Schema.Top & { readonly DecodingServices: never }>>(fields: Fields) =>
   Schema.toStandardJSONSchemaV1(Schema.toStandardSchemaV1(Schema.Struct(fields)));
@@ -159,10 +163,10 @@ export default Plugin.define({
         options: { codemode: false },
         description: `Show a region of the screen at higher detail, e.g. to read small text. The region and all later coordinates stay in full-screenshot space; zooming does not change what coordinates mean. ${COORDINATES}`,
         input: input({
-          x0: Schema.Number.annotate({ description: "left in screenshot pixels" }),
-          y0: Schema.Number.annotate({ description: "top in screenshot pixels" }),
-          x1: Schema.Number.annotate({ description: "right in screenshot pixels" }),
-          y1: Schema.Number.annotate({ description: "bottom in screenshot pixels" }),
+          x0: Schema.Finite.annotate({ description: "left in screenshot pixels" }),
+          y0: Schema.Finite.annotate({ description: "top in screenshot pixels" }),
+          x1: Schema.Finite.annotate({ description: "right in screenshot pixels" }),
+          y1: Schema.Finite.annotate({ description: "bottom in screenshot pixels" }),
         }),
         execute: ({ x0, y0, x1, y1 }, context) => call({ action: "zoom", region: [x0, y0, x1, y1] }, context),
       });
@@ -170,14 +174,14 @@ export default Plugin.define({
         name: "computer_tree",
         options: { codemode: true },
         description:
-          'Read the accessibility tree of the foreground window, or of any window by title (also one in the background), as text: one element per line as [id] role "name" value="…" @(x,y wxh) states, indented by nesting; bounds are in screenshot pixels and only on elements without listed children. For the foreground window, an open menu or popup outside it follows. Pointer actions on elements of a window read by title bring that window to the front first; computer_click with invoke=true activates supported controls without explicitly raising the window. Use it to target small or crowded controls exactly by element ID with computer_click, computer_move, computer_scroll and computer_drag, or to read text with computer_read. Pass find with text you can see on screen (a button label, a link, a field name) to list only the elements that contain it; prefer that over the full tree when you know what to target. Apps that draw their own UI (games, canvas apps) expose little or nothing; use the screenshot there.',
+          'Read the accessibility tree of the foreground window, or of any window by title (also one in the background), as text: one element per line as [id] role "name" value="…" @(x,y wxh) states, indented by nesting; bounds are in screenshot pixels and only on elements without listed children. For the foreground window, an open menu or popup outside it follows. Use it to target small or crowded controls exactly by element ID with computer_click, computer_move, computer_scroll and computer_drag, or to read text with computer_read. Apps that draw their own UI (games, canvas apps) expose little or nothing; use the screenshot there.',
         input: input({
-          find: Schema.optional(
-            Schema.String.annotate({ description: "Only list elements whose name or value contains this text (case-insensitive), each with its parent's name" }),
-          ),
-          window: Schema.optional(
-            Schema.String.annotate({ description: "Window title or part of it, matched like computer_focus; omit for the foreground window" }),
-          ),
+          find: Schema.optional(Schema.String).annotate({
+            description: "Text you can see on screen, such as a button label, a link, or a field name. Lists only elements whose name or value contains it (case-insensitive), each with its parent's name. Prefer this over the full tree when you know what to target.",
+          }),
+          window: Schema.optional(Schema.String).annotate({
+            description: "Window title or part of it, matched like computer_focus; omit for the foreground window. Pointer actions on elements from this tree bring the window to the front first; computer_click with invoke=true activates supported controls without explicitly raising it.",
+          }),
         }),
         execute: (args, context) => call({ action: "tree", ...args }, context),
       });
@@ -187,8 +191,8 @@ export default Plugin.define({
         description:
           'Read the full text of one element from the latest computer_tree: the whole page text of a browser Document, the buffer of a terminal or editor (elements with the "text" state), or the complete text of an item cut off with "…(truncated; computer_read [id])". Long text is paged: the result ends with the offset to pass for the next page. Does not act, and keeps the tree\'s IDs valid.',
         input: input({
-          element: Schema.Number.annotate({ description: "Element ID from the latest tree" }),
-          offset: Schema.optional(Schema.Number.annotate({ description: "Character offset to start from (default 0)" })),
+          element: Schema.Finite.annotate({ description: "Element ID from the latest computer_tree" }),
+          offset: Schema.optional(Schema.Number).annotate({ description: "Character offset to start from, as given at the end of the previous page. Defaults to 0." }),
         }),
         execute: ({ element, offset }, context) =>
           call({ action: "read", element: Math.round(element), offset: offset === undefined ? undefined : Math.max(0, Math.round(offset)) }, context),
@@ -196,33 +200,35 @@ export default Plugin.define({
       tools.add({
         name: "computer_click",
         options: { codemode: false },
-        description: `Move the pointer to an element or a coordinate and click. ${TARGET} With invoke=true, activate the element through the app's accessibility API instead: no pointer movement or explicit window raising, though the app may bring itself forward. Unsupported elements return an error; there is no mouse-click fallback. ${COORDINATES} ${RESULT}`,
+        description: `Move the pointer to an element or a coordinate and click, or activate an element through accessibility with invoke. ${RESULT}`,
         input: input({
-          element: id("Element ID to click at its center"),
+          element: id("to click at its center"),
           x: coordinate("x"),
           y: coordinate("y"),
           button: Schema.optional(Schema.Literals(["left", "right", "middle"])),
-          count: Schema.optional(Schema.Literals([1, 2, 3]).annotate({ description: "1 = click, 2 = double, 3 = triple" })),
-          invoke: Schema.optional(Schema.Boolean.annotate({ description: "Activate through accessibility instead of a mouse click (default false). Requires element, no coordinates, and a single left-click activation. Does not explicitly bring the window forward; the app may do so itself." })),
+          count: Schema.optional(Schema.Literals([1, 2, 3])).annotate({ description: "1 = click, 2 = double, 3 = triple" }),
+          invoke: Schema.optional(Schema.Boolean).annotate({
+            description: "Activate the element through the app's accessibility API instead of a mouse click (default false). Requires element, no coordinates, and a single left-click activation. Does not move the pointer or explicitly bring the window forward; the app may do so itself. Unsupported elements return an error; there is no mouse-click fallback.",
+          }),
         }),
         execute: (args, context) => call({ action: "click", ...args }, context),
       });
       tools.add({
         name: "computer_move",
         options: { codemode: false },
-        description: `Move the pointer without clicking, e.g. to hover and open tooltips or hover menus. ${TARGET} ${COORDINATES} ${RESULT}`,
-        input: input({ element: id("Element ID to hover at its center"), x: coordinate("x"), y: coordinate("y") }),
+        description: `Move the pointer to an element or a coordinate without clicking, e.g. to hover and open tooltips or hover menus. ${RESULT}`,
+        input: input({ element: id("to hover at its center"), x: coordinate("x"), y: coordinate("y") }),
         execute: (args, context) => call({ action: "move", ...args }, context),
       });
       tools.add({
         name: "computer_drag",
         options: { codemode: false },
-        description: `Press the left button at the start point, drag to the end point, and release. Use for moving or resizing windows, selecting text, drag and drop. Each end is an element [id] from the latest computer_tree or x/y. ${COORDINATES} ${RESULT}`,
+        description: `Press the left button at the start point, drag to the end point, and release. Use for moving or resizing windows, selecting text, drag and drop. Each end is an element ID or a coordinate. ${RESULT}`,
         input: input({
-          start_element: id("Element ID to start the drag at"),
+          start_element: id("to start the drag at"),
           start_x: coordinate("start x"),
           start_y: coordinate("start y"),
-          end_element: id("Element ID to drop on"),
+          end_element: id("to drop on"),
           end_x: coordinate("end x"),
           end_y: coordinate("end y"),
         }),
@@ -231,24 +237,24 @@ export default Plugin.define({
       tools.add({
         name: "computer_scroll",
         options: { codemode: false },
-        description: `Scroll the mouse wheel over an element or a point. ${TARGET} ${COORDINATES} ${RESULT}`,
+        description: `Scroll the mouse wheel over an element or a point. ${RESULT}`,
         input: input({
-          element: id("Element ID to scroll over"),
+          element: id("to scroll over"),
           x: coordinate("x"),
           y: coordinate("y"),
           direction: Schema.Literals(["up", "down", "left", "right"]),
-          amount: Schema.Number.annotate({ description: "Wheel clicks, usually 3 lines each; 5 is a good default" }),
+          amount: Schema.Finite.annotate({ description: "Wheel clicks, usually 3 lines each; 5 is a good default" }),
         }),
         execute: (args, context) => call({ action: "scroll", ...args, amount: Math.round(args.amount) }, context),
       });
       tools.add({
         name: "computer_type",
         options: { codemode: false },
-        description: `Type text at the keyboard focus. Pass element (an [id] from the latest computer_tree) to focus that field first, and window to bring a window to the front first; without them the text goes to whatever app is frontmost. Any Unicode text works regardless of keyboard layout. Use computer_key for Enter, Tab, and shortcuts. Returns no screenshot, only the frontmost window and the element that had keyboard focus; the next action's result shows the outcome, or call computer_screenshot to check.`,
+        description: `Type text at the keyboard focus. Without element or window, the text goes to whatever app is frontmost. Use computer_key for Enter, Tab, and shortcuts. Returns no screenshot, only the frontmost window and the element that had keyboard focus; the next action's result shows the outcome, or call computer_screenshot to check.`,
         input: input({
-          text: Schema.String,
-          element: id("Element ID of the field to focus before typing"),
-          window: Schema.optional(Schema.String.annotate({ description: WINDOW })),
+          text: Schema.String.annotate({ description: "Any Unicode text; works regardless of keyboard layout" }),
+          element: Schema.optional(Schema.Number).annotate({ description: "Element ID from the latest computer_tree of the field to focus before typing" }),
+          window: Schema.optional(Schema.String).annotate({ description: WINDOW }),
         }),
         execute: (args, context) => call({ action: "type", ...args }, context),
       });
@@ -262,11 +268,13 @@ export default Plugin.define({
       tools.add({
         name: "computer_key",
         options: { codemode: false },
-        description: `Press a key or key chord, e.g. "Return", "Escape", "Tab", "super" (Windows key), "ctrl+s", "alt+Tab", "Down"; on macOS use cmd for shortcuts, e.g. "cmd+space" (Spotlight), "cmd+c", "cmd+tab". Names are case-insensitive: ctrl, alt/option, shift, super/win/cmd (Windows key on Windows, Command on macOS), Return/Enter, Escape/Esc, Tab, BackSpace, Delete, Home, End, Page_Up, Page_Down, Up, Down, Left, Right, Space, ${process.platform === "darwin" ? "" : "Insert, "}F1-F12, or a single character. Keys go to the frontmost app; pass window to bring a window to the front first. ${RESULT}`,
+        description: `Press a key or key chord. Keys go to the frontmost app unless window is given. ${RESULT}`,
         input: input({
-          keys: Schema.String.annotate({ description: 'Keys joined with "+", modifiers first' }),
-          repeat: Schema.optional(Schema.Number.annotate({ description: "Press the chord this many times (default 1)" })),
-          window: Schema.optional(Schema.String.annotate({ description: WINDOW })),
+          keys: Schema.String.annotate({
+            description: `Keys joined with "+", modifiers first, e.g. "Return", "Escape", "Tab", "super" (Windows key), "ctrl+s", "alt+Tab", "Down"; on macOS use cmd for shortcuts, e.g. "cmd+space" (Spotlight), "cmd+c", "cmd+tab". Names are case-insensitive: ctrl, alt/option, shift, super/win/cmd (Windows key on Windows, Command on macOS), Return/Enter, Escape/Esc, Tab, BackSpace, Delete, Home, End, Page_Up, Page_Down, Up, Down, Left, Right, Space, ${process.platform === "darwin" ? "" : "Insert, "}F1-F12, or a single character.`,
+          }),
+          repeat: Schema.optional(Schema.Number).annotate({ description: "Press the chord this many times (default 1)" }),
+          window: Schema.optional(Schema.String).annotate({ description: WINDOW }),
         }),
         execute: ({ repeat, ...args }, context) =>
           call({ action: "key", ...args, repeat: Math.max(1, Math.round(repeat ?? 1)) }, context),
@@ -275,7 +283,7 @@ export default Plugin.define({
         name: "computer_wait",
         options: { codemode: false },
         description: `Wait, then take a screenshot. Use after actions that start animations or loading (Start menu, Spotlight, menus, dialogs, app launch) before clicking positions from the previous screenshot. ${COORDINATES}`,
-        input: input({ seconds: Schema.Number.annotate({ description: "Seconds to wait, e.g. 1" }) }),
+        input: input({ seconds: Schema.Finite.annotate({ description: "Seconds to wait, e.g. 1" }) }),
         execute: ({ seconds }, context) => call({ action: "wait", seconds: Math.max(0, seconds) }, context),
       });
     });

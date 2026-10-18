@@ -270,7 +270,8 @@ correct: only when the user explicitly corrected or changed a supplied detail. G
 Writing: the hook is one line under about 100 characters, in the form "<Area>: <what it covers>" when it applies to only part of the project. The content keeps the full user-grounded detail: conditions, rationale, qualifications, rejected alternatives, and uncertainty. Completeness matters more than brevity; coarser compression happens later in derived summaries. Omit frontmatter and narration.`;
 
 const SCOPE_GUIDANCE = `New records default to project scope. Use global for user preferences that clearly apply across projects, or for any record the user explicitly asks to make global. Corrections keep their record's scope; do not save a copy in another scope.`;
-const CAPTURE_GUIDANCE = `Capture only user-stated or explicitly confirmed information, not assistant or tool findings. "Thanks", "ok", and silence do not confirm a claim. Cite supporting user message ids from <memory_source> tags in source_message_ids; for accepted proposals, cite the confirmation. Use preference or instruction only for rules the user wants future agents to follow; when unsure, use fact or working. One subject per record; no secrets or narration.`;
+const CAPTURE_GUIDANCE = `Capture only user-stated or explicitly confirmed information, not assistant or tool findings. "Thanks", "ok", and silence do not confirm a claim. One subject per record; no secrets or narration.`;
+const TYPE_CHOICE = "Use preference or instruction only for rules the user wants future agents to follow; when unsure, use fact or working.";
 
 const MEMORY_TOOL_NAMES = ["memory_read", "memory_search", "memory_save", "memory_correct", "memory_delete"] as const;
 
@@ -1130,12 +1131,12 @@ const setup = async (ctx: Plugin.Context) => {
     editor.add({
       name: "memory_search",
       options: { codemode: false },
-      description: "Find current detailed records, including details under summaries. Derived summaries are excluded; navigate them with memory_read. Set include_history to also find superseded details. Every query word must appear in the record, in any order and case. Words match literal substrings, not meanings or regexes; spaces, commas, and double quotes separate words. No match does not prove a subject is absent: try fewer words. For more results, repeat the same query and options with the offset given.",
+      description: "Find current detailed records, including details under summaries. Derived summaries are excluded; navigate them with memory_read. No match does not prove a subject is absent: try fewer words.",
       input: {
         type: "object",
         properties: {
-          query: { type: "string", description: "Distinctive search words, for example Redis fixture" },
-          offset: { type: "integer", minimum: 0, description: "Matching records to skip; use the next offset from search results" },
+          query: { type: "string", description: "Distinctive search words, for example Redis fixture. Every word must appear in the record, in any order and case. Words match literal substrings, not meanings or regexes; spaces, commas, and double quotes separate words." },
+          offset: { type: "integer", minimum: 0, description: "Matching records to skip. For more results, repeat the same query and options with the next offset from search results." },
           all_projects: { type: "boolean", description: "Search every project, not just global and this one. Use only when another project is needed; its records are read-only here." },
           include_history: { type: "boolean", description: "Also search superseded detailed records. Defaults to false. Derived summaries remain excluded." },
         },
@@ -1151,16 +1152,16 @@ const setup = async (ctx: Plugin.Context) => {
     editor.add({
       name: "memory_save",
       options: { codemode: false },
-      description: `Create a NEW record. Search related subjects first; use memory_correct for an existing detail. ${CAPTURE_GUIDANCE} ${SCOPE_GUIDANCE}`,
+      description: `Create a NEW record. Search related subjects first; use memory_correct for an existing detail. ${CAPTURE_GUIDANCE}`,
       input: {
         type: "object",
         properties: {
           title: { type: "string", minLength: 1, description: "Short record title" },
           hook: { type: "string", description: "One-line index hook under about 100 characters naming what the record covers and its retrieval terms, as \"<Area>: <what it covers>\" when it applies to only part of the project" },
           content: { type: "string", minLength: 1, description: "Complete user-grounded detail: conditions, rationale, qualifications, rejected alternatives, and uncertainty; no frontmatter" },
-          type: { type: "string", enum: [...MEMORY_TYPES], description: TYPE_GUIDANCE },
-          scope: { type: "string", enum: ["project", "global"] },
-          source_message_ids: { type: "array", items: { type: "string" }, minItems: 1, description: "Supporting user message IDs from <memory_source> annotations" },
+          type: { type: "string", enum: [...MEMORY_TYPES], description: `${TYPE_CHOICE}\n${TYPE_GUIDANCE}` },
+          scope: { type: "string", enum: ["project", "global"], description: SCOPE_GUIDANCE },
+          source_message_ids: { type: "array", items: { type: "string" }, minItems: 1, description: "Supporting user message IDs from <memory_source> annotations; for accepted proposals, cite the confirmation" },
         },
         required: ["title", "hook", "content", "type", "source_message_ids"],
         additionalProperties: false,
@@ -1178,16 +1179,16 @@ const setup = async (ctx: Plugin.Context) => {
     editor.add({
       name: "memory_correct",
       options: { codemode: false },
-      description: `Correct an existing detail by exact id (this project or global; other projects are read-only). Read it first if you only know its index hook. content replaces the whole body, so keep every condition, rationale, qualification, rejected alternative, and uncertainty that still applies. Title, hook, type, and scope are inherited unless changed; do not save a copy in another scope. Creates a new current id; the old version stays as history and summaries built on it retire. Summaries cannot be corrected: if only a summary is wrong and the user asks, delete it (its sources stay). ${CAPTURE_GUIDANCE}`,
+      description: `Correct an existing detail by exact id (this project or global; other projects are read-only). Read it first if you only know its index hook. Title, hook, type, and scope are inherited unless changed; do not save a copy in another scope. Creates a new current id; the old version stays as history and summaries built on it retire. Summaries cannot be corrected: if only a summary is wrong and the user asks, delete it (its sources stay). ${CAPTURE_GUIDANCE}`,
       input: {
         type: "object",
         properties: {
           id: { type: "string", description: "Exact id of the detail being corrected" },
-          content: { type: "string", minLength: 1, description: "Complete replacement content, not a patch or addendum" },
+          content: { type: "string", minLength: 1, description: "Complete replacement for the whole body, not a patch or addendum. Keep every condition, rationale, qualification, rejected alternative, and uncertainty that still applies." },
           title: { type: "string", description: "New title, only when intentionally changing it" },
           hook: { type: "string", description: "New index hook, only when the old one would mislead" },
-          type: { type: "string", enum: [...MEMORY_TYPES], description: "New type, only when intentionally changing it" },
-          source_message_ids: { type: "array", items: { type: "string" }, minItems: 1, description: "User message IDs supporting this correction; earlier source history is retained" },
+          type: { type: "string", enum: [...MEMORY_TYPES], description: `New type, only when intentionally changing it. ${TYPE_CHOICE}` },
+          source_message_ids: { type: "array", items: { type: "string" }, minItems: 1, description: "User message IDs from <memory_source> annotations supporting this correction; for accepted proposals, cite the confirmation. Earlier source history is retained." },
         },
         required: ["id", "content", "source_message_ids"],
         additionalProperties: false,

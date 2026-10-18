@@ -1071,15 +1071,15 @@ export default Plugin.define({
         description: [
           "Run a declarative multi-agent workflow. Only call this after an explicit user request for a workflow.",
           "",
-          "BEFORE THE FIRST CALL, outline the workflow in prose and get the user's agreement: the phases in order, what each worker does, where results are written, and what makes the run stop. Ask about scope you are guessing at. TUI approval is a safety gate, not a design review — by then the only options are approve, reject, or replace the whole plan.",
+          "BEFORE THE FIRST CALL, outline the workflow in prose and get the user's agreement: the phases in order, what each worker does, where results are written, and what makes the run stop. Ask about scope you are guessing at. TUI approval is a safety gate, not a design review; by then the only options are approve, reject, or replace the whole plan.",
           "",
-          "STRUCTURE. Phases run in order, steps within a phase run in order, and only workers inside a 'parallel' step overlap — at most `max_concurrency` (default 2) at a time, so a wide parallel step is a queue, not a fan-out. There is no loop or conditional construct. Work whose shape is unknown when you write the spec — one worker per repo/service/file you have not discovered yet, or repeat-until-exhausted — is expressed by ending the discovering phase with `checkpoint: true` and letting the coordinator write the phases that consume its output. Leave headroom in `limits.maxWorkers` for that expansion.",
+          "STRUCTURE. Phases run in order, steps within a phase run in order, and only workers inside a 'parallel' step overlap, at most `max_concurrency` (default 2) at a time, so a wide parallel step is a queue, not a fan-out. There is no loop or conditional construct; work whose shape is unknown when you write the spec needs a `checkpoint` phase.",
           "",
-          "DATA. Workers share no memory: each prompt must stand alone, and the only channel between them is `{{workers.<id>.output}}` or files on disk. Worker outputs reach checkpoint coordinators and the final handoff intact. Keep them concise; workers producing bulk results should write to an agreed scratch path and return {path, count, notes}. The final handoff is a fixed report schema (summary, evidence, changed files, unresolved issues) — it is not the deliverable, so a workflow that produces an artifact writes it to a file and cites the path.",
+          "DATA. Workers share no memory: each prompt must stand alone, and the only channel between them is worker output templates or files on disk. Worker outputs reach checkpoint coordinators and the final handoff intact, so keep them concise. The final handoff is a fixed report schema (summary, evidence, changed files, unresolved issues), not the deliverable, so a workflow that produces an artifact writes it to a file and cites the path.",
           "",
-          "Call the `workflow_authoring` tool for the AUTHORING.md reference with worked examples of the common shapes; it returns the full document.",
+          "Call the `workflow_authoring` tool for the AUTHORING.md reference with worked examples of the common shapes.",
           "",
-          "The run starts only after the user approves it in the TUI. Returns { runID, status } once the run is running or queued, or early with status \"blocked\" or \"repair_required\" if the run needs a user decision (worker failure, coordinator failure); the run stays resumable from the TUI dashboard and the final result still arrives later as a synthetic <workflow_result> message in this session — do not wait or poll for it.",
+          "The run starts only after the user approves it in the TUI. Returns { runID, status } once the run is running or queued, or early with status \"blocked\" or \"repair_required\" if the run needs a user decision (worker failure, coordinator failure). The run stays resumable from the TUI dashboard, and the final result arrives later as a synthetic <workflow_result> message in this session. Do not wait or poll for it.",
         ].join("\n"),
         input: Schema.toStandardJSONSchemaV1(Schema.toStandardSchemaV1(Schema.Struct({ spec: WORKFLOW_SPEC_SCHEMA }))),
         execute: async (args, context) => {
@@ -1132,7 +1132,7 @@ export default Plugin.define({
       tools.add({
         name: "workflow_status",
         options: { codemode: false },
-        description: "Return the current state of a workflow run: status, current phase, per-worker states, failure reason, and plan revision count. Read-only — use it to answer questions about a run's progress or diagnose a blocked/stopped run. The final result arrives separately as a synthetic <workflow_result> message.",
+        description: "Return the current state of a workflow run: status, current phase, per-worker states, failure reason, and plan revision count. Read-only; use it to answer questions about a run's progress or diagnose a blocked/stopped run. The final result arrives separately as a synthetic <workflow_result> message.",
         input: Schema.toStandardJSONSchemaV1(Schema.toStandardSchemaV1(Schema.Struct({ runID: RUN_ID.annotate({ description: "The runID previously returned by the workflow tool" }) }))),
         execute: async ({ runID }) => {
           // Memory first: disk state can lag the live run. The disk fallback must work while another
@@ -1149,7 +1149,7 @@ export default Plugin.define({
       tools.add({
         name: "workflow_authoring",
         options: { codemode: false },
-        description: "Return the full AUTHORING.md reference for designing a `workflow` spec: the four facts that decide a spec's shape, worked examples of the common workflow shapes (discover/fan-out/verify, adversarial verification, staged migration), and the pre-submission checklist. Read this before writing your first workflow spec or when a spec design question arises. Cheap to call; returns only this document.",
+        description: "Return the AUTHORING.md reference for designing a `workflow` spec: the four facts that decide a spec's shape, worked examples of the common shapes (discover, fan-out, and verify; adversarial verification; staged migration), and the pre-submission checklist. Read it before writing your first workflow spec or when a spec design question arises.",
         input: Schema.Record(Schema.String, Schema.Unknown),
         execute: async () => ({ content: authoringDoc }),
       });

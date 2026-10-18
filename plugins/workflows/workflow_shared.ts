@@ -175,7 +175,7 @@ export const WORKER_SCHEMA = Schema.Struct({
 export const PHASE_SCHEMA = Schema.Struct({
   id: IDENTIFIER,
   title: NONEMPTY_TEXT,
-  checkpoint: Schema.optional(Schema.Boolean.annotate({ description: "After this phase, a coordinator sees its outputs and rewrites ALL remaining phases. This is the only way to express work whose shape is unknown up front — fan-out over a list this phase discovers, or repeat-until-exhausted. There is no loop construct; end the discovering phase with a checkpoint and let the coordinator write the phases that consume it." })),
+  checkpoint: Schema.optional(Schema.Boolean.annotate({ description: "After this phase, a coordinator sees its outputs and rewrites ALL remaining phases. This is the only way to express work whose shape is unknown up front, such as one worker per item this phase discovers, or repeat-until-exhausted. There is no loop construct; end the discovering phase with a checkpoint and let the coordinator write the phases that consume it." })),
   steps: Schema.Array(Schema.Union([
     Schema.Struct({ type: Schema.Literal("worker"), worker: WORKER_SCHEMA }),
     Schema.Struct({ type: Schema.Literal("parallel"), id: IDENTIFIER, title: Schema.optional(NONEMPTY_TEXT), workers: Schema.Array(WORKER_SCHEMA).check(NOT_EMPTY) }),
@@ -185,14 +185,14 @@ export const WORKFLOW_SPEC_SCHEMA = Schema.Struct({
   version: Schema.Literal(1),
   name: NONEMPTY_TEXT,
   description: NONEMPTY_TEXT.annotate({ description: "One line shown in the approval dialog and run tree" }),
-  goal: NONEMPTY_TEXT.annotate({ description: "The complete objective AND the condition that ends the run, in a few full sentences — this is the only context a checkpoint coordinator gets besides worker outputs: it has no tools and no conversation history, so everything it must know between phases belongs here. A workflow that repeats until exhausted must state its stopping rule here or it will not converge." }),
+  goal: NONEMPTY_TEXT.annotate({ description: "The complete objective AND the condition that ends the run, in a few full sentences. This is the only context a checkpoint coordinator gets besides worker outputs: it has no tools and no conversation history, so everything it must know between phases belongs here. A workflow that repeats until exhausted must state its stopping rule here or it will not converge." }),
   allowedAgents: Schema.Array(IDENTIFIER).check(Schema.isNonEmpty({ message: "must contain at least one agent" })).annotate({ description: "Unique registered agents workers may use; also bounds anything a checkpoint coordinator adds later" }),
   phases: Schema.Array(PHASE_SCHEMA).check(NOT_EMPTY),
   limits: Schema.optional(Schema.Struct({
     maxWorkers: Schema.optional(POSITIVE_INT.annotate({ description: "Total worker budget. A checkpoint coordinator may only add (maxWorkers - workers already listed) workers, so a spec with checkpoints must set this well above its own worker count or the expansion silently has no room." })),
     maxRevisions: Schema.optional(POSITIVE_INT.annotate({ description: "Coordinator revisions allowed; each checkpoint consumes one" })),
-    maxRunMs: Schema.optional(POSITIVE_INT),
-  })),
+    maxRunMs: Schema.optional(POSITIVE_INT.annotate({ description: "Run time window in milliseconds. When it passes, scheduling pauses after active work finishes." })),
+  }).annotate({ description: "Each limit defaults to, and cannot exceed, the plugin's configured ceiling" })),
 });
 export const DEFAULT_LIMITS: WorkflowLimits = { maxWorkers: 100, maxRevisions: 10, maxRunMs: 6 * 60 * 60 * 1000, maxConcurrency: 2 };
 export const RETRY_DELAYS_MS = [5_000, 10_000, 20_000, 30_000, 40_000] as const;
