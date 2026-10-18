@@ -22,7 +22,7 @@
     "websearch"
   ],
   "engines": {
-    "opencode": ">=2.0.15"
+    "opencode": ">=2.0.32"
   },
   "publishConfig": {
     "access": "public"
@@ -31,8 +31,8 @@
     "@ai-sdk/anthropic": "3.0.125",
     "@ai-sdk/google": "3.0.129",
     "@ai-sdk/openai": "3.0.121",
-    "@opencode/plugin": "2.0.15",
+    "@opencode/plugin": "2.0.32",
     "ai": "6.0.297",
-    "effect": "4.0.0-rc.112"
+    "effect": "4.0.1"
   }
 }
