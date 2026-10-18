@@ -9,7 +9,7 @@ The plugin owns a separate `opencode-pty` daemon. It does not attach to your ter
 Requirements:
 
 - OpenCode 2.0.32 or newer, running on Bun.
-- Linux or macOS on x64 or arm64. Windows is not supported.
+- Linux, macOS, or Windows on x64 or arm64. Windows uses ConPTY and Windows PowerShell.
 
 Run `bun install` from this repository. Add the local package to `opencode.jsonc`:
 
@@ -65,7 +65,7 @@ All terminal IDs are private to the calling OpenCode session. Child sessions can
 
 ### Starting programs
 
-`command` runs through `$SHELL -lc`, or `/bin/sh -lc` when `SHELL` is unset. Shell startup files can affect execution. Relative `cwd` values resolve from the plugin's location directory; omitting `cwd` uses that directory.
+On Linux and macOS, `command` runs through `$SHELL -lc`, or `/bin/sh -lc` when `SHELL` is unset. Shell startup files can affect execution. On Windows, it runs through `powershell.exe -NoLogo -NoProfile -Command`, so command strings use PowerShell syntax. Relative `cwd` values resolve from the plugin's location directory; omitting `cwd` uses that directory.
 
 `env` overrides the daemon's inherited environment. The daemon sets `TERM=xterm-256color` and `COLORTERM=truecolor`. Every terminal is fixed at **300 columns by 60 rows**. There is no resize tool.
 
@@ -99,7 +99,7 @@ Unknown names fail before sending input. Text can also contain raw control or es
 }
 ```
 
-- `status` is `running`, `exited`, or `failed`. Exited programs include `exitCode`, which can be null when the daemon has no code. Failed programs include `error`.
+- `status` is `running`, `exited`, or `failed`. `exitCode` is the terminal shell's exit code, which can be null when unavailable. On Windows, native programs' exit codes are propagated on normal completion; PowerShell may report 1 after Ctrl+C even if its native child later exits with another code. Failed programs include `error`.
 - `screen` contains parsed text, not ANSI escape codes or a raw output transcript. Trailing spaces and trailing blank rows are removed. Internal blank rows remain.
 - Reads default to the live 60-row screen. `read.lines` requests the most recent physical rows, including retained scrollback, up to 65,535. Alternate-screen applications do not expose primary-screen scrollback through this read.
 - Views keep the newest complete rows within about 12,000 characters. `omittedLines` reports rows removed by that character budget. A daemon read larger than its own 1 MiB limit fails rather than returning a partial read.
@@ -126,7 +126,7 @@ A timeout does not undo input or terminate the program. Cancelling a call stops 
 
 Terminals keep running between tool calls, including while a session is idle. Exited programs retain their final screen until closed. Session deletion or movement closes that session's terminals. Unloading the plugin closes every terminal it owns. Losing the owner connection also causes the daemon to stop its terminals.
 
-There is no restart handoff or reconnection to a previous daemon. Runtime registrations use fresh directories under `${XDG_STATE_HOME:-~/.local/state}/opencode-plugins/pty`, separate from OpenCode's built-in daemon registrations.
+There is no restart handoff or reconnection to a previous daemon. Runtime registrations use fresh directories under `${XDG_STATE_HOME:-~/.local/state}/opencode-plugins/pty` on Unix and `%LOCALAPPDATA%\opencode-plugins\pty` on Windows, separate from OpenCode's built-in daemon registrations. Windows connects only to the spawned daemon's process ID before sending credentials or input.
 
 ## Development
 

@@ -7,7 +7,7 @@ const timeoutMs = Schema.optional(Schema.Int.check(Schema.isBetween({ minimum: 0
   description: "Maximum wait in milliseconds, from 0 to 120000. Defaults to 10000. 0 captures the screen immediately and reports timeout unless the wait condition is already met.",
 });
 export const Start = Schema.Struct({
-  command: Schema.String.check(Schema.isMinLength(1)).annotate({ description: "Shell command to run, for example python3 or an installer" }),
+  command: Schema.String.check(Schema.isMinLength(1)).annotate({ description: "Command to run, for example python3 or an installer. Windows uses PowerShell -NoLogo -NoProfile -Command; Linux and macOS use $SHELL -lc." }),
   cwd: Schema.optional(Schema.String).annotate({ description: "Working directory, resolved against the project directory. Defaults to the project directory." }),
   env: Schema.optional(Schema.Record(Schema.String, Schema.String)).annotate({ description: "Environment variable overrides. Other variables are inherited from the PTY daemon's environment." }),
   until: Schema.optional(until).annotate({ description: "Literal text to wait for on the screen. Without it, the wait ends after 500 ms of quiet output." }),
@@ -50,8 +50,11 @@ export class Terminals {
   async start(sessionID: string, input: typeof Start.Type & { cwd: string }, signal: AbortSignal) {
     const response = await this.daemon.request({
       op: "create",
-      program: process.env.SHELL || "/bin/sh",
-      args: ["-lc", input.command],
+      program: process.platform === "win32" ? "powershell.exe" : process.env.SHELL || "/bin/sh",
+      // PowerShell -Command otherwise collapses native programs' nonzero exit codes to 1.
+      args: process.platform === "win32"
+        ? ["-NoLogo", "-NoProfile", "-Command", `${input.command}\nif (!$?) { if ($LASTEXITCODE) { exit $LASTEXITCODE }; exit 1 }`]
+        : ["-lc", input.command],
       cwd: input.cwd,
       title: input.command,
       group_id: sessionID,

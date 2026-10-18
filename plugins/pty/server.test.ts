@@ -1,11 +1,17 @@
 import { expect, test } from "bun:test";
 import type { Info, ToolContext } from "@opencode/plugin/promise/tool";
 import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import Pty from "./server.ts";
 import { available } from "./daemon.ts";
 
 test.skipIf(!available)("plugin controls a private interactive PTY, preserves final output, and shuts down its children", async () => {
-  const directory = await mkdtemp("/tmp/opencode/pty-test-");
+  const directory = await mkdtemp(path.join(process.platform === "win32" ? tmpdir() : "/tmp/opencode", "pty-test-"));
+  const fixture = path.join(import.meta.dir, "terminal.fixture.ts");
+  const command = process.platform === "win32"
+    ? `& '${process.execPath.replaceAll("'", "''")}' '${fixture.replaceAll("'", "''")}'`
+    : `exec '${process.execPath.replaceAll("'", "'\\''")}' '${fixture.replaceAll("'", "'\\''")}'`;
   const tools = new Map<string, Info>();
   const approvals: unknown[] = [];
   let deny = true;
@@ -45,19 +51,7 @@ test.skipIf(!available)("plugin controls a private interactive PTY, preserves fi
     expect((await call("list", {})).terminals).toEqual([]);
     deny = false;
     const started = await call("start", {
-      command: `printf '\\033[31mready:%s\\033[0m\\n' "$PTY_TEST"
-stty size
-while IFS= read -r line; do
-  case "$line" in
-    bye) printf 'done\\n'; exit 7;;
-    hold) printf 'hold-requested\\n'; IFS= read -r release; printf 'ready:interactive\\n';;
-    flood)
-      i=0
-      while [ "$i" -lt 80 ]; do printf '%0280d\\n' "$i"; i=$((i+1)); done
-      printf 'flood-done\\n';;
-    *) printf 'value:%s\\n' "$line";;
-  esac
-done`,
+      command,
       env: { PTY_TEST: "interactive" },
       until: "60 300",
     });
@@ -98,7 +92,11 @@ done`,
     await call("close", { id: started.id });
     expect((await call("list", {})).terminals).toEqual([]);
 
-    await call("start", { command: 'echo $$ > child.pid; printf "waiting\\n"; read -r line', until: "waiting" });
+    const cleanup = await call("start", { command, env: { PTY_TEST: "cleanup" }, until: "ready:cleanup" });
+    const interrupted = await call("send", { id: cleanup.id, keys: ["Ctrl+C"], until: "interrupted" });
+    expect(interrupted.screen).toContain("interrupted");
+    expect(interrupted.status).toBe("running");
+    expect((await call("send", { id: cleanup.id, text: "still-running", keys: ["Enter"], until: "value:still-running" })).screen).toContain("value:still-running");
     const pid = Number(await Bun.file(`${directory}/child.pid`).text());
     expect(() => process.kill(pid, 0)).not.toThrow();
     await dispose();
@@ -108,3 +106,18 @@ done`,
     await rm(directory, { recursive: true, force: true });
   }
 }, 15_000);
+
+test.skipIf(process.platform !== "win32")("rejects a Windows pipe with a mismatched server PID before sending input", async () => {
+  const { createServer } = await import("node:net");
+  const { connect } = await import("./pipe.windows.ts");
+  let received = 0;
+  const server = createServer((socket) => socket.on("data", (data) => { received += data.length; }));
+  const name = `\\\\.\\pipe\\opencode-pty-test-${crypto.randomUUID()}`;
+  await new Promise<void>((resolve) => server.listen(name, resolve));
+  try {
+    await expect(connect(name, 0, AbortSignal.timeout(5_000))).rejects.toThrow("not the spawned PTY daemon");
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  }
+  expect(received).toBe(0);
+});

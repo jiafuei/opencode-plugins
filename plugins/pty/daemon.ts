@@ -49,12 +49,12 @@ const Response = Schema.Union([
 export class PtyDaemon {
   private constructor(
     private readonly registration: typeof Registration.Type,
-    private readonly owner: Bun.Socket<undefined>,
+    private readonly releaseOwner: () => void,
     private readonly process: Bun.Subprocess<"ignore", "ignore", "ignore">,
   ) {}
 
   static async start(root: string) {
-    if (!binaryPath) throw new Error("The PTY plugin requires Linux or macOS on x64 or arm64.");
+    if (!binaryPath) throw new Error("The PTY plugin requires Linux, macOS, or Windows on x64 or arm64.");
     await mkdir(root, { recursive: true, mode: 0o700 });
     const name = crypto.randomUUID();
     const child = Bun.spawn([binaryPath, "daemon", "--runtime-dir", root, "--name", name], {
@@ -62,7 +62,8 @@ export class PtyDaemon {
       stdout: "ignore",
       stderr: "ignore",
     });
-    child.unref();
+    // Windows Bun 1.3 loses exit notifications after unref, so keep its child referenced through shutdown.
+    if (process.platform !== "win32") child.unref();
     try {
       const file = path.join(root, name, "service.json");
       const signal = AbortSignal.timeout(5_000);
@@ -73,13 +74,12 @@ export class PtyDaemon {
         await Bun.sleep(25);
       }
       const registration = Schema.decodeUnknownSync(Registration)(await Bun.file(file).json());
-      const owner = await exchange(registration, { op: "own", instance_id: registration.instance_id }, signal, true);
+      const owner = await exchange(registration, { op: "own", instance_id: registration.instance_id }, signal, child.pid, true);
       if (owner.response.type !== "owned") {
-        owner.socket.terminate();
+        owner.close();
         throw new Error(`Expected PTY ownership, received ${owner.response.type}.`);
       }
-      owner.socket.unref();
-      return new PtyDaemon(registration, owner.socket, child);
+      return new PtyDaemon(registration, owner.close, child);
     } catch (error) {
       child.kill();
       await child.exited;
@@ -89,26 +89,42 @@ export class PtyDaemon {
 
   async request(value: object, signal: AbortSignal) {
     if (this.process.exitCode !== null) throw new Error("PTY daemon exited. Reload the plugin to start fresh terminals.");
-    return (await exchange(this.registration, value, signal)).response;
+    return (await exchange(this.registration, value, signal, this.process.pid)).response;
   }
 
   async close() {
     // Owner loss is the daemon's normal shutdown path, including termination of every child PTY.
-    this.owner.terminate();
+    this.releaseOwner();
     await this.process.exited;
   }
 }
 
-async function exchange(registration: typeof Registration.Type, request: object, signal: AbortSignal, keep = false) {
+async function exchange(registration: typeof Registration.Type, request: object, signal: AbortSignal, expectedPid: number, keep = false) {
   const payload = Buffer.from(JSON.stringify({ token: registration.token, request }));
   if (payload.length > 8 * 1024 * 1024) throw new Error("PTY request exceeds the 8 MiB protocol limit.");
   const frame = Buffer.allocUnsafe(payload.length + 4);
   frame.writeUInt32BE(payload.length);
   payload.copy(frame, 4);
 
-  const reply = Promise.withResolvers<{ response: Exclude<typeof Response.Type, { type: "error" }>; socket: Bun.Socket<undefined> }>();
   const cancellation = AbortSignal.any([signal, AbortSignal.timeout(5_000)]);
   cancellation.throwIfAborted();
+  if (process.platform === "win32") {
+    const { connect } = await import("./pipe.windows.ts");
+    const pipe = await connect(registration.socket, expectedPid, cancellation);
+    try {
+      pipe.write(frame, cancellation);
+      const length = (await pipe.read(4, cancellation)).readUInt32BE();
+      if (length > 8 * 1024 * 1024) throw new Error("PTY response exceeds the 8 MiB protocol limit.");
+      const response = decode(await pipe.read(length, cancellation));
+      if (!keep) pipe.close();
+      return { response, close: pipe.close };
+    } catch (error) {
+      pipe.close();
+      throw error;
+    }
+  }
+
+  const reply = Promise.withResolvers<{ response: Exclude<typeof Response.Type, { type: "error" }>; close: () => void }>();
   let connection: Bun.Socket<undefined> | undefined;
   let pending = Buffer.alloc(0);
   let sent = 0;
@@ -133,10 +149,10 @@ async function exchange(registration: typeof Registration.Type, request: object,
             const length = pending.readUInt32BE(0);
             if (length > 8 * 1024 * 1024) throw new Error("PTY response exceeds the 8 MiB protocol limit.");
             if (pending.length < length + 4) return;
-            const response = Schema.decodeUnknownSync(Response)(JSON.parse(pending.subarray(4, length + 4).toString("utf8")));
-            if (response.type === "error") throw new Error(response.message);
-            reply.resolve({ response, socket });
-            if (!keep) socket.end();
+            const response = decode(pending.subarray(4, length + 4));
+            reply.resolve({ response, close: () => socket.terminate() });
+            if (keep) socket.unref();
+            if (!keep) socket.terminate();
           } catch (error) {
             reply.reject(error);
             socket.terminate();
@@ -156,4 +172,10 @@ async function exchange(registration: typeof Registration.Type, request: object,
   } finally {
     cancellation.removeEventListener("abort", abort);
   }
+}
+
+function decode(payload: Buffer) {
+  const response = Schema.decodeUnknownSync(Response)(JSON.parse(payload.toString("utf8")));
+  if (response.type === "error") throw new Error(response.message);
+  return response;
 }

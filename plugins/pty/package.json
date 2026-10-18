@@ -11,13 +11,14 @@
     "server.ts",
     "terminal.ts",
     "daemon.ts",
+    "pipe.windows.ts",
     "README.md"
   ],
   "engines": {
     "opencode": ">=2.0.32"
   },
   "dependencies": {
-    "@opencode-ai/pty": "0.2.0"
+    "@opencode-ai/pty": "0.3.1"
   },
   "peerDependencies": {
     "@opencode/plugin": ">=2.0.32",
