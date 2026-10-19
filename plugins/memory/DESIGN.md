@@ -64,7 +64,10 @@ competing current record. Corrections inherit omitted or empty title/hook metada
 as superseded history. Their responses explicitly name the new current ID. There is no mandatory read tracking or
 confirmation gate; reading full details is recommended when needed to preserve qualifications. The authoring contract permits user-stated or explicitly confirmed preferences, instructions, facts, working
 details, recaps, and references. Tentative ideas retain their uncertainty. Assistant output and tool results alone do
-not establish memories. Saves emit a `Saved: <title>` toast and count toward automatic dreaming.
+not establish memories. One capture threshold is shared by `memory_save` and reflection: keep explicit remember
+requests, lasting rules, and durable decisions with rationale the repository does not show; skip current task requests,
+plans, intermediate choices, and progress; skip when unsure. Task completion is neither a save trigger nor a
+confirmation. Saves emit a `Saved: <title>` toast and count toward automatic dreaming.
 
 Corrections target detailed records, not derived summaries. Changing a source invalidates all dependent summaries;
 unaffected details become roots again. Source capture preserves complete qualifications and uncertainty; compression

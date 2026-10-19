@@ -203,7 +203,7 @@ const READ_GUIDANCE = `How to use memory:
 - Summaries are coarse overviews derived from other records, not user statements. When a decision or exception matters, open relevant sources (which may be summaries too) or search. Omission from a summary does not establish absence.
 - Index dates are capture or version-update dates, not when the user made the statement.
 - You see global memory (global: ids) and this project's memory. Search other projects only when the task needs their memory, with all_projects: true; read returned project:<key>:<id> ids directly. Other projects are read-only here.`;
-const SAVE_GUIDANCE = `- Save with memory_save when the user states a lasting preference, rule, or decision, or asks you to remember something. Search first, and use memory_correct when the user changes an existing detail. Background review catches misses, so skip routine requests.`;
+const SAVE_GUIDANCE = `- Save right away only when the user asks you to remember something, states a lasting preference or rule for future work, or corrects an existing record. Search first, and use memory_correct for corrections. Keep current task requests, plans, and intermediate choices in the conversation; background review considers durable project decisions once the work settles. When unsure, do not save.`;
 
 function renderDelta(deltas: Iterable<[string, IndexEntry | null]>): string {
   const upserts: string[] = [];
@@ -248,12 +248,14 @@ function memoryEvidence(sessionID: string, ids: readonly string[], messages: Tra
 const REFLECT_SYSTEM = "You are a project-memory reviewer. Return only the requested JSON result.";
 const REFLECT_SELECTOR_SYSTEM = "You are a project-memory reflection selector. Return only the requested JSON result.";
 
-const REFLECT_SELECTOR_PROMPT = `Decide whether the agent missed user-stated or explicitly confirmed information worth keeping, or an explicit user correction of an existing record. Most reviews need nothing: return needed: false and ids: []. Otherwise return needed: true with exact ids of related details to inspect, usually no more than ${CONSOLIDATION_BATCH}. Check these to avoid duplicates and preserve qualifications when correcting them. The root index lists rules, summaries, and ungrouped details; the detail index adds details beneath summaries. New subjects may need no ids. Ignore subjects in <session_saves> unless the user later corrected them. Do not write records in this step. "Thanks", "ok", or silence does not confirm an assistant claim.`;
+const CAPTURE_THRESHOLD = `Keep only what future sessions need: explicit requests to remember, lasting preferences or rules, and durable project decisions with rationale or constraints the repository does not show. Skip current task requests, implementation plans, intermediate choices, and progress. A finished task is neither a reason to save nor a confirmation. When unsure, skip.`;
+
+const REFLECT_SELECTOR_PROMPT = `Decide whether the agent missed user-stated or explicitly confirmed information worth keeping, or an explicit user correction of an existing record. ${CAPTURE_THRESHOLD} Most reviews need nothing: return needed: false and ids: []. Otherwise return needed: true with exact ids of related details to inspect, usually no more than ${CONSOLIDATION_BATCH}. Check these to avoid duplicates and preserve qualifications when correcting them. The root index lists rules, summaries, and ungrouped details; the detail index adds details beneath summaries. New subjects may need no ids. Ignore subjects in <session_saves> unless the user later corrected them. Do not write records in this step. "Thanks", "ok", or silence does not confirm an assistant claim.`;
 
 const TYPE_GUIDANCE = `preference: a lasting general preference.
 instruction: a rule for specific future work; state when it applies.
-fact: a user-stated or confirmed constraint, decision, or piece of context.
-working: a plan, idea, open question, or working detail; write it as tentative unless the user explicitly decided or abandoned it.
+fact: a user-stated or confirmed constraint, decision, or piece of context that will matter in future sessions.
+working: a plan, idea, or open question the user explicitly wants carried into later sessions; write it as tentative unless the user explicitly decided or abandoned it.
 recap: a user-confirmed conclusion with useful rationale and rejected alternatives.
 reference: lasting external material the user pointed to or confirmed is worth returning to.`;
 
@@ -264,14 +266,14 @@ Sources: capture only what the user wrote or explicitly confirmed. Use assistant
 Types: preference and instruction are rules the user wants future agents to follow; everything else is a hint. If unsure, do not make it a rule.
 ${TYPE_GUIDANCE}
 
-create: new subjects only, one subject per record. Skip routine requests with no lasting value (for example "run the tests") and secrets. Ignore subjects in <session_saves> unless the user explicitly corrected them.
+create: new subjects only, one subject per record. ${CAPTURE_THRESHOLD} Never capture secrets. Ignore subjects in <session_saves> unless the user explicitly corrected them.
 correct: only when the user explicitly corrected or changed a supplied detail. Give its exact id and complete updated content. Add a title or hook only if the old wording would mislead; type is inherited. The previous version stays as history. Never correct a summary, infer a correction from silence, or re-save an unchanged detail.
 
 Writing: the hook is one line under about 100 characters, in the form "<Area>: <what it covers>" when it applies to only part of the project. The content keeps the full user-grounded detail: conditions, rationale, qualifications, rejected alternatives, and uncertainty. Completeness matters more than brevity; coarser compression happens later in derived summaries. Omit frontmatter and narration.`;
 
 const SCOPE_GUIDANCE = `New records default to project scope. Use global for user preferences that clearly apply across projects, or for any record the user explicitly asks to make global. Corrections keep their record's scope; do not save a copy in another scope.`;
 const CAPTURE_GUIDANCE = `Capture only user-stated or explicitly confirmed information, not assistant or tool findings. "Thanks", "ok", and silence do not confirm a claim. One subject per record; no secrets or narration.`;
-const TYPE_CHOICE = "Use preference or instruction only for rules the user wants future agents to follow; when unsure, use fact or working.";
+const TYPE_CHOICE = "Use preference or instruction only for rules the user wants future agents to follow; otherwise use fact. Use working only for unfinished work the user wants carried into later sessions.";
 
 const MEMORY_TOOL_NAMES = ["memory_read", "memory_search", "memory_save", "memory_correct", "memory_delete"] as const;
 
@@ -1152,7 +1154,7 @@ const setup = async (ctx: Plugin.Context) => {
     editor.add({
       name: "memory_save",
       options: { codemode: false },
-      description: `Create a NEW record. Search related subjects first; use memory_correct for an existing detail. ${CAPTURE_GUIDANCE}`,
+      description: `Create a NEW record. Search related subjects first; use memory_correct for an existing detail. ${CAPTURE_THRESHOLD} ${CAPTURE_GUIDANCE}`,
       input: {
         type: "object",
         properties: {

@@ -12,8 +12,11 @@ available beneath progressively coarser summaries. Memory is a hint layer, not a
   reads in full and verifies before relying on them.
 - **Saving.** The model saves user-stated or explicitly confirmed preferences, instructions, facts, and working
   details with `memory_save`, and updates existing details with `memory_correct`. Conditions, qualifications, and uncertainty are preserved before summarization.
-  Tentative ideas stay labeled as tentative. A `Saved: <title>` toast shows each save.
-- **Reflection.** When a session goes idle, a background review catches user-grounded memories the model missed.
+  Tentative ideas stay labeled as tentative. A `Saved: <title>` toast shows each save. The model saves immediately
+  only for explicit remember requests, lasting preferences or rules, and corrections. Current task requests, plans,
+  and intermediate choices stay in the session; when unsure, nothing is saved.
+- **Reflection.** When a session goes idle, a background review catches user-grounded memories the model missed,
+  including durable project decisions and their rationale once the work settles.
   It can read existing details and apply explicit user corrections while retaining the previous version. The TUI
   shows `Reviewing conversation...` while it runs.
 - **Updates.** Saves and index/body edits reach primary sessions on their next user message as reread notices.
@@ -54,8 +57,8 @@ current project; switch to their project to correct or delete them.
 | --- | --- |
 | `preference` | A lasting general preference |
 | `instruction` | A rule for specific future work, with its conditions stated |
-| `fact` | A user-stated or confirmed constraint, decision, or piece of context |
-| `working` | A plan, idea, open question, or working detail; tentative unless explicitly decided or abandoned |
+| `fact` | A user-stated or confirmed constraint, decision, or piece of context that matters in future sessions |
+| `working` | A plan, idea, or open question you explicitly want carried into later sessions; tentative unless explicitly decided or abandoned |
 | `recap` | A user-confirmed conclusion with useful rationale and rejected alternatives |
 | `reference` | Lasting external material you pointed to or confirmed is worth returning to |
 | `insight` | A derived summary with links to its source records; a hint, not a fact you stated |
