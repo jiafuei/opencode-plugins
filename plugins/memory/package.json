@@ -32,16 +32,16 @@
   },
   "peerDependencies": {
     "@opencode/plugin": ">=2.0.32",
-    "@opentui/core": ">=0.5.17",
-    "@opentui/solid": ">=0.5.17",
+    "@opentui/core": ">=0.6.6",
+    "@opentui/solid": ">=0.6.6",
     "effect": "^4.0.1",
     "solid-js": "^1.9"
   },
   "devDependencies": {
-    "@opencode/plugin": "2.0.32",
-    "@opencode/theme": "2.0.32",
-    "@opentui/core": "0.5.17",
-    "@opentui/solid": "0.5.17",
+    "@opencode/plugin": "2.1.0",
+    "@opencode/theme": "2.1.0",
+    "@opentui/core": "0.6.6",
+    "@opentui/solid": "0.6.6",
     "effect": "4.0.1",
     "solid-js": "1.9.15"
   }

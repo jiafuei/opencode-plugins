@@ -31,7 +31,7 @@
     "effect": "^4.0.1"
   },
   "devDependencies": {
-    "@opencode/plugin": "2.0.32",
+    "@opencode/plugin": "2.1.0",
     "effect": "4.0.1"
   }
 }
