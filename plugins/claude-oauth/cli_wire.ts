@@ -88,6 +88,8 @@ export function patchCliCch(body: string): string {
 
 export function rewriteCliBody(body: string, attribution: CliAttribution, attributionHeader = true, profile: CliProfile = CLI_PROFILE) {
   const params = JSON.parse(body) as Record<string, any>;
+  const search = attribution.requestClass === "auxiliary" && params.tools?.length === 1 &&
+    params.tools[0].type?.startsWith("web_search_");
   const providerNames = new Set<string>((params.tools ?? []).filter((tool: any) => typeof tool.type === "string").map((tool: any) => tool.name));
   const prefix = (name: string) => providerNames.has(name) ? name : profile.toolPrefix + name;
   for (const tool of params.tools ?? []) {
@@ -95,7 +97,7 @@ export function rewriteCliBody(body: string, attribution: CliAttribution, attrib
     delete tool.cache_control;
   }
   if (params.tool_choice?.type === "tool") params.tool_choice.name = prefix(params.tool_choice.name);
-  if (params.tool_choice?.type === "auto" && Object.keys(params.tool_choice).length === 1) delete params.tool_choice;
+  if (!search && params.tool_choice?.type === "auto" && Object.keys(params.tool_choice).length === 1) delete params.tool_choice;
   let firstUserText: string | undefined;
   for (const message of params.messages) {
     const blocks = typeof message.content === "string" ? [{ type: "text", text: message.content }] : message.content;
@@ -114,7 +116,8 @@ export function rewriteCliBody(body: string, attribution: CliAttribution, attrib
     }
   }
 
-  const incoming = typeof params.system === "string" ? [{ type: "text", text: params.system }] : params.system ?? [];
+  const incoming = search ? [{ type: "text", text: "You are an assistant for performing a web search tool use" }]
+    : typeof params.system === "string" ? [{ type: "text", text: params.system }] : params.system ?? [];
   // Only the harness opening is replaced. Repository instructions, memories,
   // skills, quoted text, and user references to OpenCode remain verbatim.
   const instructions = incoming
@@ -143,11 +146,11 @@ export function rewriteCliBody(body: string, attribution: CliAttribution, attrib
   }
   system.push({ type: "text", text: attribution.agentId ? AGENT_IDENTITY : profile.systemInstruction,
     ...(!utility && attribution.agentId ? { cache_control: cache } : {}) });
-  if (!utility && !attribution.agentId) {
+  if (!utility && !search && !attribution.agentId) {
     system.push({ type: "text", text: PREAMBLE, cache_control: { ...cache, scope: "global" } });
   }
-  if (instructions) system.push({ type: "text", text: instructions, ...(!utility ? { cache_control: cache } : {}) });
-  if (!utility && params.messages.length) {
+  if (instructions) system.push({ type: "text", text: instructions, ...(!utility && !search ? { cache_control: cache } : {}) });
+  if (!utility && !search && params.messages.length) {
     // CC's compaction request reads the conversation's cache up to the block before its summary prompt.
     const last = (compaction && params.messages.at(-2)) || params.messages.at(-1);
     if (typeof last.content === "string") last.content = [{ type: "text", text: last.content }];
@@ -181,11 +184,11 @@ export function rewriteCliBody(body: string, attribution: CliAttribution, attrib
     ...(context ? { context_management: context } : {}),
     ...(params.temperature !== undefined ? { temperature: params.temperature } : {}),
     ...(params.output_config ? { output_config: params.output_config } : {}),
-    ...(!utility ? { diagnostics: { previous_message_id: attribution.previousMessageId ?? null } } : {}),
+    ...(!utility && !search ? { diagnostics: { previous_message_id: attribution.previousMessageId ?? null } } : {}),
     ...(params.stream !== undefined ? { stream: params.stream } : {}),
   };
   for (const [key, value] of Object.entries(params)) if (!(key in rewritten)) rewritten[key] = value;
-  return { json: patchCliCch(JSON.stringify(rewritten)), model: params.model as string, utility, thinking };
+  return { json: patchCliCch(JSON.stringify(rewritten)), model: params.model as string, utility, search, thinking };
 }
 
 export function cliHeaders(
@@ -202,19 +205,19 @@ export function cliHeaders(
   const betas = [
     ...(!body.utility && !haiku ? ["claude-code-20250219"] : []),
     "oauth-2025-04-20", "interleaved-thinking-2025-05-14",
-    ...(body.utility ? ["redact-thinking-2026-02-12"] : []),
+    ...(body.utility || body.search ? ["redact-thinking-2026-02-12"] : []),
     "thinking-token-count-2026-05-13", "context-management-2025-06-27", "prompt-caching-scope-2026-01-05",
     ...(full ? ["mid-conversation-system-2026-04-07"] : []),
     // Haiku main requests move the Claude Code beta behind the mid-conversation system beta.
     ...(!body.utility && haiku ? ["claude-code-20250219"] : []),
     ...(full && !attribution.agentId ? ["per-turn-control-2026-07-01", "mid-conversation-tool-changes-2026-07-01"] : []),
-    ...(!body.utility ? ["advanced-tool-use-2025-11-20"] : []),
+    ...(!body.utility && !body.search ? ["advanced-tool-use-2025-11-20"] : []),
     ...(full ? ["mid-conversation-system-clear-at-2026-08-21", "effort-2025-11-24"] : []),
     ...(body.utility ? ["structured-outputs-2025-12-15"] : [
       ...(profile.id === "cli" && ["auxiliary", "compaction"].includes(attribution.requestClass) ? ["fallback-credit-2026-06-01"] : []),
-      "thinking-binding-controls-2026-08-01",
+      ...(!body.search ? ["thinking-binding-controls-2026-08-01"] : []),
       ...(body.thinking?.display === "updates" ? ["thinking-display-updates-2026-08-18"] : []),
-      ...(!attribution.agentId && attribution.requestClass !== "compaction" ? ["extended-cache-ttl-2025-04-11"] : []),
+      ...(!body.search && !attribution.agentId && attribution.requestClass !== "compaction" ? ["extended-cache-ttl-2025-04-11"] : []),
     ]),
     "cache-diagnosis-2026-04-07",
   ];

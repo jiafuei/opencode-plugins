@@ -61,6 +61,12 @@ Anthropic server-side compaction through
 [`@jiafuei/opencode-anthropic-compaction`](../anthropic-compaction/README.md) works over the subscription with both
 of its mechanisms.
 
+## Web search
+
+Load [`@jiafuei/opencode-websearch`](../websearch/README.md) and select its `anthropic` search provider to search with your subscription. The websearch plugin configures the model and parses results; this plugin resolves the current OAuth credential and prepares the request using your selected client profile.
+
+Searches are independent auxiliary requests. They do not advance a conversation's request chain or change its prompt indexes.
+
 ## Troubleshooting
 
 If requests fail with HTTP 400 "Third-party apps now draw from your extra usage, not your plan limits.", Anthropic
@@ -72,8 +78,8 @@ requests sent, set `HTTPS_PROXY` to a debugging proxy and trust its CA through `
 
 - **Pinned to one Claude Code version.** The profiles must be updated as Claude Code changes. The TLS handshake is not
   Claude Code's.
-- **Session requests only.** The rewrite covers the model requests OpenCode sends for sessions: agent turns,
-  compaction, titles, and generation.
+- **Request coverage.** The rewrite covers session agent turns, compaction, titles, generation, and searches from
+  `@jiafuei/opencode-websearch`.
 - **OpenCode owns retries.** Claude Code's own stream watchdogs, retry loop, and recovery paths are not reproduced.
 - **No model filtering.** OpenCode's full Anthropic catalog stays visible. A model the subscription can't use fails
   when you call it.

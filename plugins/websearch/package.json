@@ -28,6 +28,7 @@
     "access": "public"
   },
   "dependencies": {
+    "@jiafuei/opencode-claude-oauth": "file:../claude-oauth",
     "@ai-sdk/anthropic": "3.0.125",
     "@ai-sdk/google": "3.0.129",
     "@ai-sdk/openai": "3.0.121",

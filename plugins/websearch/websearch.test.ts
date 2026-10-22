@@ -1,4 +1,7 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
+import http from "node:http";
+import * as https from "node:https";
+import { OAUTH_CREDENTIAL, setupPlugin } from "../claude-oauth/test_harness.ts";
 import plugin from "./server.ts";
 
 async function searchProvider(
@@ -6,11 +9,13 @@ async function searchProvider(
   credential: Record<string, unknown> | undefined,
   options: Record<string, unknown> = {},
   provider: Record<string, unknown> = { id, name: id },
+  rpc?: unknown,
 ) {
   const added: any[] = [];
   let transform!: (editor: unknown) => void;
   await plugin.setup({
     options,
+    rpc,
     provider: {
       list: async () => ({ data: credential ? [provider] : [] }),
       get: async () => ({ data: provider }),
@@ -119,6 +124,102 @@ describe("OpenAI web search provider", () => {
       }
     });
   });
+});
+
+test.each([
+  { profile: "cli", model: "claude-sonnet-5", maxTokens: 64000 },
+  { profile: "sdk-cli", model: "claude-sonnet-5-5", maxTokens: 128000 },
+])("Claude subscription search uses $profile OAuth wire and returns citations", async ({ profile, model, maxTokens }) => {
+  const oauth = await setupPlugin({ spoofingProfile: profile });
+  const captures: Array<{ headers: Headers; body: any }> = [];
+  const upstream = Bun.serve({
+    hostname: "127.0.0.1", port: 0,
+    async fetch(request) {
+      captures.push({ headers: request.headers, body: await request.json() });
+      const events = [
+        { type: "message_start", message: { id: "msg_search", model: "claude-opus-5-5", role: "assistant", content: [], usage: { input_tokens: 10 } } },
+        { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
+        { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "Grounded answer" } },
+        { type: "content_block_delta", index: 0, delta: { type: "citations_delta", citation: {
+          type: "web_search_result_location", cited_text: "Evidence", url: "https://example.com", title: "Example", encrypted_index: "citation",
+        } } },
+        { type: "content_block_stop", index: 0 },
+        { type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: 3 } },
+        { type: "message_stop" },
+      ];
+      return new Response(events.map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join(""), {
+        headers: { "content-type": "text/event-stream", "request-id": "req_search" },
+      });
+    },
+  });
+  // Redirect only the final network hop; both plugins, SDK parsing, and the relay run normally.
+  const transport = spyOn(https, "request").mockImplementation(((url: URL, options: http.RequestOptions, callback: any) => {
+    expect(String(url)).toBe("https://api.anthropic.com/v1/messages?beta=true");
+    return http.request(new URL("v1/messages", upstream.url), { ...options, agent: undefined }, callback);
+  }) as typeof https.request);
+  try {
+    const provider = await searchProvider("anthropic", OAUTH_CREDENTIAL,
+      { providers: { anthropic: { model } } }, undefined,
+      () => oauth.rpcMethods);
+    // A refreshed credential must be resolved when preparing each search, not captured at setup.
+    oauth.state.credential = { ...OAUTH_CREDENTIAL, access: "refreshed-access" };
+    const results = await provider.execute({ query: "latest news" }, { signal: new AbortController().signal });
+    expect(results).toEqual([{ url: "https://example.com", title: "Example", content: "Grounded answer", time: {} }]);
+    const { headers, body } = captures[0]!;
+    expect(headers.get("authorization")).toBe("Bearer refreshed-access");
+    expect(headers.get("x-api-key")).toBeNull();
+    expect(headers.get("user-agent")).toContain(`(external, ${profile})`);
+    expect(headers.get("x-claude-code-request-class")).toBe("auxiliary");
+    expect(headers.get("anthropic-beta")).toContain("oauth-2025-04-20");
+    expect(headers.get("anthropic-beta")).not.toContain("advanced-tool-use");
+    expect(headers.get("anthropic-beta")).not.toContain("thinking-binding-controls");
+    expect(body.model).toBe(model);
+    expect(body.max_tokens).toBe(maxTokens);
+    expect(body.tools).toEqual([{ type: "web_search_20250305", name: "web_search", max_uses: 8 }]);
+    expect(body.tool_choice).toEqual({ type: "auto" });
+    expect(body.system).toHaveLength(3);
+    expect(body.system[0].text).toContain(`cc_entrypoint=${profile};`);
+    expect(body.system[0].text).not.toContain("cch=00000");
+    expect(body.system[2].text).toBe("You are an assistant for performing a web search tool use");
+    expect(JSON.stringify(body)).not.toContain("cache_control");
+    expect(body.diagnostics).toBeUndefined();
+    expect(body.messages[0].content[0].text).toContain("latest news");
+    expect(JSON.parse(body.metadata.user_id).account_uuid).toBe("acct-test-123");
+    expect(oauth.state.sessions).toEqual({});
+  } finally {
+    transport.mockRestore();
+    oauth.cleanup?.();
+    upstream.stop(true);
+  }
+});
+
+test("Anthropic API-key search keeps provider settings and exposes the original HTTP error", async () => {
+  const provider = await searchProvider("claude-proxy", { type: "key", key: "anthropic-key" },
+    { providers: { "claude-proxy": { type: "anthropic", model: "claude-sonnet-5-5" } } },
+    { id: "claude-proxy", name: "Claude proxy", settings: { baseURL: "https://proxy.example/v1" }, headers: { "x-proxy": "configured" } });
+  const originalFetch = globalThis.fetch;
+  let request: { url: string; headers: Headers; body: any } | undefined;
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    request = { url: String(input), headers: new Headers(init?.headers), body: JSON.parse(String(init?.body)) };
+    return Response.json({ type: "error", error: { type: "rate_limit_error", message: "Search quota exceeded" } },
+      { status: 429, headers: { "retry-after": "30" } });
+  }) as typeof fetch;
+  // streamText logs errors by default, even when the caller consumes and handles its error event.
+  const logging = spyOn(console, "error").mockImplementation(() => {});
+  try {
+    await expect(provider.execute({ query: "latest news" }, { signal: new AbortController().signal })).rejects.toMatchObject({
+      statusCode: 429, message: "Search quota exceeded", responseHeaders: { "retry-after": "30" },
+    });
+    expect(request?.url).toBe("https://proxy.example/v1/messages");
+    expect(request?.headers.get("x-api-key")).toBe("anthropic-key");
+    expect(request?.headers.get("authorization")).toBeNull();
+    expect(request?.headers.get("x-proxy")).toBe("configured");
+    expect(request?.body.model).toBe("claude-sonnet-5-5");
+    expect(request?.body.tools[0].type).toBe("web_search_20260209");
+  } finally {
+    globalThis.fetch = originalFetch;
+    logging.mockRestore();
+  }
 });
 
 test("custom @ai-sdk/google provider searches through its own endpoint", async () => {

@@ -20,6 +20,7 @@ export async function setupPlugin(options: Record<string, unknown> = {}, credent
   let wake: (() => void) | undefined;
   let method: any;
   let modelTransform: any;
+  let rpcMethods: any;
   const cleanup = await plugin.setup({
     options,
     integration: {
@@ -29,7 +30,7 @@ export async function setupPlugin(options: Record<string, unknown> = {}, credent
         resolve: async () => state.credential,
       },
     },
-    rpc: { register: async () => {} },
+    rpc: { register: async (_definition: unknown, methods: unknown) => { rpcMethods = methods; } },
     model: {
       transform: async (callback: any) => (modelTransform = callback),
       reload: async () => {
@@ -106,5 +107,5 @@ export async function setupPlugin(options: Record<string, unknown> = {}, credent
     return { request, bodyText: await request.clone().text(), response: responseEvent.response as Response };
   };
 
-  return { state, hooks, method, modelTransform, emit, send, cleanup };
+  return { state, hooks, method, modelTransform, rpcMethods, emit, send, cleanup };
 }

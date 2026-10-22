@@ -1,6 +1,7 @@
 import { createAnthropic, type AnthropicLanguageModelOptions } from "@ai-sdk/anthropic";
 import { createGoogleGenerativeAI, type GoogleLanguageModelOptions } from "@ai-sdk/google";
 import { createOpenAI, type OpenAIResponsesProviderOptions } from "@ai-sdk/openai";
+import { ClaudeOAuthRpc } from "@jiafuei/opencode-claude-oauth/rpc";
 import { Plugin } from "@opencode/plugin";
 import { streamText } from "ai";
 import { createWebSocketFetch } from "./websocket_fetch.ts";
@@ -106,12 +107,25 @@ export default Plugin.define({
                   tools: { google_search: google.tools.googleSearch({}) },
                 };
               }
-              const anthropic = createAnthropic(settings);
+              const subscription = auth?.type === "oauth";
+              const anthropic = subscription ? createAnthropic({
+                // The OAuth plugin owns credentials and the final HTTP request.
+                apiKey: "oauth",
+                fetch: async (input, init) => {
+                  const request = new Request(input, init);
+                  const { url } = await ctx.rpc(ClaudeOAuthRpc).prepareSearch({
+                    integrationID: provider.integrationID ?? id,
+                    body: await request.text(), beta: request.headers.get("anthropic-beta") ?? undefined,
+                  }, { signal: request.signal });
+                  return fetch(url, { method: "POST", signal: request.signal });
+                },
+              }) : createAnthropic(settings);
               return {
                 model: anthropic(modelID),
-                maxOutputTokens: 64000,
+                maxOutputTokens: subscription && /^claude-(?:opus-5|(?:sonnet|haiku)-5-5)/.test(modelID) ? 128000 : 64000,
                 providerOptions: { anthropic: { effort: "low" } satisfies AnthropicLanguageModelOptions },
-                tools: { web_search: anthropic.tools.webSearch_20260209() },
+                toolChoice: "auto",
+                tools: { web_search: subscription ? anthropic.tools.webSearch_20250305({ maxUses: 8 }) : anthropic.tools.webSearch_20260209() },
               };
             })();
             const result = streamText({
@@ -120,6 +134,8 @@ export default Plugin.define({
               maxRetries: 0,
               prompt: `Search the live web for this query and return a concise, factual answer grounded in the retrieved content. Include useful details and cite sources.\n\n${query}`,
             });
+            // Preserve API errors (including 429) instead of the aggregate promises' NoOutputGeneratedError.
+            for await (const part of result.fullStream) if (part.type === "error") throw part.error;
             const [text, sources, toolResults] = await Promise.all([result.text, result.sources, result.toolResults]);
             const found = new Map<string, string | undefined>();
             for (const source of sources) if (source.sourceType === "url" && !found.has(source.url)) found.set(source.url, source.title);

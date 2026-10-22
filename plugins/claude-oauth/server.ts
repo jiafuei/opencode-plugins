@@ -348,6 +348,23 @@ export default Plugin.define({
 
     // Mirrors Claude Code's /usage request (October 3 capture).
     await ctx.rpc.register(ClaudeOAuthRpc, {
+      prepareSearch: async ({ integrationID, body, beta }, { signal }) => {
+        const connection = await ctx.integration.connection.active(integrationID);
+        const credential = connection ? await ctx.integration.connection.resolve(connection) : undefined;
+        if (credential?.type !== "oauth" || credential.methodID !== METHOD_ID) {
+          throw new Error("Anthropic is not connected with Claude Pro/Max.");
+        }
+        // Search has its own attribution and never advances a conversation's request chain.
+        const attribution: CliAttribution = {
+          sessionId: randomUUID(), accountId: credential.metadata?.accountId as string | undefined, requestClass: "auxiliary",
+        };
+        const rewritten = rewriteCliBody(body, attribution, attributionHeader, profile);
+        const headers = cliHeaders(new Headers({
+          authorization: `Bearer ${credential.access}`, ...(beta ? { "anthropic-beta": beta } : {}),
+        }), attribution, rewritten, randomUUID(), 0, profile);
+        relay ??= createCliRelay();
+        return { url: relay.forward(new URL(`${API_ORIGIN}/v1/messages?beta=true`), headers, rewritten.json, signal).url };
+      },
       usage: async () => {
         const connection = await ctx.integration.connection.active("anthropic");
         // Resolving refreshes a token close to expiry.

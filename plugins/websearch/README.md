@@ -38,9 +38,13 @@ Out of the box the built-in `openai`, `google`, and `anthropic` providers are se
 - `model`: model used for searches.
 - `transport`: `"https"` (default) or `"websocket"` for a persistent WebSocket to the Codex backend. Only affects `openai` entries connected with a ChatGPT subscription.
 
+Put `model` and `transport` inside `providers.<provider-id>`, as shown above. Top-level options with those names have no effect.
+
 Each search uses the provider's connected API key (or its `apiKey` setting), `baseURL`, and `headers`, so custom providers pointing at proxies or gateways work as configured.
 
-The built-in `openai` provider also accepts a ChatGPT Pro/Plus subscription, which calls the Codex backend (`https://chatgpt.com/backend-api/codex`) with the account id from the connection. ChatGPT subscriptions only accept Codex-eligible models. Other OAuth connections, such as a Claude subscription, are not supported; use an API key.
+The built-in `openai` provider also accepts a ChatGPT Pro/Plus subscription, which calls the Codex backend (`https://chatgpt.com/backend-api/codex`) with the account id from the connection. ChatGPT subscriptions only accept Codex-eligible models.
+
+For Claude Pro/Max search, load [`@jiafuei/opencode-claude-oauth`](../claude-oauth) alongside this plugin and connect Anthropic using **Claude Pro/Max**. Select the `anthropic` search provider. Searches use the OAuth plugin's refreshed credential, client profile, and HTTP relay. No `ANTHROPIC_API_KEY` is needed. Subscription searches use Claude Code's `web_search_20250305` tool with up to eight searches per request; API-key searches use `web_search_20260209`. The model remains configurable under `providers.anthropic.model`.
 
 For Google Antigravity search, install [`@jiafuei/opencode-antigravity-oauth`](../antigravity-oauth); it registers its own `antigravity` web search provider.
 
