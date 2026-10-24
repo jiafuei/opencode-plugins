@@ -2,7 +2,7 @@
 
 Global and project memory for OpenCode, with a Claude Code-like `/memory` browser. The model remembers your preferences,
 instructions, facts, and working details across sessions, so you don't have to repeat them. Detailed records remain
-available beneath progressively coarser summaries. Memory is a hint layer, not a source of truth.
+available beneath topic summaries. Memory is a hint layer, not a source of truth.
 
 ## How it works
 
@@ -17,13 +17,14 @@ available beneath progressively coarser summaries. Memory is a hint layer, not a
   and intermediate choices stay in the session; when unsure, nothing is saved.
 - **Reflection.** When a session goes idle, a background review catches user-grounded memories the model missed,
   including durable project decisions and their rationale once the work settles.
-  It can read existing details and apply explicit user corrections while retaining the previous version. The TUI
+  It can read existing details and apply explicit user corrections while retaining the previous version. It always
+  sees records that already cite the reviewed messages, and it drops records that only matter for the current task. The TUI
   shows `Reviewing conversation...` while it runs.
 - **Updates.** Saves and index/body edits reach primary sessions on their next user message as reread notices.
-- **Dreaming.** As memory grows, background consolidation adds summaries over related topics without deleting their
-  sources. Summaries can themselves be summarized, and each level is a coarser overview rather than a merge of the
-  details below it. A summary covers shared themes and major decisions; exact conditions and history stay in its linked
-  sources. The synthesis prompt targets 150 words or fewer, but nothing enforces or truncates that length. Preferences
+- **Dreaming.** Once there are more than `dream_target` hint entries, background consolidation adds summaries over
+  3–12 related details without deleting them. Summaries stay one flat layer: a new related detail is added to an
+  existing summary, which is rebuilt from its details, instead of stacking another summary on top. A summary covers
+  shared themes and major decisions; exact conditions and history stay in its linked sources. The synthesis prompt targets 150 words or fewer, but nothing enforces or truncates that length. Preferences
   and instructions are never folded into summaries. The sidebar shows `Dreaming...` while it runs.
 - **Retrieval.** Read a summary to discover its source IDs, then read those IDs for more detail. All-words search reaches
   current detailed records directly, including details omitted from summaries. Derived summaries are excluded from
@@ -169,7 +170,8 @@ Preserve hierarchy comments when editing metadata; malformed metadata is
 reported through logs and an error toast rather than silently discarded. Lines outside the index format are dropped
 the next time the plugin writes the index.
 
-Correcting a detailed record creates a new ID and retains the old record as superseded. Metadata is inherited unless
+Correcting a detailed record creates a new ID and retains the old record as superseded, unless every source of the old
+record came from the correcting session; then the old record is replaced without history. Metadata is inherited unless
 explicitly changed. Correct an incorrect source
 detail; if only the summary is wrong, delete/unfold it and run dreaming again. Explicit deletion removes the selected
 record and dependent summaries, not earlier versions or sibling details. Deleting a summary lists its preserved source
@@ -199,7 +201,8 @@ The package includes both the server and TUI sides. To customize it, replace its
         "dream_interval_hours": 36,
         "dream_min_additions": 7,
         "dream_index_bytes": 8192,
-        "dream_topic_limit": 200
+        "dream_topic_limit": 200,
+        "dream_target": 30
       }
     }
   ]
@@ -215,6 +218,7 @@ The package includes both the server and TUI sides. To customize it, replace its
 | `dream_min_additions` | `7` | Minimum additions/replacements for periodic automatic dreams |
 | `dream_index_bytes` | `8192` | Dreamable root-index byte threshold; crossing it starts a dream |
 | `dream_topic_limit` | `200` | Dreamable root-count threshold; crossing it starts a dream |
+| `dream_target` | `30` | Automatic dreams stop summarizing once hint roots are at or below this count |
 
 Auto-dream controls both periodic and threshold-triggered runs. Thresholds exclude pinned rules, trigger only on a
 crossing, and respect the failure retry backoff. An already-running dream may finish after Auto-dream is disabled;

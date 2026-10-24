@@ -36,6 +36,7 @@ async function fixture(
     dream_model?: string;
     idle_delay_ms?: number;
     dream_topic_limit?: number;
+    dream_target?: number;
     canonical?: string;
   } = {},
   storage = new Map<string, unknown>(),
@@ -198,14 +199,14 @@ describe("memory scopes", () => {
   test.serial("manual dreaming visits both scopes without combining their sources", async () => {
     const directory = "/tmp/scoped-memory-dream";
     const storage = new Map<string, unknown>();
-    const project = store(storage, directory, [{ file: "one.md", content: "project evidence one" }, { file: "two.md", content: "project evidence two" }]);
+    const files = ["one.md", "two.md", "three.md"];
+    const project = store(storage, directory, files.map((file) => ({ file, content: `project evidence ${file}` })));
     const central = join(dataHome, "opencode", "memory");
     const global = openMemoryStore(central, "global");
-    await global.writeTopic("one.md", "global evidence one");
-    await global.writeTopic("two.md", "global evidence two");
-    await global.writeIndex(["one.md", "two.md"].map((file) => ({ title: file, file, summary: "Global evidence", type: "reference" as const, updated: "2026-10-16" })));
+    for (const file of files) await global.writeTopic(file, `global evidence ${file}`);
+    await global.writeIndex(files.map((file) => ({ title: file, file, summary: "Global evidence", type: "reference" as const, updated: "2026-10-16" })));
     const app = await fixture(directory, (call) => {
-      if (isDreamSelector(call)) return { action: "synthesize", files: ["one.md", "two.md"], reason: "Related evidence" };
+      if (isDreamSelector(call)) return { action: "synthesize", files, reason: "Related evidence" };
       const globalScope = call.prompt.includes("global evidence one");
       expect(call.prompt.includes("project evidence one")).toBe(!globalScope);
       return { title: globalScope ? "Global summary" : "Project summary", hook: "Evidence", content: globalScope ? "global evidence" : "project evidence" };
@@ -220,11 +221,11 @@ describe("memory scopes", () => {
       const projectSummary = project.index().find((entry) => entry.children)!;
       expect(globalSummary.title).toBe("Global summary");
       expect(projectSummary.title).toBe("Project summary");
-      expect(globalSummary.children!.map((child) => child.file)).toEqual(["one.md", "two.md"]);
-      expect(projectSummary.children!.map((child) => child.file)).toEqual(["one.md", "two.md"]);
+      expect(globalSummary.children!.map((child) => child.file)).toEqual(files);
+      expect(projectSummary.children!.map((child) => child.file)).toEqual(files);
       const state = await app.rpc.state!({} as never) as { topics: Array<{ file: string; scope: string; path: string; children: string[]; parent?: string }> };
       const globalTopic = state.topics.find((entry) => entry.file === `global:${globalSummary.file}`)!;
-      expect(globalTopic).toMatchObject({ scope: "global", path: join(memoryScopeRoot(central, "global"), globalSummary.file), children: ["global:one.md", "global:two.md"] });
+      expect(globalTopic).toMatchObject({ scope: "global", path: join(memoryScopeRoot(central, "global"), globalSummary.file), children: files.map((file) => `global:${file}`) });
       expect(state.topics.find((entry) => entry.file === "global:one.md")!.parent).toBe(`global:${globalSummary.file}`);
       expect(state.topics.find((entry) => entry.file === projectSummary.file)!.scope).toBe("project");
     } finally {
@@ -283,7 +284,7 @@ describe("memory scopes", () => {
     await global.writeIndex([{ title: "Style", file: "rule.md", summary: "Style preference", type: "preference", updated: "2026-10-16" }]);
     const app = await fixture(directory, (call) => isReflectionSelector(call)
       ? { needed: true, ids: ["global:rule.md"] }
-      : { create: [{ ...memoryExtraction({ title: "Shared reference", type: "reference" }), scope: "global", source_message_ids: ["msg_1"] }], correct: [{ id: "global:rule.md", content: "Use the new style.", source_message_ids: ["msg_1"] }] }, { idle_delay_ms: 1000 }, storage);
+      : { create: [{ ...memoryExtraction({ title: "Shared reference", type: "reference" }), scope: "global", outlasts_task: true, source_message_ids: ["msg_1"] }], correct: [{ id: "global:rule.md", content: "Use the new style.", source_message_ids: ["msg_1"] }] }, { idle_delay_ms: 1000 }, storage);
     try {
       await app.context("ses_scope_reflect");
       app.history("ses_scope_reflect", [{ id: "msg_1", type: "user", text: "Use the new style everywhere, and save this reference globally." }]);
@@ -434,7 +435,7 @@ describe("memory persistence", () => {
     ]);
     if (mode === "disabled") project.set("settings", { dream_auto: false });
     if (mode === "backoff") project.set("dream", { auto: true, additions: 0, since: Date.now(), failAt: Date.now() });
-    const app = await fixture(directory, (call) => isDreamSelector(call) ? { action: "none" } : noMemories(), { dream_topic_limit: 2 }, storage);
+    const app = await fixture(directory, (call) => isDreamSelector(call) ? { action: "none" } : noMemories(), { dream_topic_limit: 2, dream_target: 0 }, storage);
     try {
       await app.save("ses_writer", memoryExtraction({ title: "Threshold detail", type: "fact" }));
       if (mode === "no-op") {
@@ -595,7 +596,7 @@ describe("memory persistence", () => {
     const app = await fixture(directory, (call) => {
       if (isReflectionSelector(call)) return { needed: !call.prompt.includes("Thanks, now rename the helper."), ids: [] };
       return isReflection(call)
-        ? { create: [{ ...memoryExtraction({ title: "Login investigation", type: "working", content: "The user suspects the shared Redis fixture; this is not confirmed." }), source_message_ids: ["msg_1"] }], correct: [] }
+        ? { create: [{ ...memoryExtraction({ title: "Login investigation", type: "working", content: "The user suspects the shared Redis fixture; this is not confirmed." }), outlasts_task: true, source_message_ids: ["msg_1"] }], correct: [] }
         : noMemories();
     }, { idle_delay_ms: 1000, reflect_model: "test/small#low" }, storage);
     const assistant = (id: string, text: string) => ({
@@ -663,9 +664,9 @@ describe("memory persistence", () => {
     app = await fixture(directory, (call) => {
       if (isReflectionSelector(call)) return { needed: true, ids: [] };
       if (call.prompt.includes('<user id="msg_3"')) {
-        return { create: [{ ...memoryExtraction({ title: "Deployment workflow", content: "The user accepted a staging-first workflow." }), source_message_ids: ["msg_3"] }], correct: [] };
+        return { create: [{ ...memoryExtraction({ title: "Deployment workflow", content: "The user accepted a staging-first workflow." }), outlasts_task: true, source_message_ids: ["msg_3"] }], correct: [] };
       }
-      return { create: [{ ...memoryExtraction({ title: "Deployment approval", type: "instruction", content: "Ask before deploying." }), source_message_ids: ["msg_1"] }], correct: [] };
+      return { create: [{ ...memoryExtraction({ title: "Deployment approval", type: "instruction", content: "Ask before deploying." }), outlasts_task: true, source_message_ids: ["msg_1"] }], correct: [] };
     }, { idle_delay_ms: 1000 }, storage);
     try {
       jest.useFakeTimers();
@@ -705,8 +706,8 @@ describe("memory persistence", () => {
     let app = await fixture(directory, (call) => isReflectionSelector(call)
       ? { needed: true, ids: ["plan.md"] }
       : { create: [
-        { ...memoryExtraction({ title: "Successful sibling", content: "Keep this memory." }), source_message_ids: ["msg_1"] },
-        { ...memoryExtraction({ title: "Pending sibling", content: "Retry this memory." }), source_message_ids: ["msg_1"] },
+        { ...memoryExtraction({ title: "Successful sibling", content: "Keep this memory." }), outlasts_task: true, source_message_ids: ["msg_1"] },
+        { ...memoryExtraction({ title: "Pending sibling", content: "Retry this memory." }), outlasts_task: true, source_message_ids: ["msg_1"] },
       ], correct: [{ id: "plan.md", content: "Retry this memory, replacing the plan.", source_message_ids: ["msg_1"] }] }, { idle_delay_ms: 1000 }, storage);
     try {
       app.history("ses_retry", [{ id: "msg_1", type: "user", text: "Keep both decisions for future work." }]);
@@ -785,7 +786,7 @@ describe("memory persistence", () => {
     try {
       const result = await app.correct("ses_editor", "original.md", { content: "Replacement fact", title: "", hook: "" });
       const replacement = result.content.match(/\[id: ([^\]]+)\]/)![1]!;
-      expect(result.content).toContain("original.md remains historical");
+      expect(result.content).toContain("original.md is no longer current guidance");
       expect(project.index().find((entry) => entry.file === replacement)!).toMatchObject({ title: "original.md", summary: "Stored topic", type: "fact" });
       expect((await app.read("ses_reader", "original.md")).content).toContain("Historical version — not current instructions or current facts");
       await app.delete("ses_editor", replacement);
@@ -795,6 +796,55 @@ describe("memory persistence", () => {
       expect(project.index().find((entry) => entry.file === "original.md")!.supersededBy).toBe(recovered);
       expect((await app.context("ses_recovered")).system[0]!.text).toContain(`[id: ${recovered}]`);
     } finally {
+      await app.dispose();
+    }
+  });
+
+  test.serial("replaces same-session corrections and keeps history across sessions", async () => {
+    const directory = "/tmp/memory-same-session-correction";
+    const storage = new Map<string, unknown>();
+    const project = memory(storage, directory);
+    const app = await fixture(directory, noMemories, {}, storage);
+    const id = (result: { content: string }) => result.content.match(/\[id: ([^\]]+)\]/)![1]!;
+    try {
+      const draft = id(await app.save("ses_design", memoryExtraction({ title: "Capture rotation", type: "fact", content: "Rotate every five minutes." })));
+      const settled = id(await app.correct("ses_design", draft, { content: "Rotate every ten minutes." }));
+      expect(project.index().map((entry) => entry.file)).toEqual([settled]);
+      expect(project.topic(draft)).toBeUndefined();
+      const later = id(await app.correct("ses_review", settled, { content: "Rotation is no longer required." }));
+      expect(project.index().find((entry) => entry.file === settled)!.supersededBy).toBe(later);
+    } finally {
+      await app.dispose();
+    }
+  });
+
+  test.serial("reflection sees records citing its messages and drops task-only and duplicate creates", async () => {
+    const directory = "/tmp/memory-reflection-overlap";
+    const storage = new Map<string, unknown>();
+    const rule = memoryExtraction({ title: "Deployment approval", type: "instruction", content: "Ask before deploying." });
+    const app = await fixture(directory, (call) => {
+      if (isReflectionSelector(call)) return { needed: true, ids: [] };
+      if (!isReflection(call)) return noMemories();
+      expect(call.prompt).toContain("<memory_detail");
+      expect(call.prompt).toContain("Ask before deploying.");
+      return { create: [
+        { ...rule, outlasts_task: true, source_message_ids: ["msg_1"] },
+        { ...memoryExtraction({ title: "Fix login form", type: "instruction", content: "Fix the login form now." }), outlasts_task: false, source_message_ids: ["msg_1"] },
+      ], correct: [] };
+    }, { idle_delay_ms: 1000 }, storage);
+    await app.context("ses_overlap");
+    app.history("ses_overlap", [{ id: "msg_1", type: "user", text: "Always ask before deploying. Also fix the login form." }]);
+    try {
+      await app.save("ses_overlap", { ...rule, source_message_ids: ["msg_1"] });
+      jest.useFakeTimers();
+      await app.emit("session.execution.succeeded", "ses_overlap");
+      jest.advanceTimersByTime(1000);
+      await until(() => (storage.get("session/ses_overlap") as { cursor?: string }).cursor === "msg_1");
+      await settle();
+      expect(memory(storage, directory).index()).toHaveLength(1);
+      expect(app.errors()).toEqual([]);
+    } finally {
+      jest.useRealTimers();
       await app.dispose();
     }
   });
@@ -836,9 +886,10 @@ describe("memory persistence", () => {
     const project = store(storage, directory, [
       { file: "plan.md", title: "Fixture plan", summary: "Fixtures: use shared Redis", type: "working", content: "Status: tentative. Use shared Redis fixtures." },
       { file: "context.md", content: "The user needs isolated test runs." },
+      { file: "runner.md", content: "Tests run in parallel." },
     ]);
     const app = await fixture(directory, (call) => {
-      if (isDreamSelector(call)) return { action: "synthesize", files: ["plan.md", "context.md"], reason: "Fixture context" };
+      if (isDreamSelector(call)) return { action: "synthesize", files: ["plan.md", "context.md", "runner.md"], reason: "Fixture context" };
       if (isDreamCurator(call)) return memoryExtraction({ title: "Fixture context summary" });
       if (isReflectionSelector(call)) return { needed: true, ids: ["missing.md", "plan.md"] };
       if (!isReflection(call)) return noMemories();
@@ -953,12 +1004,13 @@ describe("memory manual dreaming", () => {
       { file: "missing.md", title: "Missing" },
       { file: "a.md", title: "Alpha" },
       { file: "b.md", title: "Beta" },
+      { file: "c.md", title: "Gamma" },
     ]);
     await rm(join(dataHome, "opencode", "memory", memoryProjectKey(directory), "missing.md"));
     const app = await fixture(directory, (call) => {
       if (isDreamSelector(call)) {
         expect(call.prompt).not.toContain("missing.md");
-        return { action: "synthesize", files: ["a.md", "b.md"], reason: "shared pattern" };
+        return { action: "synthesize", files: ["a.md", "b.md", "c.md"], reason: "shared pattern" };
       }
       return memoryExtraction({ title: "Merged", content: "Combined facts" });
     }, {}, storage);
@@ -980,73 +1032,67 @@ describe("memory manual dreaming", () => {
     }
   });
 
-  test.serial("builds recursive summaries while retaining searchable source details", async () => {
+  test.serial("extends summaries flatly from their details while retaining searchable sources", async () => {
     const directory = "/tmp/memory-dream-run-project";
-    const sourceBody = Array.from({ length: 600 }, (_, i) => `Observation ${i}: the shared pattern has this condition and qualification.`).join("\n");
-    const synthesizedBody = Array.from({ length: 80 }, (_, i) => `- Fact ${i}: retain its distinct condition and qualification.`).join("\n");
     const storage = new Map<string, unknown>();
     const project = store(storage, directory, [
       { file: "a.md", title: "Alpha plan", summary: "Alpha summary", content: "ALPHA_BODY_ONE [shared] duplicate fact" },
       { file: "b.md", title: "Alpha variant", summary: "Alpha variant summary", content: "ALPHA_BODY_TWO shared duplicate fact" },
       { file: "c.md", title: "Gamma outcome", summary: "Gamma summary", content: "GAMMA_BODY outdated claim" },
-      { file: "d.md", title: "Delta note", summary: "Delta summary", content: sourceBody, type: "insight" },
+      { file: "d.md", title: "Delta note", summary: "Delta summary", content: "DELTA_BODY stable pattern" },
+      { file: "e.md", title: "Epsilon note", summary: "Epsilon summary", content: "EPSILON_BODY unrelated" },
     ]);
 
-    const findPrefix = (prefix: string) => project.index().find((entry) => entry.file.startsWith(prefix))!.file;
+    let first: string | undefined;
     let selections = 0;
-    let curations = 0;
     const app = await fixture(directory, async (call) => {
       if (isDreamSelector(call)) {
         selections += 1;
-        if (selections === 1) return { action: "synthesize", files: ["a.md", "b.md"], reason: "duplicate alpha recaps" };
-        if (selections === 2) return { action: "synthesize", files: [findPrefix("merged-alpha-"), "c.md"], reason: "corrected gamma outcome" };
-        if (selections === 3) return { action: "synthesize", files: [findPrefix("superseding-gamma-"), "d.md"], reason: "shared stable pattern" };
-        return { action: "none" };
+        if (selections === 1) return { action: "synthesize", files: ["a.md", "b.md", "c.md"], reason: "alpha and gamma" };
+        // A summary written in this run is not offered again.
+        if (selections === 2) {
+          expect(call.prompt).not.toContain("SUMMARY_LAYER");
+          return { action: "none" };
+        }
+        first = project.index().find((entry) => entry.title === "Alpha summary layer")!.file;
+        return { action: "synthesize", files: [first, "d.md"], reason: "shared stable pattern" };
       }
       if (isDreamCurator(call)) {
-        curations += 1;
-        if (curations === 1) return memoryExtraction({ title: "Merged alpha" });
-        if (curations === 2) return memoryExtraction({ title: "Superseding gamma" });
-        expect(call.prompt).toContain(sourceBody);
-        return memoryExtraction({ title: "Cross-topic insight", content: synthesizedBody });
+        if (selections === 1) return memoryExtraction({ title: "Alpha summary layer", hook: "SUMMARY_LAYER", content: "First overview" });
+        // Rebuilt from the details, never from the absorbed summary's prose.
+        for (const body of ["ALPHA_BODY_ONE", "ALPHA_BODY_TWO", "GAMMA_BODY", "DELTA_BODY"]) expect(call.prompt).toContain(body);
+        expect(call.prompt).not.toContain("First overview");
+        return memoryExtraction({ title: "Cross-topic insight", content: "Rebuilt overview" });
       }
       return noMemories();
     }, {}, storage);
 
-    await app.dream("req-big", "ses_dreamer");
+    await app.dream("req-first", "ses_dreamer");
     await finished(app, "changed");
+    await app.dream("req-absorb", "ses_dreamer");
+    await until(() => app.statuses().filter((status) => status.state === "changed").length === 2);
     const status = app.statuses().at(-1)!;
     const manifest = project.get(`dreams/${status.runID}`);
-    const merged = manifest.actions[0].output.file as string;
-    const superseded = manifest.actions[1].output.file as string;
-    const insight = manifest.actions[2].output.file as string;
+    const insight = manifest.actions[0].output.file as string;
     await app.dispose();
+
     const reader = await fixture(directory, noMemories, {}, storage);
-    for (const retained of ["a.md", "b.md", "c.md", "d.md", merged, superseded]) expect(project.topic(retained)).toBeDefined();
+    expect(project.index().some((entry) => entry.file === first)).toBe(false);
+    expect(project.topic(first!)).toBeUndefined();
+    expect(project.index().find((entry) => entry.file === insight)!.children!.map((child) => child.file)).toEqual(["a.md", "b.md", "c.md", "d.md"]);
     const roots = (await reader.context("ses_roots")).system[0]!.text;
     expect(roots).toContain(`[id: ${insight}]`);
-    expect(roots).not.toContain(`[id: ${merged}]`);
     expect(roots).not.toContain("[id: a.md]");
     const summary = (await reader.read("ses_reader", insight)).content;
-    expect(summary).toContain(superseded);
     expect(summary).toContain("Derived summary — not user-stated");
-    expect((await reader.read("ses_reader", superseded)).content).toContain(merged);
-    expect((await reader.read("ses_reader", merged)).content).toContain("a.md");
-    expect((await reader.read("ses_reader", "a.md")).content).toContain("ALPHA_BODY_ONE");
+    expect(summary).toContain("a.md");
     expect((await reader.search("ses_sub", "ALPHA_BODY_ONE [shared]")).content).toContain("a.md");
-    for (const includeHistory of [false, true]) {
-      const matches = (await reader.search("ses_sub", "durable project outcome", 0, false, includeHistory)).content;
-      for (const file of [merged, superseded, insight]) expect(matches).not.toContain(`[id: ${file}]`);
-    }
-
-    expect(project.index()[0]!.type).toBe("insight");
-    expect(project.topic(insight)).toBe(synthesizedBody);
-    expect(status.counts).toEqual({ synthesize: 3 });
+    expect((await reader.search("ses_sub", "durable project outcome", 0, false, true)).content).not.toContain(`[id: ${insight}]`);
     expect(JSON.stringify(manifest)).not.toContain("ALPHA_BODY");
     await reader.dispose();
   });
 
-  test.each(["correction", "body edit", "metadata edit", "delete", "unfold"] as const)("invalidates summary ancestors after %s without losing sibling details", async (change) => {
+  test.each(["correction", "body edit", "metadata edit", "delete", "unfold"] as const)("invalidates a summary after %s without losing sibling details", async (change) => {
     const directory = `/tmp/memory-hierarchy-invalidation-${change}`;
     const storage = new Map<string, unknown>();
     const project = store(storage, directory, [
@@ -1055,25 +1101,19 @@ describe("memory manual dreaming", () => {
       { file: "c.md", title: "Gamma", content: "Gamma detail" },
       { file: "rule.md", title: "Rule", content: "Keep instructions precise", type: "instruction" },
     ]);
-    let selections = 0;
     const app = await fixture(directory, (call) => {
       if (isDreamSelector(call)) {
         expect(call.prompt).not.toContain("[id: rule.md]");
-        if (++selections === 1) return { action: "synthesize", files: ["a.md", "b.md"], reason: "related details" };
-        const first = project.index().find((entry) => entry.children?.some((child) => child.file === "a.md"))!;
-        return selections === 2
-          ? { action: "synthesize", files: [first.file, "c.md"], reason: "broader pattern" }
-          : { action: "none" };
+        return { action: "synthesize", files: ["a.md", "b.md", "c.md"], reason: "related details" };
       }
-      if (isDreamCurator(call)) return memoryExtraction({ title: `Layer ${selections}`, content: `Summary layer ${selections}` });
+      if (isDreamCurator(call)) return memoryExtraction({ title: "Layer", content: "Summary layer" });
       return noMemories();
     }, {}, storage);
 
     try {
       await app.dream("req-invalidation");
       await finished(app, "changed");
-      const first = project.index().find((entry) => entry.title === "Layer 1")!;
-      const second = project.index().find((entry) => entry.title === "Layer 2")!;
+      const first = project.index().find((entry) => entry.title === "Layer")!;
       await expect(app.correct("ses_editor", first.file, { content: "Wrong summary correction" })).rejects.toThrow("derived summary");
       let replacement: string | undefined;
       if (change === "correction") {
@@ -1091,14 +1131,13 @@ describe("memory manual dreaming", () => {
       else {
         const removed = (await app.delete("ses_editor", change === "delete" ? "a.md" : first.file)).content;
         if (change === "unfold") {
-          expect(removed).toContain("sources were not deleted: a.md, b.md");
+          expect(removed).toContain("sources were not deleted: a.md, b.md, c.md");
           expect(removed).toContain("No replacement summary was generated");
         }
       }
 
       const roots = (await app.context("ses_roots")).system[0]!.text;
       expect(roots).not.toContain(`[id: ${first.file}]`);
-      expect(roots).not.toContain(`[id: ${second.file}]`);
       expect(roots).toContain("[id: b.md]");
       expect(roots).toContain("[id: c.md]");
       expect(roots).toContain("[id: rule.md]");
@@ -1107,14 +1146,13 @@ describe("memory manual dreaming", () => {
       if (change === "delete") {
         expect(project.topic("a.md")).toBeUndefined();
         expect(project.topic(first.file)).toBeUndefined();
-        expect(project.topic(second.file)).toBeUndefined();
         expect((await app.search("ses_reader", "Original alpha detail")).content).not.toContain("a.md");
       } else if (change !== "correction") expect(roots).toContain("[id: a.md]");
       if (change === "body edit") {
         project.setTopic("a.md", "Original alpha detail");
         const reverted = (await app.context("ses_reverted")).system[0]!.text;
         expect(reverted).not.toContain(`[id: ${first.file}]`);
-        expect(project.index().find((entry) => entry.file === second.file)!.retired).toBe(true);
+        expect(project.index().find((entry) => entry.file === first.file)!.retired).toBe(true);
       }
     } finally {
       await app.dispose();
@@ -1127,13 +1165,14 @@ describe("memory manual dreaming", () => {
     const project = store(storage, directory, [
       { file: "x.md", title: "X topic", summary: "X summary", content: "X_SHARED_BODY" },
       { file: "y.md", title: "Y topic", summary: "Y summary", content: "Y_SHARED_BODY" },
+      { file: "z.md", title: "Z topic", summary: "Z summary" },
     ]);
     project.set("dream", { auto: true, additions: 3, since: Date.now() });
 
     const started = Promise.withResolvers<void>();
     const gate = Promise.withResolvers<unknown>();
     const app = await fixture(directory, (call) => {
-      if (isDreamSelector(call)) return { action: "synthesize", files: ["x.md", "y.md"], reason: "duplicate topics" };
+      if (isDreamSelector(call)) return { action: "synthesize", files: ["x.md", "y.md", "z.md"], reason: "duplicate topics" };
       if (isDreamCurator(call)) {
         started.resolve();
         return gate.promise;
@@ -1168,13 +1207,14 @@ describe("memory manual dreaming", () => {
     const project = store(storage, directory, [
       { file: "x.md", title: "X topic", summary: "X summary", content: "X_KEEP_BODY" },
       { file: "y.md", title: "Y topic", summary: "Y summary", content: "Y_KEEP_BODY" },
+      { file: "z.md", title: "Z topic", summary: "Z summary" },
     ]);
     project.set("dream", { auto: true, additions: 4, since: Date.now() });
 
     const curatorGate = Promise.withResolvers<Extraction>();
     const curatorStarted = Promise.withResolvers<void>();
     const app = await fixture(directory, (call) => {
-      if (isDreamSelector(call)) return { action: "synthesize", files: ["x.md", "y.md"], reason: "duplicate topics" };
+      if (isDreamSelector(call)) return { action: "synthesize", files: ["x.md", "y.md", "z.md"], reason: "duplicate topics" };
       if (isDreamCurator(call)) {
         curatorStarted.resolve();
         return curatorGate.promise;

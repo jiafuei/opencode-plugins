@@ -61,7 +61,10 @@ Global IDs use `global:<file>` and other-project IDs use `project:<key>:<file>`.
 compatibility. Stored filenames and source links remain local; qualification happens at the tool and RPC boundaries.
 Creation and correction are separate operations; omitting an optional target can no longer accidentally create a
 competing current record. Corrections inherit omitted or empty title/hook metadata and create a new record, retaining the previous body
-as superseded history. Their responses explicitly name the new current ID. There is no mandatory read tracking or
+as superseded history. When every source of the corrected record came from the correcting session, the record is replaced
+instead: an evolving discussion leaves one record, not a chain of drafts. Earlier versions from other sessions are relinked
+to the replacement. Dashboard edits always keep history. Their responses explicitly name the new current ID. Creating a
+preference or instruction with the same title, type, and cited user messages as a current record is refused as a duplicate. There is no mandatory read tracking or
 confirmation gate; reading full details is recommended when needed to preserve qualifications. The authoring contract permits user-stated or explicitly confirmed preferences, instructions, facts, working
 details, recaps, and references. Tentative ideas retain their uncertainty. Assistant output and tool results alone do
 not establish memories. One capture threshold is shared by `memory_save` and reflection: keep explicit remember
@@ -81,15 +84,18 @@ When a primary session goes idle for `idle_delay_ms` after an execution finishes
 since the last reflection (user and assistant text only) together with the index and the topics already saved in the
 session. The selector sees global and current-project roots plus a separate index of details beneath summaries, with no
 duplicate entries between the indexes. Both indexes have scope labels. The extractor receives selected detail bodies,
-the saved-topic list, and the transcript, without repeating the lookup indexes. Superseded history stays out of reflection, even if its replacement was deleted; recovering it
+the saved-topic list, and the transcript, without repeating the lookup indexes. Details that already cite a user message in
+the batch are always supplied, so a subject the agent saved during the turn is visible before the extractor creates another.
+Each create states whether it outlasts the current task; task-only creates are dropped in code, and duplicate rules are
+dropped silently. Superseded history stays out of reflection, even if its replacement was deleted; recovering it
 requires an explicit foreground `memory_correct` call. Reflection is asked to read up to eight details in one lookup round and
 propose up to three changes. A selection-only schema returns whether extraction is needed and IDs to inspect; a no-op
 review ends there. A separate extraction schema returns `create` and `correct` arrays, with no lookup field or
 optional-target switch. Explicit user corrections refer to supplied details by ID and complete content, inheriting
 metadata and retaining history. Optional title/hook updates keep an old index claim from contradicting the corrected
 body; classification remains inherited. The commit rechecks the inspected revision so concurrent changes cannot be overwritten.
-Summaries may not be corrected. Unknown selection IDs and unsupplied correction IDs are reported as unresolved while
-valid siblings continue. Valid replies are not rejected solely for exceeding suggested counts.
+Summaries may not be corrected. Unknown selection IDs are skipped silently; unsupplied correction IDs are reported as
+unresolved while valid siblings continue. Valid replies are not rejected solely for exceeding suggested counts.
 Reflection chooses global scope for clearly general user preferences, or for any memory the user explicitly asks to make
 global; project-specific and uncertain scope stays project-local. Existing records are not bulk-classified or promoted. Working details and facts are not forced into instruction types. Most reviews save nothing. Worker failures are
 logged and surfaced in the TUI; a successful review advances the cursor, with individual failed commits reported too.
@@ -124,23 +130,26 @@ while already over budget. Dreams also run from
 creates/replacements since the last successful run).
 
 A run consolidates eligible hint roots in at most four actions. Candidates are partitioned by scope: no summary mixes
-global and project sources or different projects. Each synthesis adds an `insight` above 2–8 related
-roots and retains every source. A summary can become a child of another summary, creating progressively coarser
-layers. The selector favors keeping recent working details fine-grained; elapsed time and accumulation trigger
-maintenance, not deletion. Preferences and instructions remain roots and are excluded from dreaming.
+global and project sources or different projects. Automatic runs stop once hint roots are at or below `dream_target`
+(default 30); a manual `/dream` may go below it. Preferences and instructions remain roots and are excluded from dreaming.
+
+Summaries form one flat layer above details. The selector picks 2–8 related roots. A selected summary is absorbed: the
+new summary is rebuilt from all details beneath it plus the other selected records, and the absorbed summary (with any
+older summaries beneath it) is deleted, since summaries are derived and regenerable. A group must cover 3–12 details. A
+summary written during a run is not offered again in the same run, so one run cannot stack layers on its own output.
+The curator always reads detail bodies, never earlier summary prose, so a summary's distortions are not carried
+upward. The selector favors keeping recent working details fine-grained; elapsed time and accumulation trigger
+maintenance, not deletion. Summaries stacked by older versions remain valid until they are absorbed or retired.
 
 Summaries are navigation overviews, not replacements for their sources. The synthesis prompt asks for shared themes
 and major decisions in 150 words or fewer, usually 3-5 short bullets; no validator enforces or truncates the length.
 Exact conditions, implementation details, and history stay in the linked sources unless omitting them would make the
-overview misleading. A summary over other summaries names their shared themes instead of merging their bullets, so
-each level is coarser than the one below. Summaries do not recap each source's contribution or repeat source IDs,
+overview misleading. Summaries do not recap each source's contribution or repeat source IDs,
 because `memory_read` lists immediate sources. Summaries keep brief provenance distinctions: user-stated or confirmed,
-tentative or abandoned, and derived. They note contradictions instead of resolving them by recency. This guidance
-affects future synthesis only; dreaming does not rewrite existing summaries.
+and tentative or abandoned. They note contradictions between records instead of resolving them by recency.
 
-Grouping is topical rather than OptMem's chronological binary grouping. The LSM-like property is progressive
-consolidation, not sorted-key storage. Context thresholds trigger consolidation; they are not hard context caps when
-no justified grouping exists. Automatic pruning and quarantine purging are no longer performed.
+Grouping is topical rather than OptMem's chronological binary grouping. Context thresholds trigger consolidation; they
+are not hard context caps when no justified grouping exists. Automatic pruning and quarantine purging are no longer performed.
 
 Every run writes a decision-only manifest under `dreams/`. One server process runs at most one dream at a time. Dream
 commits recheck enabled state, source eligibility, metadata, and contents, and abort the run when a source changed.

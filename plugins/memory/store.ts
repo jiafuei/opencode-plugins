@@ -23,6 +23,7 @@ export type TopicStatus = "active" | "consolidated" | "superseded" | "retired" |
 export type MemoryInput = { target?: string; title?: string; summary?: string; content: string; type?: StoredType; evidence?: MemoryEvidence[]; origin?: IndexEntry["origin"] };
 
 export class MemoryConflictError extends Error {}
+export class MemoryDuplicateError extends Error {}
 
 // Metadata stays in index comments so topic bodies remain ordinary markdown.
 export function parseIndex(text: string): IndexEntry[] {
@@ -157,7 +158,9 @@ export function createMemoryStore(root: string, enabled: () => Promise<boolean>)
   };
 
   // Called within serializeWrite, also used by reflection's revision-checked corrections.
-  const save = async (catalog: IndexEntry[], input: MemoryInput, expectedRevision?: string) => {
+  // A correction from the session that produced every source of its target
+  // replaces the target instead of keeping it as history.
+  const save = async (catalog: IndexEntry[], input: MemoryInput, expectedRevision?: string, sessionID?: string) => {
     const previous = input.target === undefined ? undefined : catalog.find((entry) => entry.file === input.target);
     if (input.target !== undefined) {
       if (!previous) throw new MemoryConflictError(`Memory index does not contain ${input.target}`);
@@ -169,6 +172,15 @@ export function createMemoryStore(root: string, enabled: () => Promise<boolean>)
     if (!title) throw new Error("Provide a non-empty title for a new memory.");
     const summary = input.summary?.trim() || previous?.summary || "";
     const type = expectedRevision || previous?.type === "insight" ? previous!.type : input.type ?? previous!.type;
+    if (!previous && (type === "preference" || type === "instruction")) {
+      const sources = new Set(input.evidence?.map((source) => source.messageID));
+      const duplicate = catalog.find((entry) => !entry.supersededBy && !entry.retired && entry.type === type
+        && entry.title.toLowerCase() === title.toLowerCase()
+        && entry.evidence?.length === sources.size && entry.evidence.every((source) => sources.has(source.messageID)));
+      if (duplicate) throw new MemoryDuplicateError(`${duplicate.file} already records this ${type} from the same user messages; use memory_correct with that id to change it.`);
+    }
+    const replace = previous !== undefined && sessionID !== undefined && previous.evidence !== undefined && previous.evidence.length > 0
+      && previous.evidence.every((source) => source.sessionID === sessionID);
     const file = topicFile(title);
     await writeTopic(file, input.content);
     const evidence = [...new Map([...(previous?.evidence ?? []), ...(input.evidence ?? [])].map((source) => [`${source.sessionID}/${source.messageID}`, source])).values()];
@@ -177,13 +189,17 @@ export function createMemoryStore(root: string, enabled: () => Promise<boolean>)
       ...(evidence.length > 0 ? { evidence } : {}),
       ...(input.origin ? { origin: input.origin } : {}),
     };
-    const index = [entry, ...catalog.map((current) => current === previous ? { ...current, supersededBy: file } : current)];
+    const index = [entry, ...catalog.flatMap((current) => {
+      if (current !== previous) return [replace && current.supersededBy === previous!.file ? { ...current, supersededBy: file } : current];
+      return replace ? [] : [{ ...current, supersededBy: file }];
+    })];
     try {
       await writeIndex(index);
     } catch (error) {
       await rm(join(root, file), { force: true });
       throw error;
     }
+    if (replace) await rm(join(root, previous!.file), { force: true });
     return { entry, index };
   };
   const remove = async (catalog: IndexEntry[], file: string) => {
