@@ -1,0 +1,38 @@
+{
+  "name": "@jiafuei/opencode-webfetch",
+  "version": "0.0.1",
+  "description": "Local Markdown-first web fetching with content pruning and HTTP caching",
+  "type": "module",
+  "exports": {
+    "./server": "./server.ts"
+  },
+  "files": [
+    "server.ts",
+    "fetch.ts",
+    "markdown.ts",
+    "types.d.ts",
+    "README.md"
+  ],
+  "keywords": ["opencode", "opencode-plugin", "webfetch", "markdown"],
+  "engines": {
+    "opencode": ">=2.0.32"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "@mixmark-io/domino": "^2.2.0",
+    "@mozilla/readability": "^0.6.0",
+    "turndown": "^7.2.1",
+    "turndown-plugin-gfm": "^1.0.2"
+  },
+  "peerDependencies": {
+    "@opencode/plugin": ">=2.0.32",
+    "effect": "^4.0.1"
+  },
+  "devDependencies": {
+    "@opencode/plugin": "2.1.0",
+    "@types/turndown": "^5.0.6",
+    "effect": "4.0.1"
+  }
+}

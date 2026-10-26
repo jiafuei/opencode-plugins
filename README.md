@@ -12,6 +12,7 @@ Standalone plugins for [OpenCode](https://opencode.ai), maintained as independen
 - [Computer use](plugins/computer-use/README.md): screenshot-driven desktop control on Windows (OpenCode in WSL2) and macOS. Not published; load it from a local checkout.
 - [Memory](plugins/memory/README.md): project-scoped automatic memory with a `/memory` browser.
 - [Web search](plugins/websearch/README.md): web search for the built-in `websearch` tool through OpenAI, Google, or Anthropic hosted search.
+- [Webfetch](plugins/webfetch/README.md): local Markdown-first page reading with HTML pruning, documentation index discovery, and HTTP caching.
 - [Redact keys](plugins/redact-keys/README.md): redact secrets from protected files before they reach the model.
 - [OpenRouter](plugins/openrouter/README.md): routing and privacy settings with global, folder, and session overrides and a local web UI.
 - [PTY](plugins/pty/README.md): session-private interactive terminals for REPLs, installers, debuggers, and terminal applications. Not published; load it from a local checkout.
