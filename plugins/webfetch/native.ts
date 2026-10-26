@@ -82,11 +82,11 @@ async function load() {
     strerror: lib.func("const char *curl_easy_strerror(int)"),
     slistAppend: lib.func("void *curl_slist_append(void *, const char *)"),
     slistFree: lib.func("void curl_slist_free_all(void *)"),
-    Write: koffi.pointer(koffi.proto("size_t webfetch_curl_write(void *, size_t, size_t, void *)")),
-    Progress: koffi.pointer(koffi.proto("int webfetch_curl_progress(void *, int64, int64, int64, int64)")),
+    Write: koffi.pointer(koffi.proto("size_t", ["void *", "size_t", "size_t", "void *"])),
+    Progress: koffi.pointer(koffi.proto("int", ["void *", "int64", "int64", "int64", "int64"])),
     LongOut: koffi.out(koffi.pointer("long")),
     StringOut: koffi.out(koffi.pointer("str")),
-    Blob: koffi.pointer(koffi.struct("webfetch_curl_blob", { data: "void *", len: "size_t", flags: "uint" })),
+    Blob: koffi.pointer(koffi.struct({ data: "void *", len: "size_t", flags: "uint" })),
     // Bun's own fetch trusts this bundle too; curl copies it (CURL_BLOB_COPY).
     ca: Buffer.from(rootCertificates.join("\n")),
   };

@@ -4,7 +4,7 @@ import type { NativeProfile } from "./profiles.ts";
 
 type Storage = Pick<Plugin.Context["storage"], "get" | "set" | "remove">;
 type Discovery = { url: string | null; expiresAt: number };
-type Page = { url: string; content: string; expiresAt: number; headers: Record<string, string> };
+type Page = { url: string; type: string; body: string; expiresAt: number; headers: Record<string, string> };
 
 const MONTH = 30 * 24 * 60 * 60 * 1000;
 const CACHE_HEADERS = ["cache-control", "expires", "etag", "last-modified"];
@@ -16,18 +16,16 @@ function isHTML(type: string, text: string): boolean {
 }
 
 export class WebFetcher {
-  constructor(private readonly storage: Storage, private readonly profile?: NativeProfile, private readonly cookies?: string) {}
+  constructor(private readonly storage: Storage, private readonly profile: NativeProfile = "chrome152", private readonly cookies?: string) {}
 
-  async read(url: URL, fresh: boolean, signal: AbortSignal): Promise<string> {
-    if (this.cookies) {
-      const page = await this.page(url, false, fresh, signal);
-      return `Source: ${page.url}\n\n${page.content}`;
-    }
+  async read(url: URL, format: "markdown" | "raw", fresh: boolean, signal: AbortSignal): Promise<string> {
     const [page, index] = await Promise.all([
-      this.content(url, fresh, signal),
-      this.index(url, fresh, signal),
+      this.cookies || format === "raw" ? this.page(url, false, fresh, signal) : this.content(url, fresh, signal),
+      this.cookies ? undefined : this.index(url, fresh, signal),
     ]);
-    return `${index ? `Site documentation index: ${index}\n` : ""}Source: ${page.url}\n\n${page.content}`;
+    const body = format === "raw" ? page.body : isHTML(page.type, page.body) ? toMarkdown(page.body, page.url) : page.body.trim();
+    const type = format === "raw" && page.type ? `\nContent-Type: ${page.type}` : "";
+    return `${index ? `Site documentation index: ${index}\n` : ""}Source: ${page.url}${type}\n\n${body}`;
   }
 
   private async content(url: URL, fresh: boolean, signal: AbortSignal): Promise<Page> {
@@ -44,12 +42,12 @@ export class WebFetcher {
   private page(url: URL, candidate: false, fresh: boolean, signal: AbortSignal): Promise<Page>;
   private page(url: URL, candidate: true, fresh: boolean, signal: AbortSignal): Promise<Page | undefined>;
   private async page(url: URL, candidate: boolean, fresh: boolean, signal: AbortSignal): Promise<Page | undefined> {
-    const discoveryKey = `discovery/${this.profile ?? "default"}/${url.href}`;
+    const discoveryKey = `discovery/${this.profile}/${url.href}`;
     if (candidate && !fresh) {
       const known = await this.storage.get(discoveryKey) as Discovery | undefined;
       if (known && known.expiresAt > Date.now() && known.url === null) return;
     }
-    const key = `content/v1/${this.profile ?? "default"}/${url.href}`;
+    const key = `content/v2/${this.profile}/${url.href}`;
     const cached = fresh || this.cookies ? undefined : await this.storage.get(key) as Page | undefined;
     if (cached && cached.expiresAt > Date.now()) return cached;
 
@@ -87,7 +85,7 @@ export class WebFetcher {
         && !(type.startsWith("application/octet-stream") && /\.(?:md|txt)$/.test(final.pathname))) {
         throw new Error(`Unsupported content type: ${type}. This tool reads text pages.`);
       }
-      page = { url: final.href, content: html ? toMarkdown(text, final.href) : text.trim(), expiresAt: 0, headers: {} };
+      page = { url: final.href, type, body: text, expiresAt: 0, headers: {} };
     }
     if (this.cookies) return page;
 
@@ -112,7 +110,7 @@ export class WebFetcher {
     let directory = new URL(".", url);
     while (true) {
       const target = new URL("llms.txt", directory);
-      const key = `discovery/${this.profile ?? "default"}/${target.href}`;
+      const key = `discovery/${this.profile}/${target.href}`;
       const known = fresh ? undefined : await this.storage.get(key) as Discovery | undefined;
       if (known && known.expiresAt > Date.now()) {
         if (known.url) return known.url;
@@ -150,7 +148,6 @@ export class WebFetcher {
   }
 
   private async request(url: URL, headers: Headers, signal: AbortSignal): Promise<Response> {
-    if (!this.profile && !this.cookies) return fetch(url, { headers, signal });
     const native = await import("./native.ts");
     return native.request(url, headers, signal, this.profile, this.cookies);
   }

@@ -26,13 +26,14 @@ export default Plugin.define({
       const profiles = [...NATIVE_PROFILES, ...(exaEnabled ? ["exa" as const] : [])];
       const Input = Schema.Struct({
         url: Schema.String.annotate({ description: "HTTP or HTTPS URL to read." }),
+        format: Schema.optional(Schema.Literals(["markdown", "raw"])).annotate({ description: "Defaults to markdown. raw returns the original response body without conversion or .md lookup. Ignored by exa." }),
         fresh: Schema.optional(Schema.Boolean).annotate({ description: "Ignore cached results and fetch the page again." }),
-        profile: Schema.optional(Schema.Literals(profiles)).annotate({ description: "Omit for standard local HTTP. Browser profiles impersonate a browser locally; exa sends the URL to the Exa service. Call webfetch_profile to list profiles." }),
+        profile: Schema.optional(Schema.Literals(profiles)).annotate({ description: "Defaults to chrome152. Browser profiles impersonate a browser locally; exa sends the URL to the Exa service. Call webfetch_profile to list profiles." }),
         cookies: Schema.optional(Schema.String).annotate({ description: "Path to a cookies.txt file for this fetch. Ignored by exa." }),
       });
       tools.add({
         name: "webfetch_profile",
-        description: "List the profiles available to webfetch. Omit profile from a fetch to use standard local HTTP.",
+        description: "List the profiles available to webfetch. The default is chrome152.",
         input: Schema.toStandardJSONSchemaV1(Schema.toStandardSchemaV1(Schema.Struct({}))),
         options: { codemode: false },
         async execute() {
@@ -41,7 +42,7 @@ export default Plugin.define({
       });
       tools.add({
         name: ctx.options.replace === true ? "webfetch" : "webfetch_enhanced",
-        description: "Read a webpage as Markdown. Fetches locally by default. Does not run JavaScript.",
+        description: "Read a webpage as Markdown or its original response body. Fetches locally by default. Does not run JavaScript.",
         input: Schema.toStandardJSONSchemaV1(Schema.toStandardSchemaV1(Input)),
         options: { codemode: false, permission: "webfetch" },
         async execute(input, context) {
@@ -79,7 +80,7 @@ export default Plugin.define({
             await access(cookieFile, constants.R_OK);
           }
           const fetcher = new WebFetcher(ctx.storage, input.profile, cookieFile);
-          return { content: await fetcher.read(url, input.fresh ?? false, signal) };
+          return { content: await fetcher.read(url, input.format ?? "markdown", input.fresh ?? false, signal) };
         },
       });
     });

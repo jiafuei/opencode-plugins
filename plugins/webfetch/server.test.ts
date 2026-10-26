@@ -96,8 +96,10 @@ async function plugin({ replace = false, storage = new Map<string, Schema.Json>(
       return JSON.stringify(input["~standard"].jsonSchema.input({ target: "draft-07" }));
     },
     async profiles() { return (await tools.get("webfetch_profile")!.execute({}, {} as ToolContext)).content as string; },
-    async read(url: string, fresh = false, profile?: string, cookies?: string, signal = new AbortController().signal) {
-      const result = await tools.get(name)!.execute({ url, fresh, profile, cookies }, { signal } as ToolContext);
+    async read(url: string, { fresh = false, profile, cookies, format, signal = new AbortController().signal }: {
+      fresh?: boolean; profile?: string; cookies?: string; format?: "markdown" | "raw"; signal?: AbortSignal;
+    } = {}) {
+      const result = await tools.get(name)!.execute({ url, fresh, profile, cookies, format }, { signal } as ToolContext);
       expect(typeof result.content).toBe("string");
       return result.content as string;
     },
@@ -128,7 +130,7 @@ test("prefers Markdown candidates, reports the nearest index, and reuses persist
   content = "# Fresh Markdown";
   expect(await reloaded.read(web.url("/docs/guide#section"))).toContain("# Original Markdown");
   expect(web.count("/docs/guide.md")).toBe(1);
-  expect(await reloaded.read(web.url("/docs/guide"), true)).toContain("# Fresh Markdown");
+  expect(await reloaded.read(web.url("/docs/guide"), { fresh: true })).toContain("# Fresh Markdown");
   expect(web.count("/docs/guide.md")).toBe(2);
   expect(web.count("/docs/llms.txt")).toBe(2);
   expect(first.permissions[0]).toMatchObject({ action: "webfetch", resources: [web.url("/docs/guide")] });
@@ -157,8 +159,35 @@ test("rejects HTML probe fallbacks and prunes short HTML docs without losing cod
   expect(output).toContain("| timeout | 30 |");
   expect(output).not.toMatch(/CLUTTER|SPA shell|ROOT INDEX CONTENT/);
   await app.read(web.url("/docs/install"));
+  const raw = await app.read(web.url("/docs/install"), { format: "raw" });
+  expect(raw).toContain("Content-Type: text/html; charset=utf-8");
+  expect(raw).toEndWith(html);
+  expect(web.count("/docs/install")).toBe(1);
   expect(web.count("/docs/install.md")).toBe(1);
   expect(web.count("/docs/llms.txt")).toBe(1);
+});
+
+test("raw reads the requested resource without Markdown probing and preserves non-HTML whitespace", async () => {
+  const html = "<!doctype html><main><h1>Original HTML</h1></main>\n";
+  const json = '  { "answer": 42 }\n';
+  const web = site((_request, path) => {
+    if (path === "/guide") return new Response(html, { headers: { "Content-Type": "text/html" } });
+    if (path === "/guide.md") return new Response("# Preferred Markdown");
+    if (path === "/data.json") return new Response(json, { headers: { "Content-Type": "application/json" } });
+    return new Response("Missing", { status: 404 });
+  });
+  const app = await plugin();
+  expect(await app.read(web.url("/guide"), { format: "raw" })).toEndWith(html);
+  expect(web.count("/guide.md")).toBe(0);
+  expect(await app.read(web.url("/guide"))).toEndWith("# Preferred Markdown");
+  expect(await app.read(web.url("/guide"), { format: "raw" })).toEndWith(html);
+  expect(web.count("/guide")).toBe(1);
+  expect(web.count("/guide.md")).toBe(1);
+  const raw = await app.read(web.url("/data.json"), { format: "raw" });
+  expect(raw).toContain("Content-Type: application/json\n\n");
+  expect(raw).toEndWith(json);
+  expect(await app.read(web.url("/data.json"))).toEndWith(json.trim());
+  expect(web.count("/data.json")).toBe(1);
 });
 
 test("uses HTTP freshness and the 15-minute fallback, but never caches no-store responses", async () => {
@@ -240,25 +269,25 @@ test("accepts canonical probe redirects and remembers denied public probes as mi
   }
 });
 
-test("revalidates cached content with validators, merges 304 freshness, and makes fresh unconditional", async () => {
+test("revalidates raw source across output formats, merges 304 freshness, and makes fresh unconditional", async () => {
   const seen: Headers[] = [];
   const web = site((request, path) => {
     if (path === "/llms.txt") return new Response("Missing", { status: 404 });
     seen.push(request.headers);
     if (request.headers.has("if-none-match")) return new Response(null, { status: 304, headers: { "Cache-Control": "max-age=3600" } });
-    return new Response(`# Version ${seen.length}`, {
-      headers: { ETag: '"v1"', "Last-Modified": "Mon, 26 Oct 2026 00:00:00 GMT", "Cache-Control": "max-age=0" },
+    return new Response(`<main><h1>Version ${seen.length}</h1></main>`, {
+      headers: { "Content-Type": "text/html", ETag: '"v1"', "Last-Modified": "Mon, 26 Oct 2026 00:00:00 GMT", "Cache-Control": "max-age=0" },
     });
   });
   const app = await plugin();
   const url = web.url("/page.txt");
-  expect(await app.read(url)).toEndWith("# Version 1");
+  expect(await app.read(url, { format: "raw" })).toEndWith("<main><h1>Version 1</h1></main>");
   expect(await app.read(url)).toEndWith("# Version 1");
   expect(seen[1]!.get("if-none-match")).toBe('"v1"');
   expect(seen[1]!.get("if-modified-since")).toBe("Mon, 26 Oct 2026 00:00:00 GMT");
   expect(await app.read(url)).toEndWith("# Version 1");
   expect(seen).toHaveLength(2);
-  expect(await app.read(url, true)).toEndWith("# Version 3");
+  expect(await app.read(url, { fresh: true })).toEndWith("# Version 3");
   expect(seen[2]!.has("if-none-match")).toBe(false);
   expect(seen[2]!.has("if-modified-since")).toBe(false);
   expect(seen[2]!.get("cache-control")).toBe("no-cache");
@@ -295,10 +324,10 @@ test("caches discovery misses for a month, bypasses them on fresh, and retries t
   expect(web.count("/guide.md")).toBe(2);
 
   published = false;
-  await app.read(web.url("/guide"), true);
+  await app.read(web.url("/guide"), { fresh: true });
   published = true;
   expect(await app.read(web.url("/guide"))).toContain("# HTML fallback");
-  expect(await app.read(web.url("/guide"), true)).toContain("# Published Markdown");
+  expect(await app.read(web.url("/guide"), { fresh: true })).toContain("# Published Markdown");
 });
 
 test("replacement registers only webfetch and permission denials prevent network access", async () => {
@@ -330,10 +359,10 @@ test("Exa availability updates the profile enum and retrieval has a separate cac
     expect((await app.profiles()).split("\n")).toContain("exa");
     expect(await app.read(web.url("/guide"))).toContain("# Local content");
     const requests = web.requests.length;
-    expect(await app.read(web.url("/guide"), false, "exa", `/tmp/opencode/missing-exa-cookies-${crypto.randomUUID()}.txt`)).toContain("Backend: Exa\n\n# Exa version 1");
+    expect(await app.read(web.url("/guide"), { profile: "exa", format: "raw", cookies: `/tmp/opencode/missing-exa-cookies-${crypto.randomUUID()}.txt` })).toContain("Backend: Exa\n\n# Exa version 1");
     expect(app.permissions).not.toContainEqual(expect.objectContaining({ action: "read" }));
-    expect(await app.read(web.url("/guide"), false, "exa")).toContain("# Exa version 1");
-    expect(await app.read(web.url("/guide"), true, "exa")).toContain("# Exa version 2");
+    expect(await app.read(web.url("/guide"), { profile: "exa" })).toContain("# Exa version 1");
+    expect(await app.read(web.url("/guide"), { fresh: true, profile: "exa" })).toContain("# Exa version 2");
     expect(calls).toHaveLength(2);
     expect(web.requests).toHaveLength(requests);
     expect(calls[0]!.headers.get("x-api-key")).toBe("exa-test-key");
@@ -342,7 +371,7 @@ test("Exa availability updates the profile enum and retrieval has a separate cac
     await app.emit("credential.switched");
     expect(app.schema()).not.toContain('"exa"');
     expect((await app.profiles()).split("\n")).not.toContain("exa");
-    await expect(app.read(web.url("/guide"), false, "exa")).rejects.toThrow("Connect the Exa integration");
+    await expect(app.read(web.url("/guide"), { profile: "exa" })).rejects.toThrow("Connect the Exa integration");
     expect(calls).toHaveLength(2);
   } finally {
     remote.mockRestore();
@@ -356,16 +385,16 @@ test("per-fetch cookie files bypass public caches and discovery and stay read-on
   await Bun.write(file, exported);
   const web = site((request, path) => {
     if (path.endsWith(".md") || path.endsWith("llms.txt")) return new Response("Missing", { status: 404 });
-    return new Response(request.headers.get("cookie") === "session=private-test-value" ? "# Private account" : "# Public account", {
-      headers: { "Cache-Control": "max-age=3600" },
+    return new Response(request.headers.get("cookie") === "session=private-test-value" ? "<main><h1>Private account</h1></main>" : "<main><h1>Public account</h1></main>", {
+      headers: { "Content-Type": "text/html", "Cache-Control": "max-age=3600" },
     });
   });
   const anonymous = await plugin();
   expect(await anonymous.read(web.url("/account"))).toContain("# Public account");
   const app = await plugin({ storage: anonymous.storage });
   expect(app.schema()).toContain('"cookies"');
-  expect(await app.read(web.url("/account"), false, undefined, relative(process.cwd(), file))).toContain("# Private account");
-  expect(await app.read(web.url("/account"), false, undefined, file)).toContain("# Private account");
+  expect(await app.read(web.url("/account"), { cookies: relative(process.cwd(), file) })).toContain("# Private account");
+  expect(await app.read(web.url("/account"), { cookies: file, format: "raw" })).toEndWith("<main><h1>Private account</h1></main>");
   expect(app.permissions).toContainEqual(expect.objectContaining({ action: "read", resources: [file] }));
   expect(web.count("/account")).toBe(3);
   expect(web.count("/account.md")).toBe(1);
@@ -374,11 +403,11 @@ test("per-fetch cookie files bypass public caches and discovery and stay read-on
   expect(JSON.stringify([...app.storage.values()])).not.toContain("private-test-value");
   expect(await Bun.file(file).text()).toBe(exported);
   expect(await app.read(web.url("/account"))).toContain("# Public account");
-  await expect(app.read(web.url("/account"), false, undefined, `${file}.missing`)).rejects.toHaveProperty("code", "ENOENT");
+  await expect(app.read(web.url("/account"), { cookies: `${file}.missing` })).rejects.toHaveProperty("code", "ENOENT");
   expect(web.count("/account")).toBe(3);
 });
 
-test("browser profiles preserve their headers and have independent public caches", async () => {
+test("defaults to chrome152 and keeps browser profile headers and caches separate", async () => {
   const web = site((request, path) => path.endsWith(".md") || path.endsWith("llms.txt")
     ? new Response("Missing", { status: 404 })
     : new Response(`# ${request.headers.get("user-agent")}`, { headers: { "Cache-Control": "max-age=3600" } }));
@@ -387,12 +416,12 @@ test("browser profiles preserve their headers and have independent public caches
   expect(profiles).toContain("chrome152");
   expect(profiles).toContain("firefox155");
   expect(app.schema()).toContain('"chrome152"');
-  const chrome = await app.read(web.url("/guide"), false, "chrome152");
-  const firefox = await app.read(web.url("/guide"), false, "firefox155");
-  expect(chrome).toContain("Chrome/");
+  const chrome = await app.read(web.url("/guide"));
+  const firefox = await app.read(web.url("/guide"), { profile: "firefox155" });
+  expect(chrome).toContain("Chrome/152.");
   expect(firefox).toContain("Firefox/");
-  expect(await app.read(web.url("/guide"), false, "chrome152")).toBe(chrome);
-  expect(await app.read(web.url("/guide"), false, "firefox155")).toBe(firefox);
+  expect(await app.read(web.url("/guide"), { profile: "chrome152" })).toBe(chrome);
+  expect(await app.read(web.url("/guide"), { profile: "firefox155" })).toBe(firefox);
   expect(web.count("/guide")).toBe(2);
   expect(web.count("/guide.md")).toBe(2);
   expect(web.count("/llms.txt")).toBe(2);

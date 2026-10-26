@@ -1,6 +1,6 @@
 # Webfetch
 
-Read webpages as Markdown with local HTML pruning, optional browser impersonation, cookie-file authentication, and an explicitly selected Exa backend. The default fetch stays local and prefers a page's `.md` version.
+Read webpages as Markdown or original response text, with local HTML pruning, browser impersonation, cookie-file authentication, and an explicitly selected Exa backend. The default fetch stays local, uses `chrome152`, and prefers a page's `.md` version.
 
 ## Load the plugin
 
@@ -39,6 +39,7 @@ Replacement names the fetch tool `webfetch` instead of `webfetch_enhanced`; it d
 webfetch_profile({})
 webfetch_enhanced({ url: "https://example.com/docs/guide" })
 webfetch_enhanced({ url: "https://example.com/docs/guide", fresh: true })
+webfetch_enhanced({ url: "https://example.com/docs/guide", format: "raw" })
 webfetch_enhanced({ url: "https://example.com/docs/guide", profile: "chrome152" })
 webfetch_enhanced({ url: "https://example.com/docs/guide", profile: "exa" })
 ```
@@ -46,13 +47,14 @@ webfetch_enhanced({ url: "https://example.com/docs/guide", profile: "exa" })
 | Input | Description |
 | --- | --- |
 | `url` | HTTP or HTTPS URL. |
+| `format` | Optional `markdown` (default) or `raw`. Raw returns the requested URL's original text, such as HTML, without conversion or `.md` probing. Ignored by Exa. |
 | `fresh` | Optional boolean. Bypass both caches, request fresh content, and update the caches. Defaults to `false`. |
-| `profile` | Optional retrieval profile. Omit for standard local HTTP. The argument's enum lists available profiles. |
+| `profile` | Optional retrieval profile. Defaults to `chrome152`. The argument's enum lists available profiles. |
 | `cookies` | Optional read-only `cookies.txt` path for local fetching; bypasses caches and discovery. Ignored by Exa. |
 
 `webfetch_profile` lists browser profiles from the pinned curl-impersonate release, including `chrome152`, `firefox155`, and `safari270`. It also lists `exa` when OpenCode's Exa integration resolves to an API key. Availability and the fetch argument's enum update when that connection changes; Exa does not need to be the selected websearch provider.
 
-The result contains the final source URL and Markdown. When a documentation index exists, its URL appears first:
+The result contains the final source URL and Markdown by default. When a documentation index exists, its URL appears first:
 
 ```text
 Site documentation index: https://example.com/docs/llms.txt
@@ -63,6 +65,8 @@ Source: https://example.com/docs/guide.md
 ```
 
 The plugin does not include the index's contents or follow its links. The agent can fetch that URL separately.
+
+With `format: "raw"`, the result contains the original decoded response body without trimming or HTML pruning, plus its `Content-Type` when provided. It may be HTML, Markdown, JSON, or another supported text type; it is not necessarily HTML. Source and documentation-index metadata still precede the body.
 
 ## Use cookies
 
@@ -99,7 +103,7 @@ Release assets cover Linux x64 and arm64 with glibc or musl, macOS x64 and arm64
 
 Connect Exa through OpenCode's existing integration. The plugin resolves that connection's API key; it does not keep a separate credential.
 
-Select `profile: "exa"` explicitly to send the URL to Exa's Contents API. Exa returns extracted page text rather than a model-written answer. The result includes `Backend: Exa`. Exa requests do not run local discovery probes and never receive your cookie file or cookie headers.
+Select `profile: "exa"` explicitly to send the URL to Exa's Contents API. Exa returns extracted page text rather than a model-written answer. The result includes `Backend: Exa`. Exa ignores `format`, including `raw`, because it does not provide the original response body. Exa requests do not run local discovery probes and never receive your cookie file or cookie headers.
 
 There is no automatic fallback to Exa. It is unavailable without a connected API key, even if anonymous Exa search works elsewhere in OpenCode.
 
@@ -107,7 +111,7 @@ Exa uses the same `webfetch` permission rules as local fetches, including saved 
 
 ## Fetch behavior
 
-- `/guide`, `/guide/`, and `/guide.html` each try `/guide.md` before the original URL. Query parameters are preserved. URLs with other file extensions and the origin root are fetched directly.
+- For Markdown output, `/guide`, `/guide/`, and `/guide.html` each try `/guide.md` before the requested URL. Query parameters are preserved. URLs with other file extensions and the origin root are fetched directly. Raw output always fetches the requested URL without `.md` probing.
 - HTML responses at Markdown candidate URLs count as misses, even when the server returns a successful status.
 - The plugin probes `llms.txt` in the requested page's directory, then each parent directory up to the origin. It reports the nearest match.
 - HTML conversion prefers a nonempty `main` or `[role="main"]`, then a single `article`. Other pages use Mozilla Readability when its readability check passes, or keep the document body for short pages.
@@ -117,7 +121,9 @@ Exa uses the same `webfetch` permission rules as local fetches, including saved 
 
 ## Caching
 
-Caches persist in OpenCode's plugin storage, including across plugin reloads. Converted Markdown is cached so a hit does not repeat HTML extraction. Public content and discovery caches are separated by browser profile. Cookie-backed requests use neither cache.
+Caches persist in OpenCode's plugin storage, including across plugin reloads. Local content entries store the original decoded response body, content type, final URL, and HTTP cache metadata. Markdown conversion runs on each read; converted output is not stored. Both output formats share the same source entry for a given URL and profile. When Markdown output selects a separate `.md` URL, that resource has its own entry.
+
+Public content and discovery caches are separated by browser profile. Cookie-backed requests use neither cache. Original HTML can use considerably more storage than converted Markdown.
 
 | Cache | Lifetime |
 | --- | --- |

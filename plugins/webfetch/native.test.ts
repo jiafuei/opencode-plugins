@@ -40,6 +40,21 @@ test("follows HTTP redirects with the profile's headers and the cookie file", as
     .rejects.toThrow("Unsupported protocol");
 });
 
+test("loads native bindings again after a plugin reload", async () => {
+  const url = new URL(`http://127.0.0.1:${server.port}/page`);
+  await request(url, new Headers(), AbortSignal.timeout(1_000), "chrome152");
+  // Bun reuses query-string imports, so use a fresh file to rerun module initialization.
+  const module = new URL(`./native-reload-${crypto.randomUUID()}.ts`, import.meta.url);
+  await Bun.write(module, Bun.file(new URL("./native.ts", import.meta.url)));
+  try {
+    const reloaded: typeof import("./native.ts") = await import(module.href);
+    const response = await reloaded.request(url, new Headers(), AbortSignal.timeout(1_000), "firefox155");
+    expect((await response.json())["user-agent"]).toContain("Firefox/");
+  } finally {
+    await Bun.file(module).delete();
+  }
+});
+
 test("aborts an in-flight transfer", async () => {
   const controller = new AbortController();
   setTimeout(() => controller.abort(), 300);
