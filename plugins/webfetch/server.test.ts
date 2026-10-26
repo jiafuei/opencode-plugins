@@ -1,12 +1,17 @@
-import { afterEach, expect, setSystemTime, test } from "bun:test";
+import { afterEach, expect, setSystemTime, spyOn, test } from "bun:test";
 import type { Plugin } from "@opencode/plugin";
 import type { Info, ToolContext } from "@opencode/plugin/promise/tool";
 import type { Schema } from "effect";
+import { relative } from "node:path";
 import Webfetch from "./server.ts";
 
 const servers: Bun.Server<undefined>[] = [];
-afterEach(() => {
+const disposers: (() => void | Promise<void>)[] = [];
+const files: string[] = [];
+afterEach(async () => {
+  for (const dispose of disposers.splice(0)) await dispose();
   for (const server of servers.splice(0)) server.stop(true);
+  for (const file of files.splice(0)) await Bun.file(file).delete();
   setSystemTime();
 });
 
@@ -28,28 +33,71 @@ function site(handler: (request: Request, path: string) => Response) {
   };
 }
 
-async function plugin({ replace = false, storage = new Map<string, Schema.Json>(), allow = true } = {}) {
-  const tools: Info[] = [];
+async function plugin({ replace = false, storage = new Map<string, Schema.Json>(), allow = true, exa }: {
+  replace?: boolean; storage?: Map<string, Schema.Json>; allow?: boolean; exa?: string;
+} = {}) {
+  const tools = new Map<string, Info>();
   const permissions: unknown[] = [];
+  type Editor = { add(tool: Info): void };
+  let transform: (editor: Editor) => void;
+  let key = exa;
+  const events: { type: string; done(): void }[] = [];
+  let wake: (() => void) | undefined;
   const ctx = {
     options: { replace },
+    location: { directory: process.cwd() },
     storage: {
       async get(key: string) { return storage.get(key); },
       async set(key: string, value: Schema.Json) { storage.set(key, structuredClone(value)); },
       async remove(key: string) { storage.delete(key); },
     },
-    tool: { async transform(callback: (editor: { add(tool: Info): void }) => void) { callback({ add: (tool) => tools.push(tool) }); } },
+    tool: {
+      async transform(callback: (editor: Editor) => void) {
+        transform = callback;
+        callback({ add: (tool) => { tools.set(tool.name, tool); } });
+      },
+      async reload() { tools.clear(); transform({ add: (tool) => { tools.set(tool.name, tool); } }); },
+    },
+    integration: { connection: {
+      async active() { return key ? { integrationID: "exa" } : undefined; },
+      async resolve() { return key ? { type: "key", key } : undefined; },
+    } },
+    event: { async *subscribe({ signal }: { signal: AbortSignal }) {
+      while (!signal.aborted) {
+        const event = events.shift();
+        if (event) {
+          yield { type: event.type };
+          event.done();
+        } else {
+          await new Promise<void>((resolve) => {
+            wake = resolve;
+            signal.addEventListener("abort", () => resolve(), { once: true });
+          });
+        }
+      }
+    } },
     permission: { async assert(input: unknown) { permissions.push(input); if (!allow) throw new Error("Denied by webfetch permission"); } },
   };
-  await Webfetch.setup(ctx as unknown as Plugin.Context);
-  expect(tools).toHaveLength(1);
-  const tool = tools[0]!;
+  const dispose = await Webfetch.setup(ctx as unknown as Plugin.Context);
+  if (dispose) disposers.push(dispose);
+  expect(tools.size).toBe(2);
+  const name = replace ? "webfetch" : "webfetch_enhanced";
+  expect([...tools.keys()]).toEqual(["webfetch_profile", name]);
   return {
-    name: tool.name,
+    name,
     permissions,
     storage,
-    async read(url: string, fresh = false, signal = new AbortController().signal) {
-      const result = await tool.execute({ url, fresh }, { signal } as ToolContext);
+    setExa(value: string | undefined) { key = value; },
+    async emit(type: string) {
+      await new Promise<void>((done) => { events.push({ type, done }); wake?.(); });
+    },
+    schema() {
+      const input = tools.get(name)!.input as { "~standard": { jsonSchema: { input(options: { target: string }): unknown } } };
+      return JSON.stringify(input["~standard"].jsonSchema.input({ target: "draft-07" }));
+    },
+    async profiles() { return (await tools.get("webfetch_profile")!.execute({}, {} as ToolContext)).content as string; },
+    async read(url: string, fresh = false, profile?: string, cookies?: string, signal = new AbortController().signal) {
+      const result = await tools.get(name)!.execute({ url, fresh, profile, cookies }, { signal } as ToolContext);
       expect(typeof result.content).toBe("string");
       return result.content as string;
     },
@@ -259,4 +307,93 @@ test("replacement registers only webfetch and permission denials prevent network
   const web = site(() => new Response("Must not be fetched"));
   await expect(app.read(web.url("/guide"))).rejects.toThrow("Denied by webfetch permission");
   expect(web.requests).toHaveLength(0);
+});
+
+test("Exa availability updates the profile enum and retrieval has a separate cache with fresh live crawling", async () => {
+  const originalFetch = globalThis.fetch;
+  const calls: Request[] = [];
+  const remote = spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+    if (input !== "https://api.exa.ai/contents") return originalFetch(input, init);
+    const request = new Request(input, init);
+    calls.push(request);
+    return Response.json({ results: [{ url: "https://example.com/canonical", text: `# Exa version ${calls.length}` }] });
+  });
+  try {
+    const web = site((_request, path) => path.endsWith(".txt") || path.endsWith(".md")
+      ? new Response("Missing", { status: 404 }) : new Response("# Local content"));
+    const app = await plugin();
+    expect(await app.profiles()).not.toContain("exa");
+    expect(app.schema()).not.toContain('"exa"');
+    app.setExa("exa-test-key");
+    await app.emit("credential.updated");
+    expect(app.schema()).toContain('"exa"');
+    expect((await app.profiles()).split("\n")).toContain("exa");
+    expect(await app.read(web.url("/guide"))).toContain("# Local content");
+    const requests = web.requests.length;
+    expect(await app.read(web.url("/guide"), false, "exa", `/tmp/opencode/missing-exa-cookies-${crypto.randomUUID()}.txt`)).toContain("Backend: Exa\n\n# Exa version 1");
+    expect(app.permissions).not.toContainEqual(expect.objectContaining({ action: "read" }));
+    expect(await app.read(web.url("/guide"), false, "exa")).toContain("# Exa version 1");
+    expect(await app.read(web.url("/guide"), true, "exa")).toContain("# Exa version 2");
+    expect(calls).toHaveLength(2);
+    expect(web.requests).toHaveLength(requests);
+    expect(calls[0]!.headers.get("x-api-key")).toBe("exa-test-key");
+    expect(await calls[0]!.json()).toEqual({ urls: [web.url("/guide")], text: true, maxAgeHours: 0 });
+    app.setExa(undefined);
+    await app.emit("credential.switched");
+    expect(app.schema()).not.toContain('"exa"');
+    expect((await app.profiles()).split("\n")).not.toContain("exa");
+    await expect(app.read(web.url("/guide"), false, "exa")).rejects.toThrow("Connect the Exa integration");
+    expect(calls).toHaveLength(2);
+  } finally {
+    remote.mockRestore();
+  }
+});
+
+test("per-fetch cookie files bypass public caches and discovery and stay read-only", async () => {
+  const file = `/tmp/opencode/webfetch-cookies-${crypto.randomUUID()}.txt`;
+  files.push(file);
+  const exported = "# Netscape HTTP Cookie File\n#HttpOnly_127.0.0.1\tFALSE\t/\tFALSE\t0\tsession\tprivate-test-value\n";
+  await Bun.write(file, exported);
+  const web = site((request, path) => {
+    if (path.endsWith(".md") || path.endsWith("llms.txt")) return new Response("Missing", { status: 404 });
+    return new Response(request.headers.get("cookie") === "session=private-test-value" ? "# Private account" : "# Public account", {
+      headers: { "Cache-Control": "max-age=3600" },
+    });
+  });
+  const anonymous = await plugin();
+  expect(await anonymous.read(web.url("/account"))).toContain("# Public account");
+  const app = await plugin({ storage: anonymous.storage });
+  expect(app.schema()).toContain('"cookies"');
+  expect(await app.read(web.url("/account"), false, undefined, relative(process.cwd(), file))).toContain("# Private account");
+  expect(await app.read(web.url("/account"), false, undefined, file)).toContain("# Private account");
+  expect(app.permissions).toContainEqual(expect.objectContaining({ action: "read", resources: [file] }));
+  expect(web.count("/account")).toBe(3);
+  expect(web.count("/account.md")).toBe(1);
+  expect(web.count("/llms.txt")).toBe(1);
+  expect(JSON.stringify([...app.storage.values()])).not.toContain("Private account");
+  expect(JSON.stringify([...app.storage.values()])).not.toContain("private-test-value");
+  expect(await Bun.file(file).text()).toBe(exported);
+  expect(await app.read(web.url("/account"))).toContain("# Public account");
+  await expect(app.read(web.url("/account"), false, undefined, `${file}.missing`)).rejects.toHaveProperty("code", "ENOENT");
+  expect(web.count("/account")).toBe(3);
+});
+
+test("browser profiles preserve their headers and have independent public caches", async () => {
+  const web = site((request, path) => path.endsWith(".md") || path.endsWith("llms.txt")
+    ? new Response("Missing", { status: 404 })
+    : new Response(`# ${request.headers.get("user-agent")}`, { headers: { "Cache-Control": "max-age=3600" } }));
+  const app = await plugin();
+  const profiles = (await app.profiles()).split("\n");
+  expect(profiles).toContain("chrome152");
+  expect(profiles).toContain("firefox155");
+  expect(app.schema()).toContain('"chrome152"');
+  const chrome = await app.read(web.url("/guide"), false, "chrome152");
+  const firefox = await app.read(web.url("/guide"), false, "firefox155");
+  expect(chrome).toContain("Chrome/");
+  expect(firefox).toContain("Firefox/");
+  expect(await app.read(web.url("/guide"), false, "chrome152")).toBe(chrome);
+  expect(await app.read(web.url("/guide"), false, "firefox155")).toBe(firefox);
+  expect(web.count("/guide")).toBe(2);
+  expect(web.count("/guide.md")).toBe(2);
+  expect(web.count("/llms.txt")).toBe(2);
 });

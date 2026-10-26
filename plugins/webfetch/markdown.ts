@@ -44,7 +44,10 @@ export function toMarkdown(html: string, url: string): string {
       const value = node.getAttribute(attribute);
       if (value === null) continue;
       if (/^(?:javascript|data):/i.test(value.trim())) node.removeAttribute(attribute);
-      else if (URL.canParse(value, base)) node.setAttribute(attribute, new URL(value, base).href);
+      else {
+        const target = URL.parse(value, base);
+        if (target) node.setAttribute(attribute, target.href);
+      }
     }
   }
 

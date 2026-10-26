@@ -1,5 +1,6 @@
 import type { Plugin } from "@opencode/plugin";
 import { toMarkdown } from "./markdown.ts";
+import type { NativeProfile } from "./profiles.ts";
 
 type Storage = Pick<Plugin.Context["storage"], "get" | "set" | "remove">;
 type Discovery = { url: string | null; expiresAt: number };
@@ -15,9 +16,13 @@ function isHTML(type: string, text: string): boolean {
 }
 
 export class WebFetcher {
-  constructor(private readonly storage: Storage) {}
+  constructor(private readonly storage: Storage, private readonly profile?: NativeProfile, private readonly cookies?: string) {}
 
   async read(url: URL, fresh: boolean, signal: AbortSignal): Promise<string> {
+    if (this.cookies) {
+      const page = await this.page(url, false, fresh, signal);
+      return `Source: ${page.url}\n\n${page.content}`;
+    }
     const [page, index] = await Promise.all([
       this.content(url, fresh, signal),
       this.index(url, fresh, signal),
@@ -39,20 +44,20 @@ export class WebFetcher {
   private page(url: URL, candidate: false, fresh: boolean, signal: AbortSignal): Promise<Page>;
   private page(url: URL, candidate: true, fresh: boolean, signal: AbortSignal): Promise<Page | undefined>;
   private async page(url: URL, candidate: boolean, fresh: boolean, signal: AbortSignal): Promise<Page | undefined> {
-    const discoveryKey = `discovery/${url.href}`;
+    const discoveryKey = `discovery/${this.profile ?? "default"}/${url.href}`;
     if (candidate && !fresh) {
       const known = await this.storage.get(discoveryKey) as Discovery | undefined;
       if (known && known.expiresAt > Date.now() && known.url === null) return;
     }
-    const key = `content/v1/${url.href}`;
-    const cached = fresh ? undefined : await this.storage.get(key) as Page | undefined;
+    const key = `content/v1/${this.profile ?? "default"}/${url.href}`;
+    const cached = fresh || this.cookies ? undefined : await this.storage.get(key) as Page | undefined;
     if (cached && cached.expiresAt > Date.now()) return cached;
 
     const headers = new Headers({ Accept: ACCEPT });
     if (fresh) headers.set("Cache-Control", "no-cache");
     if (cached?.headers.etag) headers.set("If-None-Match", cached.headers.etag);
     if (cached?.headers["last-modified"]) headers.set("If-Modified-Since", cached.headers["last-modified"]);
-    const response = await fetch(url, { headers, signal });
+    const response = await this.request(url, headers, signal);
     let page: Page;
     if (response.status === 304 && cached) {
       page = { ...cached, headers: { ...cached.headers } };
@@ -80,10 +85,11 @@ export class WebFetcher {
         }
       } else if (!html && type && !/^(?:text\/|application\/(?:json|[\w.+-]+\+json|xml|[\w.+-]+\+xml))/i.test(type)
         && !(type.startsWith("application/octet-stream") && /\.(?:md|txt)$/.test(final.pathname))) {
-        throw new Error(`Unsupported content type: ${type}. This tool reads public text pages.`);
+        throw new Error(`Unsupported content type: ${type}. This tool reads text pages.`);
       }
       page = { url: final.href, content: html ? toMarkdown(text, final.href) : text.trim(), expiresAt: 0, headers: {} };
     }
+    if (this.cookies) return page;
 
     for (const name of CACHE_HEADERS) {
       const value = response.headers.get(name);
@@ -106,12 +112,13 @@ export class WebFetcher {
     let directory = new URL(".", url);
     while (true) {
       const target = new URL("llms.txt", directory);
-      const key = `discovery/${target.href}`;
+      const key = `discovery/${this.profile ?? "default"}/${target.href}`;
       const known = fresh ? undefined : await this.storage.get(key) as Discovery | undefined;
       if (known && known.expiresAt > Date.now()) {
         if (known.url) return known.url;
       } else {
-        const response = await fetch(target, { headers: { Accept: "text/plain", ...(fresh ? { "Cache-Control": "no-cache" } : {}) }, signal });
+        const headers = new Headers({ Accept: "text/plain", ...(fresh ? { "Cache-Control": "no-cache" } : {}) });
+        const response = await this.request(target, headers, signal);
         let found = false;
         if (response.status === 200 && new URL(response.url).pathname.endsWith("/llms.txt")) {
           const reader = response.body?.getReader();
@@ -140,5 +147,11 @@ export class WebFetcher {
       if (directory.pathname === "/") return;
       directory = new URL("../", directory);
     }
+  }
+
+  private async request(url: URL, headers: Headers, signal: AbortSignal): Promise<Response> {
+    if (!this.profile && !this.cookies) return fetch(url, { headers, signal });
+    const native = await import("./native.ts");
+    return native.request(url, headers, signal, this.profile, this.cookies);
   }
 }
