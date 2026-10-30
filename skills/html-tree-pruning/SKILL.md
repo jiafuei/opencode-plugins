@@ -23,7 +23,8 @@ bun "$S" page.html --scope main --ignore .cookie-banner --ignore footer
   or generated node IDs.
 - `--ignore <css>` removes all matching subtrees; repeat it as needed.
 - `--scope <css>` keeps the first matching element and its contents, after ignored
-  and dropped subtrees are removed. A missing scope is an error.
+  and dropped subtrees are removed. A missing scope is an error. Scoped output omits
+  the page title and head JSON-LD.
 - `--base-url <url>` resolves retained `href` and `src` attributes, except fragment
   links such as `#top` and values that are not valid URLs. Otherwise they remain as
   supplied.
@@ -32,6 +33,9 @@ bun "$S" page.html --scope main --ignore .cookie-banner --ignore footer
 
 - Drop scripts, styles, metadata, templates, noscript, SVG, hidden inputs, comments,
   and elements with `hidden` or `aria-hidden="true"`.
+- Keep JSON-LD (`<script type="application/ld+json">`) as raw text, unvalidated.
+  Unscoped output starts with the page `<title>` and head JSON-LD; JSON-LD in the
+  body stays in place.
 - Remove classes, inline styles, event handlers, and arbitrary data attributes.
 - Keep links, image URLs and alt text, labels, form values and states, table spans,
   and a small set of semantic attributes. Keep IDs referenced by labels or fragment

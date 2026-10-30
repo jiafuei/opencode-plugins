@@ -18,7 +18,8 @@ const input = positionals[0] ?? "-";
 const raw = input === "-" ? await Bun.stdin.text() : await Bun.file(input).text();
 const $ = load(parse(raw, { treeAdapter: adapter }));
 for (const selector of values.ignore!) $(selector).remove();
-$("script, style, link, meta, base, template, noscript, svg, input[type='hidden' i], [hidden], [aria-hidden='true']").remove();
+const jsonLd = "script[type='application/ld+json' i]";
+$(`script:not(${jsonLd}), style, link, meta, base, template, noscript, svg, input[type='hidden' i], [hidden], [aria-hidden='true']`).remove();
 const root = values.scope ? $(values.scope).first() : $("body");
 if (!root.length) {
   console.error(`--scope matched nothing: ${values.scope}`);
@@ -35,12 +36,14 @@ const blocks = new Set([
   "address", "article", "aside", "blockquote", "body", "br", "caption", "dd", "details",
   "div", "dl", "dt", "fieldset", "figcaption", "figure", "footer", "form", "h1", "h2",
   "h3", "h4", "h5", "h6", "header", "hr", "legend", "li", "main", "nav", "ol", "optgroup",
-  "option", "p", "pre", "section", "summary", "table", "tbody", "td", "tfoot", "th",
-  "thead", "tr", "ul",
+  "option", "p", "pre", "script", "section", "summary", "table", "tbody", "td", "tfoot",
+  "th", "thead", "title", "tr", "ul",
 ]);
 
 // The output container is a body element: a block that is never unwrapped.
 const output = new Element("body", {});
+// A scoped result keeps only JSON-LD inside its subtree, not page-level metadata.
+if (!values.scope) $(output).append($("head").find(`title, ${jsonLd}`));
 $(output).append(values.scope ? root : root.contents());
 
 // Keep IDs only when a label or fragment link uses them.
@@ -61,7 +64,7 @@ function prune(node: AnyNode, preserveWhitespace = false): void {
   }
   if (!isTag(node)) return;
   const el = $(node);
-  const preserve = preserveWhitespace || node.name === "pre" || node.name === "textarea";
+  const preserve = preserveWhitespace || ["pre", "script", "textarea"].includes(node.name);
   if (node.name === "img" && (!el.attr("src") || el.attr("src")!.startsWith("data:"))) {
     const src = el.attr("data-src") ?? el.attr("data-lazy-src") ?? el.attr("data-original");
     if (src) el.attr("src", src);
