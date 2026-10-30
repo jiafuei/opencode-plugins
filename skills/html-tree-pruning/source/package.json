@@ -1,0 +1,13 @@
+{
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "bun build prune.ts --target=bun --minify-syntax --minify-identifiers --outfile=../scripts/prune.js"
+  },
+  "devDependencies": {
+    "cheerio": "1.2.0",
+    "domhandler": "5.0.3",
+    "parse5": "7.3.0",
+    "parse5-htmlparser2-tree-adapter": "7.1.0"
+  }
+}

@@ -1,8 +1,10 @@
 #!/usr/bin/env bun
 // Parse and prune HTML without rendering it or executing scripts.
 import { parseArgs } from "node:util";
-import { load } from "cheerio";
-import { isTag, type AnyNode } from "domhandler";
+import { load } from "cheerio/slim";
+import { Element, isTag, type AnyNode } from "domhandler";
+import { parse, serialize } from "parse5";
+import { adapter } from "parse5-htmlparser2-tree-adapter";
 
 const { values, positionals } = parseArgs({
   allowPositionals: true,
@@ -14,11 +16,14 @@ const { values, positionals } = parseArgs({
 });
 const input = positionals[0] ?? "-";
 const raw = input === "-" ? await Bun.stdin.text() : await Bun.file(input).text();
-const $ = load(raw);
-const root = values.scope ? $(values.scope).first() : $("body");
-if (!root.length) throw new Error(`--scope matched nothing: ${values.scope}`);
+const $ = load(parse(raw, { treeAdapter: adapter }));
 for (const selector of values.ignore!) $(selector).remove();
-$("script, style, link, meta, base, template, noscript, [hidden], [aria-hidden='true']").remove();
+$("script, style, link, meta, base, template, noscript, svg, input[type='hidden' i], [hidden], [aria-hidden='true']").remove();
+const root = values.scope ? $(values.scope).first() : $("body");
+if (!root.length) {
+  console.error(`--scope matched nothing: ${values.scope}`);
+  process.exit(1);
+}
 
 const attributes = new Set([
   "href", "src", "alt", "title", "role", "aria-label", "aria-expanded", "aria-checked",
@@ -27,13 +32,20 @@ const attributes = new Set([
   "start", "reversed", "datetime", "open",
 ]);
 const blocks = new Set([
-  "address", "article", "aside", "blockquote", "div", "dl", "fieldset", "figure",
-  "footer", "form", "h1", "h2", "h3", "h4", "h5", "h6", "header", "hr", "main",
-  "nav", "ol", "p", "pre", "section", "table", "ul",
+  "address", "article", "aside", "blockquote", "body", "br", "caption", "dd", "details",
+  "div", "dl", "dt", "fieldset", "figcaption", "figure", "footer", "form", "h1", "h2",
+  "h3", "h4", "h5", "h6", "header", "hr", "legend", "li", "main", "nav", "ol", "optgroup",
+  "option", "p", "pre", "section", "summary", "table", "tbody", "td", "tfoot", "th",
+  "thead", "tr", "ul",
 ]);
+
+// The output container is a body element: a block that is never unwrapped.
+const output = new Element("body", {});
+$(output).append(values.scope ? root : root.contents());
+
 // Keep IDs only when a label or fragment link uses them.
 const referencedIds = new Set<string>();
-root.find("label[for], a[href^='#']").each((_, element) => {
+$(output).find("label[for], a[href^='#']").each((_, element) => {
   const el = $(element);
   referencedIds.add(el.attr("for") ?? el.attr("href")!.slice(1));
 });
@@ -62,19 +74,25 @@ function prune(node: AnyNode, preserveWhitespace = false): void {
   if (values["base-url"]) {
     for (const name of ["href", "src"]) {
       const url = el.attr(name);
-      if (url) el.attr(name, new URL(url, values["base-url"]).href);
+      if (url && !url.startsWith("#")) el.attr(name, URL.parse(url, values["base-url"])?.href ?? url);
     }
   }
   for (const child of [...node.children]) prune(child, preserve);
   if (preserve) return;
-  // Whitespace beside block elements is formatting, not a word separator.
+  // Unwrapped spans leave adjacent text nodes; merge them so spaces collapse.
   for (const child of [...node.children]) {
-    if (child.type !== "text" || child.data.trim()) continue;
-    const prev = child.prev;
-    const next = child.next;
-    if ((prev && isTag(prev) && blocks.has(prev.name)) ||
-        (next && isTag(next) && blocks.has(next.name)) ||
-        (blocks.has(node.name) && (!prev || !next))) $(child).remove();
+    if (child.type === "text" && child.prev?.type === "text") {
+      child.data = (child.prev.data + child.data).replace(/ +/g, " ");
+      $(child.prev).remove();
+    }
+  }
+  // Whitespace beside block boundaries is formatting, not a word separator.
+  for (const child of [...node.children]) {
+    if (child.type !== "text") continue;
+    const { prev, next } = child;
+    if (prev ? isTag(prev) && blocks.has(prev.name) : blocks.has(node.name)) child.data = child.data.replace(/^ /, "");
+    if (next ? isTag(next) && blocks.has(next.name) : blocks.has(node.name)) child.data = child.data.replace(/ $/, "");
+    if (!child.data) $(child).remove();
   }
   if (Object.keys(node.attribs).length) return;
   if (node.name === "span") {
@@ -87,7 +105,5 @@ function prune(node: AnyNode, preserveWhitespace = false): void {
   }
 }
 
-const output = $("<div></div>");
-output.append(values.scope ? root : root.contents());
-for (const node of output.contents().toArray()) prune(node);
-console.log(output.html()!.trim());
+prune(output);
+console.log(serialize(output, { treeAdapter: adapter }));

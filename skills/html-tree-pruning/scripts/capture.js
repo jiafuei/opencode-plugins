@@ -1,6 +1,6 @@
-// Serialize the live page into an HTML string that prune.ts can rebuild faithfully.
+// Serialize the live page into an HTML string for prune.js.
 // outerHTML drops shadow roots and live form state, and keeps scripts that would re-run.
-// - shadow roots (open; closed too from an extension) → declarative <template shadowrootmode>
+// - shadow roots (open; closed too from an extension) → inlined before the host's light children
 // - same-origin iframes → their <body> content inlined in a <section>
 // - <script>/<noscript>/<template> dropped, comments dropped
 // - live checked/selected state written back to attributes
@@ -37,12 +37,7 @@ function capture() {
     parent.append(clone);
 
     const shadowRoot = shadowRootOf(src);
-    if (shadowRoot) {
-      const template = document.createElement("template");
-      template.setAttribute("shadowrootmode", "open");
-      shadowRoot.childNodes.forEach((child) => append(child, template.content));
-      clone.append(template);
-    }
+    shadowRoot?.childNodes.forEach((child) => append(child, clone));
     src.childNodes.forEach((child) => append(child, clone));
   }
 
