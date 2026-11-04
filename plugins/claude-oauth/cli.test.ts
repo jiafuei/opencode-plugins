@@ -174,7 +174,8 @@ async function fixture(options: Record<string, unknown> = { spoofingProfile: "cl
   });
   const prepare = async (sessionID = "ses_root", kind = "primary", turn = "msg_user1", synthetic = false) => {
     const scope = { sessionID, agent: sessionID === "ses_child" ? "explore" : "build", model: { providerID: "anthropic", id: BODY.model }, kind };
-    if (kind === "primary") await plugin.hooks.context!({ ...scope, messages: [{ id: turn, role: "user", content: [{ type: "text", text: "hello" }], ...(!synthetic ? { metadata: {} } : {}) }] });
+    if (synthetic) plugin.state.synthetic.add(turn);
+    if (kind === "primary") await plugin.hooks.context!({ ...scope, messages: [{ id: turn, role: "user", content: [{ type: "text", text: "hello" }] }] });
     const modelEvent = { ...scope, headers: {} as Record<string, string> };
     await plugin.hooks["model.request"]!(modelEvent);
     return { scope, modelEvent };

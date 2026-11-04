@@ -526,7 +526,7 @@ const setup = async (ctx: Plugin.Context) => {
   const runWorker = async <S extends Schema.Decoder<unknown>>(model: WorkerModel | undefined, schema: S, system: string, prompt: string): Promise<S["Type"]> => {
     let timer: ReturnType<typeof setTimeout> | undefined;
     const { text } = await Promise.race([
-      ctx.generate.text({
+      ctx.experimental.generate.text({
         prompt: `${system}\n\n${prompt}\n\nRespond with only one JSON value matching this JSON Schema, without code fences or commentary:\n${JSON.stringify(Schema.toJsonSchemaDocument(schema).schema)}`,
         model: model && { providerID: model.providerID, id: model.modelID, variant: model.variant },
       }),

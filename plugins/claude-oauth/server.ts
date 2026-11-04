@@ -400,9 +400,15 @@ export default Plugin.define({
       const user = event.messages.findLast((message) => message.role === "user");
       if (!user || state.agentId) return;
       const turn = user.id ?? new Bun.CryptoHasher("sha256").update(JSON.stringify(user.content)).digest("hex");
-      // Core retains metadata (even an empty object) on human messages;
-      // synthetic task notifications are lowered without it.
-      state.turnOrigin = profile.id === "sdk-cli" ? "sdk" : user.metadata !== undefined ? "human" : "task_notification";
+      // Classify once per turn: synthetic messages are task notifications, every other user message is human.
+      // turnOrigin is not persisted, so a resumed turn classifies again without advancing the indices.
+      if (turn !== state.turn || !state.turnOrigin) {
+        if (profile.id === "sdk-cli") state.turnOrigin = "sdk";
+        else {
+          const messages = await ctx.session.context({ sessionID: event.sessionID });
+          state.turnOrigin = messages.find((message) => message.id === user.id)?.type === "synthetic" ? "task_notification" : "human";
+        }
+      }
       if (turn !== state.turn) {
         state.turn = turn;
         state.promptId = randomUUID();

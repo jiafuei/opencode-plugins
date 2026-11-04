@@ -1,4 +1,4 @@
-import { binaryPath } from "@opencode-ai/pty";
+import { binaryPath } from "@opencode/pty";
 import { mkdir } from "node:fs/promises";
 import path from "node:path";
 import { Schema } from "effect";

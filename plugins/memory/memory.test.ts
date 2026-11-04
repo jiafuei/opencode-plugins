@@ -59,10 +59,12 @@ async function fixture(
   const ctx = {
     location: { directory, project: { id: "test-project", directory, canonical: options.canonical ?? directory } },
     options,
-    generate: {
-      text: async (input: WorkerCall) => {
-        calls.push(input);
-        return { text: JSON.stringify(await respond(input)) };
+    experimental: {
+      generate: {
+        text: async (input: WorkerCall) => {
+          calls.push(input);
+          return { text: JSON.stringify(await respond(input)) };
+        },
       },
     },
     rpc: {

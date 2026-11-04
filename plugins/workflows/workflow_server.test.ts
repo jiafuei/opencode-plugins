@@ -55,12 +55,14 @@ async function createHarness(options: Record<string, unknown> = {}) {
     rpc: { register: async (_definition: unknown, handlers: { control: typeof control }) => { control = handlers.control; return { ...registration, events: { emit: async () => {} } }; } },
     agent: { list: async () => ({ data: state.agents.map((id) => ({ id })) }) },
     model: { list: async () => ({ data: state.models.map((id) => ({ providerID: "anthropic", id })) }) },
-    generate: {
-      text: async ({ prompt }: { prompt: string }) => {
-        state.generated.push(prompt);
-        await Bun.sleep(20);
-        if (state.failGenerate) throw new Error("permission denied for generation");
-        return { text: JSON.stringify(prompt.startsWith("You are an internal workflow coordinator") ? { rationale: "keep the plan", phases: [] } : handoffResult) };
+    experimental: {
+      generate: {
+        text: async ({ prompt }: { prompt: string }) => {
+          state.generated.push(prompt);
+          await Bun.sleep(20);
+          if (state.failGenerate) throw new Error("permission denied for generation");
+          return { text: JSON.stringify(prompt.startsWith("You are an internal workflow coordinator") ? { rationale: "keep the plan", phases: [] } : handoffResult) };
+        },
       },
     },
     event: { subscribe: () => ({ [Symbol.asyncIterator]: () => ({ next: never }) }) },
@@ -155,7 +157,7 @@ describe("workflow server", () => {
       rpc: { register: async () => ({ ...registered, events: { emit: async () => {} } }) },
       agent: { list: () => { calls.agents++; return never(); } },
       model: { list: () => { calls.models++; return never(); } },
-      generate: { text: () => { calls.generate++; return never(); } },
+      experimental: { generate: { text: () => { calls.generate++; return never(); } } },
       event: { subscribe: () => ({ [Symbol.asyncIterator]: () => ({ next: never }) }) },
       command: { transform: async () => registered },
       tool: { transform: async () => registered },

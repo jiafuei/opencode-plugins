@@ -14,7 +14,7 @@ export const OAUTH_CREDENTIAL = {
 };
 
 export async function setupPlugin(options: Record<string, unknown> = {}, credential: unknown = OAUTH_CREDENTIAL) {
-  const state = { credential, reloads: 0, sessions: {} as Record<string, { parentID?: string; metadata?: Record<string, unknown> }> };
+  const state = { credential, reloads: 0, sessions: {} as Record<string, { parentID?: string; metadata?: Record<string, unknown> }>, synthetic: new Set<string>() };
   const hooks: Record<string, (event: any) => unknown> = {};
   const queue: Array<{ event: any; done: () => void }> = [];
   let wake: (() => void) | undefined;
@@ -43,6 +43,7 @@ export async function setupPlugin(options: Record<string, unknown> = {}, credent
       update: async ({ sessionID, metadata }: { sessionID: string; metadata: Record<string, unknown> }) => {
         state.sessions[sessionID] = { ...state.sessions[sessionID], metadata };
       },
+      context: async () => [...state.synthetic].map((id) => ({ id, type: "synthetic" })),
     },
     event: {
       subscribe: () => ({

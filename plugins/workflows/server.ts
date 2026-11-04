@@ -324,7 +324,7 @@ export default Plugin.define({
 
     /** One-shot model call whose reply must be JSON matching `schema`; a malformed reply is a retryable structured failure. */
     const generateStructured = async <A>(schema: Schema.Codec<A, any>, prompt: string, model: ModelRef | undefined): Promise<A> => {
-      const { text } = await ctx.generate.text({ prompt: `${prompt}\n\nReply with only a JSON object matching this JSON Schema, without prose or code fences:\n${JSON.stringify(Schema.toJsonSchemaDocument(schema))}`, ...(model ? { model } : {}) });
+      const { text } = await ctx.experimental.generate.text({ prompt: `${prompt}\n\nReply with only a JSON object matching this JSON Schema, without prose or code fences:\n${JSON.stringify(Schema.toJsonSchemaDocument(schema))}`, ...(model ? { model } : {}) });
       try {
         return Schema.decodeUnknownSync(Schema.fromJsonString(schema))(text.trim().replace(/^```(?:json)?\s*|\s*```$/g, ""));
       } catch (error) {
@@ -411,7 +411,7 @@ export default Plugin.define({
           try {
             assertOwned(run);
             // The persisted message ID makes a resumed turn reconcile with its first admission instead of duplicating it.
-            await ctx.session.prompt({ sessionID, id: attempt.messageID, text: continuation, ...(worker.schema && { format: { type: "json_schema", schema: worker.schema } }) });
+            await ctx.session.prompt({ sessionID, id: attempt.messageID, text: continuation, ...(worker.schema && { format: { type: "json_schema", schema: worker.schema as Schema.MutableJsonObject } }) });
             await ctx.session.wait({ sessionID });
             if (signal.aborted) throw new Error("Workflow worker interrupted");
             const messages = await ctx.session.context({ sessionID });
