@@ -389,13 +389,51 @@ export default Plugin.define({
           signal: AbortSignal.timeout(10_000),
         });
         if (!response.ok) throw new Error(`Anthropic usage request failed: ${response.status}`);
+        type Money = { amount_minor: number; currency: string; exponent: number };
         const usage = (await response.json()) as {
-          limits: { kind: string; percent: number; resets_at: string | null }[];
-          spend: { enabled: boolean };
+          limits: {
+            kind: string; group: string; percent: number; resets_at: string | null;
+            scope: { model: { display_name: string } | null; surface: { display_name: string } | null } | null;
+            severity: string; is_active: boolean;
+          }[];
+          seven_day_breakdown?: {
+            as_of: string; window_started_at: string;
+            rows: { key: string; display_name: string; percent: number }[];
+          } | null;
+          weekly_scoped_shares?: {
+            limit_index: number; used_percent_of_weekly: number; allowance_percent_of_weekly: number;
+          }[] | null;
+          spend: { used: Money; limit: Money | null; percent: number; severity: string; enabled: boolean; disabled_reason: string | null };
+          extra_usage: { disabled_reason: string | null; user_disabled: boolean; spend_limit_reached: boolean };
         };
         return {
-          limits: usage.limits.map((limit) => ({ kind: limit.kind, percent: limit.percent, resetsAt: limit.resets_at })),
-          extraUsage: usage.spend.enabled,
+          limits: usage.limits.map((limit, index) => {
+            const share = usage.weekly_scoped_shares?.find((share) => share.limit_index === index);
+            return {
+              kind: limit.kind, group: limit.group, percent: limit.percent, resetsAt: limit.resets_at,
+              model: limit.scope?.model?.display_name ?? null, surface: limit.scope?.surface?.display_name ?? null,
+              severity: limit.severity, isActive: limit.is_active,
+              weeklyShare: share ? { usedPercent: share.used_percent_of_weekly, allowancePercent: share.allowance_percent_of_weekly } : null,
+            };
+          }),
+          weeklyBreakdown: usage.seven_day_breakdown ? {
+            asOf: usage.seven_day_breakdown.as_of,
+            windowStartedAt: usage.seven_day_breakdown.window_started_at,
+            rows: usage.seven_day_breakdown.rows.map((row) => ({ key: row.key, displayName: row.display_name, percent: row.percent })),
+          } : null,
+          spend: {
+            used: { amountMinor: usage.spend.used.amount_minor, currency: usage.spend.used.currency, exponent: usage.spend.used.exponent },
+            limit: usage.spend.limit ? {
+              amountMinor: usage.spend.limit.amount_minor, currency: usage.spend.limit.currency, exponent: usage.spend.limit.exponent,
+            } : null,
+            percent: usage.spend.percent, severity: usage.spend.severity,
+          },
+          extraUsage: {
+            enabled: usage.spend.enabled,
+            disabledReason: usage.spend.disabled_reason ?? usage.extra_usage.disabled_reason,
+            userDisabled: usage.extra_usage.user_disabled,
+            spendLimitReached: usage.extra_usage.spend_limit_reached,
+          },
         };
       },
     });

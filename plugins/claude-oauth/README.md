@@ -53,7 +53,11 @@ naming. See [DESIGN.md](DESIGN.md) for exactly what each request carries.
 ## Usage limits
 
 Run `/anthropic-usage` (or **Anthropic usage** in the command palette) to see your plan's 5-hour and weekly
-utilization with reset times, and whether extra usage is enabled.
+utilization with reset times, model and surface limits, and the current limiting window. The dialog also shows
+the weekly usage breakdown and scoped limits' shares of the weekly total when reported by Anthropic.
+
+Extra usage includes its enabled status, spending amounts and limits in the reported currency, and any reported
+reason it is disabled or capped.
 
 ## Server-side compaction
 
