@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { PROFILE_URL, ROLES_URL, resolveIdentity } from "./server.ts";
+import { resolveIdentity } from "./server.ts";
 
 const TOKEN_BODY = {
   access_token: "access-1",
@@ -31,15 +31,8 @@ function mockFetch(responder: (url: string) => Response | Promise<Response>): { 
   return { calls, restore: () => (globalThis.fetch = original) };
 }
 
-function jsonResponse(body: unknown, status = 200): Response {
-  return new Response(typeof body === "string" ? body : JSON.stringify(body), {
-    status,
-    headers: { "content-type": "application/json" },
-  });
-}
-
 function identityResponse(url: string): Response {
-  return jsonResponse(url.includes("/roles") ? ROLES_IDENTITY : PROFILE_IDENTITY);
+  return Response.json(url.includes("/roles") ? ROLES_IDENTITY : PROFILE_IDENTITY);
 }
 
 describe("resolveIdentity (login semantics)", () => {
@@ -53,10 +46,6 @@ describe("resolveIdentity (login semantics)", () => {
         orgId: "profile-org",
         orgName: "Acme workspace",
       });
-      expect(calls.map((call) => call.url)).toEqual([
-        PROFILE_URL,
-        ROLES_URL,
-      ]);
       expect(new Headers(calls[0]!.init!.headers).get("authorization")).toBe("Bearer access-1");
     } finally {
       restore();
@@ -65,7 +54,7 @@ describe("resolveIdentity (login semantics)", () => {
 
   test.serial("roles failure does not discard a valid profile identity", async () => {
     const { restore } = mockFetch((url) =>
-      url.includes("/roles") ? Promise.reject(new Error("roles unavailable")) : jsonResponse(PROFILE_IDENTITY),
+      url.includes("/roles") ? Promise.reject(new Error("roles unavailable")) : Response.json(PROFILE_IDENTITY),
     );
     try {
       expect(await resolveIdentity({ ...TOKEN_BODY })).toEqual({

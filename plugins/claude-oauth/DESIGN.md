@@ -19,8 +19,8 @@ established by the earlier SDK capture. A 2.1.321 SDK capture has not been verif
 | Main system identity | Official Claude Code CLI | Claude Agent SDK |
 | Billing entrypoint | `cli` | `sdk-cli` |
 | Turn origin | `human` / `task_notification` | `sdk` |
-| Adaptive thinking display | `updates` | `omitted` |
-| Fallback-credit beta | Activity summaries and compaction requests | Absent |
+| Thinking display | `updates` | `omitted` |
+| Fallback-credit beta | Compaction requests | Absent |
 | Thinking-display-updates beta | Present with updates | Absent |
 
 Device identity is derived from the plugin's install ID and the OAuth account. Neither profile reads
@@ -32,17 +32,19 @@ Device identity is derived from the plugin's install ID and the OAuth account. N
   HTTP retries), the Stainless header set, and a per-session `X-Claude-Code-Session-Id` UUID. OpenCode's
   session-routing, project, and client headers are dropped.
 - Claude 3 and Claude 4 models do not get the per-turn control, mid-conversation tool changes, mid-conversation
-  system clear-at, and thinking-display updates betas. Every other model gets all four. This is looser than the
-  2.1.321 client, which also withholds some of them from Opus 5, Sonnet 5, and Fable 5, and sends some to Opus 4.7
-  and 4.8. Adaptive thinking or an explicit effort setting enables the effort beta. Haiku requests place the Claude
-  Code beta after prompt-caching-scope. The obsolete mid-conversation-system beta is removed, and the
-  tool-provenance beta precedes thinking-token-count.
-- Auxiliary searches omit fallback-credit and caching. Plain tool-less side queries use the side-query beta;
-  JSON-schema output uses the structured-outputs beta. Claude Code's activity-summary profile is not reproduced
-  because OpenCode has no such request.
-- Other caller betas are appended and deduplicated. Obsolete betas and the profile-controlled fallback-credit and
-  structured-output betas cannot be reintroduced by the caller. The context-1m beta is omitted because subscription
-  credentials rejected it with HTTP 429.
+  system clear-at, and thinking-display updates betas, and keep the caller's thinking options. Every other ID is
+  sent with the profile's current betas and thinking display, including models and families released after this
+  profile. This is looser than the 2.1.321 client, which also withholds some of these betas from Opus 5, Sonnet 5,
+  and Fable 5, and sends some to Opus 4.7 and 4.8.
+- Adaptive thinking or an explicit effort setting enables the effort beta. Haiku requests place the Claude Code
+  beta after prompt-caching-scope. The tool-provenance beta precedes thinking-token-count.
+- Plain tool-less side queries use the side-query beta; title requests do not. JSON-schema output uses the
+  structured-outputs beta. Claude Code's activity-summary profile is not reproduced because OpenCode has no such
+  request.
+- Other caller betas are appended and deduplicated. Obsolete betas and the profile-controlled fallback-credit,
+  redact-thinking, and structured-output betas cannot be reintroduced by the caller, nor can thinking-display
+  updates under `sdk-cli`. The context-1m beta is omitted because subscription credentials rejected it with
+  HTTP 429.
 - The provider's `max_tokens` is preserved. The plugin does not infer an output limit from a model name.
 - `x-claude-code-sandy-plover` reports tools used across the conversation and its subagents. The list is bounded to
   64 entries and 7,168 bytes, with an incomplete-history marker when truncated.
@@ -63,9 +65,10 @@ Device identity is derived from the plugin's install ID and the OAuth account. N
 
 ### Billing header and `cch`
 
-- The `x-anthropic-billing-header` carries the request-chain fields `cc_prev_req` and `cc_prompt_id`. Main requests
-  also carry `x-claude-code-prompt-id` and `cc_prompt_index` / `cc_turn_index`: every turn advances the turn index, and
-  task notifications do not count as prompts. Subagents carry the prompt ID header but no indexes.
+- The `x-anthropic-billing-header` carries the request-chain fields `cc_prev_req` and `cc_prompt_id`, and the prompt
+  ID is repeated in `x-claude-code-prompt-id`. Compactions carry only `cc_prev_req`; titles and searches carry
+  neither. Main requests also carry `cc_prompt_index` / `cc_turn_index`: every turn advances the turn index, and
+  task notifications do not count as prompts. Subagents carry no indexes.
 - `cch` uses Claude Code's serialized-byte algorithm (global byte-marker normalization, nested `model` values,
   `max_tokens`/fallback exclusions) and is patched over the `cch=00000` placeholder as five lowercase hex characters.
 - The version suffix uses the original user text from session context when available, before the provider merges

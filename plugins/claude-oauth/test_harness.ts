@@ -1,8 +1,7 @@
-import plugin, { API_ORIGIN } from "./server.ts";
+import plugin from "./server.ts";
 
 // Minimal stand-in for the v2 plugin host: records the OAuth method, the model
-// transform, and the session hooks, and drives an Anthropic /v1/messages
-// request through them the way core's session model request does.
+// transform, the RPC methods, and the session and tool hooks for tests to drive.
 
 export const OAUTH_CREDENTIAL = {
   type: "oauth" as const,
@@ -69,47 +68,5 @@ export async function setupPlugin(options: Record<string, unknown> = {}, credent
     wake?.();
   });
 
-  /** Run one request through model.request -> http.request -> respond -> http.response. */
-  const send = async (
-    body: Record<string, unknown>,
-    respond: (request: Request) => Response = () => new Response("{}", { headers: { "content-type": "application/json" } }),
-    sessionID = "ses_test",
-  ) => {
-    const scope = { sessionID, agent: "build", model: { providerID: "anthropic", modelID: String(body.model) }, kind: "primary" };
-    const modelEvent = {
-      ...scope,
-      baseURL: `${API_ORIGIN}/v1`,
-      headers: {
-        "x-session-affinity": sessionID,
-        "X-Session-Id": sessionID,
-        "User-Agent": "opencode/test",
-        "x-opencode-session": sessionID,
-      } as Record<string, string>,
-    };
-    await hooks["model.request"]!(modelEvent);
-    const credential = state.credential as { type: string; access?: string; key?: string } | undefined;
-    const requestEvent = {
-      ...scope,
-      request: new Request(`${API_ORIGIN}/v1/messages?beta=true`, {
-        method: "POST",
-        headers: {
-          ...modelEvent.headers,
-          "content-type": "application/json",
-          "anthropic-version": "2023-06-01",
-          "anthropic-beta": "interleaved-thinking-2025-05-14",
-          ...(credential?.type === "oauth"
-            ? { authorization: `Bearer ${credential.access}` }
-            : { "x-api-key": credential?.key ?? "" }),
-        },
-        body: JSON.stringify(body),
-      }),
-    };
-    await hooks["http.request"]!(requestEvent);
-    const request = requestEvent.request;
-    const responseEvent = { ...scope, request, response: respond(request.clone() as Request) };
-    await hooks["http.response"]!(responseEvent);
-    return { request, bodyText: await request.clone().text(), response: responseEvent.response as Response };
-  };
-
-  return { state, hooks, method, modelTransform, rpcMethods, emit, send, cleanup };
+  return { state, hooks, method, modelTransform, rpcMethods, emit, cleanup };
 }

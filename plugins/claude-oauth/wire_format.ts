@@ -109,7 +109,7 @@ export function createSseToolNameTransform(
 /**
  * Headers for a rewritten Response: cloned from the upstream response with
  * stale entity headers removed — they describe bytes we replaced, not the
- * transformed body. Status/statusText/content-type are preserved by the caller.
+ * transformed body.
  */
 export function uncloakedResponseHeaders(response: Response): Headers {
   const headers = new Headers(response.headers);

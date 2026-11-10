@@ -86,7 +86,8 @@ requests sent, set `HTTPS_PROXY` to a debugging proxy and trust its CA through `
   `@jiafuei/opencode-websearch`.
 - **OpenCode owns retries.** Claude Code's own stream watchdogs, retry loop, and recovery paths are not reproduced.
 - **No model filtering.** OpenCode's full Anthropic catalog stays visible. A model the subscription can't use fails
-  when you call it.
+  when you call it. A model released after the pinned version needs no plugin update: once OpenCode lists it, its
+  requests use the current profile.
 
 ## Storage
 

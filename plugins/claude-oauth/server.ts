@@ -23,13 +23,13 @@ function rot18(value: string): string {
 }
 
 const CLIENT_ID = rot18("4q6p705n-r16o-99q4-33rq-0499q6417s0r"); // Claude Code's public OAuth client ID
-export const API_ORIGIN = rot18("uggcf://ncv.naguebcvp.pbz");
-export const AUTHORIZE_URL = rot18("uggcf://pynhqr.pbz/pnv/bnhgu/nhgubevmr");
-export const TOKEN_URL = rot18("uggcf://cyngsbez.pynhqr.pbz/i6/bnhgu/gbxra");
-export const PROFILE_URL = `${API_ORIGIN}${rot18("/ncv/bnhgu/cebsvyr")}`;
-export const ROLES_URL = `${API_ORIGIN}${rot18("/ncv/bnhgu/pynhqr_pyv/ebyrf")}`;
+const API_ORIGIN = rot18("uggcf://ncv.naguebcvp.pbz");
+const AUTHORIZE_URL = rot18("uggcf://pynhqr.pbz/pnv/bnhgu/nhgubevmr");
+const TOKEN_URL = rot18("uggcf://cyngsbez.pynhqr.pbz/i6/bnhgu/gbxra");
+const PROFILE_URL = `${API_ORIGIN}${rot18("/ncv/bnhgu/cebsvyr")}`;
+const ROLES_URL = `${API_ORIGIN}${rot18("/ncv/bnhgu/pynhqr_pyv/ebyrf")}`;
 const USAGE_URL = `${API_ORIGIN}${rot18("/ncv/bnhgu/hfntr")}`;
-export const REDIRECT_URI = rot18("uggcf://cyngsbez.pynhqr.pbz/bnhgu/pbqr/pnyyonpx");
+const REDIRECT_URI = rot18("uggcf://cyngsbez.pynhqr.pbz/bnhgu/pbqr/pnyyonpx");
 const SCOPES =
   rot18("bet:perngr_ncv_xrl hfre:cebsvyr hfre:vasrerapr hfre:frffvbaf:pynhqr_pbqr hfre:zpc_freiref hfre:svyr_hcybnq hfre:cyhtvaf");
 const REFRESH_SCOPES = rot18("hfre:cebsvyr hfre:vasrerapr hfre:frffvbaf:pynhqr_pbqr hfre:zpc_freiref hfre:svyr_hcybnq hfre:cyhtvaf");
@@ -184,7 +184,7 @@ export default Plugin.define({
     const profile = resolveSpoofingProfile(options.spoofingProfile);
     const attributionHeader = options.attributionHeader !== false;
     // The active Anthropic credential when it is this plugin's OAuth grant;
-    // every wire rewrite below is gated on it.
+    // the session, tool, and model hooks below are gated on it.
     let oauth: Credential.OAuth | undefined;
     let credentialIdentity: string | undefined;
     let cliGeneration = 0;
@@ -353,7 +353,6 @@ export default Plugin.define({
 
     await load();
 
-    // Mirrors Claude Code's /usage request (October 3 capture).
     await ctx.rpc.register(ClaudeOAuthRpc, {
       prepareSearch: async ({ integrationID, body, beta }, { signal }) => {
         const connection = await ctx.integration.connection.active(integrationID);
@@ -379,6 +378,7 @@ export default Plugin.define({
         if (credential?.type !== "oauth" || credential.methodID !== METHOD_ID) {
           throw new Error("Anthropic is not connected with Claude Pro/Max.");
         }
+        // Mirrors Claude Code's /usage request (October 3 capture).
         const response = await fetch(USAGE_URL, {
           headers: {
             Authorization: `Bearer ${credential.access}`,
@@ -562,8 +562,8 @@ export default Plugin.define({
       { providerID: "anthropic" },
     );
 
-    // Uncloak custom tool names on the way back, incrementally (no full
-    // buffering). Rewritten responses get cloned headers with stale entity
+    // Uncloak custom tool names on the way back: SSE streams incrementally, JSON
+    // messages whole. Rewritten responses get cloned headers with stale entity
     // headers stripped.
     await ctx.session.hook(
       "http.response",

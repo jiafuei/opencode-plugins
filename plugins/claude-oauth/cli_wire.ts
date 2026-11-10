@@ -47,7 +47,8 @@ const AGENT_IDENTITY = SDK_CLI_PROFILE.systemInstruction;
 const PREAMBLE = "You are an interactive agent that helps users with software engineering tasks. " +
   "Workspace tools are provided by the oc MCP server. Use the available tool schemas and follow the user's instructions.";
 const BILLING = "x-anthropic-billing-header:";
-// Claude 3 and 4 models predate the per-turn, tool-change, clear-at, and thinking-update betas. Every other model gets them.
+// Claude 3 and 4 models go without the per-turn, tool-change, clear-at, and thinking-update betas and keep their
+// thinking options. Every other ID gets the current set, including models and families released after this profile.
 const LEGACY = /^claude-(?:3-|(?:opus|sonnet|haiku)-4)/;
 
 /** Native byte-marker normalization, verified against 2.1.280 and 2.1.284 captures (September 29–30) and 48 2.1.296 requests (October 11). */
@@ -135,8 +136,8 @@ export function rewriteCliBody(body: string, attribution: CliAttribution, attrib
 
   const incoming = search ? [{ type: "text", text: "You are an assistant for performing a web search tool use" }]
     : typeof params.system === "string" ? [{ type: "text", text: params.system }] : params.system ?? [];
-  // Only the harness opening is replaced. Repository instructions, memories,
-  // skills, quoted text, and user references to OpenCode remain verbatim.
+  // Only the harness opening is removed and the environment preamble reworded. Repository
+  // instructions, memories, skills, quoted text, and user references to OpenCode remain verbatim.
   const instructions = incoming
     .filter((block: any) => !block.text.startsWith(BILLING) && block.text !== IDENTITY && block.text !== AGENT_IDENTITY)
     .map((block: any, index: number) => index === 0

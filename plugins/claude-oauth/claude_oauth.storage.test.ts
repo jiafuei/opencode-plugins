@@ -17,10 +17,10 @@ function isolatedDataDir(prefix: string): { dir: string; restore: () => void } {
 }
 
 function spawnRacers(script: string, dir: string, count: number): Bun.Subprocess[] {
-  return Array.from({ length: count }, (_, i) =>
+  return Array.from({ length: count }, () =>
     Bun.spawn({
       cmd: [process.execPath, "-e", script],
-      env: { ...process.env, XDG_DATA_HOME: dir, RACER_INDEX: String(i), MODULE_PATH },
+      env: { ...process.env, XDG_DATA_HOME: dir, MODULE_PATH },
       stdout: "pipe",
       stderr: "pipe",
     }),
@@ -49,8 +49,8 @@ describe("install id (stable local identity)", () => {
   const SCRIPT = `
     const mod = await import(process.env.MODULE_PATH);
     const { json } = mod.rewriteCliBody(
-      JSON.stringify({ model: "claude-sonnet-4-6", messages: [{ role: "user", content: "hi" }], max_tokens: 1 }),
-      { sessionId: "session", requestClass: "main" }, true, mod.SDK_CLI_PROFILE,
+      JSON.stringify({ model: "claude-opus-5-5", messages: [{ role: "user", content: "hi" }], max_tokens: 1 }),
+      { sessionId: "session", requestClass: "main" },
     );
     const userId = JSON.parse(JSON.parse(json).metadata.user_id);
     console.log(userId.device_id);
@@ -72,7 +72,7 @@ describe("install id (stable local identity)", () => {
     }
   });
 
-  test("a valid pre-existing identity is adopted", async () => {
+  test("a pre-existing install id is adopted", async () => {
     const { dir, restore } = isolatedDataDir("claude-oauth-installid-pre-");
     try {
       const dataDir = path.join(dir, "opencode");
