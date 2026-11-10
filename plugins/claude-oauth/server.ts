@@ -191,6 +191,9 @@ export default Plugin.define({
     let relay: ReturnType<typeof createCliRelay> | undefined;
     type CliState = {
       parentId?: string;
+      rootId: Parameters<typeof ctx.session.get>[0]["sessionID"];
+      toolsUsed: Set<string>;
+      firstUserText?: string;
       wireId: string;
       agentId?: string;
       turn?: string;
@@ -221,7 +224,7 @@ export default Plugin.define({
     type SavedSession = Pick<
       CliState,
       "wireId" | "turn" | "promptId" | "promptIndex" | "turnIndex" | "previousRequestId" | "previousMessageId"
-    > & { accountId?: string };
+    > & { accountId?: string; toolsUsed?: string[] };
     const cliStates = new Map<string, CliState>();
     const cliCalls = new Map<string, CliCall>();
     const cliResponses = new WeakMap<Request, CliCall>();
@@ -239,6 +242,8 @@ export default Plugin.define({
         parentId: session.parentID,
         wireId: parent?.wireId ?? randomUUID(),
         ...(parent ? { agentId: `a${randomBytes(8).toString("hex")}`, promptId: parent.promptId } : resumed),
+        rootId: parent?.rootId ?? sessionID,
+        toolsUsed: parent?.toolsUsed ?? new Set(resumed.toolsUsed),
         sequence: 0, committed: 0,
       };
       const winner = cliStates.get(sessionID) ?? created;
@@ -251,7 +256,8 @@ export default Plugin.define({
       const { wireId, turn, promptId, promptIndex, turnIndex, previousRequestId, previousMessageId } = state;
       const saved = Object.fromEntries(Object.entries({
         accountId: oauth?.metadata?.accountId as string | undefined, wireId, turn, promptId, promptIndex, turnIndex, previousRequestId, previousMessageId,
-      }).filter((entry): entry is [string, string | number] => entry[1] !== undefined));
+        toolsUsed: [...state.toolsUsed],
+      }).filter((entry) => entry[1] !== undefined));
       const { metadata } = await ctx.session.get({ sessionID });
       await ctx.session.update({ sessionID, metadata: { ...metadata, [SESSION_METADATA_KEY]: saved } });
     };
@@ -397,6 +403,10 @@ export default Plugin.define({
     await ctx.session.hook("context", async (event) => {
       if (!oauth) return;
       const state = await cliState(event.sessionID);
+      const messages = await ctx.session.context({ sessionID: event.sessionID });
+      const first = event.messages.find((message) => message.role === "user");
+      const original = messages.find((message) => message.id === first?.id);
+      state.firstUserText = original?.type === "user" || original?.type === "synthetic" ? original.text : undefined;
       const user = event.messages.findLast((message) => message.role === "user");
       if (!user || state.agentId) return;
       const turn = user.id ?? new Bun.CryptoHasher("sha256").update(JSON.stringify(user.content)).digest("hex");
@@ -405,7 +415,6 @@ export default Plugin.define({
       if (turn !== state.turn || !state.turnOrigin) {
         if (profile.id === "sdk-cli") state.turnOrigin = "sdk";
         else {
-          const messages = await ctx.session.context({ sessionID: event.sessionID });
           state.turnOrigin = messages.find((message) => message.id === user.id)?.type === "synthetic" ? "task_notification" : "human";
         }
       }
@@ -418,6 +427,18 @@ export default Plugin.define({
         await persist(event.sessionID, state);
       }
     }, { providerID: "anthropic" });
+
+    // Record execution before a tool starts so its nested model calls see it too.
+    // The root owns the set; child sessions share it rather than reconstructing the parent's history.
+    await ctx.tool.hook("execute.before", async (event) => {
+      if (!oauth) return;
+      const state = await cliState(event.sessionID);
+      const name = profile.toolPrefix + event.tool;
+      if (state.toolsUsed.has(name)) return;
+      state.toolsUsed.add(name);
+      const root = await cliState(state.rootId);
+      await persist(state.rootId, root);
+    });
 
     // Subscription-billed: zero out costs so usage tracking doesn't report
     // API spend for Pro/Max requests.
@@ -454,6 +475,9 @@ export default Plugin.define({
             agentType: state.agentId ? event.agent : undefined,
             requestClass: event.kind === "primary" ? state.agentId ? "subagent" : "main"
               : event.kind === "compaction" ? "compaction" : "auxiliary",
+            ...(event.kind === "title" ? { purpose: "title" } : {}),
+            ...(["primary", "compaction"].includes(event.kind) ? { firstUserText: state.firstUserText } : {}),
+            toolsUsed: state.toolsUsed,
             // CC's compaction billing line carries only the previous request.
             ...(event.kind !== "title" && event.kind !== "compaction" ? { promptId: state.promptId, turnOrigin: state.turnOrigin } : {}),
             ...(event.kind === "primary" ? { promptIndex: state.promptIndex, turnIndex: state.turnIndex } : {}),
@@ -480,6 +504,12 @@ export default Plugin.define({
         const call = cliCalls.get(id);
         if (!call || cliStates.get(event.sessionID) !== call.state) throw new Error("Claude CLI request belongs to an inactive session");
         const rewritten = rewriteCliBody(body, call.attribution, attributionHeader, profile);
+        const size = call.state.toolsUsed.size;
+        for (const name of rewritten.usedTools) call.state.toolsUsed.add(name);
+        if (call.state.toolsUsed.size !== size) {
+          const root = await cliState(call.state.rootId);
+          await persist(call.state.rootId, root);
+        }
         const headers = cliHeaders(request.headers, call.attribution, rewritten, id, call.attempts++, profile);
         relay ??= createCliRelay();
         event.request = relay.forward(url, headers, rewritten.json, request.signal);

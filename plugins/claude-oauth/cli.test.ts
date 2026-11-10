@@ -30,18 +30,26 @@ test("CLI preserves instruction and tool semantics while namespacing definitions
       { role: "user", content: [{ type: "text", text: "<system-reminder>Keep this exactly.</system-reminder>" }, { type: "text", text: "My OpenCode request" }] },
       { role: "assistant", content: [{ type: "tool_use", id: "toolu_1", name: "shell", input: { command: "echo OpenCode" } }] },
       { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_1", content: "OpenCode output" }] },
+      { role: "system", content: [
+        { type: "tool_addition", tool: { type: "tool_reference", name: "shell" } },
+        { type: "tool_addition", tool: { type: "custom", definition: { name: "later", input_schema: { type: "object" } } } },
+      ] },
     ],
     tools: [...BODY.tools, { type: "web_search_20250305", name: "web_search" }],
     tool_choice: { type: "tool", name: "shell" },
   };
   const rewritten = rewriteCliBody(JSON.stringify(input), { sessionId: "session", requestClass: "main", promptId: "prompt", turnOrigin: "human" });
   const body = JSON.parse(rewritten.json);
-  expect(body.tools[0]).toEqual({ ...BODY.tools[0], name: "mcp__oc__shell" });
+  expect(body.tools[0]).toEqual({ ...BODY.tools[0], name: "mcp__oc__shell", ownership_metadata: { verified: false, owner: "mcp" } });
   expect(body.tools[1]).toEqual(input.tools[1]);
   expect(body.tool_choice.name).toBe("mcp__oc__shell");
   expect(body.messages[1].content[0]).toEqual({ ...input.messages[1]!.content[0], name: "mcp__oc__shell" });
   expect(body.messages[0]).toEqual(input.messages[0]);
   expect(body.messages[2].content[0].content).toBe("OpenCode output");
+  expect(body.messages[3].content[0].tool.name).toBe("mcp__oc__shell");
+  expect(body.messages[3].content[1].tool.definition).toMatchObject({
+    name: "mcp__oc__later", ownership_metadata: { verified: false, owner: "mcp" },
+  });
   expect(body.system.at(-1).text).toContain(input.system[1]!.text);
   expect(body.system.at(-1).text).toContain("Preserve my OpenCode instructions.");
   expect(body.system.at(-1).text).not.toContain("running in OpenCode");
@@ -55,6 +63,7 @@ test("compaction requests match CC's compaction wire and keep both compaction me
     { role: "user", content: [{ type: "text", text: "hello" }] },
     { role: "assistant", content: [{ type: "text", text: "hi" }] },
     { role: "user", content: [{ type: "text", text: "Summarize the conversation." }] },
+    { role: "system", content: [{ type: "text", text: "Remaining token budget" }] },
   ];
   const threshold = rewriteCliBody(JSON.stringify({
     ...BODY,
@@ -80,37 +89,68 @@ test("compaction requests match CC's compaction wire and keep both compaction me
   expect(headers["anthropic-beta"]).toContain("compact-2026-09-04");
 });
 
-test("SDK billing skips leading reminders and retains legacy model thinking options", () => {
+test("SDK billing uses original user text and retains budget-based thinking options", () => {
   const input = {
     ...BODY,
     model: "claude-sonnet-4-6",
     messages: [{ role: "user", content: [
       { type: "text", text: "<system-reminder>metadata</system-reminder>" },
-      { type: "text", text: "actual user prompt" },
+      { type: "text", text: "injected context before the actual prompt" },
     ] }],
-    thinking: { type: "adaptive", display: "summarized", budget_tokens: 2048 },
+    thinking: { type: "enabled", display: "summarized", budget_tokens: 2048 },
   };
-  const body = JSON.parse(rewriteCliBody(JSON.stringify(input), { sessionId: "s", requestClass: "main" }, true, SDK_CLI_PROFILE).json);
-  expect(body.system[0].text).toContain("cc_version=2.1.296.c66;");
+  const body = JSON.parse(rewriteCliBody(JSON.stringify(input), { sessionId: "s", requestClass: "main", firstUserText: "actual user prompt" }, true, SDK_CLI_PROFILE).json);
+  expect(body.system[0].text).toContain("cc_version=2.1.321.fbc;");
   expect(body.thinking).toEqual(input.thinking);
 });
 
-test("Haiku 5 main and utility requests use the captured 2.1.296 beta lists", () => {
+test("Fable uses the captured 2.1.321 main profile without replacing provider token limits", () => {
   const attribution = { sessionId: "s", requestClass: "main" } as const;
-  const main = rewriteCliBody(JSON.stringify({ ...BODY, model: "claude-haiku-5-5" }), attribution);
+  const main = rewriteCliBody(JSON.stringify({ ...BODY, model: "claude-fable-5-2", max_tokens: 32768 }), attribution);
+  expect(JSON.parse(main.json).max_tokens).toBe(32768);
+  expect(JSON.parse(main.json).thinking).toEqual({ type: "adaptive", display: "updates" });
   expect(cliHeaders(new Headers({ authorization: "t" }), attribution, main, "id", 0)["anthropic-beta"]).toBe(
-    "oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27," +
-    "prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,claude-code-20250219,per-turn-control-2026-07-01," +
-    "mid-conversation-tool-changes-2026-07-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21," +
+    "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27," +
+    "prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01," +
+    "tool-provenance-2026-10-26,thinking-token-count-2026-05-13,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21," +
     "effort-2025-11-24,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11," +
     "cache-diagnosis-2026-04-07");
-  const auxiliary = { sessionId: "s", requestClass: "auxiliary" } as const;
-  const utility = rewriteCliBody(JSON.stringify({ model: "claude-haiku-5-5", messages: BODY.messages, stream: true }), auxiliary);
-  expect(cliHeaders(new Headers({ authorization: "t" }), auxiliary, utility, "id", 0)["anthropic-beta"]).toBe(
-    "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13," +
-    "context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07," +
-    "per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,mid-conversation-system-clear-at-2026-08-21," +
-    "effort-2025-11-24,structured-outputs-2025-12-15,cache-diagnosis-2026-04-07");
+});
+
+test("auxiliary searches, side queries, titles, and activity summaries keep distinct wire profiles", () => {
+  const attribution = { sessionId: "s", requestClass: "auxiliary", agentId: "agent", promptId: "prompt" } as const;
+  const cases = [
+    { name: "search", input: { ...BODY, thinking: undefined, tools: [{ type: "web_search_20250305", name: "web_search" }] } },
+    { name: "side-query", input: { ...BODY, thinking: undefined, tools: [], output_config: { effort: "medium" } } },
+    { name: "title", input: { ...BODY, thinking: undefined, tools: [], output_config: { effort: "medium", format: { type: "json_schema", schema: { type: "object" } } } } },
+    { name: "activity-summary", input: { ...BODY, messages: [
+      ...BODY.messages,
+      { role: "assistant", content: [{ type: "tool_use", id: "call", name: "shell", input: {} }] },
+      { role: "user", content: [
+        { type: "tool_result", tool_use_id: "call", content: "done" },
+        { type: "text", text: "Describe your most recent action in 3-5 words using present tense (-ing)." },
+      ] },
+      { role: "system", content: "Remaining token budget" },
+    ] } },
+  ];
+  for (const { name, input } of cases) {
+    const request = rewriteCliBody(JSON.stringify(input), attribution);
+    const body = JSON.parse(request.json);
+    const headers = cliHeaders(new Headers({ authorization: "t" }), attribution, request, "id", 0);
+    const betas = headers["anthropic-beta"]!.split(",");
+    expect(betas.includes("structured-outputs-2025-12-15")).toBe(name === "title");
+    expect(betas.includes("claude-code-side-query-2026-09-29")).toBe(name === "side-query");
+    expect(betas.includes("fallback-credit-2026-06-01")).toBe(name === "activity-summary");
+    expect(headers["x-claude-code-prompt-id"]).toBe("prompt");
+    if (name === "activity-summary") {
+      expect(body.messages[1].content[0].cache_control).toEqual({ type: "ephemeral" });
+      expect(body.messages[2].content.every((part: any) => !part.cache_control)).toBe(true);
+      expect(body.messages[3].content).toBe("Remaining token budget");
+    } else {
+      expect(body.system.every((part: any) => !part.cache_control)).toBe(true);
+      expect(body.messages[0].content).toBe("hello");
+    }
+  }
 });
 
 test("relay controls actual header order/casing, drops late trace headers, and decompresses responses", async () => {
@@ -200,7 +240,7 @@ test.each(["cli", "sdk-cli"] as const)("%s selects its captured identity and tra
   try {
     f.plugin.state.sessions.ses_child = { parentID: "ses_root" };
     const first = await f.send();
-    expect(first.capture.headers.get("user-agent")).toBe(`claude-cli/2.1.296 (external, ${profile})`);
+    expect(first.capture.headers.get("user-agent")).toBe(`claude-cli/2.1.321 (external, ${profile})`);
     expect(first.capture.body.system[0].text).toContain(`cc_entrypoint=${profile};`);
     expect(first.capture.body.system[0].text).toContain(`cc_turn_origin=${profile === "sdk-cli" ? "sdk" : "human"};`);
     expect(first.capture.body.system[1].text).toBe(profile === "sdk-cli"
@@ -216,13 +256,19 @@ test.each(["cli", "sdk-cli"] as const)("%s selects its captured identity and tra
     expect(first.capture.body.tools[0].name).toBe("mcp__oc__shell");
     expect(first.text).toContain('"name":"shell"');
     expect(first.text).not.toContain(CLI_PROFILE.toolPrefix);
+    await f.plugin.hooks["tool.execute.before"]!({ sessionID: "ses_root", tool: "shell" });
     const child = await f.send(await f.prepare("ses_child"));
+    expect(JSON.parse(child.capture.headers.get("x-claude-code-sandy-plover")!)).toEqual([{ name: "mcp__oc__shell", mcp: true }]);
+    await f.plugin.hooks["tool.execute.before"]!({ sessionID: "ses_child", tool: "read" });
     expect(child.capture.headers.get("x-claude-code-session-id")).toBe(first.capture.headers.get("x-claude-code-session-id"));
     expect(child.capture.headers.get("x-claude-code-agent-type")).toBe("explore");
     expect(child.capture.body.system[0].text.match(/cc_prompt_id=([^;]+)/)[1]).toBe(first.capture.body.system[0].text.match(/cc_prompt_id=([^;]+)/)[1]);
     expect(child.capture.body.diagnostics.previous_message_id).toBeNull();
     await f.send(await f.prepare("ses_root", "generate"));
     const root = await f.send();
+    expect(JSON.parse(root.capture.headers.get("x-claude-code-sandy-plover")!)).toEqual([
+      { name: "mcp__oc__shell", mcp: true }, { name: "mcp__oc__read", mcp: true },
+    ]);
     expect(root.capture.headers.get("x-claude-code-session-id")).toBe(first.capture.headers.get("x-claude-code-session-id"));
     expect(root.capture.body.diagnostics.previous_message_id).toBe("msg_1");
     expect(root.capture.body.system[0].text).toContain("cc_prev_req=req_1;");
@@ -231,6 +277,7 @@ test.each(["cli", "sdk-cli"] as const)("%s selects its captured identity and tra
     const notification = await f.send(await f.prepare("ses_root", "primary", "msg_notify", true));
     expect(notification.capture.body.system[0].text).toContain(`cc_turn_origin=${profile === "sdk-cli" ? "sdk" : "task_notification"};`);
     expect(notification.capture.body.system[0].text.match(/cc_prompt_id=([^;]+)/)[1]).not.toBe(first.capture.body.system[0].text.match(/cc_prompt_id=([^;]+)/)[1]);
+    expect((await f.send(await f.prepare("ses_other"))).capture.headers.get("x-claude-code-sandy-plover")).toBe("[]");
   } finally { f.close(); }
 });
 
@@ -283,11 +330,13 @@ test("session state survives a plugin reload through session metadata, like a Cl
   try {
     before.plugin.state.sessions.ses_root = { metadata: { other: "kept" } };
     const first = await before.send();
+    await before.plugin.hooks["tool.execute.before"]!({ sessionID: "ses_root", tool: "shell" });
     const promptId = first.capture.headers.get("x-claude-code-prompt-id");
     await Bun.sleep(0);
     // A fresh plugin instance sees only the persisted session metadata.
     after.plugin.state.sessions = before.plugin.state.sessions;
     const sameTurn = await after.send();
+    expect(sameTurn.capture.headers.get("x-claude-code-sandy-plover")).toBe('[{"name":"mcp__oc__shell","mcp":true}]');
     expect(sameTurn.capture.headers.get("x-claude-code-prompt-id")).toBe(promptId);
     expect(sameTurn.capture.headers.get("x-claude-code-session-id")).toBe(first.capture.headers.get("x-claude-code-session-id"));
     expect(sameTurn.capture.body.diagnostics.previous_message_id).toBe("msg_1");

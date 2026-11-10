@@ -3,8 +3,8 @@ import { deriveDeviceId } from "./local_storage.ts";
 
 export const CLI_PROFILE = {
   id: "cli",
-  version: "2.1.296",
-  userAgent: "claude-cli/2.1.296 (external, cli)",
+  version: "2.1.321",
+  userAgent: "claude-cli/2.1.321 (external, cli)",
   billingEntrypoint: "cli",
   systemInstruction: "You are Claude Code, Anthropic's official CLI for Claude.",
   toolPrefix: "mcp__oc__",
@@ -13,7 +13,7 @@ export const CLI_PROFILE = {
 export const SDK_CLI_PROFILE = {
   ...CLI_PROFILE,
   id: "sdk-cli",
-  userAgent: "claude-cli/2.1.296 (external, sdk-cli)",
+  userAgent: "claude-cli/2.1.321 (external, sdk-cli)",
   billingEntrypoint: "sdk-cli",
   systemInstruction: "You are a Claude agent, built on Anthropic's Claude Agent SDK.",
 } as const;
@@ -26,6 +26,10 @@ export interface CliAttribution {
   agentId?: string;
   agentType?: string;
   requestClass: "main" | "subagent" | "auxiliary" | "compaction";
+  purpose?: "title" | "side-query" | "activity-summary";
+  /** Original user text, before the provider merges injected context into user blocks. */
+  firstUserText?: string;
+  toolsUsed?: ReadonlySet<string>;
   promptId?: string;
   turnOrigin?: "human" | "task_notification" | "sdk";
   /** Main-thread turns and the prompts among them, both from 1. */
@@ -43,7 +47,6 @@ const AGENT_IDENTITY = SDK_CLI_PROFILE.systemInstruction;
 const PREAMBLE = "You are an interactive agent that helps users with software engineering tasks. " +
   "Workspace tools are provided by the oc MCP server. Use the available tool schemas and follow the user's instructions.";
 const BILLING = "x-anthropic-billing-header:";
-const CLAUDE_5 = /^claude-(?:opus|sonnet|haiku)-5(?:-|$)/;
 
 /** Native byte-marker normalization, verified against 2.1.280 and 2.1.284 captures (September 29–30) and 48 2.1.296 requests (October 11). */
 export function patchCliCch(body: string): string {
@@ -90,26 +93,53 @@ export function rewriteCliBody(body: string, attribution: CliAttribution, attrib
   const params = JSON.parse(body) as Record<string, any>;
   const search = attribution.requestClass === "auxiliary" && params.tools?.length === 1 &&
     params.tools[0].type?.startsWith("web_search_");
-  const providerNames = new Set<string>((params.tools ?? []).filter((tool: any) => typeof tool.type === "string").map((tool: any) => tool.name));
+  const utility = !params.tools?.length && !["enabled", "adaptive"].includes(params.thinking?.type);
+  const structured = params.output_config?.format?.type === "json_schema";
+  const sideQuery = attribution.requestClass === "auxiliary" && utility && !structured && attribution.purpose !== "title";
+  const compaction = attribution.requestClass === "compaction";
+  const lastUser = params.messages.findLastIndex((message: any) => message.role === "user");
+  const lastContent = params.messages[lastUser]?.content;
+  const summary = compaction || attribution.purpose === "activity-summary" ||
+    (attribution.requestClass === "auxiliary" && (typeof lastContent === "string" ? [lastContent]
+      : (lastContent ?? []).filter((part: any) => part.type === "text").map((part: any) => part.text))
+      .some((text: string) => text.startsWith("Describe your most recent action in 3-5 words")));
+  const providerNames = new Set<string>((params.tools ?? []).filter((tool: any) => typeof tool.type === "string" && tool.type !== "custom").map((tool: any) => tool.name));
   const prefix = (name: string) => providerNames.has(name) ? name : profile.toolPrefix + name;
   for (const tool of params.tools ?? []) {
-    if (typeof tool.type !== "string") tool.name = prefix(tool.name);
+    if (typeof tool.type !== "string" || tool.type === "custom") {
+      tool.name = prefix(tool.name);
+      tool.ownership_metadata = { verified: false, owner: "mcp" };
+    }
     delete tool.cache_control;
   }
   if (params.tool_choice?.type === "tool") params.tool_choice.name = prefix(params.tool_choice.name);
   if (!search && params.tool_choice?.type === "auto" && Object.keys(params.tool_choice).length === 1) delete params.tool_choice;
-  let firstUserText: string | undefined;
+  let firstUserText = attribution.firstUserText;
+  const usedTools = new Set<string>();
   for (const message of params.messages) {
     const blocks = typeof message.content === "string" ? [{ type: "text", text: message.content }] : message.content;
     for (const block of blocks) {
       delete block.cache_control;
-      if (block.type === "tool_use") block.name = prefix(block.name);
+      if (block.type === "tool_use") {
+        block.name = prefix(block.name);
+        usedTools.add(block.name);
+      }
+      if (block.type === "server_tool_use" || block.type === "mcp_tool_use") usedTools.add(block.name);
       if (block.type === "tool_result" && Array.isArray(block.content)) {
         for (const part of block.content) {
           if (part.type === "tool_reference") part.tool_name = prefix(part.tool_name);
         }
       }
-      if (block.type === "tool_addition" && typeof block.tool?.type !== "string") block.tool.name = prefix(block.tool.name);
+      if (block.type === "tool_addition") {
+        if (block.tool.type === "tool_reference") block.tool.name = prefix(block.tool.name);
+        else {
+          const definition = block.tool.definition ?? block.tool;
+          if (typeof definition.type !== "string" || definition.type === "custom") {
+            definition.name = prefix(definition.name);
+            definition.ownership_metadata = { verified: false, owner: "mcp" };
+          }
+        }
+      }
       if (firstUserText === undefined && message.role === "user" && block.type === "text" && !block.text.startsWith("<system-reminder>")) {
         firstUserText = block.text;
       }
@@ -129,9 +159,7 @@ export function rewriteCliBody(body: string, attribution: CliAttribution, attrib
     .filter(Boolean).join("\n\n")
     // Anthropic flags OpenCode's environment preamble next to its <env> block as a third-party app.
     .replace("Here is some useful information about the environment you are running in:", "You have been invoked in the following environment:");
-  const compaction = attribution.requestClass === "compaction";
   const cache = attribution.agentId || compaction ? { type: "ephemeral" } : { type: "ephemeral", ttl: "1h" };
-  const utility = !params.tools?.length && !["enabled", "adaptive"].includes(params.thinking?.type);
   const system: any[] = [];
   if (attributionHeader) {
     const sample = [4, 7, 20].map((index) => (firstUserText ?? "")[index] ?? "0").join("");
@@ -145,22 +173,25 @@ export function rewriteCliBody(body: string, attribution: CliAttribution, attrib
     system.push({ type: "text", text: billing });
   }
   system.push({ type: "text", text: attribution.agentId ? AGENT_IDENTITY : profile.systemInstruction,
-    ...(!utility && attribution.agentId ? { cache_control: cache } : {}) });
+    ...(!utility && !search && attribution.agentId ? { cache_control: cache } : {}) });
   if (!utility && !search && !attribution.agentId) {
     system.push({ type: "text", text: PREAMBLE, cache_control: { ...cache, scope: "global" } });
   }
   if (instructions) system.push({ type: "text", text: instructions, ...(!utility && !search ? { cache_control: cache } : {}) });
   if (!utility && !search && params.messages.length) {
-    // CC's compaction request reads the conversation's cache up to the block before its summary prompt.
-    const last = (compaction && params.messages.at(-2)) || params.messages.at(-1);
-    if (typeof last.content === "string") last.content = [{ type: "text", text: last.content }];
-    const block = last.content.findLast((part: any) => !["thinking", "redacted_thinking"].includes(part.type));
-    if (block) block.cache_control = cache;
+    // Summary prompts may share a user message with tool results and have trailing system messages.
+    const last = summary ? params.messages.slice(0, lastUser).findLast((message: any) => message.role !== "system")
+      : params.messages.at(-1);
+    if (last) {
+      if (typeof last.content === "string") last.content = [{ type: "text", text: last.content }];
+      const block = last.content.findLast((part: any) => !["thinking", "redacted_thinking"].includes(part.type));
+      if (block) block.cache_control = cache;
+    }
   }
 
   const thinking = params.thinking ? { ...params.thinking } : undefined;
   const activeThinking = ["enabled", "adaptive"].includes(thinking?.type);
-  if (activeThinking && CLAUDE_5.test(params.model)) {
+  if (thinking?.type === "adaptive") {
     thinking.display = profile.id === "sdk-cli" ? "omitted" : "updates";
     delete thinking.block_binding;
   }
@@ -179,7 +210,7 @@ export function rewriteCliBody(body: string, attribution: CliAttribution, attrib
     tools: params.tools ?? [],
     metadata: { user_id: JSON.stringify({ device_id: deriveDeviceId(attribution.accountId),
       ...(attribution.accountId ? { account_uuid: attribution.accountId } : {}), session_id: attribution.sessionId }) },
-    max_tokens: params.max_tokens ?? (/^claude-(?:opus-5|(?:sonnet|haiku)-5-5)/.test(params.model) ? 128000 : 64000),
+    max_tokens: params.max_tokens,
     ...(thinking ? { thinking } : {}),
     ...(context ? { context_management: context } : {}),
     ...(params.temperature !== undefined ? { temperature: params.temperature } : {}),
@@ -188,7 +219,8 @@ export function rewriteCliBody(body: string, attribution: CliAttribution, attrib
     ...(params.stream !== undefined ? { stream: params.stream } : {}),
   };
   for (const [key, value] of Object.entries(params)) if (!(key in rewritten)) rewritten[key] = value;
-  return { json: patchCliCch(JSON.stringify(rewritten)), model: params.model as string, utility, search, thinking };
+  return { json: patchCliCch(JSON.stringify(rewritten)), utility, search, structured, sideQuery, summary, thinking,
+    perTurn: thinking?.type === "adaptive" || params.output_config?.effort !== undefined, usedTools };
 }
 
 export function cliHeaders(
@@ -199,33 +231,48 @@ export function cliHeaders(
   retry: number,
   profile: CliProfile = CLI_PROFILE,
 ): Record<string, string> {
-  const haiku = body.model.startsWith("claude-haiku-");
-  // Utility requests to Claude 5 models carry the mid-conversation and effort betas that older small models omit.
-  const full = !body.utility || CLAUDE_5.test(body.model);
   const betas = [
-    ...(!body.utility && !haiku ? ["claude-code-20250219"] : []),
+    ...(!body.utility ? ["claude-code-20250219"] : []),
     "oauth-2025-04-20", "interleaved-thinking-2025-05-14",
     ...(body.utility || body.search ? ["redact-thinking-2026-02-12"] : []),
-    "thinking-token-count-2026-05-13", "context-management-2025-06-27", "prompt-caching-scope-2026-01-05",
-    ...(full ? ["mid-conversation-system-2026-04-07"] : []),
-    // Haiku main requests move the Claude Code beta behind the mid-conversation system beta.
-    ...(!body.utility && haiku ? ["claude-code-20250219"] : []),
-    ...(full && !attribution.agentId ? ["per-turn-control-2026-07-01", "mid-conversation-tool-changes-2026-07-01"] : []),
+    "context-management-2025-06-27", "prompt-caching-scope-2026-01-05",
+    ...(body.perTurn ? ["per-turn-control-2026-07-01"] : []),
+    "mid-conversation-tool-changes-2026-07-01", "tool-provenance-2026-10-26", "thinking-token-count-2026-05-13",
     ...(!body.utility && !body.search ? ["advanced-tool-use-2025-11-20"] : []),
-    ...(full ? ["mid-conversation-system-clear-at-2026-08-21", "effort-2025-11-24"] : []),
-    ...(body.utility ? ["structured-outputs-2025-12-15"] : [
-      ...(profile.id === "cli" && ["auxiliary", "compaction"].includes(attribution.requestClass) ? ["fallback-credit-2026-06-01"] : []),
+    "mid-conversation-system-clear-at-2026-08-21",
+    ...(body.sideQuery ? ["claude-code-side-query-2026-09-29"] : []),
+    ...(body.perTurn ? ["effort-2025-11-24"] : []),
+    ...(body.structured ? ["structured-outputs-2025-12-15"] : []),
+    ...(!body.utility ? [
+      ...(profile.id === "cli" && body.summary ? ["fallback-credit-2026-06-01"] : []),
       ...(!body.search ? ["thinking-binding-controls-2026-08-01"] : []),
       ...(body.thinking?.display === "updates" ? ["thinking-display-updates-2026-08-18"] : []),
-      ...(!body.search && !attribution.agentId && attribution.requestClass !== "compaction" ? ["extended-cache-ttl-2025-04-11"] : []),
-    ]),
+      ...(!body.search && !body.summary && !attribution.agentId ? ["extended-cache-ttl-2025-04-11"] : []),
+    ] : []),
     "cache-diagnosis-2026-04-07",
   ];
   for (const beta of incoming.get("anthropic-beta")?.split(",").map((value) => value.trim()) ?? []) {
     if (profile.id === "sdk-cli" && ["fallback-credit-2026-06-01", "thinking-display-updates-2026-08-18"].includes(beta)) continue;
     if (!beta || betas.includes(beta) || ["context-1m-2025-08-07", "fine-grained-tool-streaming-2025-05-14",
-      "structured-outputs-2025-11-13", "redact-thinking-2026-02-12"].includes(beta)) continue;
+      "structured-outputs-2025-11-13", "redact-thinking-2026-02-12", "mid-conversation-system-2026-04-07",
+      "fallback-credit-2026-06-01", "structured-outputs-2025-12-15"].includes(beta)) continue;
     betas.push(beta);
+  }
+  // All local tools are exposed through oc's MCP namespace. Provider tools retain their native names.
+  const used = [...new Set([...(attribution.toolsUsed ?? []), ...body.usedTools])].map((name) =>
+    JSON.stringify({ name, ...(name.startsWith("mcp__") ? { mcp: true } : {}) })
+      .replace(/[\u007f-\uffff]/g, (char) => `\\u${char.charCodeAt(0).toString(16).padStart(4, "0")}`));
+  const toolsHeader: string[] = [];
+  let bytes = 2;
+  for (const entry of used) {
+    if (toolsHeader.length === 64 || bytes + entry.length + toolsHeader.length > 7168) break;
+    toolsHeader.push(entry);
+    bytes += entry.length;
+  }
+  if (toolsHeader.length < used.length) {
+    const marker = '{"name":"unreadable-tools-used-before-summary"}';
+    while (toolsHeader.length >= 64 || bytes + marker.length + toolsHeader.length > 7168) bytes -= toolsHeader.pop()!.length;
+    toolsHeader.unshift(marker);
   }
   return {
     Accept: "application/json",
@@ -239,7 +286,7 @@ export function cliHeaders(
     "X-Stainless-Package-Version": "0.128.0",
     "X-Stainless-Retry-Count": String(retry),
     "X-Stainless-Runtime": "node",
-    "X-Stainless-Runtime-Version": "v26.3.0",
+    "X-Stainless-Runtime-Version": "v26.12.1",
     "X-Stainless-Timeout": "600",
     "anthropic-beta": betas.join(","),
     "anthropic-dangerous-direct-browser-access": "true",
@@ -253,8 +300,9 @@ export function cliHeaders(
     } : {}),
     ...(attribution.agentId ? { "x-claude-code-agent-id": attribution.agentId } : {}),
     ...(attribution.agentType && attribution.requestClass === "subagent" ? { "x-claude-code-agent-type": attribution.agentType } : {}),
-    ...(attribution.promptId && !body.utility ? { "x-claude-code-prompt-id": attribution.promptId } : {}),
+    ...(attribution.promptId && attribution.purpose !== "title" ? { "x-claude-code-prompt-id": attribution.promptId } : {}),
     "x-claude-code-request-class": attribution.requestClass,
+    "x-claude-code-sandy-plover": `[${toolsHeader.join(",")}]`,
     "x-client-request-id": requestId,
   };
 }

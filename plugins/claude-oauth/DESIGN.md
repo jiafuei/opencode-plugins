@@ -10,16 +10,17 @@ When the active Anthropic connection is the Claude Pro/Max OAuth credential, the
 
 ### Profiles
 
-Both profiles follow Linux x64 Claude Code 2.1.296. The interactive CLI reference is a 2.1.296 capture; `sdk-cli`
-applies the same 2.1.296 changes to a 2.1.280 SDK capture.
+Both profiles follow Linux x64 Claude Code 2.1.321 with the Node v26.12.1 runtime header. The interactive CLI reference
+is the November 10 capture; `sdk-cli` applies these changes while retaining the identity and display differences
+established by the earlier SDK capture. A 2.1.321 SDK capture has not been verified.
 
 | Wire behavior | `cli` | `sdk-cli` |
 | --- | --- | --- |
 | Main system identity | Official Claude Code CLI | Claude Agent SDK |
 | Billing entrypoint | `cli` | `sdk-cli` |
 | Turn origin | `human` / `task_notification` | `sdk` |
-| Claude 5 thinking display | `updates` | `omitted` |
-| Fallback-credit beta | Auxiliary and compaction requests | Absent |
+| Adaptive thinking display | `updates` | `omitted` |
+| Fallback-credit beta | Activity summaries and compaction requests | Absent |
 | Thinking-display-updates beta | Present with updates | Absent |
 
 Device identity is derived from the plugin's install ID and the OAuth account. Neither profile reads
@@ -30,24 +31,31 @@ Device identity is derived from the plugin's install ID and the OAuth account. N
 - Requests carry the profile's exact `User-Agent`, `x-app: cli`, a per-invocation `x-client-request-id` (stable across
   HTTP retries), the Stainless header set, and a per-session `X-Claude-Code-Session-Id` UUID. OpenCode's
   session-routing, project, and client headers are dropped.
-- Each request class (main, subagent, auxiliary, compaction) gets its own header and beta profile. Other caller betas
-  are kept and deduplicated after the profile's list, except `fine-grained-tool-streaming-2025-05-14` (absent from the
-  profile), the SDK's obsolete `structured-outputs-2025-11-13` tool beta, and `context-1m-2025-08-07` (hard-429'd for
-  subscription credentials).
-- Beta lists also vary by model: tool-less utility requests to Claude 5 models add the mid-conversation and effort betas
-  that older small models omit, and Haiku main requests list `claude-code-20250219` after
-  `mid-conversation-system-2026-04-07`.
-- The model's output limit is kept, including 128000-token Opus requests.
+- Request settings determine betas without matching model-family names. Adaptive thinking or an explicit effort
+  setting enables the per-turn and effort betas, including on subagents. The obsolete mid-conversation-system beta
+  is removed, and the tool-provenance beta precedes thinking-token-count.
+- Auxiliary searches omit fallback-credit and caching. Plain tool-less side queries use the side-query beta;
+  JSON-schema output uses the structured-outputs beta. Activity summaries retain thinking and tools and cache the
+  conversation before the summary-bearing user message.
+- Other caller betas are appended and deduplicated. Obsolete betas and the profile-controlled fallback-credit and
+  structured-output betas cannot be reintroduced by the caller. The context-1m beta is omitted because subscription
+  credentials rejected it with HTTP 429.
+- The provider's `max_tokens` is preserved. The plugin does not infer an output limit from a model name.
+- `x-claude-code-sandy-plover` reports tools used across the conversation and its subagents. The list is bounded to
+  64 entries and 7,168 bytes, with an incomplete-history marker when truncated.
 
 ### Body
 
 - Custom tools are exposed as `mcp__oc__<name>` with their schemas and arguments intact. Definitions, forced tool
   choices, historical calls, and tool references are rewritten consistently; response tool names are restored.
+  Custom definitions carry `ownership_metadata: { verified: false, owner: "mcp" }`. The in-process oc namespace has
+  no server URL to report.
 - The OpenCode harness opening is replaced by the profile's identity. System blocks are regrouped into stable
   instructions and caller instructions; repository rules, skills, memories, user messages, and tool results keep their
   text. OpenCode's environment preamble is reworded to Claude Code's "You have been invoked in the following
   environment:" (see [Third-party classification](#third-party-classification)).
 - Main agent requests use 1-hour caches; child agents use short caches.
+  Web searches and tool-less utility requests do not receive cache markers.
 
 ### Billing header and `cch`
 
@@ -56,6 +64,8 @@ Device identity is derived from the plugin's install ID and the OAuth account. N
   task notifications do not count as prompts. Subagents carry the prompt ID header but no indexes.
 - `cch` uses Claude Code's serialized-byte algorithm (global byte-marker normalization, nested `model` values,
   `max_tokens`/fallback exclusions) and is patched over the `cch=00000` placeholder as five lowercase hex characters.
+- The version suffix uses the original user text from session context when available, before the provider merges
+  injected instructions into user blocks. Requests without that context use their first non-reminder user text.
 - `attributionHeader: false` drops the billing header and `cch`; the rest of the profile stays.
 
 ### Session state
@@ -65,9 +75,11 @@ Device identity is derived from the plugin's install ID and the OAuth account. N
 - `cc_prev_req` and `diagnostics.previous_message_id` advance only after a complete JSON message or an SSE stream that
   ends with a parsed `message_stop` and no error event. Retries reuse logical IDs and increment
   `X-Stainless-Retry-Count`. Late completions cannot replace newer chains or restore deleted or account-switched state.
-- A root session's state (wire session UUID, `cc_prev_req` / `previous_message_id` chain, prompt ID, and prompt/turn
+- A root session's state (wire session UUID, `cc_prev_req` / `previous_message_id` chain, prompt ID, tool-use history, and prompt/turn
   indexes) is saved in the session's metadata under `claude-oauth.session` and restored after plugin reloads and
   restarts, as a Claude Code `--resume` keeps all of it. State saved under another account is not restored.
+- Tool execution records its name before nested model calls run. Children share the root's tool-use set and persist
+  it through the root's metadata. Outgoing history also supplies tool names when resuming older sessions.
 
 ### Compaction
 

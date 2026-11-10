@@ -37,6 +37,9 @@ export async function setupPlugin(options: Record<string, unknown> = {}, credent
         state.reloads++;
       },
     },
+    tool: {
+      hook: async (name: string, callback: any) => (hooks[`tool.${name}`] = callback),
+    },
     session: {
       hook: async (name: string, callback: any) => (hooks[name] = callback),
       get: async ({ sessionID }: { sessionID: string }) => ({ id: sessionID, ...state.sessions[sessionID] }),
