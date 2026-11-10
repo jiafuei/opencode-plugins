@@ -26,7 +26,7 @@ export interface CliAttribution {
   agentId?: string;
   agentType?: string;
   requestClass: "main" | "subagent" | "auxiliary" | "compaction";
-  purpose?: "title" | "side-query" | "activity-summary";
+  title?: boolean;
   /** Original user text, before the provider merges injected context into user blocks. */
   firstUserText?: string;
   toolsUsed?: ReadonlySet<string>;
@@ -47,6 +47,8 @@ const AGENT_IDENTITY = SDK_CLI_PROFILE.systemInstruction;
 const PREAMBLE = "You are an interactive agent that helps users with software engineering tasks. " +
   "Workspace tools are provided by the oc MCP server. Use the available tool schemas and follow the user's instructions.";
 const BILLING = "x-anthropic-billing-header:";
+// Claude 3 and 4 models predate the per-turn, tool-change, clear-at, and thinking-update betas. Every other model gets them.
+const LEGACY = /^claude-(?:3-|(?:opus|sonnet|haiku)-4)/;
 
 /** Native byte-marker normalization, verified against 2.1.280 and 2.1.284 captures (September 29–30) and 48 2.1.296 requests (October 11). */
 export function patchCliCch(body: string): string {
@@ -95,14 +97,8 @@ export function rewriteCliBody(body: string, attribution: CliAttribution, attrib
     params.tools[0].type?.startsWith("web_search_");
   const utility = !params.tools?.length && !["enabled", "adaptive"].includes(params.thinking?.type);
   const structured = params.output_config?.format?.type === "json_schema";
-  const sideQuery = attribution.requestClass === "auxiliary" && utility && !structured && attribution.purpose !== "title";
+  const sideQuery = attribution.requestClass === "auxiliary" && utility && !structured && !attribution.title;
   const compaction = attribution.requestClass === "compaction";
-  const lastUser = params.messages.findLastIndex((message: any) => message.role === "user");
-  const lastContent = params.messages[lastUser]?.content;
-  const summary = compaction || attribution.purpose === "activity-summary" ||
-    (attribution.requestClass === "auxiliary" && (typeof lastContent === "string" ? [lastContent]
-      : (lastContent ?? []).filter((part: any) => part.type === "text").map((part: any) => part.text))
-      .some((text: string) => text.startsWith("Describe your most recent action in 3-5 words")));
   const providerNames = new Set<string>((params.tools ?? []).filter((tool: any) => typeof tool.type === "string" && tool.type !== "custom").map((tool: any) => tool.name));
   const prefix = (name: string) => providerNames.has(name) ? name : profile.toolPrefix + name;
   for (const tool of params.tools ?? []) {
@@ -130,16 +126,7 @@ export function rewriteCliBody(body: string, attribution: CliAttribution, attrib
           if (part.type === "tool_reference") part.tool_name = prefix(part.tool_name);
         }
       }
-      if (block.type === "tool_addition") {
-        if (block.tool.type === "tool_reference") block.tool.name = prefix(block.tool.name);
-        else {
-          const definition = block.tool.definition ?? block.tool;
-          if (typeof definition.type !== "string" || definition.type === "custom") {
-            definition.name = prefix(definition.name);
-            definition.ownership_metadata = { verified: false, owner: "mcp" };
-          }
-        }
-      }
+      if (["tool_addition", "tool_removal"].includes(block.type) && block.tool.type === "tool_reference") block.tool.name = prefix(block.tool.name);
       if (firstUserText === undefined && message.role === "user" && block.type === "text" && !block.text.startsWith("<system-reminder>")) {
         firstUserText = block.text;
       }
@@ -179,8 +166,10 @@ export function rewriteCliBody(body: string, attribution: CliAttribution, attrib
   }
   if (instructions) system.push({ type: "text", text: instructions, ...(!utility && !search ? { cache_control: cache } : {}) });
   if (!utility && !search && params.messages.length) {
-    // Summary prompts may share a user message with tool results and have trailing system messages.
-    const last = summary ? params.messages.slice(0, lastUser).findLast((message: any) => message.role !== "system")
+    // CC's compaction request reads the conversation's cache up to the message before its summary prompt.
+    // System messages may trail that prompt.
+    const prompt = params.messages.findLastIndex((message: any) => message.role === "user");
+    const last = compaction ? params.messages.slice(0, prompt).findLast((message: any) => message.role !== "system")
       : params.messages.at(-1);
     if (last) {
       if (typeof last.content === "string") last.content = [{ type: "text", text: last.content }];
@@ -191,7 +180,7 @@ export function rewriteCliBody(body: string, attribution: CliAttribution, attrib
 
   const thinking = params.thinking ? { ...params.thinking } : undefined;
   const activeThinking = ["enabled", "adaptive"].includes(thinking?.type);
-  if (thinking?.type === "adaptive") {
+  if (activeThinking && !LEGACY.test(params.model)) {
     thinking.display = profile.id === "sdk-cli" ? "omitted" : "updates";
     delete thinking.block_binding;
   }
@@ -219,8 +208,8 @@ export function rewriteCliBody(body: string, attribution: CliAttribution, attrib
     ...(params.stream !== undefined ? { stream: params.stream } : {}),
   };
   for (const [key, value] of Object.entries(params)) if (!(key in rewritten)) rewritten[key] = value;
-  return { json: patchCliCch(JSON.stringify(rewritten)), utility, search, structured, sideQuery, summary, thinking,
-    perTurn: thinking?.type === "adaptive" || params.output_config?.effort !== undefined, usedTools };
+  return { json: patchCliCch(JSON.stringify(rewritten)), model: params.model as string, utility, search, structured, sideQuery, thinking,
+    effort: thinking?.type === "adaptive" || params.output_config?.effort !== undefined, usedTools };
 }
 
 export function cliHeaders(
@@ -231,23 +220,28 @@ export function cliHeaders(
   retry: number,
   profile: CliProfile = CLI_PROFILE,
 ): Record<string, string> {
+  const compaction = attribution.requestClass === "compaction";
+  const legacy = LEGACY.test(body.model);
+  const haiku = body.model.startsWith("claude-haiku-");
   const betas = [
-    ...(!body.utility ? ["claude-code-20250219"] : []),
+    ...(!body.utility && !haiku ? ["claude-code-20250219"] : []),
     "oauth-2025-04-20", "interleaved-thinking-2025-05-14",
     ...(body.utility || body.search ? ["redact-thinking-2026-02-12"] : []),
     "context-management-2025-06-27", "prompt-caching-scope-2026-01-05",
-    ...(body.perTurn ? ["per-turn-control-2026-07-01"] : []),
-    "mid-conversation-tool-changes-2026-07-01", "tool-provenance-2026-10-26", "thinking-token-count-2026-05-13",
+    // Haiku requests move the Claude Code beta behind prompt-caching-scope.
+    ...(!body.utility && haiku ? ["claude-code-20250219"] : []),
+    ...(!legacy ? ["per-turn-control-2026-07-01", "mid-conversation-tool-changes-2026-07-01"] : []),
+    "tool-provenance-2026-10-26", "thinking-token-count-2026-05-13",
     ...(!body.utility && !body.search ? ["advanced-tool-use-2025-11-20"] : []),
-    "mid-conversation-system-clear-at-2026-08-21",
+    ...(!legacy ? ["mid-conversation-system-clear-at-2026-08-21"] : []),
     ...(body.sideQuery ? ["claude-code-side-query-2026-09-29"] : []),
-    ...(body.perTurn ? ["effort-2025-11-24"] : []),
+    ...(body.effort ? ["effort-2025-11-24"] : []),
     ...(body.structured ? ["structured-outputs-2025-12-15"] : []),
     ...(!body.utility ? [
-      ...(profile.id === "cli" && body.summary ? ["fallback-credit-2026-06-01"] : []),
+      ...(profile.id === "cli" && compaction ? ["fallback-credit-2026-06-01"] : []),
       ...(!body.search ? ["thinking-binding-controls-2026-08-01"] : []),
       ...(body.thinking?.display === "updates" ? ["thinking-display-updates-2026-08-18"] : []),
-      ...(!body.search && !body.summary && !attribution.agentId ? ["extended-cache-ttl-2025-04-11"] : []),
+      ...(!body.search && !compaction && !attribution.agentId ? ["extended-cache-ttl-2025-04-11"] : []),
     ] : []),
     "cache-diagnosis-2026-04-07",
   ];
@@ -300,7 +294,7 @@ export function cliHeaders(
     } : {}),
     ...(attribution.agentId ? { "x-claude-code-agent-id": attribution.agentId } : {}),
     ...(attribution.agentType && attribution.requestClass === "subagent" ? { "x-claude-code-agent-type": attribution.agentType } : {}),
-    ...(attribution.promptId && attribution.purpose !== "title" ? { "x-claude-code-prompt-id": attribution.promptId } : {}),
+    ...(attribution.promptId ? { "x-claude-code-prompt-id": attribution.promptId } : {}),
     "x-claude-code-request-class": attribution.requestClass,
     "x-claude-code-sandy-plover": `[${toolsHeader.join(",")}]`,
     "x-client-request-id": requestId,

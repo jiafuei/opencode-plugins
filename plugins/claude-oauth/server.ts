@@ -193,6 +193,7 @@ export default Plugin.define({
       parentId?: string;
       rootId: Parameters<typeof ctx.session.get>[0]["sessionID"];
       toolsUsed: Set<string>;
+      firstUserId?: string;
       firstUserText?: string;
       wireId: string;
       agentId?: string;
@@ -441,10 +442,13 @@ export default Plugin.define({
     await ctx.session.hook("context", async (event) => {
       if (!oauth) return;
       const state = await cliState(event.sessionID);
-      const messages = await ctx.session.context({ sessionID: event.sessionID });
       const first = event.messages.find((message) => message.role === "user");
-      const original = messages.find((message) => message.id === first?.id);
-      state.firstUserText = original?.type === "user" || original?.type === "synthetic" ? original.text : undefined;
+      // The window's first message only changes when a compaction moves it.
+      if (first?.id !== state.firstUserId) {
+        state.firstUserId = first?.id;
+        const original = (await ctx.session.context({ sessionID: event.sessionID })).find((message) => message.id === first?.id);
+        state.firstUserText = original?.type === "user" || original?.type === "synthetic" ? original.text : undefined;
+      }
       const user = event.messages.findLast((message) => message.role === "user");
       if (!user || state.agentId) return;
       const turn = user.id ?? new Bun.CryptoHasher("sha256").update(JSON.stringify(user.content)).digest("hex");
@@ -453,6 +457,7 @@ export default Plugin.define({
       if (turn !== state.turn || !state.turnOrigin) {
         if (profile.id === "sdk-cli") state.turnOrigin = "sdk";
         else {
+          const messages = await ctx.session.context({ sessionID: event.sessionID });
           state.turnOrigin = messages.find((message) => message.id === user.id)?.type === "synthetic" ? "task_notification" : "human";
         }
       }
@@ -468,9 +473,10 @@ export default Plugin.define({
 
     // Record execution before a tool starts so its nested model calls see it too.
     // The root owns the set; child sessions share it rather than reconstructing the parent's history.
+    // Tool hooks fire for every provider, so only sessions that already have Anthropic state are tracked.
     await ctx.tool.hook("execute.before", async (event) => {
-      if (!oauth) return;
-      const state = await cliState(event.sessionID);
+      const state = cliStates.get(event.sessionID);
+      if (!oauth || !state) return;
       const name = profile.toolPrefix + event.tool;
       if (state.toolsUsed.has(name)) return;
       state.toolsUsed.add(name);
@@ -513,8 +519,8 @@ export default Plugin.define({
             agentType: state.agentId ? event.agent : undefined,
             requestClass: event.kind === "primary" ? state.agentId ? "subagent" : "main"
               : event.kind === "compaction" ? "compaction" : "auxiliary",
-            ...(event.kind === "title" ? { purpose: "title" } : {}),
-            ...(["primary", "compaction"].includes(event.kind) ? { firstUserText: state.firstUserText } : {}),
+            // A title request has its own messages; every other kind sends the conversation.
+            ...(event.kind === "title" ? { title: true } : { firstUserText: state.firstUserText }),
             toolsUsed: state.toolsUsed,
             // CC's compaction billing line carries only the previous request.
             ...(event.kind !== "title" && event.kind !== "compaction" ? { promptId: state.promptId, turnOrigin: state.turnOrigin } : {}),

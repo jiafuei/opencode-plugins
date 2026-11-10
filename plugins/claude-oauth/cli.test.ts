@@ -32,7 +32,7 @@ test("CLI preserves instruction and tool semantics while namespacing definitions
       { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_1", content: "OpenCode output" }] },
       { role: "system", content: [
         { type: "tool_addition", tool: { type: "tool_reference", name: "shell" } },
-        { type: "tool_addition", tool: { type: "custom", definition: { name: "later", input_schema: { type: "object" } } } },
+        { type: "tool_removal", tool: { type: "tool_reference", name: "shell" } },
       ] },
     ],
     tools: [...BODY.tools, { type: "web_search_20250305", name: "web_search" }],
@@ -46,10 +46,7 @@ test("CLI preserves instruction and tool semantics while namespacing definitions
   expect(body.messages[1].content[0]).toEqual({ ...input.messages[1]!.content[0], name: "mcp__oc__shell" });
   expect(body.messages[0]).toEqual(input.messages[0]);
   expect(body.messages[2].content[0].content).toBe("OpenCode output");
-  expect(body.messages[3].content[0].tool.name).toBe("mcp__oc__shell");
-  expect(body.messages[3].content[1].tool.definition).toMatchObject({
-    name: "mcp__oc__later", ownership_metadata: { verified: false, owner: "mcp" },
-  });
+  expect(body.messages[3].content.map((part: any) => part.tool.name)).toEqual(["mcp__oc__shell", "mcp__oc__shell"]);
   expect(body.system.at(-1).text).toContain(input.system[1]!.text);
   expect(body.system.at(-1).text).toContain("Preserve my OpenCode instructions.");
   expect(body.system.at(-1).text).not.toContain("running in OpenCode");
@@ -89,7 +86,7 @@ test("compaction requests match CC's compaction wire and keep both compaction me
   expect(headers["anthropic-beta"]).toContain("compact-2026-09-04");
 });
 
-test("SDK billing uses original user text and retains budget-based thinking options", () => {
+test("SDK billing uses original user text and an older model keeps its thinking options and betas", () => {
   const input = {
     ...BODY,
     model: "claude-sonnet-4-6",
@@ -97,60 +94,33 @@ test("SDK billing uses original user text and retains budget-based thinking opti
       { type: "text", text: "<system-reminder>metadata</system-reminder>" },
       { type: "text", text: "injected context before the actual prompt" },
     ] }],
-    thinking: { type: "enabled", display: "summarized", budget_tokens: 2048 },
+    thinking: { type: "adaptive", display: "summarized", budget_tokens: 2048 },
   };
-  const body = JSON.parse(rewriteCliBody(JSON.stringify(input), { sessionId: "s", requestClass: "main", firstUserText: "actual user prompt" }, true, SDK_CLI_PROFILE).json);
+  const attribution = { sessionId: "s", requestClass: "main", firstUserText: "actual user prompt" } as const;
+  const request = rewriteCliBody(JSON.stringify(input), attribution, true, SDK_CLI_PROFILE);
+  const body = JSON.parse(request.json);
   expect(body.system[0].text).toContain("cc_version=2.1.321.fbc;");
   expect(body.thinking).toEqual(input.thinking);
-});
-
-test("Fable uses the captured 2.1.321 main profile without replacing provider token limits", () => {
-  const attribution = { sessionId: "s", requestClass: "main" } as const;
-  const main = rewriteCliBody(JSON.stringify({ ...BODY, model: "claude-fable-5-2", max_tokens: 32768 }), attribution);
-  expect(JSON.parse(main.json).max_tokens).toBe(32768);
-  expect(JSON.parse(main.json).thinking).toEqual({ type: "adaptive", display: "updates" });
-  expect(cliHeaders(new Headers({ authorization: "t" }), attribution, main, "id", 0)["anthropic-beta"]).toBe(
-    "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27," +
-    "prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01," +
-    "tool-provenance-2026-10-26,thinking-token-count-2026-05-13,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21," +
-    "effort-2025-11-24,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11," +
-    "cache-diagnosis-2026-04-07");
-});
-
-test("auxiliary searches, side queries, titles, and activity summaries keep distinct wire profiles", () => {
-  const attribution = { sessionId: "s", requestClass: "auxiliary", agentId: "agent", promptId: "prompt" } as const;
-  const cases = [
-    { name: "search", input: { ...BODY, thinking: undefined, tools: [{ type: "web_search_20250305", name: "web_search" }] } },
-    { name: "side-query", input: { ...BODY, thinking: undefined, tools: [], output_config: { effort: "medium" } } },
-    { name: "title", input: { ...BODY, thinking: undefined, tools: [], output_config: { effort: "medium", format: { type: "json_schema", schema: { type: "object" } } } } },
-    { name: "activity-summary", input: { ...BODY, messages: [
-      ...BODY.messages,
-      { role: "assistant", content: [{ type: "tool_use", id: "call", name: "shell", input: {} }] },
-      { role: "user", content: [
-        { type: "tool_result", tool_use_id: "call", content: "done" },
-        { type: "text", text: "Describe your most recent action in 3-5 words using present tense (-ing)." },
-      ] },
-      { role: "system", content: "Remaining token budget" },
-    ] } },
-  ];
-  for (const { name, input } of cases) {
-    const request = rewriteCliBody(JSON.stringify(input), attribution);
-    const body = JSON.parse(request.json);
-    const headers = cliHeaders(new Headers({ authorization: "t" }), attribution, request, "id", 0);
-    const betas = headers["anthropic-beta"]!.split(",");
-    expect(betas.includes("structured-outputs-2025-12-15")).toBe(name === "title");
-    expect(betas.includes("claude-code-side-query-2026-09-29")).toBe(name === "side-query");
-    expect(betas.includes("fallback-credit-2026-06-01")).toBe(name === "activity-summary");
-    expect(headers["x-claude-code-prompt-id"]).toBe("prompt");
-    if (name === "activity-summary") {
-      expect(body.messages[1].content[0].cache_control).toEqual({ type: "ephemeral" });
-      expect(body.messages[2].content.every((part: any) => !part.cache_control)).toBe(true);
-      expect(body.messages[3].content).toBe("Remaining token budget");
-    } else {
-      expect(body.system.every((part: any) => !part.cache_control)).toBe(true);
-      expect(body.messages[0].content).toBe("hello");
-    }
+  const betas = cliHeaders(new Headers({ authorization: "t" }), attribution, request, "id", 0, SDK_CLI_PROFILE)["anthropic-beta"]!;
+  for (const beta of ["per-turn-control", "mid-conversation-tool-changes", "mid-conversation-system-clear-at", "thinking-display-updates"]) {
+    expect(betas).not.toContain(beta);
   }
+});
+
+test("auxiliary searches, side queries, and titles keep distinct wire profiles", () => {
+  const profile = (input: object, title = false) => {
+    const attribution = { sessionId: "s", requestClass: "auxiliary", title } as const;
+    const request = rewriteCliBody(JSON.stringify({ ...BODY, thinking: undefined, ...input }), attribution);
+    expect(JSON.parse(request.json).system.every((part: any) => !part.cache_control)).toBe(true);
+    return cliHeaders(new Headers({ authorization: "t" }), attribution, request, "id", 0)["anthropic-beta"]!;
+  };
+  const search = profile({ tools: [{ type: "web_search_20250305", name: "web_search" }] });
+  expect(search).toContain("claude-code-20250219");
+  expect(search).not.toContain("side-query");
+  expect(profile({ tools: [] })).toContain("claude-code-side-query-2026-09-29");
+  const title = profile({ tools: [], output_config: { format: { type: "json_schema", schema: { type: "object" } } } }, true);
+  expect(title).toContain("structured-outputs-2025-12-15");
+  expect(title).not.toContain("side-query");
 });
 
 test("relay controls actual header order/casing, drops late trace headers, and decompresses responses", async () => {
@@ -239,6 +209,9 @@ test.each(["cli", "sdk-cli"] as const)("%s selects its captured identity and tra
   const f = await fixture(profile === "sdk-cli" ? {} : { spoofingProfile: profile });
   try {
     f.plugin.state.sessions.ses_child = { parentID: "ses_root" };
+    // A session on another provider is left alone.
+    await f.plugin.hooks["tool.execute.before"]!({ sessionID: "ses_openai", tool: "shell" });
+    expect(f.plugin.state.sessions.ses_openai).toBeUndefined();
     const first = await f.send();
     expect(first.capture.headers.get("user-agent")).toBe(`claude-cli/2.1.321 (external, ${profile})`);
     expect(first.capture.body.system[0].text).toContain(`cc_entrypoint=${profile};`);
@@ -249,6 +222,7 @@ test.each(["cli", "sdk-cli"] as const)("%s selects its captured identity and tra
     expect(first.capture.body.thinking).toEqual({ type: "adaptive", display: profile === "sdk-cli" ? "omitted" : "updates" });
     const betas = first.capture.headers.get("anthropic-beta")!.split(",");
     expect(betas.includes("fallback-credit-2026-06-01")).toBe(false);
+    expect(betas.includes("per-turn-control-2026-07-01")).toBe(true);
     expect(first.capture.body.system[0].text).toContain("cc_prompt_index=1; cc_turn_index=1;");
     expect(first.capture.headers.get("x-claude-code-prompt-id")).toBeTruthy();
     expect(betas.includes("thinking-display-updates-2026-08-18")).toBe(profile === "cli");

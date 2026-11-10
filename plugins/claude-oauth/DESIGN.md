@@ -31,12 +31,15 @@ Device identity is derived from the plugin's install ID and the OAuth account. N
 - Requests carry the profile's exact `User-Agent`, `x-app: cli`, a per-invocation `x-client-request-id` (stable across
   HTTP retries), the Stainless header set, and a per-session `X-Claude-Code-Session-Id` UUID. OpenCode's
   session-routing, project, and client headers are dropped.
-- Request settings determine betas without matching model-family names. Adaptive thinking or an explicit effort
-  setting enables the per-turn and effort betas, including on subagents. The obsolete mid-conversation-system beta
-  is removed, and the tool-provenance beta precedes thinking-token-count.
+- Claude 3 and Claude 4 models do not get the per-turn control, mid-conversation tool changes, mid-conversation
+  system clear-at, and thinking-display updates betas. Every other model gets all four. This is looser than the
+  2.1.321 client, which also withholds some of them from Opus 5, Sonnet 5, and Fable 5, and sends some to Opus 4.7
+  and 4.8. Adaptive thinking or an explicit effort setting enables the effort beta. Haiku requests place the Claude
+  Code beta after prompt-caching-scope. The obsolete mid-conversation-system beta is removed, and the
+  tool-provenance beta precedes thinking-token-count.
 - Auxiliary searches omit fallback-credit and caching. Plain tool-less side queries use the side-query beta;
-  JSON-schema output uses the structured-outputs beta. Activity summaries retain thinking and tools and cache the
-  conversation before the summary-bearing user message.
+  JSON-schema output uses the structured-outputs beta. Claude Code's activity-summary profile is not reproduced
+  because OpenCode has no such request.
 - Other caller betas are appended and deduplicated. Obsolete betas and the profile-controlled fallback-credit and
   structured-output betas cannot be reintroduced by the caller. The context-1m beta is omitted because subscription
   credentials rejected it with HTTP 429.
@@ -49,7 +52,8 @@ Device identity is derived from the plugin's install ID and the OAuth account. N
 - Custom tools are exposed as `mcp__oc__<name>` with their schemas and arguments intact. Definitions, forced tool
   choices, historical calls, and tool references are rewritten consistently; response tool names are restored.
   Custom definitions carry `ownership_metadata: { verified: false, owner: "mcp" }`. The in-process oc namespace has
-  no server URL to report.
+  no server URL to report. Claude Code sends the same URL-less form for a local MCP server, and marks that server's
+  tools `mcp: true` in the tool-use header (November 10 capture).
 - The OpenCode harness opening is replaced by the profile's identity. System blocks are regrouped into stable
   instructions and caller instructions; repository rules, skills, memories, user messages, and tool results keep their
   text. OpenCode's environment preamble is reworded to Claude Code's "You have been invoked in the following
