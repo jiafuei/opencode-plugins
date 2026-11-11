@@ -120,7 +120,7 @@ export async function request(url: URL, headers: Headers, signal: AbortSignal, p
   }, curl.Write);
   const progress = koffi.register(() => (signal.aborted ? 1 : 0), curl.Progress);
   const handle = curl.init();
-  let list = null;
+  let list: unknown = null;
   let transfer: Promise<number> | undefined;
   const release = () => {
     curl.cleanup(handle);

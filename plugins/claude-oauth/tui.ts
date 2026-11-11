@@ -26,7 +26,7 @@ export default Plugin.define({
                 const dateOptions = { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" } as const;
                 const lines: string[] = [];
                 for (const [index, limit] of usage.limits.entries()) {
-                  if (index === 0 || limit.group !== usage.limits[index - 1].group) {
+                  if (index === 0 || limit.group !== usage.limits[index - 1]!.group) {
                     if (index > 0) lines.push("");
                     lines.push(GROUP_LABELS[limit.group] ?? limit.group);
                   }

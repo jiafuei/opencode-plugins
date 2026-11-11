@@ -4,7 +4,7 @@ import { request } from "./native.ts";
 const files: string[] = [];
 const server = Bun.serve({
   port: 0,
-  async fetch(req) {
+  async fetch(req): Promise<Response> {
     const url = new URL(req.url);
     if (url.pathname === "/redirect") return new Response("Intermediate redirect body", { status: 302, headers: { location: "/page", "set-cookie": "step=2; Path=/" } });
     if (url.pathname === "/ftp-redirect") return new Response(null, { status: 302, headers: { location: `ftp://127.0.0.1:${server.port}/file` } });

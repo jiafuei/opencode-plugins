@@ -43,6 +43,11 @@ type NativeCompaction = {
   send: (input: { options: Record<string, unknown> }) => Promise<{ content: ReadonlyArray<ContentPart> }>;
   result?: { replacement: ReadonlyArray<unknown> };
 };
+type NativeCompactionHook = (
+  name: "experimental.compaction.native",
+  callback: (event: NativeCompaction) => Promise<void>,
+  options: { providerID: string },
+) => Promise<unknown>;
 
 // Anthropic's lowest threshold trigger, so a threshold request always compacts once input reaches it.
 const MINIMUM_TRIGGER = 50_000;
@@ -70,7 +75,7 @@ export default Plugin.define({
     const { providers = {}, instructions } = ctx.options as CompactionOptions;
 
     for (const [providerID, { mechanism: fallback, models = {}, aws }] of Object.entries(providers)) {
-      await (ctx.session.hook as any)(
+      await (ctx.session.hook as typeof ctx.session.hook & NativeCompactionHook)(
         "experimental.compaction.native",
         async (event: NativeCompaction) => {
           const modelID = event.model.id;

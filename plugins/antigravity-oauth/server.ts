@@ -87,6 +87,11 @@ type NativeCompaction = {
   send: (input: { options: Record<string, unknown> }) => Promise<{ content: TextMessage["content"] }>;
   result?: { replacement: ReadonlyArray<unknown> };
 };
+type NativeCompactionHook = (
+  name: "experimental.compaction.native",
+  callback: (event: NativeCompaction) => Promise<void>,
+  options: { providerID: string },
+) => Promise<unknown>;
 
 /** The Cloud Code Assist project and account email ride the credential metadata. */
 function toCredential(methodID: Integration.MethodID, credentials: OAuthCredentials): Credential.OAuth {
@@ -503,7 +508,7 @@ export default Plugin.define({
     // Native compaction (opt in with the provider's `compaction.type: "native"`;
     // the hook needs an OpenCode build that has it): the native summary prompt
     // over the full history, and the native resume message as the new window.
-    await (ctx.session.hook as any)(
+    await (ctx.session.hook as typeof ctx.session.hook & NativeCompactionHook)(
       "experimental.compaction.native",
       async (event: NativeCompaction) => {
         nativeCompactions.add(event.sessionID);

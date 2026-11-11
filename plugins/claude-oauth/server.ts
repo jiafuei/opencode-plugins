@@ -186,6 +186,7 @@ export default Plugin.define({
     // The active Anthropic credential when it is this plugin's OAuth grant;
     // the session, tool, and model hooks below are gated on it.
     let oauth: Credential.OAuth | undefined;
+    let activeCredentialID: string | undefined;
     let credentialIdentity: string | undefined;
     let cliGeneration = 0;
     let relay: ReturnType<typeof createCliRelay> | undefined;
@@ -238,7 +239,7 @@ export default Plugin.define({
       if (generation !== cliGeneration) throw new Error("Claude CLI session changed while preparing the request");
       // Children inherit the parent's metadata but not its state; another account starts a fresh session.
       const saved = parent ? undefined : session.metadata?.[SESSION_METADATA_KEY] as SavedSession | undefined;
-      const { accountId: _, ...resumed } = saved && saved.accountId === oauth?.metadata?.accountId ? saved : {};
+      const { accountId: _, ...resumed }: Partial<SavedSession> = saved && saved.accountId === oauth?.metadata?.accountId ? saved : {};
       const created: CliState = {
         parentId: session.parentID,
         wireId: parent?.wireId ?? randomUUID(),
@@ -258,13 +259,14 @@ export default Plugin.define({
       const saved = Object.fromEntries(Object.entries({
         accountId: oauth?.metadata?.accountId as string | undefined, wireId, turn, promptId, promptIndex, turnIndex, previousRequestId, previousMessageId,
         toolsUsed: [...state.toolsUsed],
-      }).filter((entry) => entry[1] !== undefined));
+      }).filter((entry): entry is [string, string | number | string[]] => entry[1] !== undefined));
       const { metadata } = await ctx.session.get({ sessionID });
       await ctx.session.update({ sessionID, metadata: { ...metadata, [SESSION_METADATA_KEY]: saved } });
     };
 
     const load = async () => {
       const connection = await ctx.integration.connection.active("anthropic");
+      activeCredentialID = connection?.type === "credential" ? connection.id : undefined;
       const credential = connection
         ? await ctx.integration.connection.resolve(connection).catch(() => undefined)
         : undefined;
@@ -640,6 +642,10 @@ export default Plugin.define({
           event.type === "credential.updated" ||
           (event.type === "credential.switched" && event.data.integrationID === "anthropic")
         ) {
+          if (event.type === "credential.updated") {
+            const { integrationID, credentialID } = event.data;
+            if (integrationID !== "anthropic" || credentialID !== activeCredentialID) continue;
+          }
           if (event.type === "credential.switched") {
             cliGeneration++;
             cliStates.clear();

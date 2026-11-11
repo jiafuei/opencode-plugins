@@ -23,7 +23,7 @@ test("API-key requests pass through untouched and keep catalog costs", async () 
   expect(updates).toEqual([]);
 });
 
-test("a switch to the OAuth credential reloads models and zeroes Anthropic costs", async () => {
+test("credential events refresh only the active Anthropic credential", async () => {
   const { state, modelTransform, emit } = await setupPlugin({}, null);
   state.credential = OAUTH_CREDENTIAL;
   await emit({ type: "credential.switched", data: { integrationID: "anthropic", credentialID: "cred_1" } });
@@ -31,4 +31,19 @@ test("a switch to the OAuth credential reloads models and zeroes Anthropic costs
   const draft = { cost: [{ input: 3, output: 15 }] };
   modelTransform({ list: () => [MODEL], update: (_: string, __: string, update: (model: typeof draft) => void) => update(draft) });
   expect(draft.cost).toEqual([]);
+
+  await emit({ type: "credential.updated", data: { integrationID: "openai", credentialID: "cred_other" } });
+  await emit({ type: "credential.updated", data: { integrationID: "anthropic", credentialID: "cred_other" } });
+  expect(state.reloads).toBe(1);
+
+  state.credential = { type: "key", key: "sk-ant-api" };
+  await emit({ type: "credential.updated", data: { integrationID: "anthropic", credentialID: "cred_1" } });
+  const paid = { cost: [{ input: 3, output: 15 }] };
+  modelTransform({ list: () => [MODEL], update: (_: string, __: string, update: (model: typeof paid) => void) => update(paid) });
+  expect(paid.cost).toEqual([{ input: 3, output: 15 }]);
+
+  state.credential = OAUTH_CREDENTIAL;
+  await emit({ type: "credential.updated", data: { integrationID: "anthropic", credentialID: "cred_1" } });
+  modelTransform({ list: () => [MODEL], update: (_: string, __: string, update: (model: typeof paid) => void) => update(paid) });
+  expect(paid.cost).toEqual([]);
 });

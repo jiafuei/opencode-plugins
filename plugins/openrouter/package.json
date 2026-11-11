@@ -10,9 +10,9 @@
   },
   "files": ["server.ts", "settings.ts", "tui.ts", "rpc.ts", "web", "README.md"],
   "keywords": ["opencode", "opencode-plugin", "openrouter"],
-  "engines": { "opencode": ">=2.0.32" },
+  "engines": { "opencode": ">=2.2.7" },
   "publishConfig": { "access": "public" },
   "dependencies": { "zod": "4.1.8" },
-  "peerDependencies": { "@opencode/plugin": ">=2.0.32" },
-  "devDependencies": { "@opencode/plugin": "2.1.0" }
+  "peerDependencies": { "@opencode/plugin": ">=2.2.7" },
+  "devDependencies": { "@opencode/plugin": ">=2.2.7" }
 }

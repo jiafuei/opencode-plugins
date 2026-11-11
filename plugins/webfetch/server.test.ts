@@ -193,7 +193,7 @@ test("raw reads the requested resource without Markdown probing and preserves no
 test("uses HTTP freshness and the 15-minute fallback, but never caches no-store responses", async () => {
   const start = Date.now();
   setSystemTime(start);
-  const policies = [
+  const policies: { path: string; headers: Record<string, string>; ttl: number }[] = [
     { path: "/default.txt", headers: {}, ttl: 900 },
     { path: "/max-age.txt", headers: { "Cache-Control": "private, max-age=120" }, ttl: 120 },
     { path: "/age.txt", headers: { "Cache-Control": "max-age=120", Age: "100" }, ttl: 20 },
@@ -341,12 +341,12 @@ test("replacement registers only webfetch and permission denials prevent network
 test("Exa availability updates the profile enum and retrieval has a separate cache with fresh live crawling", async () => {
   const originalFetch = globalThis.fetch;
   const calls: Request[] = [];
-  const remote = spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+  const remote = spyOn(globalThis, "fetch").mockImplementation((async (input, init) => {
     if (input !== "https://api.exa.ai/contents") return originalFetch(input, init);
     const request = new Request(input, init);
     calls.push(request);
     return Response.json({ results: [{ url: "https://example.com/canonical", text: `# Exa version ${calls.length}` }] });
-  });
+  }) as typeof fetch);
   try {
     const web = site((_request, path) => path.endsWith(".txt") || path.endsWith(".md")
       ? new Response("Missing", { status: 404 }) : new Response("# Local content"));

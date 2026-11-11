@@ -155,7 +155,7 @@ export default Plugin.define({
         name: "computer_screenshot",
         options: { codemode: false },
         description: `Capture the primary display, with the frontmost window, the element that has keyboard focus, and the open windows front to back (exact titles for computer_focus, including minimized and covered ones). Screenshots returned after actions omit that list.${OVERLAY} ${COORDINATES}`,
-        input: Schema.Record(Schema.String, Schema.Unknown),
+        input: { type: "object", additionalProperties: true },
         execute: (_, context) => call({ action: "screenshot" }, context),
       });
       tools.add({

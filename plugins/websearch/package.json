@@ -22,7 +22,7 @@
     "websearch"
   ],
   "engines": {
-    "opencode": ">=2.0.32"
+    "opencode": ">=2.2.7"
   },
   "publishConfig": {
     "access": "public"
@@ -35,11 +35,11 @@
     "ai": "6.0.297"
   },
   "peerDependencies": {
-    "@opencode/plugin": ">=2.0.32",
+    "@opencode/plugin": ">=2.2.7",
     "effect": "^4.0.1"
   },
   "devDependencies": {
-    "@opencode/plugin": "2.1.0",
-    "effect": "4.0.1"
+    "@opencode/plugin": ">=2.2.7",
+    "effect": "^4.0.6"
   }
 }

@@ -67,7 +67,8 @@ export function createCliRelay() {
           }
           responseHeaders.delete("connection");
           responseHeaders.delete("transfer-encoding");
-          const stream = Readable.toWeb(decompress ? response.pipe(decompress) : response) as ReadableStream<Uint8Array>;
+          // Node's web-stream declarations differ from the DOM declarations used by Response.
+          const stream = Readable.toWeb(decompress ? response.pipe(decompress) : response) as unknown as ReadableStream<Uint8Array>;
           resolve(new Response([204, 205, 304].includes(response.statusCode!) ? null : stream, {
             status: response.statusCode!, headers: responseHeaders,
           }));

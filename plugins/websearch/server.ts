@@ -111,14 +111,14 @@ export default Plugin.define({
               const anthropic = subscription ? createAnthropic({
                 // The OAuth plugin owns credentials and the final HTTP request.
                 apiKey: "oauth",
-                fetch: async (input, init) => {
+                fetch: (async (input, init) => {
                   const request = new Request(input, init);
                   const { url } = await ctx.rpc(ClaudeOAuthRpc).prepareSearch({
                     integrationID: provider.integrationID ?? id,
                     body: await request.text(), beta: request.headers.get("anthropic-beta") ?? undefined,
                   }, { signal: request.signal });
                   return fetch(url, { method: "POST", signal: request.signal });
-                },
+                }) as typeof fetch,
               }) : createAnthropic(settings);
               return {
                 model: anthropic(modelID),

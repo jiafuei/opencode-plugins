@@ -20,7 +20,8 @@ export function createWebSocketFetch(url = DEFAULT_URL): WebSocketFetch {
     if (socket?.readyState === WebSocket.OPEN && socketAuth === auth) return socket;
     close();
     headers.set("openai-beta", "responses_websockets=2026-02-06");
-    const next = new WebSocket(url, { headers: Object.fromEntries(headers) });
+    // DOM declarations omit Bun's constructor options.
+    const next = new (WebSocket as typeof WebSocket & { new (url: string, options: Bun.WebSocketOptions): WebSocket })(url, { headers: Object.fromEntries(headers) });
     await new Promise((resolve, reject) => {
       next.addEventListener("open", resolve, { once: true });
       next.addEventListener("error", () => reject(new Error("WebSocket connection failed")), { once: true });
