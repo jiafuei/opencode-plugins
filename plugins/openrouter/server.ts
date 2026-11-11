@@ -12,12 +12,46 @@ const selectionSchema = z.object({
   patch: patchSchema.optional(),
 });
 
+const modelSelectionSchema = z.object({ disabled: z.array(z.string()) });
+const disabledModelsKey = "models/disabled";
+// Local plugin reloads re-evaluate modules, but loaded locations share this realm.
+const modelReloadsKey = Symbol.for("@jiafuei/opencode-openrouter/model-reloads");
+const shared = globalThis as typeof globalThis & { [modelReloadsKey]?: Set<() => Promise<void>> };
+const modelReloads = shared[modelReloadsKey] ??= new Set<() => Promise<void>>();
+
 export default Plugin.define({
   id: "openrouter-settings",
   async setup(ctx) {
     let server: Bun.Server<undefined> | undefined;
     let idleTimer: ReturnType<typeof setTimeout> | undefined;
     const token = crypto.randomUUID();
+    let disabledModels = new Set((await ctx.storage.get(disabledModelsKey) as string[] | undefined) ?? []);
+    let models: { id: string; name: string; variants: string[]; available: boolean }[] = [];
+
+    await ctx.model.transform((editor) => {
+      models = editor.list("openrouter").map((model) => ({
+        id: model.id,
+        name: model.name,
+        variants: model.variants.map((variant) => variant.id),
+        available: model.enabled,
+      })).sort((a, b) => a.name.localeCompare(b.name) || a.id.localeCompare(b.id));
+      for (const model of models) {
+        if (!disabledModels.has(model.id)) continue;
+        editor.update("openrouter", model.id, (draft) => {
+          draft.name = `${model.name} (disabled - DO NOT USE)`;
+        });
+      }
+    });
+
+    async function reloadModels() {
+      disabledModels = new Set((await ctx.storage.get(disabledModelsKey) as string[] | undefined) ?? []);
+      await ctx.model.reload();
+    }
+
+    await ctx.session.hook("model.request", async (event) => {
+      const disabled = await ctx.storage.get(disabledModelsKey) as string[] | undefined;
+      if (disabled?.includes(event.model.id)) throw new Error("Model is explicitly disabled");
+    }, { providerID: "openrouter" });
 
     function stop() {
       clearTimeout(idleTimer);
@@ -86,13 +120,23 @@ export default Plugin.define({
               }
               if (url.pathname === "/api/context" && request.method === "GET") {
                 const info = await context(url.searchParams.get("sessionID") ?? undefined);
-                const models = (await ctx.model.list()).data.filter((model) => model.providerID === "openrouter");
+                await reloadModels();
+                await ctx.model.list();
                 return Response.json({
                   directory: info.directory,
                   session: info.session ? { id: info.session.id, title: info.session.title, model: info.session.model } : null,
-                  models: models.map((model) => ({ id: model.id, name: model.name, variants: model.variants.map((variant) => variant.id) })),
+                  models,
+                  disabled: [...disabledModels],
                   fields,
                 }, { headers: { "Cache-Control": "no-store" } });
+              }
+              if (url.pathname === "/api/models" && request.method === "POST") {
+                const input = modelSelectionSchema.parse(await request.json());
+                await ctx.storage.set(disabledModelsKey, [...new Set(input.disabled)]);
+                // Every loaded location owns a registry; invalidate each after a global edit.
+                await Promise.all([...modelReloads].map((reload) => reload()));
+                await ctx.model.list();
+                return Response.json({ models, disabled: [...disabledModels] }, { headers: { "Cache-Control": "no-store" } });
               }
               if ((url.pathname === "/api/settings" || url.pathname === "/api/preview") && request.method === "POST") {
                 const input = selectionSchema.parse(await request.json());
@@ -138,6 +182,10 @@ export default Plugin.define({
       },
     });
 
-    return stop;
+    modelReloads.add(reloadModels);
+    return () => {
+      modelReloads.delete(reloadModels);
+      stop();
+    };
   },
 });

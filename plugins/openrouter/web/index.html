@@ -15,10 +15,34 @@
     <main>
       <div class="intro">
         <p class="eyebrow">Connection settings</p>
-        <h1>Choose how your requests are routed.</h1>
-        <p>Routing and privacy preferences for every OpenRouter request. Saved changes apply on the next call.</p>
+        <h1>Your models. Your routing.</h1>
+        <p>Choose which OpenRouter models can be used, then fine-tune how their requests are routed.</p>
       </div>
       <p id="error" role="alert" hidden></p>
+      <nav class="tabs" aria-label="OpenRouter settings">
+        <button type="button" id="models-tab" aria-controls="models-panel" aria-pressed="true">Models</button>
+        <button type="button" id="routing-tab" aria-controls="routing-panel" aria-pressed="false">Routing &amp; Privacy</button>
+      </nav>
+      <section id="models-panel" aria-labelledby="models-title" inert>
+        <div class="editor-heading"><h2 id="models-title">Model availability</h2><span class="badge">Global</span></div>
+        <p class="help">Disabled models stay in OpenCode’s catalog with “(disabled - DO NOT USE)” in their names. Requests fail with “Model is explicitly disabled” before dispatch. These exclusions apply across projects.</p>
+        <div class="model-filters">
+          <label>Search models<input id="model-search" type="search" placeholder="Name or model ID…" autocomplete="off"></label>
+          <label>Status<select id="model-filter"><option value="all">All models</option><option value="enabled">Enabled</option><option value="disabled">Disabled</option></select></label>
+          <label>Author<select id="model-author"><option value="">All authors</option></select></label>
+        </div>
+        <div class="model-actions">
+          <label class="check-label"><input id="select-models" type="checkbox">Select shown</label>
+          <span id="model-selection" class="help">0 selected</span>
+          <button type="button" id="enable-models" class="quiet" disabled>Enable selected</button>
+          <button type="button" id="disable-models" class="quiet" disabled>Disable selected</button>
+        </div>
+        <p id="model-warning" class="warning" role="status" hidden></p>
+        <div id="model-list" class="card model-list" aria-label="OpenRouter models" aria-busy="true"></div>
+        <p id="model-count" class="help" role="status">Loading models…</p>
+        <div class="save-bar"><span id="model-status" role="status">Loading…</span><button type="button" id="save-models" disabled>Save changes</button></div>
+      </section>
+      <section id="routing-panel" aria-label="Routing and privacy" hidden>
       <section class="context card" aria-label="Configuration scope">
         <div class="selectors">
           <label>Scope<select id="scope"><option value="global">Global</option><option value="folder">This folder</option><option value="session">This session</option></select></label>
@@ -48,6 +72,7 @@
           <p class="help">Preview includes unsaved edits and configured OpenCode model/variant defaults. Other request-time hooks and OpenRouter account policies may change the final result.</p>
         </aside>
       </div>
+      </section>
     </main>
   </body>
 </html>

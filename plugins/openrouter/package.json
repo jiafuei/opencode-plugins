@@ -1,7 +1,7 @@
 {
   "name": "@jiafuei/opencode-openrouter",
   "version": "0.0.1",
-  "description": "OpenRouter routing and privacy settings with a local web UI",
+  "description": "OpenRouter model exclusions, routing, and privacy settings with a local web UI",
   "type": "module",
   "exports": {
     "./server": "./server.ts",

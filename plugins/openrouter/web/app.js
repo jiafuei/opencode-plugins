@@ -9,6 +9,166 @@ let sequence = 0;
 let timer;
 let selection = { scope: "global", modelID: "" };
 const controls = new Map();
+let savedDisabled = new Set();
+let disabledModels = new Set();
+const selectedModels = new Set();
+let modelsDirty = false;
+
+function tab(name) {
+  for (const id of ["models", "routing"]) {
+    $(`${id}-panel`).hidden = id !== name;
+    $(`${id}-tab`).setAttribute("aria-pressed", String(id === name));
+  }
+}
+$("models-tab").addEventListener("click", () => tab("models"));
+$("routing-tab").addEventListener("click", () => tab("routing"));
+
+function renderModels() {
+  const focused = document.activeElement.id;
+  const search = $("model-search").value.trim().toLowerCase();
+  const filter = $("model-filter").value;
+  const author = $("model-author").value;
+  const visible = catalog.models.filter((model) => {
+    const disabled = !model.available || disabledModels.has(model.id);
+    return `${model.name} ${model.id}`.toLowerCase().includes(search)
+      && (!author || model.id.split("/")[0] === author)
+      && (filter === "all" || (filter === "disabled" ? disabled : !disabled));
+  });
+  $("model-list").replaceChildren();
+  for (const model of visible) {
+    const row = document.createElement("div");
+    row.className = "model-row";
+    const select = document.createElement("input");
+    select.type = "checkbox";
+    select.id = `select-${model.id}`;
+    select.checked = selectedModels.has(model.id);
+    select.disabled = !model.available;
+    select.setAttribute("aria-label", `Select ${model.name}`);
+    select.addEventListener("change", () => {
+      if (select.checked) selectedModels.add(model.id);
+      else selectedModels.delete(model.id);
+      renderModels();
+    });
+    const info = document.createElement("div");
+    info.className = "model-info";
+    const name = document.createElement("strong");
+    name.textContent = model.name;
+    const id = document.createElement("code");
+    id.textContent = model.id;
+    info.append(name, id);
+    const badges = document.createElement("div");
+    badges.className = "model-badges";
+    const current = catalog.session?.model;
+    const labels = [
+      ...(!model.available ? ["Disabled by OpenCode configuration or another plugin"] : []),
+      ...(current?.providerID === "openrouter" && current.id === model.id ? ["Current session"] : []),
+    ];
+    for (const text of labels) {
+      const badge = document.createElement("span");
+      badge.className = "badge";
+      badge.textContent = text;
+      badges.append(badge);
+    }
+    info.append(badges);
+    const toggle = document.createElement("label");
+    toggle.className = "model-toggle";
+    const enabled = document.createElement("input");
+    enabled.type = "checkbox";
+    enabled.id = `enabled-${model.id}`;
+    enabled.checked = model.available && !disabledModels.has(model.id);
+    enabled.disabled = !model.available;
+    enabled.setAttribute("aria-label", `Enable ${model.name}`);
+    const state = document.createElement("span");
+    state.textContent = enabled.checked ? "Enabled" : "Disabled";
+    enabled.addEventListener("change", () => {
+      if (enabled.checked) disabledModels.delete(model.id);
+      else disabledModels.add(model.id);
+      renderModels();
+    });
+    toggle.append(enabled, state);
+    const routing = document.createElement("button");
+    routing.type = "button";
+    routing.className = "quiet model-route";
+    routing.textContent = "Routing →";
+    routing.setAttribute("aria-label", `Routing settings for ${model.name}`);
+    routing.addEventListener("click", async () => {
+      if (dirty && !confirm("Discard unsaved routing settings?")) return;
+      $("model").value = model.id;
+      $("preview-model").value = model.id;
+      selection = { scope: $("scope").value, modelID: model.id };
+      variants();
+      tab("routing");
+      await load();
+    });
+    row.append(select, info, toggle, routing);
+    $("model-list").append(row);
+  }
+  if (!visible.length) {
+    const empty = document.createElement("p");
+    empty.className = "model-empty";
+    empty.textContent = catalog.models.length ? "No models match these filters." : "No OpenRouter models found. Check your OpenRouter connection in OpenCode.";
+    $("model-list").append(empty);
+  }
+  const selectable = visible.filter((model) => model.available);
+  const selectedVisible = selectable.filter((model) => selectedModels.has(model.id)).length;
+  $("select-models").checked = selectable.length > 0 && selectedVisible === selectable.length;
+  $("select-models").indeterminate = selectedVisible > 0 && selectedVisible < selectable.length;
+  $("select-models").disabled = !selectable.length;
+  $("select-models").onchange = (event) => {
+    for (const model of selectable) {
+      if (event.target.checked) selectedModels.add(model.id);
+      else selectedModels.delete(model.id);
+    }
+    renderModels();
+  };
+  const hiddenSelected = selectedModels.size - selectedVisible;
+  $("model-selection").textContent = `${selectedModels.size} selected${hiddenSelected ? ` (${hiddenSelected} hidden)` : ""}`;
+  $("enable-models").disabled = !selectedModels.size;
+  $("disable-models").disabled = !selectedModels.size;
+  const disabled = catalog.models.filter((model) => !model.available || disabledModels.has(model.id)).length;
+  $("model-count").textContent = `${visible.length} of ${catalog.models.length} shown · ${catalog.models.length - disabled} enabled · ${disabled} disabled`;
+  modelsDirty = disabledModels.size !== savedDisabled.size || [...disabledModels].some((id) => !savedDisabled.has(id));
+  $("model-status").textContent = modelsDirty ? "Unsaved changes · global exclusions" : "Saved · global exclusions";
+  $("save-models").disabled = !modelsDirty;
+  const current = catalog.session?.model;
+  const blocked = current?.providerID === "openrouter" && disabledModels.has(current.id);
+  $("model-warning").hidden = !blocked;
+  $("model-warning").textContent = blocked
+    ? `The current session’s model is disabled. ${savedDisabled.has(current.id) ? "New" : "After saving, new"} requests using it will fail until you enable it or switch models. Requests already in progress are not interrupted.`
+    : "";
+  if (focused) document.getElementById(focused)?.focus({ preventScroll: true });
+}
+
+for (const id of ["model-search", "model-filter", "model-author"]) {
+  $(id).addEventListener(id === "model-search" ? "input" : "change", () => {
+    selectedModels.clear();
+    renderModels();
+  });
+}
+for (const action of ["enable", "disable"]) {
+  $(`${action}-models`).addEventListener("click", () => {
+    for (const id of selectedModels) {
+      if (action === "enable") disabledModels.delete(id);
+      else disabledModels.add(id);
+    }
+    renderModels();
+  });
+}
+$("save-models").addEventListener("click", async () => {
+  $("models-panel").inert = true;
+  $("model-status").textContent = "Saving…";
+  try {
+    const state = await api("models", { disabled: [...disabledModels] });
+    catalog.models = state.models;
+    savedDisabled = new Set(state.disabled);
+    disabledModels = new Set(state.disabled);
+    renderModels();
+    showError(null);
+  } catch (error) {
+    showError(error);
+    $("model-status").textContent = "Could not save · changes kept";
+  } finally { $("models-panel").inert = false; }
+});
 
 async function api(path, body) {
   const response = await fetch(`/api/${path}`, {
@@ -194,7 +354,7 @@ $("settings").addEventListener("submit", async (event) => {
   clearTimeout(timer);
   ++sequence;
   // Keep the selected layer stable while its save is in flight.
-  const inputs = document.querySelectorAll("input, select, textarea, button");
+  const inputs = $("routing-panel").querySelectorAll("input, select, textarea, button");
   try {
     const patch = collect();
     inputs.forEach((input) => { input.disabled = true; });
@@ -213,10 +373,18 @@ $("copy").addEventListener("click", async () => {
   try { await navigator.clipboard.writeText($("effective").textContent); $("copy").textContent = "Copied"; setTimeout(() => { $("copy").textContent = "Copy"; }, 1200); }
   catch (error) { showError(error); }
 });
-addEventListener("beforeunload", (event) => { if (dirty) { event.preventDefault(); event.returnValue = ""; } });
+addEventListener("beforeunload", (event) => { if (dirty || modelsDirty) { event.preventDefault(); event.returnValue = ""; } });
 
 try {
   catalog = await api(`context${sessionID ? `?sessionID=${encodeURIComponent(sessionID)}` : ""}`);
+  savedDisabled = new Set(catalog.disabled);
+  disabledModels = new Set(catalog.disabled);
+  for (const author of [...new Set(catalog.models.map((model) => model.id.split("/")[0]))].sort()) {
+    $("model-author").add(new Option(author, author));
+  }
+  renderModels();
+  $("model-list").setAttribute("aria-busy", "false");
+  $("models-panel").inert = false;
   $("location").textContent = catalog.directory;
   $("session").textContent = catalog.session ? `Session: ${catalog.session.title ?? catalog.session.id}` : "Open /openrouter from a session to configure session overrides.";
   $("scope").querySelector('[value="session"]').disabled = !catalog.session;

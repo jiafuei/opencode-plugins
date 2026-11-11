@@ -1,6 +1,6 @@
 # OpenRouter settings
 
-Control OpenRouter provider routing and privacy from OpenCode: which upstream providers serve your requests, data-collection and ZDR policies, price caps, and more. Settings can be global, per folder, per session, or per model, and are edited in a local browser UI that previews the effective result.
+Manage OpenRouter model exclusions, provider routing, and privacy from OpenCode. The local browser UI has a global model list and a routing editor with an effective-settings preview. Routing settings can be global, per folder, per session, or per model.
 
 ## Install
 
@@ -10,11 +10,27 @@ opencode plugin add @jiafuei/opencode-openrouter
 
 Uses your existing OpenCode OpenRouter connection. Open **OpenRouter settings** in the command palette or run `/openrouter`. The plugin starts a loopback-only server on an available port and opens your browser. The launch URL grants access to the settings UI; no OpenRouter credential is sent to the browser. Reopen the command after restarting OpenCode.
 
-Tabs send heartbeats every 30 seconds, even in the background. After five minutes without a heartbeat, the listener stops but saved routing settings still apply. Suspended tabs can time out; run `/openrouter` again to restart the listener.
+Tabs send heartbeats every 30 seconds, even in the background. After five minutes without a heartbeat, the listener stops but saved routing settings and model exclusions still apply. Suspended tabs can time out; run `/openrouter` again to restart the listener.
 
-## Configuration
+## Model exclusions
 
-Choose **Global**, **This folder**, or **This session**. Leave **Model override** empty to edit the scope's defaults, or enter an exact OpenCode OpenRouter model ID (for example `anthropic/claude-sonnet-4.5`). Model IDs are suggested from OpenCode's model registry. The preview model and variant select which settings to resolve.
+Open **Models** to search by name or ID and filter by status or author. Use each model's **Enabled** checkbox, or select rows and choose **Enable selected** or **Disable selected**. **Select shown** selects the editable results of the current filters. Changing a filter clears the row selection.
+
+Click **Save changes** to apply exclusions globally across projects. The plugin adds ` (disabled - DO NOT USE)` to excluded models' OpenCode display names without changing their IDs or removing them from `ctx.model.list()` or the model picker. The plugin UI keeps the original names.
+
+Before dispatch, session requests using an excluded model fail with `Model is explicitly disabled`. This covers agent turns, subagents, titles, compaction, and session generation. Existing requests are not interrupted, and the plugin does not choose a replacement model. Re-enable the model or switch models to continue.
+
+Models disabled by OpenCode configuration or earlier plugin transforms appear as locked rows. Enabling a model here removes only this plugin's exclusion; it never overrides an external disable. New catalog models follow OpenCode's defaults.
+
+Exclusions persist in plugin storage. Saving refreshes model names in loaded locations in the OpenCode process, including local plugin reloads. Request checks read shared storage on each call. Independent OpenCode processes refresh names when the settings UI reopens or the plugin reloads.
+
+Because excluded models stay in the catalog, OpenCode can still select them automatically as defaults or title models. Those requests fail too.
+
+Direct generation outside a session, such as `ctx.experimental.generate.text`, does not run session hooks and is not blocked by these exclusions. This feature is a local usage preference, not an OpenRouter account policy.
+
+## Routing configuration
+
+Open **Routing & Privacy** and choose **Global**, **This folder**, or **This session**. Leave **Model override** empty to edit the scope's defaults, or enter an exact OpenCode OpenRouter model ID (for example `anthropic/claude-sonnet-4.5`). Use a model row's **Routing** button to open its override. The preview model and variant select which settings to resolve.
 
 Precedence, lowest to highest:
 

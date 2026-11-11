@@ -1,16 +1,40 @@
 import { expect, test } from "bun:test";
 import { Model, Plugin, Provider } from "@opencode/plugin";
+import type { ModelEditor } from "@opencode/plugin/promise/model";
 import OpenRouter from "./server.ts";
 
-async function instance(storage: Map<string, unknown>, directory = "/work/app") {
-  let hook: (event: any) => Promise<void>;
+async function instance(storage: Map<string, unknown>, directory = "/work/app", plugin = OpenRouter) {
+  const hooks = new Map<string, (event: any) => Promise<void>>();
   let open: (input: { sessionID?: string }) => Promise<{ url: string }>;
+  let transform: (editor: ModelEditor) => void;
+  const source = [{
+    ...Model.Info.default(Provider.ID.make("openrouter"), Model.ID.make("vendor/model")),
+    name: "Model",
+    settings: { provider: { allow_fallbacks: true, max_price: { prompt: 3, completion: 4 } } },
+    body: { provider: { require_parameters: true } },
+    variants: [{ id: "fast", settings: { provider: { max_price: { completion: 2 } } } }],
+  }, {
+    ...Model.Info.default(Provider.ID.make("openrouter"), Model.ID.make("vendor/locked")),
+    name: "Config-disabled model",
+    enabled: false,
+  }];
+  let models = structuredClone(source);
+  const reload = async () => {
+    models = structuredClone(source);
+    transform({
+      list: () => models,
+      update: (_providerID, modelID, update) => {
+        const model = models.find((model) => model.id === modelID)!;
+        update(model);
+      },
+    } as ModelEditor);
+  };
   const sessions: Record<string, unknown> = {
     parent: { id: "parent", title: "Parent", location: { directory: "/work/app" } },
     child: { id: "child", parentID: "parent", title: "Child", location: { directory: "/work/app" } },
     other: { id: "other", location: { directory: "/work/app/worktree" } },
   };
-  const dispose = await OpenRouter.setup({
+  const dispose = await plugin.setup({
     location: { directory },
     storage: {
       get: async (key: string) => structuredClone(storage.get(key)),
@@ -18,19 +42,20 @@ async function instance(storage: Map<string, unknown>, directory = "/work/app") 
     },
     session: {
       get: async ({ sessionID }: { sessionID: string }) => sessions[sessionID],
-      hook: async (name: string, callback: typeof hook, scope: unknown) => {
-        expect(name).toBe("http.request");
+      hook: async (name: string, callback: (event: any) => Promise<void>, scope: unknown) => {
         expect(scope).toEqual({ providerID: "openrouter" });
-        hook = callback;
+        hooks.set(name, callback);
       },
     },
-    model: { list: async () => ({ location: { directory }, data: [{
-      ...Model.Info.default(Provider.ID.make("openrouter"), Model.ID.make("vendor/model")),
-      name: "Model",
-      settings: { provider: { allow_fallbacks: true, max_price: { prompt: 3, completion: 4 } } },
-      body: { provider: { require_parameters: true } },
-      variants: [{ id: "fast", settings: { provider: { max_price: { completion: 2 } } } }],
-    }] }) } satisfies Pick<Plugin.Context["model"], "list">,
+    model: {
+      list: async () => ({ location: { directory }, data: models.filter((model) => model.enabled) }),
+      transform: async (callback) => {
+        transform = callback;
+        await reload();
+        return { dispose: async () => {} };
+      },
+      reload,
+    } satisfies Pick<Plugin.Context["model"], "list" | "transform" | "reload">,
     rpc: { register: async (_definition: unknown, handlers: { open: typeof open }) => { open = handlers.open; } },
   } as never);
   const { url } = await open!({});
@@ -38,6 +63,7 @@ async function instance(storage: Map<string, unknown>, directory = "/work/app") 
   return {
     dispose: dispose!,
     url,
+    models: () => models.filter((model) => model.enabled),
     api: (path: string, input: Record<string, unknown>) => fetch(new URL(`/api/${path}`, address), {
       method: "POST",
       headers: { authorization: `Bearer ${address.hash.slice(1)}`, "content-type": "application/json" },
@@ -51,7 +77,8 @@ async function instance(storage: Map<string, unknown>, directory = "/work/app") 
           body: JSON.stringify({ model: modelID, messages: [{ role: "user", content: "Hello" }], stream: true, provider: { order: ["original"], only: ["original"], allow_fallbacks: true } }),
         }),
       };
-      await hook!(event);
+      await hooks.get("model.request")!(event);
+      await hooks.get("http.request")!(event);
       expect(event.request.headers.get("authorization")).toBe("Bearer existing-connection");
       const body = await event.request.json() as { provider: Record<string, unknown>; [key: string]: unknown };
       expect(body.messages).toEqual([{ role: "user", content: "Hello" }]);
@@ -101,7 +128,11 @@ test("local UI API previews unsaved settings without persisting them, validates 
     expect(await context.json()).toMatchObject({
       directory: "/work/app",
       session: { id: "child" },
-      models: [{ id: "vendor/model", name: "Model", variants: ["fast"] }],
+      models: [
+        { id: "vendor/locked", name: "Config-disabled model", available: false },
+        { id: "vendor/model", name: "Model", variants: ["fast"], available: true },
+      ],
+      disabled: [],
     });
     expect((await fetch(new URL("/api/heartbeat", app.url), { method: "POST" })).status).toBe(401);
     expect((await app.api("heartbeat", {})).status).toBe(200);
@@ -120,4 +151,43 @@ test("local UI API previews unsaved settings without persisting them, validates 
     const sent = await app.send("parent");
     expect(sent).toEqual({ order: ["original"], only: ["original"], allow_fallbacks: true });
   } finally { await app.dispose(); }
+});
+
+test("global model exclusions keep catalog entries visible, block session requests, and can be reversed", async () => {
+  const storage = new Map<string, unknown>();
+  const app = await instance(storage);
+  const { default: separateModule } = await import(`./server.ts?location=${crypto.randomUUID()}`);
+  let other = await instance(storage, "/work/other", separateModule);
+  try {
+    const response = await app.api("models", { disabled: ["vendor/model"] });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({
+      disabled: ["vendor/model"],
+      models: [
+        { id: "vendor/locked", available: false },
+        { id: "vendor/model", name: "Model", available: true },
+      ],
+    });
+    for (const location of [app, other]) {
+      expect(location.models().map((model) => ({ id: model.id, name: model.name }))).toEqual([
+        { id: "vendor/model", name: "Model (disabled - DO NOT USE)" },
+      ]);
+      for (const kind of ["primary", "title", "compaction", "generate"]) {
+        await expect(location.send("child", kind)).rejects.toThrow("Model is explicitly disabled");
+      }
+    }
+    // Reopening keeps one suffix, and exclusions outlive the plugin instance.
+    await other.dispose();
+    other = await instance(storage, "/work/other", separateModule);
+    expect(other.models()[0]!.name).toBe("Model (disabled - DO NOT USE)");
+    await expect(other.send("parent")).rejects.toThrow("Model is explicitly disabled");
+    expect((await other.api("models", { disabled: [] })).status).toBe(200);
+    expect(app.models().map((model) => model.name)).toEqual(["Model"]);
+    expect(other.models().map((model) => model.name)).toEqual(["Model"]);
+    expect(await app.send("child")).toEqual({ order: ["original"], only: ["original"], allow_fallbacks: true });
+    expect((await app.api("models", { disabled: [false] })).status).toBe(400);
+  } finally {
+    await app.dispose();
+    await other.dispose();
+  }
 });
