@@ -1,0 +1,25 @@
+{
+  "name": "@jiafuei/opencode-sleep",
+  "version": "0.0.1",
+  "description": "Cancellable sleep tool for OpenCode Code Mode",
+  "type": "module",
+  "exports": {
+    "./server": "./server.ts"
+  },
+  "files": ["server.ts", "README.md"],
+  "keywords": ["opencode", "opencode-plugin", "codemode", "sleep"],
+  "engines": {
+    "opencode": ">=2.0.32"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "peerDependencies": {
+    "@opencode/plugin": ">=2.0.32",
+    "effect": "^4.0.1"
+  },
+  "devDependencies": {
+    "@opencode/plugin": "2.1.0",
+    "effect": "4.0.1"
+  }
+}
