@@ -292,7 +292,23 @@ export default Plugin.define({
       if (choice?.action === "open") openDashboard();
       if (choice?.action === "discard") await discard(choice.run!);
     };
-    void initialize().catch(failure);
+    let startupPending = true;
+    const initializeWhenActive = async () => {
+      if (!startupPending) return;
+      const { data } = await ctx.client.plugin.list({ location: location() });
+      if (!startupPending) return;
+      const server = data.find((plugin) => plugin.id === "workflows");
+      if (!server) return;
+      startupPending = false;
+      if (server.state.status === "failed") throw new Error(server.state.error);
+      await initialize();
+    };
+    // RPC requests no longer wait for server plugins to finish activating.
+    // Subscribe first so activation between the inventory read and setup cannot be missed.
+    unsubscribe.push(ctx.data.on("plugin.updated", (event) => {
+      if (ours(event)) void initializeWhenActive().catch(failure);
+    }));
+    void initializeWhenActive().catch(failure);
 
     const back = (run?: WorkflowRun) => {
       ctx.ui.router.navigate(previous() ?? (run ? { type: "session", sessionID: run.parentSessionID } : { type: "home" }));
@@ -349,6 +365,7 @@ export default Plugin.define({
     });
 
     return () => {
+      startupPending = false;
       clearInterval(blinkTimer);
       for (const stop of unsubscribe) stop();
     };
