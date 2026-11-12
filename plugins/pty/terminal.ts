@@ -49,7 +49,7 @@ export class Terminals {
 
   async start(sessionID: string, input: typeof Start.Type & { cwd: string }, signal: AbortSignal) {
     const response = await this.daemon.request({
-      op: "create",
+      op: "create_pty",
       program: process.platform === "win32" ? "powershell.exe" : process.env.SHELL || "/bin/sh",
       // PowerShell -Command otherwise collapses native programs' nonzero exit codes to 1.
       args: process.platform === "win32"
@@ -63,13 +63,13 @@ export class Terminals {
       rows: 60,
     }, signal);
     if (response.type !== "created") throw new Error(`Expected created, received ${response.type}.`);
-    return this.view(response.terminal, input, signal);
+    return this.view(response.process, input, signal);
   }
 
   async list(sessionID: string, signal: AbortSignal) {
-    const response = await this.daemon.request({ op: "list" }, signal);
-    if (response.type !== "terminals") throw new Error(`Expected terminals, received ${response.type}.`);
-    return response.terminals.filter((terminal) => terminal.group_id === sessionID);
+    const response = await this.daemon.request({ op: "list", mode: "pty" }, signal);
+    if (response.type !== "processes") throw new Error(`Expected processes, received ${response.type}.`);
+    return response.processes.filter((terminal) => terminal.group_id === sessionID);
   }
 
   private async get(sessionID: string, id: number, signal: AbortSignal) {
@@ -122,10 +122,10 @@ export class Terminals {
       signal.throwIfAborted();
       const response = await this.rows(terminal.id, input.lines, signal);
       const now = performance.now();
-      if (response.terminal.output_tail !== tail) changedAt = now;
-      tail = response.terminal.output_tail;
+      if (response.process.output_tail !== tail) changedAt = now;
+      tail = response.process.output_tail;
       const text = response.lines.join("\n");
-      const exited = response.terminal.lifecycle.status !== "running";
+      const exited = response.process.lifecycle.status !== "running";
       // Count new occurrences after a send so echoed input cannot unlock an unchanged old prompt.
       // Child exit precedes PTY EOF; confirm an unchanged output tail on the next read before returning exited.
       const waited: "matched" | "settled" | "exited" | "timeout" | undefined = exited && exitTail === tail ? "exited"
@@ -148,8 +148,8 @@ export class Terminals {
         const omittedLines = lines.length - retained;
         return {
           id: terminal.id,
-          ...status(response.terminal),
-          foreground: response.terminal.foreground_process,
+          ...status(response.process),
+          foreground: response.process.pty.foreground_process,
           waited,
           cursor: { row: response.cursor_y, col: response.cursor_x },
           screen: lines.slice(omittedLines).join("\n"),

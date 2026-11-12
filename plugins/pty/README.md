@@ -8,7 +8,7 @@ The plugin owns a separate `opencode-pty` daemon. It does not attach to your ter
 
 Requirements:
 
-- OpenCode 2.0.32 or newer, running on Bun.
+- OpenCode 2.2.7 or newer, running on Bun.
 - Linux, macOS, or Windows on x64 or arm64. Windows uses ConPTY and Windows PowerShell.
 
 Run `bun install` from this repository. Add the local package to `opencode.jsonc`:
@@ -21,6 +21,8 @@ Run `bun install` from this repository. Add the local package to `opencode.jsonc
 ```
 
 This package is not published. Loading it registers tools but does not start a daemon. The first approved `pty.start` call starts the daemon on the machine running the OpenCode service.
+
+The plugin pins `@opencode/pty` 0.5.2 and uses daemon protocol 8.
 
 ## Control an interactive program
 

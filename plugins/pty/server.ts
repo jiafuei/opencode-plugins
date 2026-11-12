@@ -103,7 +103,7 @@ export default Plugin.define({
         execute: async (_input, context) => ({
           output: {
             terminals: runtime ? (await (await runtime).terminals.list(context.sessionID, context.signal)).map((terminal) => ({
-              id: terminal.id, command: terminal.title, cwd: terminal.cwd, ...status(terminal),
+              id: terminal.id, command: terminal.pty.title, cwd: terminal.cwd, ...status(terminal),
             })) : [],
           },
         }),

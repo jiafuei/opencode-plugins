@@ -7,20 +7,23 @@ export const available = binaryPath !== undefined;
 
 const Registration = Schema.Struct({
   instance_id: Schema.String,
-  protocol: Schema.Literal(7),
+  protocol: Schema.Literal(8),
   socket: Schema.String,
   token: Schema.String,
 });
 
 const Terminal = Schema.Struct({
   id: Schema.Number,
-  title: Schema.String,
+  mode: Schema.Literal("pty"),
   group_id: Schema.String,
   command: Schema.Array(Schema.String),
   cwd: Schema.String,
-  cols: Schema.Number,
-  rows: Schema.Number,
-  foreground_process: Schema.NullOr(Schema.String),
+  pty: Schema.Struct({
+    title: Schema.String,
+    cols: Schema.Number,
+    rows: Schema.Number,
+    foreground_process: Schema.NullOr(Schema.String),
+  }),
   output_tail: Schema.Number,
   lifecycle: Schema.Union([
     Schema.Struct({ status: Schema.Literal("running") }),
@@ -33,11 +36,11 @@ export type Terminal = typeof Terminal.Type;
 const Response = Schema.Union([
   Schema.Struct({ type: Schema.Literal("owned") }),
   Schema.Struct({ type: Schema.Literal("ok") }),
-  Schema.Struct({ type: Schema.Literal("created"), terminal: Terminal }),
-  Schema.Struct({ type: Schema.Literal("terminals"), terminals: Schema.Array(Terminal) }),
+  Schema.Struct({ type: Schema.Literal("created"), process: Terminal }),
+  Schema.Struct({ type: Schema.Literal("processes"), processes: Schema.Array(Terminal) }),
   Schema.Struct({
     type: Schema.Literal("rows"),
-    terminal: Terminal,
+    process: Terminal,
     lines: Schema.Array(Schema.String),
     cursor_x: Schema.Number,
     cursor_y: Schema.Number,
