@@ -126,7 +126,7 @@ function rewrite(
   args: Record<string, any>,
   wireModelId: string,
   state = createSessionState(),
-  kind: "agent" | "title" | "compaction" = "agent",
+  mode: "agent" | "passthrough" | "native-compaction" = "agent",
   model = SNAPSHOT_CATALOG[wireModelId]!,
 ): Record<string, any> {
   return rewriteBodyForAntigravity({
@@ -135,10 +135,8 @@ function rewrite(
     wireModelId,
     model,
     projectId: "proj-1",
-    state,
-    history: state,
-    kind,
-    nativeCompaction: kind === "compaction",
+    sessionId: state.sessionId,
+    ...(mode === "passthrough" ? { mode } : { mode, state }),
   });
 }
 
@@ -157,7 +155,7 @@ describe("body rewrite", () => {
   });
 
   test("prefers Argon's catalog thinking level over its budget for agent and compaction requests", () => {
-    for (const kind of ["agent", "compaction"] as const) {
+    for (const kind of ["agent", "native-compaction"] as const) {
       const body = rewrite(baseArgs(), "gemini-4-argon-low", createSessionState(), kind, ARGON_MODEL);
       expect(body.request.generationConfig.thinkingConfig).toEqual({ includeThoughts: true, thinkingLevel: "LOW" });
     }
@@ -198,7 +196,7 @@ describe("body rewrite", () => {
   test("title requests preserve OpenCode's model and payload without advancing the trajectory", () => {
     const state = createSessionState();
     const args = { ...baseArgs(), generationConfig: { temperature: 0.5, maxOutputTokens: 100 } };
-    const body = rewrite(args, "claude-opus-5-5-high", state, "title");
+    const body = rewrite(args, "claude-opus-5-5-high", state, "passthrough");
     expect(body).toEqual({
       project: "proj-1",
       requestId: expect.stringMatching(/^checkpoint\/[0-9a-f-]{36}$/),
@@ -221,7 +219,7 @@ describe("body rewrite", () => {
     const agent = rewrite(args, "gemini-3.8-flash-medium", state);
     const steps = state.historySteps;
 
-    const body = rewrite({ ...args, contents: [...args.contents, user("Summarize")] }, "gemini-3.8-flash-medium", state, "compaction");
+    const body = rewrite({ ...args, contents: [...args.contents, user("Summarize")] }, "gemini-3.8-flash-medium", state, "native-compaction");
     expect(body).toMatchObject({ model: "gemini-3.8-flash-medium", requestType: "checkpoint" });
     expect(Object.keys(body.request)).toEqual(["contents", "systemInstruction", "tools", "generationConfig", "sessionId"]);
     expect(body.request.toolConfig).toBeUndefined();
@@ -898,9 +896,8 @@ describe("response unwrapping", () => {
   test("unwraps response-wrapped SSE chunks incrementally, preserving framing", async () => {
     const chunkA = JSON.stringify({ response: { candidates: [], usageMetadata: {}, responseId: "r-1" }, traceId: "t-1" });
     const chunkB = JSON.stringify({ response: { candidates: [{ finishReason: "STOP" }], responseId: "r-1" } });
-    const completions: unknown[] = [];
     // Split mid-line across writes to prove incremental processing.
-    const output = await collect(createCcaSseUnwrap(undefined, (completion) => completions.push(completion)), [
+    const output = await collect(createCcaSseUnwrap(), [
       `data: ${chunkA.slice(0, 20)}`,
       chunkA.slice(20),
       "\n\n",
@@ -910,16 +907,11 @@ describe("response unwrapping", () => {
     expect(dataLines).toHaveLength(2);
     expect(JSON.parse(dataLines[0]!.slice(6))).toEqual(JSON.parse(chunkA).response);
     expect(JSON.parse(dataLines[1]!.slice(6))).toEqual(JSON.parse(chunkB).response);
-    // A call-only or empty turn has no first-message time.
-    expect(completions).toEqual([{ traceId: "t-1" }]);
   });
 
   test("[DONE] and non-data lines pass through", async () => {
-    const completions: unknown[] = [];
-    const output = await collect(createCcaSseUnwrap(undefined, (completion) => completions.push(completion)), ["event: x\ndata: [DONE]\n\n"]);
+    const output = await collect(createCcaSseUnwrap(), ["event: x\ndata: [DONE]\n\n"]);
     expect(output).toContain("event: x\n");
     expect(output).toContain("data: [DONE]\n\n");
-    // A stream without a finish reason is not a completed response.
-    expect(completions).toEqual([]);
   });
 });

@@ -24,10 +24,8 @@ export function rot18(value: string): string {
 }
 
 export const ANTIGRAVITY_DAILY_ENDPOINT = rot18("uggcf://qnvyl-pybhqpbqr-cn.tbbtyrncvf.pbz");
-export const ANTIGRAVITY_SANDBOX_ENDPOINT = rot18("uggcf://qnvyl-pybhqpbqr-cn.fnaqobk.tbbtyrncvf.pbz");
-export const ANTIGRAVITY_ENDPOINTS = [ANTIGRAVITY_DAILY_ENDPOINT, ANTIGRAVITY_SANDBOX_ENDPOINT] as const;
 
-/** IDE login/metrics version; kept separate from the CLI request identity. */
+/** IDE login version; kept separate from the CLI request identity. */
 export function getAntigravityVersion(): string {
   return process.env.OPENCODE_ANTIGRAVITY_VERSION || "2.5.5";
 }
@@ -53,13 +51,6 @@ export function getAntigravityNodeUserAgent(): string {
   const os = process.env.OPENCODE_ANTIGRAVITY_OS || "windows";
   const arch = process.env.OPENCODE_ANTIGRAVITY_ARCH || "amd64";
   return `antigravity/${getAntigravityVersion()} ${os}/${arch} google-api-nodejs-client/10.3.0`;
-}
-
-/** Metrics platform enum: `WINDOWS_AMD64`. */
-export function getAntigravityPlatform(): string {
-  const os = process.env.OPENCODE_ANTIGRAVITY_OS || "windows";
-  const arch = process.env.OPENCODE_ANTIGRAVITY_ARCH || "amd64";
-  return `${os}_${arch}`.toUpperCase();
 }
 
 /** Header set of the language server's Go HTTP client on Cloud Code Assist calls. */
@@ -260,8 +251,6 @@ export interface AntigravitySessionState {
   usedNonGemini: boolean;
   /** `writeTrajectoryAcls` precedes the trajectory's first agent request. */
   aclWritten: boolean;
-  /** Auto endpoint mode: where this session's next request goes (daily when unset). */
-  endpoint?: string;
   /** Wire model that produced each response signature. */
   signatureModels: Map<string, string>;
   /** When each tool call arrived and its result was first sent. */
@@ -272,11 +261,11 @@ export interface AntigravitySessionState {
   modelName: string;
 }
 
-export function createSessionState(): AntigravitySessionState {
+export function createSessionState(sessionId = randomSignedDecimalSessionId()): AntigravitySessionState {
   return {
     agentId: crypto.randomUUID(),
     trajectoryId: crypto.randomUUID(),
-    sessionId: randomSignedDecimalSessionId(),
+    sessionId,
     historySteps: 0,
     stepOffset: 0,
     userTurns: 0,
@@ -351,7 +340,7 @@ export function advanceEnvelope(
 // Request body rewrite
 // ---------------------------------------------------------------------------
 
-export interface BodyRewriteOptions {
+export type BodyRewriteOptions = {
   /** Native Gemini generateContent body sent by OpenCode's Google client. */
   args: Record<string, any>;
   /** Logical OpenCode model id (tier family). */
@@ -359,15 +348,12 @@ export interface BodyRewriteOptions {
   wireModelId: string;
   model: WireModel;
   projectId: string;
-  /** Trajectory state of this request kind. */
-  state: AntigravitySessionState;
-  /** The conversation's state: session id and history annotations (the primary state for title and compaction). */
-  history: AntigravitySessionState;
-  /** Title and compaction requests go out as native checkpoints; everything else as agent requests. */
-  kind: "agent" | "title" | "compaction";
-  nativeCompaction?: boolean;
+  sessionId: string;
   failedToolCalls?: ReadonlySet<string>;
-}
+} & (
+  | { mode: "passthrough" }
+  | { mode: "agent" | "native-compaction"; state: AntigravitySessionState }
+);
 
 /**
  * Wrap a standard Gemini generateContent payload in the Antigravity Cloud
@@ -378,24 +364,22 @@ export interface BodyRewriteOptions {
  * request; compaction uses the current model and captured generation settings.
  */
 export function rewriteBodyForAntigravity(options: BodyRewriteOptions): Record<string, any> {
-  const { args, logicalModelId, wireModelId, model, projectId, state, history, kind } = options;
+  const { args, logicalModelId, wireModelId, model, projectId, sessionId, mode } = options;
   // The native system prompt is one text part.
   const systemInstruction = args.systemInstruction && {
     role: "user",
     parts: [{ text: args.systemInstruction.parts.map((part: Record<string, any>) => part.text).join("\n") }],
   };
 
-  if (kind === "title" || (kind === "compaction" && !options.nativeCompaction)) {
+  if (mode === "passthrough") {
     return {
       project: projectId,
       requestId: `checkpoint/${crypto.randomUUID()}`,
       request: {
         ...args,
-        ...(kind === "compaction" ? {
-          contents: normalizeContentsForAntigravity(args.contents, logicalModelId, model.apiProvider === ANTHROPIC, undefined, options.failedToolCalls),
-        } : {}),
+        contents: normalizeContentsForAntigravity(args.contents, logicalModelId, model.apiProvider === ANTHROPIC, undefined, options.failedToolCalls),
         ...(args.tools ? { tools: normalizeTools(args.tools) } : {}),
-        sessionId: history.sessionId,
+        sessionId,
       },
       model: wireModelId,
       userAgent: "antigravity",
@@ -404,16 +388,17 @@ export function rewriteBodyForAntigravity(options: BodyRewriteOptions): Record<s
   }
 
   const claude = model.apiProvider === ANTHROPIC;
+  const { state } = options;
   // A compaction request ends with its summary prompt, which stays plain user text.
   const end =
-    kind === "compaction"
+    mode === "native-compaction"
       ? args.contents.findLastIndex(
           (content: Record<string, any>) =>
             content.role === "model" || content.parts.some((part: Record<string, any>) => part.functionResponse),
         ) + 1
       : args.contents.length;
   const contents = normalizeContentsForAntigravity(args.contents, logicalModelId, claude, {
-    state: history,
+    state,
     wireModelId,
     modelName: model.displayName ?? wireModelId,
     end,
@@ -431,10 +416,10 @@ export function rewriteBodyForAntigravity(options: BodyRewriteOptions): Record<s
       ? { includeThoughts: true, thinkingBudget: model.thinkingBudget }
       : undefined;
 
-  if (kind === "compaction") {
+  if (mode === "native-compaction") {
     if (model.apiProvider !== GEMINI) request["toolConfig"] = { functionCallingConfig: { mode: "NONE" } };
     request["generationConfig"] = { maxOutputTokens: model.apiProvider === GEMINI ? 32768 : 16384, ...(thinkingConfig ? { thinkingConfig } : {}) };
-    request["sessionId"] = history.sessionId;
+    request["sessionId"] = sessionId;
     return {
       project: projectId,
       requestId: `checkpoint/${crypto.randomUUID()}`,
@@ -454,7 +439,7 @@ export function rewriteBodyForAntigravity(options: BodyRewriteOptions): Record<s
   const envelope = advanceEnvelope(state, contents, model);
   request["labels"] = envelope.labels;
   request["generationConfig"] = { maxOutputTokens: model.maxOutputTokens, ...(thinkingConfig ? { thinkingConfig } : {}) };
-  request["sessionId"] = history.sessionId;
+  request["sessionId"] = sessionId;
 
   return {
     project: projectId,
@@ -665,31 +650,19 @@ export function describeInBandError(error: InBandError): string {
   return `Cloud Code Assist error (${error.status ?? error.code ?? "unknown"}): ${detail}`;
 }
 
-export interface StreamCompletion {
-  /** Outer `traceId` of the stream's events. */
-  traceId?: string;
-  /** `performance.now()` when the first non-empty text or thought arrived; unset for call-only turns. */
-  firstMessageAt?: number;
-}
-
 /**
  * Incrementally unwrap Cloud Code Assist SSE events (standard Gemini chunks
  * nested under `response`) without buffering the stream. SSE framing is
  * preserved line-by-line; an in-band top-level error event errors the stream
- * with a sanitized Error (no raw bodies or credentials); `onError` is called
- * first. `onComplete` reports a stream that ended with a finish reason, and
+ * with a sanitized Error (no raw bodies or credentials).
  * `onChunk` sees each unwrapped Gemini chunk.
  */
 export function createCcaSseUnwrap(
-  onError?: (error: InBandError) => void,
-  onComplete?: (completion: StreamCompletion) => void,
   onChunk?: (chunk: Record<string, any>) => void,
 ): TransformStream<Uint8Array, Uint8Array> {
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
   let buffer = "";
-  const completion: StreamCompletion = {};
-  let finished = false;
 
   const handleData = (payload: string, controller: TransformStreamDefaultController<Uint8Array>): boolean => {
     if (payload === "[DONE]") {
@@ -705,23 +678,12 @@ export function createCcaSseUnwrap(
     }
     const inBand = readInBandError(parsed);
     if (inBand && parsed.response === undefined) {
-      onError?.(inBand);
       // Surface the failure instead of ending as a silent empty stream.
       controller.error(new Error(describeInBandError(inBand)));
       return false;
     }
     if (parsed.response !== undefined && typeof parsed.response === "object") {
       onChunk?.(parsed.response);
-      completion.traceId ??= parsed.traceId;
-      finished ||= parsed.response.candidates?.some((candidate: Record<string, any>) => candidate.finishReason) ?? false;
-      if (
-        completion.firstMessageAt === undefined &&
-        parsed.response.candidates?.some((candidate: Record<string, any>) =>
-          candidate.content?.parts?.some((part: Record<string, any>) => part.text),
-        )
-      ) {
-        completion.firstMessageAt = performance.now();
-      }
       controller.enqueue(encoder.encode(`data: ${JSON.stringify(parsed.response)}\n\n`));
       return true;
     }
@@ -753,7 +715,6 @@ export function createCcaSseUnwrap(
           if (!handleData(line.slice(5).trim(), controller)) return;
         }
       }
-      if (finished) onComplete?.(completion);
     },
   });
 }

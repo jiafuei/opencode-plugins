@@ -4,8 +4,6 @@ import { goFetch } from "./transport.ts";
 import { AntigravityRpc } from "./rpc.ts";
 import {
   ANTIGRAVITY_DAILY_ENDPOINT,
-  ANTIGRAVITY_ENDPOINTS,
-  ANTIGRAVITY_SANDBOX_ENDPOINT,
   COMPACTION_PROMPT,
   COMPACTION_RESUME_HEADER,
   PROVIDER_ID,
@@ -15,15 +13,13 @@ import {
   createCcaSseUnwrap,
   createSessionState,
   describeInBandError,
-  getAntigravityPlatform,
-  getAntigravityVersion,
+  randomSignedDecimalSessionId,
   providerModels,
   readInBandError,
   rewriteBodyForAntigravity,
   unwrapCcaJson,
   unwrappedResponseHeaders,
   type AntigravitySessionState,
-  type StreamCompletion,
   type WireCatalog,
 } from "./wire.ts";
 import {
@@ -40,7 +36,7 @@ import {
 // Configure in `opencode.json` like:
 //
 // {
-//   "plugins": [{ "package": "@jiafuei/opencode-antigravity-oauth", "options": { "endpointMode": "auto", "trajectoryAcls": false, "metrics": false } }]
+//   "plugins": [{ "package": "@jiafuei/opencode-antigravity-oauth", "options": { "trajectoryAcls": false } }]
 // }
 //
 // Then connect Google Antigravity and sign in with your Google account.
@@ -72,8 +68,6 @@ async function refreshCredential(credential: Credential.OAuth): Promise<Credenti
   }
   return { ...credential, ...(await pending) };
 }
-
-type EndpointMode = "auto" | "production" | "sandbox";
 
 type TextMessage = {
   role: string;
@@ -183,59 +177,53 @@ export function createCallbackWaiter(state: string, timeoutMs: number = FLOW_TIM
 export default Plugin.define({
   id: "antigravity_oauth",
   setup: async (ctx) => {
-    const options = ctx.options as { endpointMode?: EndpointMode; trajectoryAcls?: boolean; metrics?: boolean };
-    if (
-      options.endpointMode !== undefined &&
-      options.endpointMode !== "auto" &&
-      options.endpointMode !== "production" &&
-      options.endpointMode !== "sandbox"
-    ) {
-      throw new Error(`Unsupported Antigravity endpointMode "${String(options.endpointMode)}"`);
-    }
-    const endpointMode: EndpointMode = options.endpointMode ?? "auto";
-    /** Opt-in native side calls around generation requests. */
+    const options = ctx.options as { trajectoryAcls?: boolean };
+    /** Opt-in trajectory ACL grant before generation. */
     const trajectoryAcls = options.trajectoryAcls ?? false;
-    const metrics = options.metrics ?? false;
-    // Pinned modes use one endpoint; auto starts at daily and falls back to sandbox.
-    const endpoints: string[] =
-      endpointMode === "production"
-        ? [ANTIGRAVITY_DAILY_ENDPOINT]
-        : endpointMode === "sandbox"
-          ? [ANTIGRAVITY_SANDBOX_ENDPOINT]
-          : [...ANTIGRAVITY_ENDPOINTS];
 
     /** Per-OpenCode-session envelope identity; cleared on session deletion and credential switches. */
-    const sessionStates = new Map<string, Map<string, AntigravitySessionState>>();
+    const sessionStates = new Map<string, {
+      sessionId: string;
+      trajectories: Map<string, AntigravitySessionState>;
+    }>();
     /** Sessions with a native compaction in flight; its request carries the native summary prompt. */
     const nativeCompactions = new Set<string>();
     // The Gemini serializer flattens error results into ordinary text. Keep
     // their call IDs from the typed messages before that distinction is lost.
     const failedToolCalls = new Map<string, Set<string>>();
-    /** Dispatched generation calls, for the metrics the native client records after each stream. */
+    /** Request-local replay state, retained across response streaming. */
     const pendingCalls = new WeakMap<
       Request,
       {
-        sentAt: number;
-        access: string;
-        projectId: string;
         wireModelId: string;
-        trajectoryId?: string;
-        /** The request's session state, which outlives a credential switch clearing the map. */
-        state: AntigravitySessionState;
+        state?: AntigravitySessionState;
       }
     >();
     /** Account-specific state loaded from the active connection. */
-    let loaded: { connection?: Awaited<ReturnType<typeof ctx.integration.connection.active>>; projectId?: string; catalog?: WireCatalog; webSearchModelId?: string } = {};
+    let loaded: {
+      connection: NonNullable<Awaited<ReturnType<typeof ctx.integration.connection.active>>>;
+      projectId: string;
+      catalog: WireCatalog;
+      webSearchModelId: string;
+      discovered: boolean;
+    } | undefined;
 
     const load = async () => {
       const connection = await ctx.integration.connection.active(INTEGRATION_ID);
       const credential = connection ? await ctx.integration.connection.resolve(connection).catch(() => undefined) : undefined;
-      if (credential?.type !== "oauth") {
-        loaded = {};
+      if (!connection || credential?.type !== "oauth") {
+        loaded = undefined;
         return;
       }
       const projectId = credential.metadata?.projectId as string;
-      loaded = { connection, projectId, ...await discoverModels(credential.access, projectId, endpoints) };
+      const discovered = await discoverModels(credential.access, projectId);
+      loaded = {
+        connection,
+        projectId,
+        catalog: discovered?.catalog ?? SNAPSHOT_CATALOG,
+        webSearchModelId: discovered?.webSearchModelId ?? "gemini-3.5-flash-lite",
+        discovered: discovered !== undefined,
+      };
     };
     // Requests wait for the account state, so a prompt sent right after
     // startup or a connection switch still carries the project.
@@ -333,13 +321,13 @@ export default Plugin.define({
           package: "@opencode/ai/providers/google",
           settings: { baseURL: ANTIGRAVITY_DAILY_ENDPOINT },
         },
-        models: providerModels(loaded.catalog),
-        sourceConnection: loaded.catalog && loaded.connection,
+        models: providerModels(loaded?.catalog),
+        sourceConnection: loaded?.discovered ? loaded.connection : undefined,
       });
     });
 
     for (const hook of ["context", "compaction", "generate", "title"] as const) {
-      await ctx.session.hook(hook, async (event) => {
+      await ctx.session.hook(hook, (event) => {
         for (const message of event.messages) {
           if (message.role !== "tool") continue;
           for (const part of message.content) {
@@ -349,11 +337,16 @@ export default Plugin.define({
             failed.add(part.id);
           }
         }
+      }, { providerID: PROVIDER_ID });
+    }
+
+    for (const hook of ["context", "compaction", "generate", "title"] as const) {
+      await ctx.session.hook(hook, async (event) => {
         if (!event.model.id.startsWith("gemini-") || !event.messages.some((message) => message.role === "assistant")) return;
-        const originals = await ctx.session.context({ sessionID: event.sessionID });
+        const originals = new Map((await ctx.session.context({ sessionID: event.sessionID })).map((message) => [message.id, message]));
         event.messages = event.messages.map((message) => {
           if (message.role !== "assistant") return message;
-          const original = originals.find((item) => item.id === message.id);
+          const original = originals.get(message.id);
           // Incomplete/failed responses keep core's replay restrictions.
           if (original?.type !== "assistant" || original.error || original.finish === undefined ||
             original.model.providerID !== PROVIDER_ID || !original.model.id.startsWith("gemini-")) return message;
@@ -391,25 +384,36 @@ export default Plugin.define({
         const match = /\/models\/([^/:]+):(streamGenerateContent|generateContent)$/.exec(new URL(request.url).pathname);
         if (!match) return;
         await loading;
+        const account = loaded;
+        if (!account) throw new Error("Google Antigravity is not connected.");
         const verb = match[2]!;
         const stream = verb === "streamGenerateContent";
 
-        const states = sessionStates.get(evt.sessionID) ?? new Map<string, AntigravitySessionState>();
-        sessionStates.set(evt.sessionID, states);
-        const stateFor = (kind: string) => {
-          if (!states.has(kind)) states.set(kind, createSessionState());
-          return states.get(kind)!;
-        };
-        // Auxiliary calls keep their own trajectory and retry endpoint; title
-        // and compaction share the conversation's session id and annotations.
-        const state = stateFor(evt.kind);
-        const kind = evt.kind === "title" || evt.kind === "compaction" ? evt.kind : "agent";
+        let session = sessionStates.get(evt.sessionID);
+        if (!session) {
+          session = { sessionId: randomSignedDecimalSessionId(), trajectories: new Map() };
+          sessionStates.set(evt.sessionID, session);
+        }
+        const mode = evt.kind === "compaction" && nativeCompactions.has(evt.sessionID)
+          ? "native-compaction"
+          : evt.kind === "title" || evt.kind === "compaction" ? "passthrough" : "agent";
+        let execution: { mode: "passthrough" } | { mode: "agent" | "native-compaction"; state: AntigravitySessionState } = { mode: "passthrough" };
+        if (mode !== "passthrough") {
+          const key = mode === "native-compaction" ? "primary" : evt.kind;
+          let state = session.trajectories.get(key);
+          if (!state) {
+            state = createSessionState(key === "primary" ? session.sessionId : undefined);
+            session.trajectories.set(key, state);
+          }
+          execution = { mode, state };
+        }
+        const state = execution.mode === "passthrough" ? undefined : execution.state;
         const wireModelId = request.headers.get(WIRE_MODEL_HEADER)!;
-        const model = (loaded.catalog ?? SNAPSHOT_CATALOG)[wireModelId];
+        const model = account.catalog[wireModelId];
         if (!model) throw new Error(`Antigravity model "${wireModelId}" is not in the current model catalog`);
         if (model.disabled) throw new Error(`Antigravity model "${wireModelId}" is unavailable. ${model.tagDescription ?? ""}`.trim());
         const args = await request.json() as Parameters<typeof rewriteBodyForAntigravity>[0]["args"];
-        if (kind === "compaction" && nativeCompactions.has(evt.sessionID)) {
+        if (mode === "native-compaction") {
           args.contents.push({ role: "user", parts: [{ text: COMPACTION_PROMPT }] });
         }
         const envelope = rewriteBodyForAntigravity({
@@ -417,11 +421,9 @@ export default Plugin.define({
           logicalModelId: match[1]!,
           wireModelId,
           model,
-          projectId: loaded.projectId!,
-          state,
-          history: kind === "agent" ? state : stateFor("primary"),
-          kind,
-          nativeCompaction: nativeCompactions.has(evt.sessionID),
+          projectId: account.projectId,
+          sessionId: state?.sessionId ?? session.sessionId,
+          ...execution,
           failedToolCalls: failedToolCalls.get(evt.sessionID),
         });
         const agent = envelope.requestType === "agent";
@@ -430,12 +432,11 @@ export default Plugin.define({
         // and user-supplied tracing headers never leak.
         const access = request.headers.get("x-goog-api-key")!;
         const headers = antigravityHeaders(access);
-        const endpoint = (endpointMode === "auto" && state.endpoint) || endpoints[0];
 
         // The native client grants the trajectory's ACL before its first agent
         // request. A failed grant never blocks generation and is retried next time.
-        if (trajectoryAcls && agent && !state.aclWritten) {
-          state.aclWritten = await goFetch(`${endpoint}/v1internal:writeTrajectoryAcls`, {
+        if (trajectoryAcls && agent && state && !state.aclWritten) {
+          state.aclWritten = await goFetch(`${ANTIGRAVITY_DAILY_ENDPOINT}/v1internal:writeTrajectoryAcls`, {
             method: "POST",
             headers,
             body: JSON.stringify({ trajectoryId: state.trajectoryId }),
@@ -443,26 +444,20 @@ export default Plugin.define({
           }).then((response) => response.ok, () => false);
         }
 
-        evt.request = new Request(`${endpoint}/v1internal:${verb}${stream ? "?alt=sse" : ""}`, {
+        evt.request = new Request(`${ANTIGRAVITY_DAILY_ENDPOINT}/v1internal:${verb}${stream ? "?alt=sse" : ""}`, {
           method: "POST",
           headers,
           body: JSON.stringify(envelope),
         });
         pendingCalls.set(evt.request, {
-          sentAt: performance.now(),
-          access,
-          projectId: envelope.project,
           wireModelId,
-          ...(agent ? { trajectoryId: state.trajectoryId } : {}),
           state,
         });
       },
       { providerID: PROVIDER_ID },
     );
 
-    // Unwrap Cloud Code Assist responses back into plain Gemini for the
-    // native parser. In auto mode a failure moves the session to the other
-    // endpoint, so core's retry of the request lands there.
+    // Unwrap Cloud Code Assist responses back into plain Gemini for the native parser.
     await ctx.session.hook(
       "http.response",
       async (evt) => {
@@ -472,12 +467,8 @@ export default Plugin.define({
         const call = pendingCalls.get(evt.request)!;
         const state = call.state;
         const response = evt.response;
-        const failover = () => {
-          if (endpointMode === "auto") state.endpoint = endpoints.find((endpoint) => endpoint !== url.origin);
-        };
 
         if (!response.ok) {
-          failover();
           const payload = await response.clone().json().catch(() => undefined) as { error?: Record<string, unknown> } | undefined;
           const verification = accountVerificationMessage(payload, "retry your request");
           if (!verification) return;
@@ -488,7 +479,6 @@ export default Plugin.define({
           });
           return;
         }
-        if (endpointMode === "auto") state.endpoint = url.origin;
 
         if (verb === "generateContent") {
           evt.response = new Response(JSON.stringify(unwrapCcaJson(await response.json() as Parameters<typeof unwrapCcaJson>[0])), {
@@ -499,45 +489,10 @@ export default Plugin.define({
           return;
         }
 
-        // Like the native client, report each completed stream's latency.
-        // Protojson seconds at the native clock's 100ns resolution, trimmed to 0/3/6/9 digits.
-        const seconds = (ms: number) => {
-          const ticks = Math.round(ms * 1e4);
-          const nanos = String((ticks % 1e7) * 100).padStart(9, "0").replace(/(000)+$/, "");
-          return `${Math.floor(ticks / 1e7)}${nanos && `.${nanos}`}`;
-        };
-        const duration = (ms: number) => `${seconds(ms)}s`;
-        const recordMetrics = ({ traceId, firstMessageAt }: StreamCompletion) => {
-          const now = performance.now();
-          const epoch = performance.timeOrigin + now;
-          void goFetch(`${url.origin}/v1internal:recordCodeAssistMetrics`, {
-            method: "POST",
-            headers: antigravityHeaders(call.access),
-            body: JSON.stringify({
-              project: call.projectId,
-              requestId: crypto.randomUUID(),
-              metadata: { ideType: "ANTIGRAVITY", ideVersion: getAntigravityVersion(), platform: getAntigravityPlatform() },
-              metrics: [{
-                timestamp: `${new Date(epoch).toISOString().slice(0, 19)}${seconds(epoch % 1000).slice(1)}Z`,
-                conversationOffered: {
-                  status: "ACTION_STATUS_NO_ERROR",
-                  traceId,
-                  streamingLatency: {
-                    ...(firstMessageAt ? { firstMessageLatency: duration(firstMessageAt - call.sentAt) } : {}),
-                    totalLatency: duration(now - call.sentAt),
-                  },
-                  ...(call.trajectoryId
-                    ? { isAgentic: true, initiationMethod: "AGENT", trajectoryId: call.trajectoryId }
-                    : {}),
-                  language: "unspecified",
-                },
-              }],
-            }),
-          }).catch(() => {}); // Telemetry never affects the conversation.
-        };
         // Remember which model signed each response and when each tool call
         // arrived, for model-switch replay and native tool-result timestamps.
         const recordChunk = (chunk: Record<string, any>) => {
+          if (!state) return;
           for (const part of chunk.candidates?.[0]?.content?.parts ?? []) {
             if (part.thoughtSignature) state.signatureModels.set(part.thoughtSignature, call.wireModelId);
             if (part.functionCall?.id && !state.callTimes.has(part.functionCall.id)) {
@@ -546,7 +501,7 @@ export default Plugin.define({
           }
         };
         evt.response = new Response(
-          response.body!.pipeThrough(createCcaSseUnwrap(failover, metrics ? recordMetrics : undefined, recordChunk)),
+          response.body!.pipeThrough(createCcaSseUnwrap(recordChunk)),
           { status: response.status, statusText: response.statusText, headers: unwrappedResponseHeaders(response) },
         );
       },
@@ -603,7 +558,7 @@ export default Plugin.define({
         const connection = await ctx.integration.connection.active(INTEGRATION_ID);
         const credential = connection && (await ctx.integration.connection.resolve(connection));
         if (credential?.type !== "oauth") throw new Error("Google Antigravity is not connected.");
-        const response = await goFetch(`${endpoints[0]}/v1internal:retrieveUserQuotaSummary`, {
+        const response = await goFetch(`${ANTIGRAVITY_DAILY_ENDPOINT}/v1internal:retrieveUserQuotaSummary`, {
           method: "POST",
           headers: antigravityHeaders(credential.access),
           body: JSON.stringify({ project: credential.metadata?.projectId }),
@@ -623,7 +578,8 @@ export default Plugin.define({
     });
 
     await ctx.websearch.transform((editor) => {
-      if (!loaded.connection) return;
+      const account = loaded;
+      if (!account) return;
       editor.add({
         id: "antigravity",
         name: "Google Antigravity",
@@ -631,7 +587,7 @@ export default Plugin.define({
           const connection = await ctx.integration.connection.active(INTEGRATION_ID);
           const credential = connection && (await ctx.integration.connection.resolve(connection));
           if (credential?.type !== "oauth") throw new Error("Connect Google Antigravity before using web search");
-          const response = await goFetch(`${endpoints[0]}/v1internal:generateContent`, {
+          const response = await goFetch(`${ANTIGRAVITY_DAILY_ENDPOINT}/v1internal:generateContent`, {
             method: "POST",
             headers: antigravityHeaders(credential.access),
             body: JSON.stringify({
@@ -649,7 +605,7 @@ export default Plugin.define({
                 tools: [{ googleSearch: { enhancedContent: { imageSearch: { maxResultCount: 5 } } } }],
                 generationConfig: { candidateCount: 1 },
               },
-              model: loaded.webSearchModelId ?? "gemini-3.5-flash-lite",
+              model: account.webSearchModelId,
               userAgent: "antigravity",
               requestType: "web_search",
             }),
@@ -698,7 +654,7 @@ export default Plugin.define({
         // Like the native client, compaction continues the trajectory; the
         // next request only rebases the shrunken history.
         if (event.type === "session.compaction.ended") {
-          const state = sessionStates.get(event.data.sessionID)?.get("primary");
+          const state = sessionStates.get(event.data.sessionID)?.trajectories.get("primary");
           if (state) state.rebase = true;
         }
         if (event.type === "credential.switched" && event.data.integrationID === INTEGRATION_ID) {

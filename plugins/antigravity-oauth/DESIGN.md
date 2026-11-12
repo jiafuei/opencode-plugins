@@ -23,21 +23,22 @@ on the earlier Windows IDE identity. Request envelopes and trajectory bookkeepin
 ## Model discovery
 
 The model list is the native agent picker: the `agentModelSorts` ids returned by `fetchAvailableModels` (sent with the
-account's project), in picker order. Discovery tries the endpoints of the endpoint mode in order with a 5-second
-timeout each, and the result is bound to the connection that produced it. Failed discovery falls back to the snapshot
-table in the README; an empty picker result tries the next endpoint before falling back.
+account's project), in picker order. Discovery uses the daily endpoint with a 5-second timeout, and the result is
+bound to the connection that produced it. Failed discovery or an empty picker result falls back to the snapshot
+table in the README.
 
 Wire models whose display names differ only by a `(Low)` / `(Medium)` / `(High)` / `(XHigh)` suffix become one OpenCode model with
 a variant per tier. Each variant selects its own wire id, and its thinking budget or level comes from the catalog
-entry. Disabled tiers are excluded from selectable variants; a fully disabled family is registered as disabled,
+entry. Connected-account state always has a project, catalog, and web-search model; discovery defaults are resolved
+when the account loads. Disabled tiers are excluded from selectable variants; a fully disabled family is registered as disabled,
 and the request hook rejects its use. Web search uses the catalog's first `webSearchModelIds` entry when present.
 
 ## Generation requests
 
 The provider uses OpenCode's native Gemini client (`@opencode/ai/providers/google`, `baseURL` set to the daily
 endpoint). Session `http.request` / `http.response` hooks rewrite its `models/<id>:streamGenerateContent` requests
-into the Cloud Code Assist envelope used by the native client. The target URL is built from the endpoint mode, never
-from the configured `baseURL`, so credentials only go to the two official endpoints.
+into the Cloud Code Assist envelope used by the native client. The target URL uses the fixed daily endpoint, never
+the configured `baseURL`.
 
 - URL: `POST <endpoint>/v1internal:streamGenerateContent?alt=sse` (or `:generateContent` for non-stream calls).
 - Envelope: `project` (from the credential metadata), `model` (the variant's wire id), `userAgent: "antigravity"`,
@@ -99,8 +100,9 @@ Native compaction goes to the current model with its thinking config and the con
 Gemini uses 32,768 output tokens and omits `toolConfig`; non-Gemini models retain 16,384 tokens and `toolConfig: NONE`.
 The history replays with the
 conversation's cached annotations and the summary prompt stays plain user text. Transient generation keeps its
-selected model. Each request kind has separate trajectory and retry-endpoint state, so auxiliary calls do not advance
-the primary conversation's trajectory.
+selected model. Request rewriting has three modes: `agent`, `passthrough`, and `native-compaction`.
+Only agent trajectories allocate replay maps and step counters. Native compaction uses the primary conversation's
+state; passthrough requests need only its session ID.
 
 ### Compaction
 
@@ -115,32 +117,27 @@ summary).
 ### Side calls
 
 When enabled, `writeTrajectoryAcls` is sent for the trajectory before its first agent request (5 s timeout; a failed
-grant is retried on the next request and never blocks generation), and `recordCodeAssistMetrics` (trace id and
-100ns-resolution streaming latencies) after each completed agent or checkpoint stream.
+grant is retried on the next request and never blocks generation).
 
 ### Responses
 
 SSE events wrapping Gemini chunks under `response` are unwrapped incrementally for OpenCode's Gemini parser. In-band
-error events surface as stream errors with sanitized messages and count as endpoint failures in `"auto"` mode.
+error events surface as stream errors with sanitized messages. OpenCode handles retries against the same daily endpoint.
 
 ## Web search and usage
 
 The `antigravity` web search provider sends the native client's dedicated `gemini-3.5-flash-lite` `web_search`
 operation. `/antigravity-usage` sends the native `retrieveUserQuotaSummary` request for the connection's project to
-the first endpoint of the endpoint mode.
+the daily endpoint.
 
 ## Known differences from the native client
 
 - Generation requests go through OpenCode's `fetch` (Bun): it sorts header names, adds `Accept: */*` and
   `Connection: keep-alive`, and sends `Content-Length` because OpenCode core buffers the hooked body (the native client
   streams it chunked). TLS handshakes differ for every call.
-- Tool errors are sent as `output` rather than the native `error` key, because OpenCode's Gemini request does not mark
-  failed tool results.
 - Tool timestamps, per-turn metadata, and the signature-to-model map live in memory: after a restart, replayed history
   gets fresh timestamps and Claude tier-switch detection only covers new signatures.
 - `<ADDITIONAL_METADATA>` has no editor-state section (open files, cursor), since OpenCode has no editor.
 - OpenCode's summary compaction sends only the older part of the history with its own prompt, and later requests open
   with its `<conversation-checkpoint>` message. The native step after compaction also advances past the checkpoint;
   the plugin only keeps it from moving backwards.
-- `"auto"` mode switches endpoints only between attempts and relies on OpenCode's retry policy to re-issue a failed
-  request; there is no in-request failover or first-event watchdog.

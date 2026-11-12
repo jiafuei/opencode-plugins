@@ -1,6 +1,6 @@
 import { describe, expect, mock, test } from "bun:test";
 import plugin from "./server.ts";
-import { ANTIGRAVITY_DAILY_ENDPOINT as DAILY, ANTIGRAVITY_SANDBOX_ENDPOINT as SANDBOX, COMPACTION_PROMPT, WIRE_MODEL_HEADER } from "./wire.ts";
+import { ANTIGRAVITY_DAILY_ENDPOINT as DAILY, COMPACTION_PROMPT, WIRE_MODEL_HEADER } from "./wire.ts";
 
 // Route the native-framed transports through the global fetch the tests mock.
 mock.module("./transport.ts", () => {
@@ -50,7 +50,13 @@ function makeHarness(credential: StoredCredential | undefined, options: Record<s
     },
     rpc: { register: async () => {} },
     session: {
-      hook: async (name: string, callback: any) => void (hooks[`session.${name}`] = callback),
+      hook: async (name: string, callback: any) => {
+        const previous = hooks[`session.${name}`];
+        hooks[`session.${name}`] = async (event) => {
+          await previous?.(event);
+          await callback(event);
+        };
+      },
       context: async () => context,
     },
     event: {
@@ -425,7 +431,7 @@ describe("web search provider", () => {
 
 describe("session HTTP hooks", () => {
   test("rewrites native Gemini requests into the Cloud Code Assist envelope and unwraps SSE", async () => {
-    const harness = makeHarness(OAUTH_AUTH, { trajectoryAcls: true, metrics: true });
+    const harness = makeHarness(OAUTH_AUTH, { trajectoryAcls: true });
     const args = {
       contents: [{ role: "user", parts: [{ text: "hello" }] }],
       systemInstruction: { parts: [{ text: "sys" }] },
@@ -465,26 +471,7 @@ describe("session HTTP hooks", () => {
       const dataLine = output.trim().split("\n").at(-1)!.replace(/^data:\s*/, "");
       expect(JSON.parse(dataLine)).toEqual(chunk.response);
 
-      // The completed stream is reported like the native client's metrics.
-      expect(mock.calls).toHaveLength(3);
-      expect(mock.calls[2]!.url).toBe(`${DAILY}/v1internal:recordCodeAssistMetrics`);
-      const metrics = JSON.parse(String(mock.calls[2]!.init.body));
-      expect(metrics).toMatchObject({
-        project: "proj-42",
-        metadata: { ideType: "ANTIGRAVITY", ideVersion: "2.5.5", platform: "WINDOWS_AMD64" },
-        metrics: [{
-          conversationOffered: {
-            status: "ACTION_STATUS_NO_ERROR",
-            traceId: "trace-9",
-            isAgentic: true,
-            initiationMethod: "AGENT",
-            trajectoryId: wireBody.request.labels.trajectory_id,
-            language: "unspecified",
-          },
-        }],
-      });
-      expect(metrics.metrics[0].conversationOffered.streamingLatency.totalLatency).toMatch(/^\d+(\.\d{3}|\.\d{6}|\.\d{9})?s$/);
-      expect(metrics.metrics[0].timestamp).toMatch(/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d{3}|\.\d{6}|\.\d{9})?Z$/);
+      expect(mock.calls).toHaveLength(2);
     } finally {
       mock.restore();
     }
@@ -500,10 +487,11 @@ describe("session HTTP hooks", () => {
     );
   });
 
-  test("auto mode moves a session to the other endpoint after a failure and stays there", async () => {
+  test("OpenCode retries stay on the daily endpoint after a failure", async () => {
     const harness = makeHarness(OAUTH_AUTH);
-    const mock = mockFetch((url) => {
-      if (url.startsWith(DAILY)) return new Response("overloaded", { status: 503 });
+    let attempts = 0;
+    const mock = mockFetch(() => {
+      if (attempts++ === 0) return new Response("overloaded", { status: 503 });
       return sseResponse([{ response: { candidates: [{ finishReason: "STOP" }] } }]);
     });
     try {
@@ -512,7 +500,7 @@ describe("session HTTP hooks", () => {
       await readStream(await send()); // core's retry
       await readStream(await send());
       const generations = mock.calls.filter((call) => call.url.includes("streamGenerateContent"));
-      expect(generations.map((call) => new URL(call.url).origin)).toEqual([DAILY, SANDBOX, SANDBOX]);
+      expect(generations.map((call) => new URL(call.url).origin)).toEqual([DAILY, DAILY, DAILY]);
     } finally {
       mock.restore();
     }
@@ -547,18 +535,6 @@ describe("session HTTP hooks", () => {
     }
   });
 
-  test("pinned production mode never touches the sandbox endpoint", async () => {
-    const harness = makeHarness(OAUTH_AUTH, { endpointMode: "production" });
-    const mock = mockFetch(() => new Response("boom", { status: 503 }));
-    try {
-      await harness.send("ses-pin", nativeRequest("gemini-3.8-flash-low", { contents: [], tools: [] }));
-      await harness.send("ses-pin", nativeRequest("gemini-3.8-flash-low", { contents: [], tools: [] }));
-      expect(mock.calls.map((call) => new URL(call.url).origin)).toEqual([DAILY, DAILY]);
-    } finally {
-      mock.restore();
-    }
-  });
-
   test("compaction continues the primary trajectory and execution, like the native client", async () => {
     const harness = makeHarness(OAUTH_AUTH, { trajectoryAcls: true });
     let attempts = 0;
@@ -588,7 +564,7 @@ describe("session HTTP hooks", () => {
       });
       expect(Number(after.body.request.labels.last_step_index)).toBeGreaterThanOrEqual(Number(labels.last_step_index));
       expect(after.body.request.sessionId).toBe(before.body.request.sessionId);
-      expect(new URL(after.url).origin).toBe(SANDBOX);
+      expect(new URL(after.url).origin).toBe(DAILY);
       expect(mock.calls.filter((call) => call.url.includes("writeTrajectoryAcls"))).toHaveLength(1);
 
       // The next new turn starts an execution as usual.

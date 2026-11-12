@@ -49,16 +49,16 @@ Each tier's thinking level is fixed by Google's catalog, so OpenCode's reasoning
 // opencode.json
 {
   "plugins": [
-    { "package": "@jiafuei/opencode-antigravity-oauth", "options": { "endpointMode": "auto", "trajectoryAcls": false, "metrics": false } }
+    { "package": "@jiafuei/opencode-antigravity-oauth", "options": { "trajectoryAcls": false } }
   ]
 }
 ```
 
 **Options**
 
-- `endpointMode`: `"auto"` (default) starts each session on Google's daily Cloud Code Assist endpoint and moves it to the sandbox endpoint (or back) after a failed response, so OpenCode's retry lands on the other one. `"production"` pins the daily endpoint; `"sandbox"` pins the sandbox endpoint.
 - `trajectoryAcls`: `true` sends the native client's `writeTrajectoryAcls` call before a session's first request. Default `false`.
-- `metrics`: `true` sends the native client's `recordCodeAssistMetrics` call after each response. Default `false`.
+
+All Cloud Code Assist calls use `daily-cloudcode-pa.googleapis.com`. OpenCode handles retries against the same endpoint.
 
 **Native compaction**
 
@@ -78,8 +78,8 @@ With this setting the plugin compacts like the native client: it summarizes with
 | --- | --- | --- |
 | `OPENCODE_ANTIGRAVITY_CLI_VERSION` | Reported CLI version | `1.5.7` |
 | `OPENCODE_ANTIGRAVITY_CLI_BUILD` | Reported CLI build | `1019769835` |
-| `OPENCODE_ANTIGRAVITY_VERSION` | IDE login and metrics version | `2.5.5` |
-| `OPENCODE_ANTIGRAVITY_OS` | Reported `os_type` | CLI `linux`; IDE login and metrics `windows` |
+| `OPENCODE_ANTIGRAVITY_VERSION` | IDE login version | `2.5.5` |
+| `OPENCODE_ANTIGRAVITY_OS` | Reported `os_type` | CLI `linux`; IDE login `windows` |
 | `OPENCODE_ANTIGRAVITY_ARCH` | Reported `arch` | `amd64` |
 
 The request User-Agent defaults to the captured Linux CLI build `1019769835` with `auth_method=consumer`, regardless of your platform. CLI version and build overrides are independent of the IDE version. OS and architecture overrides apply to both identities.
