@@ -34,14 +34,15 @@ export function getAntigravityVersion(): string {
 
 /**
  * User-Agent of the captured CLI language server:
- * `antigravity/cli/1.4.0 (aidev_client; os_type=linux; arch=amd64; cl=1000494485; auth_method=consumer)`.
- * Overrides: OPENCODE_ANTIGRAVITY_VERSION / _OS / _ARCH.
+ * `antigravity/cli/1.5.7 (aidev_client; os_type=linux; arch=amd64; cl=1019769835; auth_method=consumer)`.
+ * CLI version/build overrides are separate from the IDE version.
  */
 export function getAntigravityUserAgent(): string {
-  const version = process.env.OPENCODE_ANTIGRAVITY_VERSION || "1.4.0";
+  const version = process.env.OPENCODE_ANTIGRAVITY_CLI_VERSION || "1.5.7";
+  const build = process.env.OPENCODE_ANTIGRAVITY_CLI_BUILD || "1019769835";
   const os = process.env.OPENCODE_ANTIGRAVITY_OS || "linux";
   const arch = process.env.OPENCODE_ANTIGRAVITY_ARCH || "amd64";
-  return `antigravity/cli/${version} (aidev_client; os_type=${os}; arch=${arch}; cl=1000494485; auth_method=consumer)`;
+  return `antigravity/cli/${version} (aidev_client; os_type=${os}; arch=${arch}; cl=${build}; auth_method=consumer)`;
 }
 
 /**
@@ -73,9 +74,6 @@ export function antigravityHeaders(accessToken: string): Record<string, string> 
 
 /** CCA bypass for the first unsigned function call in a Gemini 3 / Argon turn. */
 const SKIP_THOUGHT_SIGNATURE = "skip_thought_signature_validator";
-
-/** Title requests use this checkpoint model. */
-const CHECKPOINT_MODEL = "gemini-3.1-flash-lite";
 
 /** The native client's compaction prompt, sent as the last user turn of a native compaction. */
 export const COMPACTION_PROMPT = `You have been working on the task described above but have not yet completed
@@ -148,6 +146,8 @@ export interface WireModel {
   model?: string;
   apiProvider?: string;
   supportsImages?: boolean;
+  disabled?: boolean;
+  tagDescription?: string;
   thinkingBudget?: number;
   /** Thinking tier: 1/2/3 → LOW/MEDIUM/HIGH; takes precedence over the budget. */
   thinkingLevel?: number;
@@ -160,21 +160,20 @@ export type WireCatalog = Record<string, WireModel>;
 const ANTHROPIC = "API_PROVIDER_ANTHROPIC_VERTEX";
 const GEMINI = "API_PROVIDER_GOOGLE_GEMINI";
 const THINKING_LEVELS = ["UNSPECIFIED", "LOW", "MEDIUM", "HIGH"];
-const TIERS = ["low", "medium", "high"];
+const TIERS = ["low", "medium", "high", "xhigh"];
 
-/** The native agent model picker captured on 2026-10-03; used until live discovery succeeds. */
+/** The native agent model picker captured on 2026-11-13; used until live discovery succeeds. */
 export const SNAPSHOT_CATALOG: WireCatalog = {
-  "gemini-3.8-flash-high": { displayName: "Gemini 3.8 Flash (High)", model: "MODEL_PLACEHOLDER_M318", apiProvider: GEMINI, supportsImages: true, thinkingBudget: -1, maxTokens: 1048576, maxOutputTokens: 65536 },
-  "gemini-3.8-flash-medium": { displayName: "Gemini 3.8 Flash (Medium)", model: "MODEL_PLACEHOLDER_M319", apiProvider: GEMINI, supportsImages: true, thinkingBudget: 4000, maxTokens: 1048576, maxOutputTokens: 65536 },
-  "gemini-3.8-flash-low": { displayName: "Gemini 3.8 Flash (Low)", model: "MODEL_PLACEHOLDER_M320", apiProvider: GEMINI, supportsImages: true, thinkingBudget: 1000, maxTokens: 1048576, maxOutputTokens: 65536 },
-  "gemini-3.7-flash-high": { displayName: "Gemini 3.7 Flash (High)", model: "MODEL_PLACEHOLDER_M298", apiProvider: GEMINI, supportsImages: true, thinkingBudget: -1, maxTokens: 1048576, maxOutputTokens: 65536 },
-  "gemini-3.7-flash-medium": { displayName: "Gemini 3.7 Flash (Medium)", model: "MODEL_PLACEHOLDER_M299", apiProvider: GEMINI, supportsImages: true, thinkingBudget: 4000, maxTokens: 1048576, maxOutputTokens: 65536 },
-  "gemini-3.7-flash-low": { displayName: "Gemini 3.7 Flash (Low)", model: "MODEL_PLACEHOLDER_M300", apiProvider: GEMINI, supportsImages: true, thinkingBudget: 1000, maxTokens: 1048576, maxOutputTokens: 65536 },
-  "gemini-3.6-flash-high": { displayName: "Gemini 3.6 Flash (High)", model: "MODEL_PLACEHOLDER_M71", apiProvider: GEMINI, supportsImages: true, thinkingBudget: -1, maxTokens: 1048576, maxOutputTokens: 65536 },
-  "gemini-3.6-flash-medium": { displayName: "Gemini 3.6 Flash (Medium)", model: "MODEL_PLACEHOLDER_M72", apiProvider: GEMINI, supportsImages: true, thinkingBudget: 4000, maxTokens: 1048576, maxOutputTokens: 65536 },
-  "gemini-3.6-flash-low": { displayName: "Gemini 3.6 Flash (Low)", model: "MODEL_PLACEHOLDER_M73", apiProvider: GEMINI, supportsImages: true, thinkingBudget: 1000, maxTokens: 1048576, maxOutputTokens: 65536 },
-  "gemini-pro-agent": { displayName: "Gemini 3.1 Pro (High)", model: "MODEL_PLACEHOLDER_M16", apiProvider: GEMINI, supportsImages: true, thinkingBudget: 10001, maxTokens: 1048576, maxOutputTokens: 65535 },
-  "gemini-3.1-pro-low": { displayName: "Gemini 3.1 Pro (Low)", model: "MODEL_PLACEHOLDER_M36", apiProvider: GEMINI, supportsImages: true, thinkingBudget: 1001, maxTokens: 1048576, maxOutputTokens: 65535 },
+  "gemini-4-argon-medium": { displayName: "Gemini 4 Argon (Medium)", model: "MODEL_PLACEHOLDER_M418", apiProvider: GEMINI, supportsImages: true, thinkingLevel: 2, maxTokens: 1048576, maxOutputTokens: 65536 },
+  "gemini-4-argon-high": { displayName: "Gemini 4 Argon (High)", model: "MODEL_PLACEHOLDER_M417", apiProvider: GEMINI, supportsImages: true, thinkingLevel: 3, maxTokens: 1048576, maxOutputTokens: 65536 },
+  "gemini-4-argon-low": { displayName: "Gemini 4 Argon (Low)", model: "MODEL_PLACEHOLDER_M419", apiProvider: GEMINI, supportsImages: true, thinkingLevel: 1, maxTokens: 1048576, maxOutputTokens: 65536 },
+  "gemini-4-hydrogen-high": { displayName: "Gemini 4 Hydrogen (High)", model: "MODEL_PLACEHOLDER_M525", apiProvider: GEMINI, supportsImages: true, thinkingLevel: 3, maxTokens: 1048576, maxOutputTokens: 262144 },
+  "gemini-4-hydrogen-xhigh": { displayName: "Gemini 4 Hydrogen (XHigh)", model: "MODEL_PLACEHOLDER_M528", apiProvider: GEMINI, supportsImages: true, thinkingLevel: 100, maxTokens: 1048576, maxOutputTokens: 262144 },
+  "gemini-4-hydrogen-medium": { displayName: "Gemini 4 Hydrogen (Medium)", model: "MODEL_PLACEHOLDER_M526", apiProvider: GEMINI, supportsImages: true, thinkingLevel: 2, maxTokens: 1048576, maxOutputTokens: 262144 },
+  "gemini-4-hydrogen-low": { displayName: "Gemini 4 Hydrogen (Low)", model: "MODEL_PLACEHOLDER_M527", apiProvider: GEMINI, supportsImages: true, thinkingLevel: 1, maxTokens: 1048576, maxOutputTokens: 262144 },
+  "gemini-3.8-flash-high": { displayName: "Gemini 3.8 Flash (High)", model: "MODEL_PLACEHOLDER_M318", apiProvider: GEMINI, supportsImages: true, thinkingLevel: 3, maxTokens: 1048576, maxOutputTokens: 65536 },
+  "gemini-3.8-flash-medium": { displayName: "Gemini 3.8 Flash (Medium)", model: "MODEL_PLACEHOLDER_M319", apiProvider: GEMINI, supportsImages: true, thinkingLevel: 2, maxTokens: 1048576, maxOutputTokens: 65536 },
+  "gemini-3.8-flash-low": { displayName: "Gemini 3.8 Flash (Low)", model: "MODEL_PLACEHOLDER_M320", apiProvider: GEMINI, supportsImages: true, thinkingLevel: 1, maxTokens: 1048576, maxOutputTokens: 65536 },
   "claude-opus-5-5-low": { displayName: "Claude Opus 5.5 (Low)", model: "MODEL_PLACEHOLDER_M400", apiProvider: ANTHROPIC, supportsImages: true, thinkingLevel: 1, maxTokens: 1000000, maxOutputTokens: 128000 },
   "claude-opus-5-5-medium": { displayName: "Claude Opus 5.5 (Medium)", model: "MODEL_PLACEHOLDER_M401", apiProvider: ANTHROPIC, supportsImages: true, thinkingLevel: 2, maxTokens: 1000000, maxOutputTokens: 128000 },
   "claude-opus-5-5-high": { displayName: "Claude Opus 5.5 (High)", model: "MODEL_PLACEHOLDER_M402", apiProvider: ANTHROPIC, supportsImages: true, thinkingLevel: 3, maxTokens: 1000000, maxOutputTokens: 128000 },
@@ -182,6 +181,7 @@ export const SNAPSHOT_CATALOG: WireCatalog = {
   "claude-sonnet-5-5-medium": { displayName: "Claude Sonnet 5.5 (Medium)", model: "MODEL_PLACEHOLDER_M404", apiProvider: ANTHROPIC, supportsImages: true, thinkingLevel: 2, maxTokens: 1000000, maxOutputTokens: 128000 },
   "claude-sonnet-5-5-high": { displayName: "Claude Sonnet 5.5 (High)", model: "MODEL_PLACEHOLDER_M405", apiProvider: ANTHROPIC, supportsImages: true, thinkingLevel: 3, maxTokens: 1000000, maxOutputTokens: 128000 },
   "gpt-oss-120b-medium": { displayName: "GPT-OSS 120B (Medium)", model: "MODEL_OPENAI_GPT_OSS_120B_MEDIUM", apiProvider: "API_PROVIDER_OPENAI_VERTEX", thinkingBudget: 8192, maxTokens: 131072, maxOutputTokens: 32768 },
+  "gemini-4-carbon-disabled": { displayName: "Gemini 4 Carbon", model: "MODEL_PLACEHOLDER_M670", apiProvider: GEMINI, supportsImages: true, thinkingLevel: 2, maxTokens: 1048576, maxOutputTokens: 262144, disabled: true, tagDescription: "Gemini 4 Carbon is currently available to Ultra plan subscribers." },
 };
 
 /**
@@ -192,7 +192,7 @@ export const SNAPSHOT_CATALOG: WireCatalog = {
 export function providerModels(catalog: WireCatalog = SNAPSHOT_CATALOG): Model.Info[] {
   const families = new Map<string, Array<{ wireId: string; tier?: string }>>();
   for (const [wireId, model] of Object.entries(catalog)) {
-    const match = /^(.*) \((Low|Medium|High)\)$/.exec(model.displayName ?? "");
+    const match = /^(.*) \((Low|Medium|High|XHigh)\)$/.exec(model.displayName ?? "");
     const name = match?.[1] ?? model.displayName ?? wireId;
     families.set(name, [...(families.get(name) ?? []), { wireId, tier: match?.[2]?.toLowerCase() }]);
   }
@@ -201,7 +201,8 @@ export function providerModels(catalog: WireCatalog = SNAPSHOT_CATALOG): Model.I
     // `gemini-3.1-pro-low` + `gemini-pro-agent` → `gemini-3.1-pro`.
     const named = members.find((member) => member.wireId.endsWith(`-${member.tier}`));
     const id = Model.ID.make(named ? named.wireId.slice(0, -named.tier!.length - 1) : members[0]!.wireId);
-    const fallback = members.at(-1)!.wireId;
+    const available = members.filter((member) => !catalog[member.wireId]!.disabled);
+    const fallback = (available.at(-1) ?? members.at(-1))!.wireId;
     const model = catalog[fallback]!;
     return {
       id,
@@ -211,13 +212,13 @@ export function providerModels(catalog: WireCatalog = SNAPSHOT_CATALOG): Model.I
       headers: { [WIRE_MODEL_HEADER]: fallback },
       capabilities: { tools: true, input: model.supportsImages ? ["text", "image"] : ["text"], output: ["text"] },
       variants:
-        members.length > 1
-          ? members.map((member) => ({ id: Model.VariantID.make(member.tier!), headers: { [WIRE_MODEL_HEADER]: member.wireId } }))
+        available.length > 1
+          ? available.map((member) => ({ id: Model.VariantID.make(member.tier!), headers: { [WIRE_MODEL_HEADER]: member.wireId } }))
           : [],
       time: { released: 0 },
       cost: [],
       status: "active" as const,
-      enabled: true,
+      enabled: available.length > 0,
       limit: { context: model.maxTokens, output: model.maxOutputTokens },
     };
   });
@@ -364,6 +365,8 @@ export interface BodyRewriteOptions {
   history: AntigravitySessionState;
   /** Title and compaction requests go out as native checkpoints; everything else as agent requests. */
   kind: "agent" | "title" | "compaction";
+  nativeCompaction?: boolean;
+  failedToolCalls?: ReadonlySet<string>;
 }
 
 /**
@@ -371,8 +374,8 @@ export interface BodyRewriteOptions {
  * Code Assist envelope, in the native client's key order. Agent requests get
  * the catalog's output cap and thinking config, VALIDATED function calling,
  * native user turns and tool results, session labels, and session id.
- * Checkpoint calls leave the trajectory untouched: titles use the native
- * title model, compaction the current model with its tools disabled.
+ * Checkpoint calls leave the trajectory untouched. Titles preserve OpenCode's
+ * request; compaction uses the current model and captured generation settings.
  */
 export function rewriteBodyForAntigravity(options: BodyRewriteOptions): Record<string, any> {
   const { args, logicalModelId, wireModelId, model, projectId, state, history, kind } = options;
@@ -382,17 +385,19 @@ export function rewriteBodyForAntigravity(options: BodyRewriteOptions): Record<s
     parts: [{ text: args.systemInstruction.parts.map((part: Record<string, any>) => part.text).join("\n") }],
   };
 
-  if (kind === "title") {
+  if (kind === "title" || (kind === "compaction" && !options.nativeCompaction)) {
     return {
       project: projectId,
       requestId: `checkpoint/${crypto.randomUUID()}`,
       request: {
-        contents: normalizeContentsForAntigravity(args.contents, CHECKPOINT_MODEL, false),
-        ...(systemInstruction ? { systemInstruction } : {}),
-        generationConfig: { maxOutputTokens: 16384, thinkingConfig: { includeThoughts: false, thinkingBudget: 0 } },
+        ...args,
+        ...(kind === "compaction" ? {
+          contents: normalizeContentsForAntigravity(args.contents, logicalModelId, model.apiProvider === ANTHROPIC, undefined, options.failedToolCalls),
+        } : {}),
+        ...(args.tools ? { tools: normalizeTools(args.tools) } : {}),
         sessionId: history.sessionId,
       },
-      model: CHECKPOINT_MODEL,
+      model: wireModelId,
       userAgent: "antigravity",
       requestType: "checkpoint",
     };
@@ -412,7 +417,7 @@ export function rewriteBodyForAntigravity(options: BodyRewriteOptions): Record<s
     wireModelId,
     modelName: model.displayName ?? wireModelId,
     end,
-  });
+  }, options.failedToolCalls);
   const request: Record<string, any> = {
     contents,
     ...(systemInstruction ? { systemInstruction } : {}),
@@ -421,14 +426,14 @@ export function rewriteBodyForAntigravity(options: BodyRewriteOptions): Record<s
   // Only the catalog's thinking config; OpenCode's sampling settings are not
   // part of the native request.
   const thinkingConfig = model.thinkingLevel !== undefined
-    ? { includeThoughts: true, thinkingLevel: THINKING_LEVELS[model.thinkingLevel] }
+    ? { includeThoughts: true, thinkingLevel: THINKING_LEVELS[model.thinkingLevel] ?? model.thinkingLevel }
     : model.thinkingBudget !== undefined
       ? { includeThoughts: true, thinkingBudget: model.thinkingBudget }
       : undefined;
 
   if (kind === "compaction") {
-    request["toolConfig"] = { functionCallingConfig: { mode: "NONE" } };
-    request["generationConfig"] = { maxOutputTokens: 16384, ...(thinkingConfig ? { thinkingConfig } : {}) };
+    if (model.apiProvider !== GEMINI) request["toolConfig"] = { functionCallingConfig: { mode: "NONE" } };
+    request["generationConfig"] = { maxOutputTokens: model.apiProvider === GEMINI ? 32768 : 16384, ...(thinkingConfig ? { thinkingConfig } : {}) };
     request["sessionId"] = history.sessionId;
     return {
       project: projectId,
@@ -440,11 +445,11 @@ export function rewriteBodyForAntigravity(options: BodyRewriteOptions): Record<s
     };
   }
 
-  // VALIDATED like the native client, except NONE (OpenCode's step limit)
-  // for Claude. Live-tested 2026-10-04: CCA ignores NONE and ANY on Gemini,
-  // GPT-OSS leaks harmony tokens under NONE, and Claude 400s on ANY.
+  // November's Gemini and Claude clients omit toolConfig. Keep Claude's
+  // explicit step-limit NONE, and GPT-OSS's previously verified VALIDATED.
   const none = claude && args.toolConfig?.functionCallingConfig?.mode === "NONE";
-  request["toolConfig"] = { functionCallingConfig: { mode: none ? "NONE" : "VALIDATED" } };
+  if (none) request["toolConfig"] = { functionCallingConfig: { mode: "NONE" } };
+  else if (model.apiProvider !== GEMINI && !claude) request["toolConfig"] = { functionCallingConfig: { mode: "VALIDATED" } };
 
   const envelope = advanceEnvelope(state, contents, model);
   request["labels"] = envelope.labels;
@@ -476,6 +481,7 @@ function normalizeContentsForAntigravity(
   logicalModelId: string,
   claude: boolean,
   agent?: { state: AntigravitySessionState; wireModelId: string; modelName: string; end: number },
+  failedToolCalls?: ReadonlySet<string>,
 ): Record<string, any>[] {
   const needsCallSignature = logicalModelId.startsWith("gemini-3") || logicalModelId.startsWith("gemini-4-argon");
   const now = Date.now();
@@ -495,6 +501,9 @@ function normalizeContentsForAntigravity(
         parts: content.parts.map((part: Record<string, any>) => {
           if (!part.functionResponse) return part;
           let output = part.functionResponse.response.content;
+          if (failedToolCalls?.has(part.functionResponse.id)) {
+            return { ...part, functionResponse: { ...part.functionResponse, response: { error: output } } };
+          }
           if (agent) {
             const times = agent.state.callTimes.get(part.functionResponse.id) ?? { created: now };
             times.completed ??= now;

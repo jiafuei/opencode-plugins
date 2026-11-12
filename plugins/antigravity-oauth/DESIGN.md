@@ -2,7 +2,7 @@
 
 How the plugin follows captured Antigravity clients. For installation and usage, see the [README](README.md).
 
-Inference and control-plane requests use the Linux CLI identity captured on October 16, 2026. OAuth login remains
+Inference and control-plane requests use the Linux CLI identity captured on November 13, 2026. OAuth login remains
 on the earlier Windows IDE identity. Request envelopes and trajectory bookkeeping still follow the earlier IDE capture.
 
 ## Login and provisioning
@@ -25,11 +25,12 @@ on the earlier Windows IDE identity. Request envelopes and trajectory bookkeepin
 The model list is the native agent picker: the `agentModelSorts` ids returned by `fetchAvailableModels` (sent with the
 account's project), in picker order. Discovery tries the endpoints of the endpoint mode in order with a 5-second
 timeout each, and the result is bound to the connection that produced it. Failed discovery falls back to the snapshot
-table in the README; a successful empty list removes all models.
+table in the README; an empty picker result tries the next endpoint before falling back.
 
-Wire models whose display names differ only by a `(Low)` / `(Medium)` / `(High)` suffix become one OpenCode model with
+Wire models whose display names differ only by a `(Low)` / `(Medium)` / `(High)` / `(XHigh)` suffix become one OpenCode model with
 a variant per tier. Each variant selects its own wire id, and its thinking budget or level comes from the catalog
-entry.
+entry. Disabled tiers are excluded from selectable variants; a fully disabled family is registered as disabled,
+and the request hook rejects its use. Web search uses the catalog's first `webSearchModelIds` entry when present.
 
 ## Generation requests
 
@@ -52,8 +53,8 @@ from the configured `baseURL`, so credentials only go to the two official endpoi
 - Headers are rebuilt from scratch with the language server's set: the bearer token (the OAuth access token OpenCode
   sends as `x-goog-api-key`), the IDE user agent, `Content-Type: application/json`, and `Accept-Encoding: gzip`. No
   OpenCode, Gemini-client, or plugin-private header reaches Cloud Code Assist.
-- The User-Agent is `antigravity/cli/1.4.0 (aidev_client; os_type=linux; arch=amd64; cl=1000494485; auth_method=consumer)`,
-  regardless of the host platform. Environment overrides can change the version, OS, and architecture.
+- The User-Agent is `antigravity/cli/1.5.7 (aidev_client; os_type=linux; arch=amd64; cl=1019769835; auth_method=consumer)`,
+  regardless of the host platform. Environment overrides can change the CLI version, build, OS, and architecture.
 
 ### Bodies
 
@@ -61,11 +62,11 @@ Bodies use the native key order.
 
 - The system prompt is a single `role: "user"` text part.
 - `generationConfig` holds only the catalog's `maxOutputTokens` and thinking config. Catalog `thinkingLevel`
-  (`LOW`/`MEDIUM`/`HIGH`) takes precedence over `thinkingBudget` for every model, including Argon and Claude.
+  (`LOW`/`MEDIUM`/`HIGH`, or an unknown numeric enum such as Hydrogen XHigh's `100`) takes precedence over `thinkingBudget`.
   OpenCode's sampling settings (temperature, topP, topK, stop sequences, seed) are not sent.
-- Function calling is always `VALIDATED`, except OpenCode's step-limit `none`, which Claude gets as `NONE`. Cloud Code
-  Assist ignores `NONE` and `ANY` on Gemini, GPT-OSS leaks raw harmony tokens under `NONE`, and Claude rejects `ANY`
-  while thinking is on, so structured output relies on the model choosing the tool.
+- Gemini and Claude agent requests omit `toolConfig`, matching the November capture, except OpenCode's step-limit
+  `none`, which Claude gets as `NONE`. GPT-OSS retains `VALIDATED`. Earlier verification found GPT-OSS leaks raw
+  harmony tokens under `NONE`, and Claude rejects `ANY` while thinking is on.
 - Tools are sent one declaration per `Tool`, sorted by name. Schemas are converted from `parametersJsonSchema` into the
   native converter's shape: uppercase type names, sorted `properties`, no `title` or `propertyOrdering`, with
   `format`, `pattern`, `minimum`/`maximum`, `minLength`/`maxLength`, and `minItems`/`maxItems` kept in proto field
@@ -77,18 +78,26 @@ Bodies use the native key order.
 - Assistant turns are replayed the native way: one joined thought part, one joined text part (dropped when
   whitespace-only), then function calls, with the message signature on the first non-thought part. Empty or trailing
   `<tool_code>` wrappers are removed from the text. Thinking is kept only when the message carries a signature
-  (thinking from another model has none), and for Claude only when the same wire model produced it, so switching
+  and for Claude only when the same wire model produced it, so switching
   Claude tiers drops earlier thinking and signatures like the native client. The Gemini 3 and Argon signature bypass is added only
   to unsigned calls after the latest user turn; older calls replay bare.
+- Before Gemini serialization, message hooks restore stored Gemini signatures by message ID and text/tool-call
+  identity across Gemini families. Completed, successful responses qualify; interrupted and failed responses keep
+  core's replay restrictions. Claude signatures are not restored into Gemini, or Gemini signatures into Claude.
 - Tool results are sent as `functionResponse.response.output` in the provider's native role (`user` for Claude,
   `model` otherwise), prefixed with `Created At:` / `Completed At:` local timestamps (call streamed, result first
-  sent).
+  sent). Failed results use `response.error` without timestamps. Message hooks retain failed call IDs before
+  OpenCode's Gemini serializer flattens their error status into text.
 
 ### Auxiliary requests
 
-Auxiliary requests use the `checkpoint` envelope (`requestId = checkpoint/<uuid>`, 16,384 output tokens, no labels)
-with the conversation's session id. Titles go to `gemini-3.1-flash-lite` with thinking off. Compaction goes to the
-current model with its thinking config, the conversation's tools, and `toolConfig: NONE`; the history replays with the
+Auxiliary requests use the `checkpoint` envelope (`requestId = checkpoint/<uuid>`, no labels)
+with the conversation's session id. Titles preserve OpenCode's selected model, prompt, and generation settings.
+Ordinary compaction preserves OpenCode's selected model, prompt, and generation settings. Its history and tool schemas
+receive only the CCA compatibility conversion. The settings below apply only to opt-in native compaction.
+Native compaction goes to the current model with its thinking config and the conversation's tools.
+Gemini uses 32,768 output tokens and omits `toolConfig`; non-Gemini models retain 16,384 tokens and `toolConfig: NONE`.
+The history replays with the
 conversation's cached annotations and the summary prompt stays plain user text. Transient generation keeps its
 selected model. Each request kind has separate trajectory and retry-endpoint state, so auxiliary calls do not advance
 the primary conversation's trajectory.

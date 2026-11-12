@@ -208,6 +208,9 @@ export default Plugin.define({
     const sessionStates = new Map<string, Map<string, AntigravitySessionState>>();
     /** Sessions with a native compaction in flight; its request carries the native summary prompt. */
     const nativeCompactions = new Set<string>();
+    // The Gemini serializer flattens error results into ordinary text. Keep
+    // their call IDs from the typed messages before that distinction is lost.
+    const failedToolCalls = new Map<string, Set<string>>();
     /** Dispatched generation calls, for the metrics the native client records after each stream. */
     const pendingCalls = new WeakMap<
       Request,
@@ -222,7 +225,7 @@ export default Plugin.define({
       }
     >();
     /** Account-specific state loaded from the active connection. */
-    let loaded: { connection?: Awaited<ReturnType<typeof ctx.integration.connection.active>>; projectId?: string; catalog?: WireCatalog } = {};
+    let loaded: { connection?: Awaited<ReturnType<typeof ctx.integration.connection.active>>; projectId?: string; catalog?: WireCatalog; webSearchModelId?: string } = {};
 
     const load = async () => {
       const connection = await ctx.integration.connection.active(INTEGRATION_ID);
@@ -232,7 +235,7 @@ export default Plugin.define({
         return;
       }
       const projectId = credential.metadata?.projectId as string;
-      loaded = { connection, projectId, catalog: await discoverModels(credential.access, projectId, endpoints) };
+      loaded = { connection, projectId, ...await discoverModels(credential.access, projectId, endpoints) };
     };
     // Requests wait for the account state, so a prompt sent right after
     // startup or a connection switch still carries the project.
@@ -335,6 +338,48 @@ export default Plugin.define({
       });
     });
 
+    for (const hook of ["context", "compaction", "generate", "title"] as const) {
+      await ctx.session.hook(hook, async (event) => {
+        for (const message of event.messages) {
+          if (message.role !== "tool") continue;
+          for (const part of message.content) {
+            if (part.result.type !== "error") continue;
+            let failed = failedToolCalls.get(event.sessionID);
+            if (!failed) failedToolCalls.set(event.sessionID, failed = new Set());
+            failed.add(part.id);
+          }
+        }
+        if (!event.model.id.startsWith("gemini-") || !event.messages.some((message) => message.role === "assistant")) return;
+        const originals = await ctx.session.context({ sessionID: event.sessionID });
+        event.messages = event.messages.map((message) => {
+          if (message.role !== "assistant") return message;
+          const original = originals.find((item) => item.id === message.id);
+          // Incomplete/failed responses keep core's replay restrictions.
+          if (original?.type !== "assistant" || original.error || original.finish === undefined ||
+            original.model.providerID !== PROVIDER_ID || !original.model.id.startsWith("gemini-")) return message;
+          return {
+            ...message,
+            content: message.content.map((part) => {
+              const source = original.content.find((item) =>
+                part.type === "tool-call"
+                  ? item.type === "tool" && item.id === part.id
+                  : (part.type === "text" || part.type === "reasoning") && item.type === part.type && item.text === part.text,
+              );
+              const signature = source?.native?.thoughtSignature;
+              if (typeof signature !== "string") return part;
+              return {
+                ...part,
+                providerMetadata: {
+                  ...part.providerMetadata,
+                  google: { ...part.providerMetadata?.google, thoughtSignature: signature },
+                },
+              };
+            }),
+          };
+        });
+      }, { providerID: PROVIDER_ID });
+    }
+
     // The native Gemini client sends `{baseURL}/models/<id>:streamGenerateContent`
     // with the OAuth access token as `x-goog-api-key` and the selected wire
     // model in WIRE_MODEL_HEADER. Rewrite it into the Cloud Code Assist
@@ -362,6 +407,7 @@ export default Plugin.define({
         const wireModelId = request.headers.get(WIRE_MODEL_HEADER)!;
         const model = (loaded.catalog ?? SNAPSHOT_CATALOG)[wireModelId];
         if (!model) throw new Error(`Antigravity model "${wireModelId}" is not in the current model catalog`);
+        if (model.disabled) throw new Error(`Antigravity model "${wireModelId}" is unavailable. ${model.tagDescription ?? ""}`.trim());
         const args = await request.json() as Parameters<typeof rewriteBodyForAntigravity>[0]["args"];
         if (kind === "compaction" && nativeCompactions.has(evt.sessionID)) {
           args.contents.push({ role: "user", parts: [{ text: COMPACTION_PROMPT }] });
@@ -375,6 +421,8 @@ export default Plugin.define({
           state,
           history: kind === "agent" ? state : stateFor("primary"),
           kind,
+          nativeCompaction: nativeCompactions.has(evt.sessionID),
+          failedToolCalls: failedToolCalls.get(evt.sessionID),
         });
         const agent = envelope.requestType === "agent";
         // OpenCode sends the OAuth access token as the Gemini API key. The
@@ -601,7 +649,7 @@ export default Plugin.define({
                 tools: [{ googleSearch: { enhancedContent: { imageSearch: { maxResultCount: 5 } } } }],
                 generationConfig: { candidateCount: 1 },
               },
-              model: "gemini-3.5-flash-lite",
+              model: loaded.webSearchModelId ?? "gemini-3.5-flash-lite",
               userAgent: "antigravity",
               requestType: "web_search",
             }),
@@ -643,7 +691,10 @@ export default Plugin.define({
 
     void (async () => {
       for await (const event of ctx.event.subscribe()) {
-        if (event.type === "session.deleted") sessionStates.delete(event.data.sessionID);
+        if (event.type === "session.deleted") {
+          sessionStates.delete(event.data.sessionID);
+          failedToolCalls.delete(event.data.sessionID);
+        }
         // Like the native client, compaction continues the trajectory; the
         // next request only rebases the shrunken history.
         if (event.type === "session.compaction.ended") {
@@ -652,6 +703,7 @@ export default Plugin.define({
         }
         if (event.type === "credential.switched" && event.data.integrationID === INTEGRATION_ID) {
           sessionStates.clear();
+          failedToolCalls.clear();
           void refresh();
         }
       }

@@ -19,17 +19,17 @@ const SKIP = "skip_thought_signature_validator";
 
 describe("antigravity user agent", () => {
   test("matches the captured CLI language server fingerprint", () => {
-    const version = process.env.OPENCODE_ANTIGRAVITY_VERSION;
-    delete process.env.OPENCODE_ANTIGRAVITY_VERSION;
-    expect(getAntigravityUserAgent()).toBe("antigravity/cli/1.4.0 (aidev_client; os_type=linux; arch=amd64; cl=1000494485; auth_method=consumer)");
-    process.env.OPENCODE_ANTIGRAVITY_VERSION = "9.9.9";
+    const version = process.env.OPENCODE_ANTIGRAVITY_CLI_VERSION;
+    delete process.env.OPENCODE_ANTIGRAVITY_CLI_VERSION;
+    expect(getAntigravityUserAgent()).toBe("antigravity/cli/1.5.7 (aidev_client; os_type=linux; arch=amd64; cl=1019769835; auth_method=consumer)");
+    process.env.OPENCODE_ANTIGRAVITY_CLI_VERSION = "9.9.9";
     process.env.OPENCODE_ANTIGRAVITY_OS = "darwin";
     process.env.OPENCODE_ANTIGRAVITY_ARCH = "arm64";
-    expect(getAntigravityUserAgent()).toBe("antigravity/cli/9.9.9 (aidev_client; os_type=darwin; arch=arm64; cl=1000494485; auth_method=consumer)");
+    expect(getAntigravityUserAgent()).toBe("antigravity/cli/9.9.9 (aidev_client; os_type=darwin; arch=arm64; cl=1019769835; auth_method=consumer)");
     delete process.env.OPENCODE_ANTIGRAVITY_OS;
     delete process.env.OPENCODE_ANTIGRAVITY_ARCH;
-    if (version === undefined) delete process.env.OPENCODE_ANTIGRAVITY_VERSION;
-    else process.env.OPENCODE_ANTIGRAVITY_VERSION = version;
+    if (version === undefined) delete process.env.OPENCODE_ANTIGRAVITY_CLI_VERSION;
+    else process.env.OPENCODE_ANTIGRAVITY_CLI_VERSION = version;
   });
 });
 
@@ -138,10 +138,24 @@ function rewrite(
     state,
     history: state,
     kind,
+    nativeCompaction: kind === "compaction",
   });
 }
 
 describe("body rewrite", () => {
+  test("preserves Hydrogen XHigh and future numeric thinking levels on the wire", () => {
+    for (const thinkingLevel of [100, 101]) {
+      const body = rewrite(baseArgs(), "gemini-4-hydrogen-xhigh", createSessionState(), "agent", {
+        ...SNAPSHOT_CATALOG["gemini-4-hydrogen-xhigh"]!,
+        thinkingLevel,
+      });
+      expect(JSON.parse(JSON.stringify(body)).request.generationConfig).toEqual({
+        maxOutputTokens: 262144,
+        thinkingConfig: { includeThoughts: true, thinkingLevel },
+      });
+    }
+  });
+
   test("prefers Argon's catalog thinking level over its budget for agent and compaction requests", () => {
     for (const kind of ["agent", "compaction"] as const) {
       const body = rewrite(baseArgs(), "gemini-4-argon-low", createSessionState(), kind, ARGON_MODEL);
@@ -165,7 +179,6 @@ describe("body rewrite", () => {
       "contents",
       "systemInstruction",
       "tools",
-      "toolConfig",
       "labels",
       "generationConfig",
       "sessionId",
@@ -173,28 +186,24 @@ describe("body rewrite", () => {
     // The native system prompt is a single part.
     expect(body.request.systemInstruction).toEqual({ role: "user", parts: [{ text: "system\nprompt" }] });
     expect(body.request.sessionId).toMatch(/^-\d+$/);
-    // Only the catalog's output cap and thinking budget; OpenCode's sampling settings are dropped.
+    // Only the catalog's output cap and thinking level; OpenCode's sampling settings are dropped.
     expect(body.request.generationConfig).toEqual({
       maxOutputTokens: 65536,
-      thinkingConfig: { includeThoughts: true, thinkingBudget: 1000 },
+      thinkingConfig: { includeThoughts: true, thinkingLevel: "LOW" },
     });
-    expect(body.request.toolConfig.functionCallingConfig.mode).toBe("VALIDATED");
+    expect(body.request.toolConfig).toBeUndefined();
     expect(body.request.labels.model_enum).toBe("MODEL_PLACEHOLDER_M320");
   });
 
-  test("title requests become checkpoint calls that leave the trajectory untouched", () => {
+  test("title requests preserve OpenCode's model and payload without advancing the trajectory", () => {
     const state = createSessionState();
-    const body = rewrite({ ...baseArgs(), generationConfig: { temperature: 0.5 } }, "claude-opus-5-5-high", state, "title");
+    const args = { ...baseArgs(), generationConfig: { temperature: 0.5, maxOutputTokens: 100 } };
+    const body = rewrite(args, "claude-opus-5-5-high", state, "title");
     expect(body).toEqual({
       project: "proj-1",
       requestId: expect.stringMatching(/^checkpoint\/[0-9a-f-]{36}$/),
-      request: {
-        contents: [{ role: "user", parts: [{ text: "hi" }] }],
-        systemInstruction: { role: "user", parts: [{ text: "system prompt" }] },
-        generationConfig: { maxOutputTokens: 16384, thinkingConfig: { includeThoughts: false, thinkingBudget: 0 } },
-        sessionId: state.sessionId,
-      },
-      model: "gemini-3.1-flash-lite",
+      request: { ...args, sessionId: state.sessionId },
+      model: "claude-opus-5-5-high",
       userAgent: "antigravity",
       requestType: "checkpoint",
     });
@@ -202,7 +211,7 @@ describe("body rewrite", () => {
     expect(state.usedClaude).toBe(false);
   });
 
-  test("compaction is a checkpoint on the current model with tools disabled", () => {
+  test("Gemini compaction is a checkpoint on the current model without a toolConfig override", () => {
     const state = createSessionState();
     const args = {
       ...baseArgs(),
@@ -214,11 +223,11 @@ describe("body rewrite", () => {
 
     const body = rewrite({ ...args, contents: [...args.contents, user("Summarize")] }, "gemini-3.8-flash-medium", state, "compaction");
     expect(body).toMatchObject({ model: "gemini-3.8-flash-medium", requestType: "checkpoint" });
-    expect(Object.keys(body.request)).toEqual(["contents", "systemInstruction", "tools", "toolConfig", "generationConfig", "sessionId"]);
-    expect(body.request.toolConfig).toEqual({ functionCallingConfig: { mode: "NONE" } });
+    expect(Object.keys(body.request)).toEqual(["contents", "systemInstruction", "tools", "generationConfig", "sessionId"]);
+    expect(body.request.toolConfig).toBeUndefined();
     expect(body.request.generationConfig).toEqual({
-      maxOutputTokens: 16384,
-      thinkingConfig: { includeThoughts: true, thinkingBudget: 4000 },
+      maxOutputTokens: 32768,
+      thinkingConfig: { includeThoughts: true, thinkingLevel: "MEDIUM" },
     });
     // The history replays as is, but the summary prompt (plain user text) ends
     // the turn, so the unsigned call drops the bypass it carried mid-turn.
@@ -233,14 +242,14 @@ describe("body rewrite", () => {
     expect(state.historySteps).toBe(steps);
   });
 
-  test("sends VALIDATED except NONE for Claude", () => {
+  test("omits Gemini toolConfig and retains non-Gemini tool modes", () => {
     const mode = (sdkMode: string, wireModelId: string) =>
       rewrite({ ...baseArgs(), toolConfig: { functionCallingConfig: { mode: sdkMode } } }, wireModelId).request.toolConfig
-        .functionCallingConfig;
+        ?.functionCallingConfig;
     expect(mode("NONE", "claude-opus-5-5-high")).toEqual({ mode: "NONE" });
-    for (const [sdkMode, wireModelId] of [["AUTO", "claude-opus-5-5-high"], ["ANY", "claude-opus-5-5-high"], ["NONE", "gemini-3.8-flash-low"], ["ANY", "gemini-3.8-flash-low"], ["NONE", "gpt-oss-120b-medium"]]) {
-      expect(mode(sdkMode!, wireModelId!)).toEqual({ mode: "VALIDATED" });
-    }
+    expect(mode("NONE", "gpt-oss-120b-medium")).toEqual({ mode: "VALIDATED" });
+    for (const sdkMode of ["AUTO", "ANY"]) expect(mode(sdkMode, "claude-opus-5-5-high")).toBeUndefined();
+    for (const sdkMode of ["AUTO", "NONE", "ANY"]) expect(mode(sdkMode, "gemini-4-hydrogen-high")).toBeUndefined();
   });
 
   test("tool results carry timestamped output text in the provider's native role", () => {
@@ -852,8 +861,11 @@ describe("provider model registration", () => {
       { id: "medium", headers: { [WIRE_MODEL_HEADER]: "claude-opus-5-5-medium" } },
       { id: "high", headers: { [WIRE_MODEL_HEADER]: "claude-opus-5-5-high" } },
     ] as any);
-    // Asymmetric wire ids still group by display name.
-    expect(models["gemini-3.1-pro"]!.headers).toEqual({ [WIRE_MODEL_HEADER]: "gemini-pro-agent" });
+    const hydrogen = models["gemini-4-hydrogen"]!;
+    expect(hydrogen.headers).toEqual({ [WIRE_MODEL_HEADER]: "gemini-4-hydrogen-xhigh" });
+    expect(hydrogen.variants.map((variant) => variant.id)).toEqual(["low", "medium", "high", "xhigh"]);
+    expect(hydrogen.limit.output).toBe(262144);
+    expect(models["gemini-4-carbon-disabled"]!.enabled).toBe(false);
     // A single tier needs no variants.
     expect(models["gpt-oss-120b"]!.variants).toEqual([]);
     expect(models["gpt-oss-120b"]!.capabilities.input).toEqual(["text"]);

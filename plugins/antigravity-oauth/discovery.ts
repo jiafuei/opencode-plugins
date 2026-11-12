@@ -4,6 +4,7 @@ import { antigravityHeaders, type WireCatalog } from "./wire.ts";
 interface AvailableModels {
   models?: WireCatalog;
   agentModelSorts?: Array<{ groups?: Array<{ modelIds?: string[] }> }>;
+  webSearchModelIds?: string[];
 }
 
 /**
@@ -15,7 +16,7 @@ export async function discoverModels(
   projectId: string,
   endpoints: string[],
   fetcher: typeof fetch = goFetch,
-): Promise<WireCatalog | undefined> {
+): Promise<{ catalog: WireCatalog; webSearchModelId?: string } | undefined> {
   for (const endpoint of endpoints) {
     try {
       const response = await fetcher(`${endpoint}/v1internal:fetchAvailableModels`, {
@@ -27,7 +28,8 @@ export async function discoverModels(
       if (!response.ok) continue;
       const payload = (await response.json()) as AvailableModels;
       const ids = (payload.agentModelSorts ?? []).flatMap((sort) => (sort.groups ?? []).flatMap((group) => group.modelIds ?? []));
-      return Object.fromEntries(ids.filter((id) => payload.models?.[id]).map((id) => [id, payload.models![id]!]));
+      const catalog = Object.fromEntries([...new Set(ids)].filter((id) => payload.models?.[id]).map((id) => [id, payload.models![id]!]));
+      if (Object.keys(catalog).length > 0) return { catalog, webSearchModelId: payload.webSearchModelIds?.[0] };
     } catch {
       // Model discovery is optional; login and inference report auth failures.
     }

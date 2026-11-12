@@ -23,7 +23,7 @@ interface RecordedCall {
 }
 
 /** Fake plugin context capturing registrations; `send()` runs the session HTTP hooks like core does. */
-function makeHarness(credential: StoredCredential | undefined, options: Record<string, unknown> = {}) {
+function makeHarness(credential: StoredCredential | undefined, options: Record<string, unknown> = {}, context: unknown[] = []) {
   let current = credential;
   const hooks: Record<string, (evt: any) => unknown> = {};
   const transforms: Record<string, (editor: any) => void> = {};
@@ -49,7 +49,10 @@ function makeHarness(credential: StoredCredential | undefined, options: Record<s
       reload: async () => {},
     },
     rpc: { register: async () => {} },
-    session: { hook: async (name: string, callback: any) => void (hooks[`session.${name}`] = callback) },
+    session: {
+      hook: async (name: string, callback: any) => void (hooks[`session.${name}`] = callback),
+      context: async () => context,
+    },
     event: {
       subscribe: async function* () {
         while (true) {
@@ -375,7 +378,7 @@ describe("web search provider", () => {
       expect(mock.calls[0]!.init.signal).toBe(signal);
       const headers = new Headers(mock.calls[0]!.init.headers);
       expect(headers.get("authorization")).toBe("Bearer at-live");
-      expect(headers.get("user-agent")).toBe("antigravity/cli/1.4.0 (aidev_client; os_type=linux; arch=amd64; cl=1000494485; auth_method=consumer)");
+      expect(headers.get("user-agent")).toBe("antigravity/cli/1.5.7 (aidev_client; os_type=linux; arch=amd64; cl=1019769835; auth_method=consumer)");
       expect(JSON.parse(String(mock.calls[0]!.init.body))).toMatchObject({
         project: "proj-42",
         model: "gemini-3.5-flash-lite",
@@ -448,7 +451,7 @@ describe("session HTTP hooks", () => {
       expect([...headers.keys()].sort()).toEqual(["accept-encoding", "authorization", "content-type", "user-agent"]);
       expect(headers.get("accept-encoding")).toBe("gzip");
       expect(headers.get("authorization")).toBe("Bearer at-live");
-      expect(headers.get("user-agent")).toBe("antigravity/cli/1.4.0 (aidev_client; os_type=linux; arch=amd64; cl=1000494485; auth_method=consumer)");
+      expect(headers.get("user-agent")).toBe("antigravity/cli/1.5.7 (aidev_client; os_type=linux; arch=amd64; cl=1019769835; auth_method=consumer)");
 
       const wireBody = JSON.parse(String(call.init.body));
       expect(wireBody).toMatchObject({ project: "proj-42", model: "claude-opus-5-5-high", userAgent: "antigravity", requestType: "agent" });
@@ -487,10 +490,13 @@ describe("session HTTP hooks", () => {
     }
   });
 
-  test("models outside the current catalog fail loudly", async () => {
+  test("unknown and upstream-disabled models fail before generation", async () => {
     const harness = makeHarness(OAUTH_AUTH);
     await expect(harness.send("ses-1", nativeRequest("claude-opus-4-6-thinking", { contents: [] }))).rejects.toThrow(
       /not in the current model catalog/,
+    );
+    await expect(harness.send("ses-1", nativeRequest("gemini-4-carbon-disabled", { contents: [] }))).rejects.toThrow(
+      /Ultra plan subscribers/,
     );
   });
 
@@ -588,6 +594,83 @@ describe("session HTTP hooks", () => {
       // The next new turn starts an execution as usual.
       const next = await send([...window, turn("third")]);
       expect(next.body.request.labels.last_execution_id).not.toBe(labels.last_execution_id);
+    } finally {
+      mock.restore();
+    }
+  });
+
+  test("restores stored Gemini signatures across families without restoring Claude or interrupted state", async () => {
+    const model = (id: string) => ({ providerID: "google-antigravity", id });
+    const originals = [
+      { id: "gemini", type: "assistant", model: model("gemini-4-argon"), finish: "stop", content: [
+        { type: "text", text: "same reply", native: { thoughtSignature: "argon-text" } },
+        { type: "tool", id: "call-1", name: "read", native: { thoughtSignature: "argon-call" } },
+      ] },
+      { id: "claude", type: "assistant", model: model("claude-opus-5-5"), finish: "stop", content: [
+        { type: "text", text: "same reply", native: { thoughtSignature: "claude-text" } },
+      ] },
+      { id: "cut", type: "assistant", model: model("gemini-4-hydrogen"), content: [
+        { type: "text", text: "partial", native: { thoughtSignature: "partial-signature" } },
+      ] },
+    ];
+    const harness = makeHarness(OAUTH_AUTH, {}, originals);
+    await harness.ready();
+    const messages = () => [
+      { id: "gemini", role: "assistant", content: [
+        { type: "text", text: "same reply" },
+        { type: "tool-call", id: "call-1", name: "read", input: {} },
+      ] },
+      { id: "claude", role: "assistant", content: [{ type: "text", text: "same reply" }] },
+      { id: "cut", role: "assistant", content: [{ type: "text", text: "partial" }] },
+    ];
+    for (const id of ["gemini-4-hydrogen", "gemini-3.8-flash"]) {
+      const event: any = { sessionID: "switch", model: model(id), messages: messages() };
+      await harness.hooks["session.context"]!(event);
+      expect(event.messages[0].content.map((part: any) => part.providerMetadata.google.thoughtSignature)).toEqual(["argon-text", "argon-call"]);
+      expect(event.messages[1].content[0].providerMetadata).toBeUndefined();
+      expect(event.messages[2].content[0].providerMetadata).toBeUndefined();
+    }
+    const claude: any = { sessionID: "switch", model: model("claude-opus-5-5"), messages: messages() };
+    await harness.hooks["session.context"]!(claude);
+    expect(claude.messages).toEqual(messages());
+  });
+
+  test("ordinary compaction preserves OpenCode's settings and converts failed tool results", async () => {
+    const harness = makeHarness(OAUTH_AUTH);
+    await harness.ready();
+    const mock = mockFetch(() => sseResponse([]));
+    const args = {
+      contents: [
+        { role: "user", parts: [{ text: "task" }] },
+        { role: "model", parts: [{ functionCall: { id: "failed-1", name: "read", args: {} } }] },
+        { role: "user", parts: [{ functionResponse: { id: "failed-1", name: "read", response: { content: "not found" } } }] },
+        { role: "user", parts: [{ text: "OpenCode summary prompt" }] },
+      ],
+      systemInstruction: { parts: [{ text: "OpenCode instructions" }] },
+      generationConfig: { temperature: 0.2, maxOutputTokens: 1234, thinkingConfig: { thinkingBudget: 0 } },
+      toolConfig: { functionCallingConfig: { mode: "NONE" } },
+    };
+    try {
+      await harness.hooks["session.compaction"]!({
+        sessionID: "ses-ordinary",
+        model: { providerID: "google-antigravity", id: "gemini-4-hydrogen" },
+        messages: [{
+          role: "tool",
+          content: [{ type: "tool-result", id: "failed-1", name: "read", result: { type: "error", value: "not found" } }],
+        }],
+      });
+      await readStream(await harness.send("ses-ordinary", nativeRequest("gemini-4-hydrogen-high", args), "compaction"));
+      const body = JSON.parse(String(mock.calls.at(-1)!.init.body));
+      expect(body.model).toBe("gemini-4-hydrogen-high");
+      expect(body.request.generationConfig).toEqual(args.generationConfig);
+      expect(body.request.systemInstruction).toEqual(args.systemInstruction);
+      expect(body.request.toolConfig).toEqual(args.toolConfig);
+      expect(body.request.contents[0]).toEqual(args.contents[0]);
+      expect(body.request.contents.at(-1)).toEqual(args.contents.at(-1));
+      expect(body.request.contents[2].parts[0].functionResponse.response).toEqual({ error: "not found" });
+      await readStream(await harness.send("ses-ordinary", nativeRequest("gemini-4-hydrogen-high", args)));
+      const agent = JSON.parse(String(mock.calls.at(-1)!.init.body));
+      expect(agent.request.contents[2].parts[0].functionResponse.response).toEqual({ error: "not found" });
     } finally {
       mock.restore();
     }
