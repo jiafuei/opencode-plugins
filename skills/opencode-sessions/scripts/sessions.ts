@@ -14,17 +14,20 @@ const { values, positionals } = parseArgs({
     until: { type: "string" },
     session: { type: "string" },
     limit: { type: "string", default: "50" },
+    regex: { type: "boolean" },
+    context: { type: "string", default: "120" },
     "include-reasoning": { type: "boolean" },
     "include-tool-output": { type: "boolean" },
     server: { type: "string" },
   },
 })
 
-const help = `Usage: bun sessions.ts <command> [argument] [options]
+const help = `Usage: bun sessions.ts <command> [argument...] [options]
 
 Commands:
   list                  List sessions, newest updated first
-  search <text>         Search message bodies (case-insensitive literal text)
+  search <term>...      Search message bodies; every term must appear in the same text
+  outline <session-id>  Print user prompts, final answers, and compaction summaries
   dump <session-id>     Dump native message objects as chronological JSONL
 
 Options:
@@ -35,14 +38,17 @@ Options:
   --until <date>        Include sessions updated before this ISO date
   --session <id>        Search just one session
   --limit <n>           Max list/search records (default 50; 0 = unlimited)
+  --regex               Treat search terms as regular expressions
+  --context <chars>     Characters of excerpt around each search match (default 120)
   --include-reasoning   Also search assistant reasoning (dumps always retain it)
   --include-tool-output Include tool results/errors and shell output in search/dump
   --server <url>       Forward an explicit server to opencode api
   --help               Show this help
 
-All output is JSONL on stdout. Diagnostics go to stderr.
-Default search scope: all sessions, user/assistant text only.
-Dump ignores list/search filters and limits; tool results are omitted by default.
+All output is JSONL on stdout. Diagnostics go to stderr. Times are ISO 8601 UTC.
+Search terms are case-insensitive. Quote a term to match a phrase.
+Default search scope: all sessions; user text, assistant text, compaction summaries.
+Outline and dump ignore list/search filters and limits; dump omits tool results by default.
 `
 
 if (values.help || !positionals.length) {
@@ -50,24 +56,27 @@ if (values.help || !positionals.length) {
   process.exit(0)
 }
 
-const [command = "", argument = ""] = positionals
-if (!["list", "search", "dump"].includes(command) ||
-    positionals.length !== (command === "list" ? 1 : 2) ||
-    (command !== "list" && !argument)) {
-  throw new Error("Expected list, search <text>, or dump <session-id>. See --help.")
+const [command = "", ...terms] = positionals
+const arity: Record<string, [number, number]> = { list: [0, 0], search: [1, Infinity], outline: [1, 1], dump: [1, 1] }
+if (!arity[command] || terms.length < arity[command][0] || terms.length > arity[command][1]) {
+  throw new Error("Expected list, search <term>..., outline <session-id>, or dump <session-id>. See --help.")
 }
 
 const limit = Number(values.limit)
+const context = Number(values.context)
 const since = values.since === undefined ? -Infinity : Date.parse(values.since)
 const until = values.until === undefined ? Infinity : Date.parse(values.until)
-if (!Number.isInteger(limit) || limit < 0 || Number.isNaN(since) || Number.isNaN(until)) {
-  throw new Error("Use a nonnegative integer --limit and valid ISO dates for --since/--until.")
+if (!Number.isInteger(limit) || limit < 0 || !Number.isInteger(context) || context < 0 || Number.isNaN(since) || Number.isNaN(until)) {
+  throw new Error("Use nonnegative integers for --limit/--context and valid ISO dates for --since/--until.")
 }
 
 type Session = {
   id: string
+  parentID?: string
   title?: string
   projectID: string
+  agent?: string
+  model?: { id: string; providerID: string }
   location: { directory: string }
   time: { created: number; updated: number }
 }
@@ -88,8 +97,12 @@ type Part = {
 type Message = {
   id: string
   type: string
+  time: { created: number }
   text?: string
   content?: Part[]
+  finish?: string
+  summary?: string
+  native?: { messages: { content: { text?: string }[] }[] }
   output?: { output: string }
   [key: string]: unknown
 }
@@ -107,7 +120,7 @@ async function api<T>(path: string): Promise<T> {
 async function* pages<T>(path: string, filters: Record<string, string>, order: "asc" | "desc") {
   let cursor: string | undefined
   do {
-    const query = new URLSearchParams({ ...filters, limit: "100" })
+    const query = new URLSearchParams({ ...filters, limit: "200" })
     if (cursor) query.set("cursor", cursor)
     else query.set("order", order)
     const page = await api<{ data: T[]; cursor: { next?: string | null } }>(`${path}?${query}`)
@@ -116,9 +129,13 @@ async function* pages<T>(path: string, filters: Record<string, string>, order: "
   } while (cursor)
 }
 
+function messages(sessionID: string) {
+  return pages<Message>(`/api/session/${encodeURIComponent(sessionID)}/message`, {}, "asc")
+}
+
 async function* sessions() {
   if (values.session) {
-    yield await api<Session>(`/api/session/${encodeURIComponent(values.session)}`)
+    yield (await api<{ data: Session }>(`/api/session/${encodeURIComponent(values.session)}`)).data
     return
   }
   const filters: Record<string, string> = {}
@@ -127,8 +144,34 @@ async function* sessions() {
   yield* pages<Session>("/api/session", filters, "desc")
 }
 
+// Provider-native compaction keeps its text in native messages instead of summary.
+function summary(message: Message) {
+  const native = message.native?.messages.flatMap((item) => item.content.map((part) => part.text)) ?? []
+  return [message.summary, ...native].filter(Boolean).join("\n\n")
+}
+
+const patterns = terms.map((term) => new RegExp(values.regex ? term : term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi"))
+
+// One excerpt per cluster of matches; empty unless every term matches the text.
+function excerpts(text: string) {
+  const ranges: [number, number][] = []
+  for (const pattern of patterns) {
+    const found = [...text.matchAll(pattern)]
+    if (!found.length) return []
+    for (const match of found) ranges.push([match.index - context, match.index + match[0].length + context])
+  }
+  ranges.sort((a, b) => a[0] - b[0])
+  const merged: [number, number][] = []
+  for (const [start, end] of ranges) {
+    const last = merged.at(-1)
+    if (last && start <= last[1]) last[1] = Math.max(last[1], end)
+    else merged.push([start, end])
+  }
+  return merged.map(([start, end]) => text.slice(Math.max(0, start), end))
+}
+
 if (command === "dump") {
-  for await (const message of pages<Message>(`/api/session/${encodeURIComponent(argument)}/message`, {}, "asc")) {
+  for await (const message of messages(terms[0])) {
     if (!values["include-tool-output"]) {
       if (message.type === "shell") delete message.output
       if (message.type === "assistant") {
@@ -143,8 +186,23 @@ if (command === "dump") {
     }
     process.stdout.write(JSON.stringify(message) + "\n")
   }
+} else if (command === "outline") {
+  for await (const message of messages(terms[0])) {
+    let text = ""
+    if (message.type === "user") text = message.text!
+    if (message.type === "compaction") text = summary(message)
+    if (message.type === "assistant" && message.finish !== "tool-calls") {
+      text = message.content!.filter((part) => part.type === "text").map((part) => part.text).join("\n\n")
+    }
+    if (!text) continue
+    process.stdout.write(JSON.stringify({
+      messageID: message.id,
+      time: new Date(message.time.created).toISOString(),
+      type: message.type,
+      text,
+    }) + "\n")
+  }
 } else {
-  const needle = argument.toLowerCase()
   let count = 0
   outer: for await (const session of sessions()) {
     if (session.time.updated < since || session.time.updated >= until) continue
@@ -153,13 +211,23 @@ if (command === "dump") {
     if (values.directory && session.location.directory !== resolve(values.directory)) continue
     if (values.project && session.projectID !== values.project) continue
     if (command === "list") {
-      process.stdout.write(JSON.stringify(session) + "\n")
+      process.stdout.write(JSON.stringify({
+        id: session.id,
+        parentID: session.parentID,
+        title: session.title,
+        directory: session.location.directory,
+        created: new Date(session.time.created).toISOString(),
+        updated: new Date(session.time.updated).toISOString(),
+        agent: session.agent,
+        model: session.model && `${session.model.providerID}/${session.model.id}`,
+      }) + "\n")
       if (limit && ++count >= limit) break
       continue
     }
-    for await (const message of pages<Message>(`/api/session/${encodeURIComponent(session.id)}/message`, {}, "asc")) {
+    for await (const message of messages(session.id)) {
       const fields: { field: string; text: string }[] = []
       if (message.type === "user") fields.push({ field: "text", text: message.text! })
+      if (message.type === "compaction") fields.push({ field: "summary", text: summary(message) })
       if (message.type === "assistant") {
         for (const [index, part] of message.content!.entries()) {
           if (part.type === "text" || (part.type === "reasoning" && values["include-reasoning"])) {
@@ -177,18 +245,19 @@ if (command === "dump") {
         fields.push({ field: "output.output", text: message.output.output })
       }
       for (const { field, text } of fields) {
-        const offset = text.toLowerCase().indexOf(needle)
-        if (offset === -1) continue
-        process.stdout.write(JSON.stringify({
-          sessionID: session.id,
-          title: session.title,
-          directory: session.location.directory,
-          messageID: message.id,
-          type: message.type,
-          field,
-          excerpt: text.slice(Math.max(0, offset - 120), offset + argument.length + 120),
-        }) + "\n")
-        if (limit && ++count >= limit) break outer
+        for (const excerpt of excerpts(text)) {
+          process.stdout.write(JSON.stringify({
+            sessionID: session.id,
+            title: session.title,
+            directory: session.location.directory,
+            messageID: message.id,
+            time: new Date(message.time.created).toISOString(),
+            type: message.type,
+            field,
+            excerpt,
+          }) + "\n")
+          if (limit && ++count >= limit) break outer
+        }
       }
     }
   }

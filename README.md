@@ -22,7 +22,7 @@ Standalone plugins for [OpenCode](https://opencode.ai), maintained as independen
 
 ## Skills
 
-- [OpenCode sessions](skills/opencode-sessions/SKILL.md): search V2 sessions and message bodies, and dump JSONL transcripts with optional tool output. Includes a standalone Bun CLI for other harnesses.
+- [OpenCode sessions](skills/opencode-sessions/SKILL.md): search V2 sessions and message bodies, outline a session's prompts and final answers, and dump JSONL transcripts with optional tool output. Includes a standalone Bun CLI for other harnesses.
 
 Add this repository's `skills/` directory to OpenCode's `skills` configuration, or copy an individual skill directory into `~/.config/opencode/skills/`.
 
