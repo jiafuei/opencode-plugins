@@ -17,6 +17,7 @@ Standalone plugins for [OpenCode](https://opencode.ai), maintained as independen
 - [OpenRouter](plugins/openrouter/README.md): routing and privacy settings with global, folder, and session overrides and a local web UI.
 - [PTY](plugins/pty/README.md): session-private interactive terminals for REPLs, installers, debuggers, and terminal applications. Not published; load it from a local checkout.
 - [Sleep](plugins/sleep/README.md): cancellable waits in milliseconds through Code Mode.
+- [Tool result cache](plugins/tool-result-cache/README.md): opt-in, five-minute tool result caching within each session.
 - [Workflows](plugins/workflows/README.md): declarative child-agent workflows with steering and a native TUI inspector.
 
 ## Skills
