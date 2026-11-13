@@ -141,6 +141,9 @@ export default Plugin.define({
               if ((url.pathname === "/api/settings" || url.pathname === "/api/preview") && request.method === "POST") {
                 const input = selectionSchema.parse(await request.json());
                 const info = await context(input.sessionID);
+                if (input.scope === "session" && !info.session) {
+                  return Response.json({ error: "Session not found" }, { status: 400 });
+                }
                 const scope = input.scope === "folder" ? `folder/${encodeURIComponent(info.directory)}`
                   : input.scope === "session" ? `session/${info.session!.id}` : "global";
                 const key = settingsKey(scope, input.modelID);
@@ -158,8 +161,9 @@ export default Plugin.define({
                 const base: Record<string, unknown> = {};
                 for (const overlay of [model?.settings?.provider, variant?.settings?.provider, model?.body?.provider, variant?.body?.provider]) {
                   for (const [key, value] of Object.entries(overlay ?? {})) {
+                    const prev = base[key];
                     base[key] = value && typeof value === "object" && !Array.isArray(value)
-                      ? { ...(typeof base[key] === "object" ? base[key] : {}), ...value }
+                      ? { ...(prev && typeof prev === "object" && !Array.isArray(prev) ? prev : {}), ...value }
                       : value;
                   }
                 }
@@ -168,7 +172,11 @@ export default Plugin.define({
               return Response.json({ error: "Not found" }, { status: 404 });
             },
             error(error) {
-              return Response.json({ error: error.message }, { status: error instanceof z.ZodError ? 400 : 500 });
+              if (error instanceof z.ZodError) {
+                const message = error.issues.map((issue) => `${issue.path.join(".") || "value"}: ${issue.message}`).join("; ");
+                return Response.json({ error: message }, { status: 400 });
+              }
+              return Response.json({ error: error.message }, { status: 500 });
             },
           });
         }

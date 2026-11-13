@@ -36,7 +36,7 @@ const values = {
   preferred_max_latency: threshold,
   max_price: z.object({
     prompt: price.optional(), completion: price.optional(), request: price.optional(), image: price.optional(), audio: price.optional(),
-  }),
+  }).strict(),
 };
 
 export type Field = keyof typeof values;
