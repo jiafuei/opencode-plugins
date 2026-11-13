@@ -38,6 +38,12 @@ async function instance(storage: Map<string, unknown>, directory = "/work/app", 
     storage: {
       get: async (key: string) => structuredClone(storage.get(key)),
       set: async (key: string, value: unknown) => { storage.set(key, structuredClone(value)); },
+      remove: async (key: string) => { storage.delete(key); },
+      scan: async ({ prefix }: { prefix: string }) => ({
+        entries: [...storage.entries()]
+          .filter(([key]) => key.startsWith(prefix))
+          .map(([key, value]) => ({ key, value: structuredClone(value) })),
+      }),
     },
     session: {
       get: async ({ sessionID }: { sessionID: string }) => sessions[sessionID],
@@ -65,7 +71,7 @@ async function instance(storage: Map<string, unknown>, directory = "/work/app", 
     models: () => models.filter((model) => model.enabled),
     api: (path: string, input: Record<string, unknown>) => fetch(new URL(`/api/${path}`, address), {
       method: "POST",
-      headers: { authorization: `Bearer ${address.hash.slice(1)}`, "content-type": "application/json" },
+      headers: { "content-type": "application/json" },
       body: JSON.stringify({ scope: "global", modelID: "", previewModelID: "vendor/model", ...input }),
     }),
     send: async (sessionID: string, kind = "primary", modelID = "vendor/model") => {
@@ -111,16 +117,25 @@ test("saved routing applies across request kinds, scopes, models, and plugin res
   } finally { await app.dispose(); }
 });
 
-test("local UI API previews unsaved settings without persisting them, validates edits, and requires its launch token", async () => {
-  const storage = new Map<string, unknown>();
+test("local UI API previews unsaved settings without persisting them, validates edits, and prunes retired model overrides", async () => {
+  const storage = new Map<string, unknown>([
+    ["config/global/*", { zdr: { mode: "set", value: true } }],
+    ["config/global/retired%2Fmodel", { zdr: { mode: "set", value: false } }],
+    ["config/folder/%2Fwork%2Fapp/retired%2Fmodel", { allow_fallbacks: { mode: "set", value: false } }],
+    ["config/global/vendor%2Fmodel", { data_collection: { mode: "set", value: "deny" } }],
+  ]);
   const app = await instance(storage);
   try {
+    expect(storage.has("config/global/retired%2Fmodel")).toBe(false);
+    expect(storage.has("config/folder/%2Fwork%2Fapp/retired%2Fmodel")).toBe(false);
+    expect(storage.has("config/global/*")).toBe(true);
+    expect(storage.has("config/global/vendor%2Fmodel")).toBe(true);
+    storage.clear();
+
     const page = await fetch(app.url);
     expect(page.status).toBe(200);
     expect(await page.text()).toContain("Effective settings");
-    const context = await fetch(new URL("/api/context", app.url), {
-      headers: { authorization: `Bearer ${new URL(app.url).hash.slice(1)}` },
-    });
+    const context = await fetch(new URL("/api/context", app.url));
     expect(context.status).toBe(200);
     expect(await context.json()).toMatchObject({
       directory: "/work/app",
@@ -130,9 +145,7 @@ test("local UI API previews unsaved settings without persisting them, validates 
       ],
       disabled: [],
     });
-    expect((await fetch(new URL("/api/heartbeat", app.url), { method: "POST" })).status).toBe(401);
     expect((await app.api("heartbeat", {})).status).toBe(200);
-    expect((await fetch(new URL("/api/context", app.url))).status).toBe(401);
     const draft = await app.api("preview", {
       variant: "fast",
       patch: { max_price: { mode: "remove" }, allow_fallbacks: { mode: "set", value: false }, sort: { mode: "set", value: { by: "price", partition: "none" } } },

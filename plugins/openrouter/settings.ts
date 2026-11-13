@@ -6,14 +6,14 @@ export const fields = [
   { key: "ignore", label: "Ignored providers", group: "Routing", type: "list", hint: "Exclude these provider slugs." },
   { key: "allow_fallbacks", label: "Allow fallbacks", group: "Routing", type: "boolean", hint: "Allow other providers if the preferred providers are unavailable." },
   { key: "require_parameters", label: "Require parameter support", group: "Routing", type: "boolean", hint: "Only route to providers supporting every requested parameter." },
-  { key: "sort", label: "Provider sorting", group: "Routing", type: "json", hint: '"price", "throughput", "latency", or {"by":"price","partition":"model"}. Partition can also be "none".' },
+  { key: "sort", label: "Provider sorting", group: "Routing", type: "sort", hint: "Sort providers by price, throughput, or latency, optionally partitioned by model or none." },
   { key: "data_collection", label: "Data collection", group: "Privacy", type: "enum", hint: "Deny excludes providers that collect user data." },
   { key: "zdr", label: "Zero data retention", group: "Privacy", type: "boolean", hint: "Require ZDR endpoints. False does not override account-level ZDR." },
   { key: "enforce_distillable_text", label: "Distillable text", group: "Privacy", type: "boolean", hint: "Only route to models whose authors allow text distillation." },
   { key: "quantizations", label: "Quantizations", group: "Performance & price", type: "list", hint: "Allowed quantizations, one per line; e.g. fp16, bf16, int8, int4." },
-  { key: "preferred_min_throughput", label: "Preferred minimum throughput", group: "Performance & price", type: "json", hint: 'Tokens/sec, e.g. 50 or {"p50":100,"p90":50}. A preference, not a hard limit.' },
-  { key: "preferred_max_latency", label: "Preferred maximum latency", group: "Performance & price", type: "json", hint: 'Seconds, e.g. 3 or {"p50":1,"p99":5}. A preference, not a hard limit.' },
-  { key: "max_price", label: "Maximum price", group: "Performance & price", type: "json", hint: 'E.g. {"prompt":1,"completion":2}. Token prices are USD per million; "request" and "image" are per unit. A hard limit.' },
+  { key: "preferred_min_throughput", label: "Preferred minimum throughput", group: "Performance & price", type: "threshold", hint: "Tokens/sec as a single value or percentiles. A preference, not a hard limit." },
+  { key: "preferred_max_latency", label: "Preferred maximum latency", group: "Performance & price", type: "threshold", hint: "Seconds as a single value or percentiles. A preference, not a hard limit." },
+  { key: "max_price", label: "Maximum price", group: "Performance & price", type: "price", hint: "Token prices are USD per million; request, image, and audio are per unit. A hard limit." },
 ] as const;
 
 const sort = z.enum(["price", "throughput", "latency"]);

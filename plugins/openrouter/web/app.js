@@ -1,7 +1,4 @@
 const $ = (id) => document.getElementById(id);
-const token = location.hash.slice(1) || sessionStorage.getItem("openrouter-token");
-if (token) sessionStorage.setItem("openrouter-token", token);
-history.replaceState(null, "", location.pathname + location.search);
 let catalog;
 let dirty = false;
 let sequence = 0;
@@ -34,6 +31,16 @@ document.querySelector(".tabs").addEventListener("keydown", (event) => {
   event.preventDefault();
   tab(target, true);
 });
+
+function confirmDiscard(message) {
+  const dialog = $("confirm-dialog");
+  $("confirm-message").textContent = message;
+  dialog.returnValue = "";
+  dialog.showModal();
+  return new Promise((resolve) => {
+    dialog.addEventListener("close", () => resolve(dialog.returnValue === "discard"), { once: true });
+  });
+}
 
 function filteredModels() {
   const search = $("model-search").value.trim().toLowerCase();
@@ -137,7 +144,7 @@ function renderModels() {
     routing.textContent = "Routing →";
     routing.setAttribute("aria-label", `Routing settings for ${model.name} (${model.id})`);
     routing.addEventListener("click", async () => {
-      if (dirty && !confirm("Discard unsaved routing settings?")) return;
+      if (dirty && !(await confirmDiscard("Discard unsaved routing settings?"))) return;
       const previous = selection;
       const previousPreview = $("preview-model").value;
       $("model").value = model.id;
@@ -217,14 +224,14 @@ $("save-models").addEventListener("click", async () => {
     $("model-status").textContent = "Could not save · changes kept";
   } finally {
     $("models-panel").inert = false;
-    ($("save-models").disabled ? $("model-status") : $("save-models")).focus();
+    ($("save-models").disabled ? $("models-title") : $("save-models")).focus();
   }
 });
 
 async function api(path, body) {
   const response = await fetch(`/api/${path}`, {
     method: body ? "POST" : "GET",
-    headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+    headers: { "content-type": "application/json" },
     body: body && JSON.stringify(body),
   });
   const text = await response.text();
@@ -274,20 +281,25 @@ function inputData(patch) {
   return { ...selection, previewModelID: $("preview-model").value, variant: $("variant").value, patch };
 }
 
+function numberInput(labelText, key, initial) {
+  const wrap = document.createElement("label");
+  wrap.textContent = labelText;
+  const input = document.createElement("input");
+  input.type = "number";
+  input.step = "any";
+  input.min = "0";
+  input.dataset.part = key;
+  if (initial !== undefined) input.value = String(initial);
+  wrap.append(input);
+  return { wrap, input };
+}
+
 function collect() {
   const patch = {};
-  for (const [key, { mode, value, field }] of controls) {
+  for (const [key, { mode, field, read }] of controls) {
     if (mode.value === "inherit") continue;
     if (mode.value === "remove") { patch[key] = { mode: "remove" }; continue; }
-    let parsed;
-    if (field.type === "list") parsed = value.value.split(/\n|,/).map((item) => item.trim()).filter(Boolean);
-    else if (field.type === "boolean") parsed = value.value === "true";
-    else if (field.type === "enum") parsed = value.value;
-    else {
-      try { parsed = JSON.parse(value.value); }
-      catch { throw new Error(`${field.label}: enter a valid JSON value.`); }
-    }
-    patch[key] = { mode: mode.value, value: parsed };
+    patch[key] = { mode: mode.value, value: read() };
   }
   return patch;
 }
@@ -311,8 +323,14 @@ function renderFields(patch) {
     row.className = "field";
     const top = document.createElement("div");
     top.className = "field-top";
-    const label = document.createElement("label");
-    label.htmlFor = `${field.key}-value`;
+    const structured = field.type === "sort" || field.type === "threshold" || field.type === "price";
+    const label = document.createElement(structured ? "span" : "label");
+    if (structured) {
+      label.id = `${field.key}-label`;
+      label.className = "field-title";
+    } else {
+      label.htmlFor = `${field.key}-value`;
+    }
     const code = document.createElement("code");
     code.textContent = field.key;
     label.append(`${field.label} `, code);
@@ -322,26 +340,118 @@ function renderFields(patch) {
     const modes = [["inherit", "Inherit"], ["set", field.type === "list" ? "Replace" : "Set"], ...(field.type === "list" ? [["append", "Append"]] : []), ["remove", "Remove"]];
     for (const [id, text] of modes) mode.add(new Option(text, id));
     mode.value = patch[field.key]?.mode ?? "inherit";
-    const value = document.createElement(field.type === "boolean" || field.type === "enum" ? "select" : "textarea");
-    value.id = `${field.key}-value`;
-    value.className = "value";
-    value.setAttribute("aria-describedby", `${field.key}-hint`);
-    if (field.type === "boolean") { value.add(new Option("Enabled", "true")); value.add(new Option("Disabled", "false")); }
-    if (field.type === "enum") { value.add(new Option("Deny", "deny")); value.add(new Option("Allow", "allow")); }
     const configured = patch[field.key]?.value;
-    if (configured !== undefined) value.value = field.type === "list" ? configured.join("\n") : field.type === "json" ? JSON.stringify(configured, null, 2) : String(configured);
-    else if (field.type === "json") value.value = field.key === "sort" ? '"price"' : field.key === "max_price" ? "{}" : "50";
+
+    let valueEl;
+    let read;
+    if (field.type === "sort") {
+      const box = document.createElement("div");
+      box.className = "value subgrid";
+      box.setAttribute("role", "group");
+      box.setAttribute("aria-labelledby", `${field.key}-label`);
+      const byWrap = document.createElement("label");
+      byWrap.textContent = "Sort by";
+      const by = document.createElement("select");
+      for (const [id, text] of [["price", "Price"], ["throughput", "Throughput"], ["latency", "Latency"]]) by.add(new Option(text, id));
+      by.value = typeof configured === "string" ? configured : configured?.by ?? "price";
+      byWrap.append(by);
+      const partWrap = document.createElement("label");
+      partWrap.textContent = "Partition";
+      const partition = document.createElement("select");
+      for (const [id, text] of [["", "Default"], ["model", "Model"], ["none", "None"]]) partition.add(new Option(text, id));
+      partition.value = typeof configured === "object" && configured ? configured.partition ?? "" : "";
+      partWrap.append(partition);
+      box.append(byWrap, partWrap);
+      by.addEventListener("change", changed);
+      partition.addEventListener("change", changed);
+      valueEl = box;
+      read = () => (partition.value ? { by: by.value, partition: partition.value } : by.value);
+    } else if (field.type === "threshold") {
+      const box = document.createElement("div");
+      box.className = "value subgrid";
+      box.setAttribute("role", "group");
+      box.setAttribute("aria-labelledby", `${field.key}-label`);
+      const scalar = numberInput("Value", "scalar", typeof configured === "number" ? configured : undefined);
+      const percentiles = ["p50", "p75", "p90", "p99"].map((p) => {
+        const item = numberInput(p, p, typeof configured === "object" && configured ? configured[p] : undefined);
+        item.input.addEventListener("input", () => { if (item.input.value !== "") scalar.input.value = ""; changed(); });
+        return [p, item];
+      });
+      scalar.input.addEventListener("input", () => {
+        if (scalar.input.value !== "") for (const [, item] of percentiles) item.input.value = "";
+        changed();
+      });
+      box.append(scalar.wrap, ...percentiles.map(([, item]) => item.wrap));
+      valueEl = box;
+      read = () => {
+        if (scalar.input.value !== "") {
+          const n = Number(scalar.input.value);
+          if (!Number.isFinite(n)) throw new Error(`${field.label}: enter a valid number.`);
+          return n;
+        }
+        const obj = {};
+        for (const [p, item] of percentiles) {
+          if (item.input.value === "") continue;
+          const n = Number(item.input.value);
+          if (!Number.isFinite(n)) throw new Error(`${field.label} (${p}): enter a valid number.`);
+          obj[p] = n;
+        }
+        if (!Object.keys(obj).length) throw new Error(`${field.label}: enter a value or percentile.`);
+        return obj;
+      };
+    } else if (field.type === "price") {
+      const box = document.createElement("div");
+      box.className = "value subgrid";
+      box.setAttribute("role", "group");
+      box.setAttribute("aria-labelledby", `${field.key}-label`);
+      const items = [
+        ["prompt", "Prompt / 1M"],
+        ["completion", "Completion / 1M"],
+        ["request", "Request"],
+        ["image", "Image"],
+        ["audio", "Audio"],
+      ].map(([k, text]) => {
+        const item = numberInput(text, k, configured?.[k]);
+        item.input.addEventListener("input", changed);
+        box.append(item.wrap);
+        return [k, item];
+      });
+      valueEl = box;
+      read = () => {
+        const obj = {};
+        for (const [k, item] of items) {
+          if (item.input.value === "") continue;
+          const n = Number(item.input.value);
+          if (!Number.isFinite(n)) throw new Error(`${field.label} (${k}): enter a valid number.`);
+          obj[k] = n;
+        }
+        return obj;
+      };
+    } else {
+      const input = document.createElement(field.type === "boolean" || field.type === "enum" ? "select" : "textarea");
+      input.id = `${field.key}-value`;
+      input.className = "value";
+      input.setAttribute("aria-describedby", `${field.key}-hint`);
+      if (field.type === "boolean") { input.add(new Option("Enabled", "true")); input.add(new Option("Disabled", "false")); }
+      if (field.type === "enum") { input.add(new Option("Deny", "deny")); input.add(new Option("Allow", "allow")); }
+      if (configured !== undefined) input.value = field.type === "list" ? configured.join("\n") : String(configured);
+      input.addEventListener("input", changed);
+      valueEl = input;
+      read = () => field.type === "list"
+        ? input.value.split(/\n|,/).map((item) => item.trim()).filter(Boolean)
+        : field.type === "boolean" ? input.value === "true" : input.value;
+    }
+
     const hint = document.createElement("p");
     hint.id = `${field.key}-hint`;
     hint.className = "help";
     hint.textContent = field.hint;
-    value.hidden = mode.value === "inherit" || mode.value === "remove";
-    mode.addEventListener("change", () => { value.hidden = mode.value === "inherit" || mode.value === "remove"; changed(); });
-    value.addEventListener("input", changed);
+    valueEl.hidden = mode.value === "inherit" || mode.value === "remove";
+    mode.addEventListener("change", () => { valueEl.hidden = mode.value === "inherit" || mode.value === "remove"; changed(); });
     top.append(label, mode);
-    row.append(top, value, hint);
+    row.append(top, valueEl, hint);
     group.append(row);
-    controls.set(field.key, { field, mode, value });
+    controls.set(field.key, { field, mode, read });
   }
 }
 
@@ -419,14 +529,15 @@ async function load() {
 }
 
 for (const id of ["scope", "model"]) $(id).addEventListener("change", async () => {
-  if (dirty && !confirm("Discard unsaved settings for this scope and model?")) {
+  const next = { scope: $("scope").value, modelID: $("model").value };
+  if (dirty && !(await confirmDiscard("Discard unsaved settings for this scope and model?"))) {
     $("scope").value = selection.scope;
     $("model").value = selection.modelID;
     return;
   }
   const previous = selection;
   const previousPreview = $("preview-model").value;
-  selection = { scope: $("scope").value, modelID: $("model").value };
+  selection = next;
   if (selection.modelID) { $("preview-model").value = selection.modelID; variants(); }
   if (!(await load())) {
     selection = previous;
@@ -461,7 +572,7 @@ $("settings").addEventListener("submit", async (event) => {
   } finally {
     inputs.forEach((input) => { input.disabled = false; });
     $("save").disabled = !dirty;
-    (prevFocus?.isConnected && !prevFocus.disabled ? prevFocus : $("status")).focus();
+    (prevFocus?.isConnected && !prevFocus.disabled ? prevFocus : $("routing-title")).focus();
   }
 });
 $("copy").addEventListener("click", async () => {

@@ -23,7 +23,6 @@ export default Plugin.define({
   async setup(ctx) {
     let server: Bun.Server<undefined> | undefined;
     let idleTimer: ReturnType<typeof setTimeout> | undefined;
-    const token = crypto.randomUUID();
     let disabledModels = new Set((await ctx.storage.get(disabledModelsKey) as string[] | undefined) ?? []);
     let models: { id: string; name: string; variants: string[]; available: boolean }[] = [];
 
@@ -41,6 +40,24 @@ export default Plugin.define({
         });
       }
     });
+
+    async function pruneRetiredOverrides() {
+      if (!models.length) return;
+      const known = new Set(models.map((model) => model.id));
+      let after: string | undefined;
+      do {
+        const page = await ctx.storage.scan({ prefix: "config/", after });
+        for (const entry of page.entries) {
+          const encoded = entry.key.slice(entry.key.lastIndexOf("/") + 1);
+          if (encoded !== "*" && !known.has(decodeURIComponent(encoded))) {
+            await ctx.storage.remove(entry.key);
+          }
+        }
+        after = page.next;
+      } while (after);
+    }
+
+    await pruneRetiredOverrides();
 
     async function reloadModels() {
       disabledModels = new Set((await ctx.storage.get(disabledModelsKey) as string[] | undefined) ?? []);
@@ -100,7 +117,6 @@ export default Plugin.define({
                 if (!asset) return new Response("Not found", { status: 404 });
                 return new Response(Bun.file(new URL(`./web/${asset}`, import.meta.url)));
               }
-              if (request.headers.get("authorization") !== `Bearer ${token}`) return Response.json({ error: "Unauthorized" }, { status: 401 });
               if (url.pathname === "/api/heartbeat" && request.method === "POST") {
                 idleTimer!.refresh();
                 return Response.json({ ok: true });
@@ -108,6 +124,7 @@ export default Plugin.define({
               if (url.pathname === "/api/context" && request.method === "GET") {
                 await reloadModels();
                 await ctx.model.list();
+                await pruneRetiredOverrides();
                 return Response.json({
                   directory: ctx.location.directory,
                   models,
@@ -127,7 +144,10 @@ export default Plugin.define({
                 const input = selectionSchema.parse(await request.json());
                 const scope = input.scope === "folder" ? `folder/${encodeURIComponent(ctx.location.directory)}` : "global";
                 const key = settingsKey(scope, input.modelID);
-                if (url.pathname === "/api/settings" && input.patch) await ctx.storage.set(key, input.patch);
+                if (url.pathname === "/api/settings" && input.patch) {
+                  if (Object.keys(input.patch).length) await ctx.storage.set(key, input.patch);
+                  else await ctx.storage.remove(key);
+                }
                 const patch = input.patch ?? (await ctx.storage.get(key) as Patch | undefined) ?? {};
                 const applied = await layers(ctx.location.directory, input.previewModelID);
                 if (input.patch) {
@@ -164,7 +184,6 @@ export default Plugin.define({
         idleTimer = setTimeout(stop, 5 * 60_000);
         idleTimer.unref();
         const url = new URL(`http://127.0.0.1:${server.port}/`);
-        url.hash = token;
         return { url: url.href };
       },
     });

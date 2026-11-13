@@ -8,7 +8,7 @@ Manage OpenRouter model exclusions, provider routing, and privacy from OpenCode.
 opencode plugin add @jiafuei/opencode-openrouter
 ```
 
-Uses your existing OpenCode OpenRouter connection. Open **OpenRouter settings** in the command palette or run `/openrouter`. The plugin starts a loopback-only server on an available port and opens your browser. The launch URL grants access to the settings UI; no OpenRouter credential is sent to the browser. Reopen the command after restarting OpenCode.
+Uses your existing OpenCode OpenRouter connection. Open **OpenRouter settings** in the command palette or run `/openrouter`. The plugin starts a loopback-only server on an available port and opens your browser. No OpenRouter credential is sent to the browser. Reopen the command after restarting OpenCode.
 
 Tabs send heartbeats every 30 seconds, even in the background. After five minutes without a heartbeat, the listener stops but saved routing settings and model exclusions still apply. Suspended tabs can time out; run `/openrouter` again to restart the listener.
 
@@ -53,7 +53,7 @@ Each field supports:
 
 Supports every field in OpenRouter's [provider-selection guide](https://openrouter.ai/docs/guides/routing/provider-selection): `order`, `only`, `ignore`, `allow_fallbacks`, `require_parameters`, `sort`, `data_collection`, `zdr`, `enforce_distillable_text`, `quantizations`, `preferred_min_throughput`, `preferred_max_latency`, and `max_price`.
 
-Lists accept one slug per line or comma-separated values, including specific endpoint slugs. Sorting, price caps, and performance thresholds use JSON inputs to support their complete object forms. Price caps support `prompt`, `completion`, `request`, `image`, and `audio`.
+Lists accept one slug per line or comma-separated values, including specific endpoint slugs. Sorting, price caps, and performance thresholds provide structured inputs for their scalar and object forms. Price caps support `prompt`, `completion`, `request`, `image`, and `audio`.
 
 Settings apply to every session request sent to the `openrouter` provider: agent turns, subagents, titles, compaction, and generation. Plugin calls made outside a session are not covered.
 

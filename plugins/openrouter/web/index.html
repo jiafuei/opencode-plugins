@@ -24,7 +24,7 @@
         <button type="button" id="routing-tab" role="tab" aria-controls="routing-panel" aria-selected="false" tabindex="-1">Routing &amp; Privacy</button>
       </div>
       <section id="models-panel" role="tabpanel" aria-labelledby="models-tab" inert>
-        <div class="editor-heading"><h2 id="models-title">Model availability</h2><span class="badge">Global</span></div>
+        <div class="editor-heading"><h2 id="models-title" tabindex="-1">Model availability</h2><span class="badge">Global</span></div>
         <p class="help">Disabled models stay in OpenCode’s catalog with “(disabled - DO NOT USE)” in their names. Requests fail with “Model is explicitly disabled” before dispatch. These exclusions apply across projects.</p>
         <div class="model-filters">
           <label>Search models<input id="model-search" type="search" placeholder="Name or model ID…" autocomplete="off"></label>
@@ -55,7 +55,7 @@
         </section>
         <div class="layout">
           <form id="settings">
-            <div class="editor-heading"><h2>Preferences</h2><button type="button" id="reset" class="quiet">Inherit all</button></div>
+            <div class="editor-heading"><h2 id="routing-title" tabindex="-1">Preferences</h2><button type="button" id="reset" class="quiet">Inherit all</button></div>
             <p class="help">Inherit keeps the earlier value. Remove omits a field from the request. Lists can replace or append.</p>
             <div id="fields"></div>
             <div class="save-bar"><span id="status" role="status" tabindex="-1">Loading…</span><button type="submit" id="save" disabled>Save settings</button></div>
@@ -74,6 +74,16 @@
           </aside>
         </div>
       </section>
+      <dialog id="confirm-dialog" class="card" aria-labelledby="confirm-title">
+        <form method="dialog">
+          <h2 id="confirm-title">Discard unsaved changes?</h2>
+          <p id="confirm-message" class="help"></p>
+          <div class="dialog-actions">
+            <button type="submit" value="cancel" class="quiet">Keep editing</button>
+            <button type="submit" value="discard">Discard</button>
+          </div>
+        </form>
+      </dialog>
     </main>
   </body>
 </html>

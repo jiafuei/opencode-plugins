@@ -45,6 +45,10 @@ input, select, textarea { background: var(--input); color: var(--text); border: 
 textarea { resize: vertical; min-height: 84px; font-family: ui-monospace, monospace; line-height: 1.5; tab-size: 2; }
 input::placeholder { color: var(--muted); opacity: .85; }
 :focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+h2:focus:not(:focus-visible) { outline: none; }
+dialog.card { max-width: 420px; width: calc(100% - 32px); color: var(--text); margin: auto; }
+dialog::backdrop { background: #00000090; }
+.dialog-actions { display: flex; justify-content: flex-end; gap: 12px; margin-top: 20px; }
 button { min-height: 42px; padding: 9px 16px; border: 1px solid transparent; border-radius: 8px; background: var(--accent); color: #122b23; font-weight: 600; cursor: pointer; user-select: none; transition: background-color .15s, scale .15s; }
 button:not(:disabled):active { scale: .96; }
 button:hover { background: #c0eddf; }
@@ -60,9 +64,11 @@ button.quiet:hover { background: #ffffff0a; color: var(--text); }
 .group h3 { color: var(--accent); padding-block-end: 12px; border-bottom: 1px solid var(--line); }
 .field { padding-block: 20px; border-bottom: 1px solid #ffffff0a; }
 .field-top { display: grid; grid-template-columns: minmax(0, 1fr) 130px; align-items: center; gap: 16px; }
-.field-top label { display: block; }
+.field-top label, .field-title { display: block; font-size: var(--body); font-weight: 500; }
 .field-top code { display: block; color: var(--muted); font-size: var(--small); font-weight: 400; overflow-wrap: anywhere; }
 .field .value { margin-block-start: 12px; }
+.subgrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 12px; }
+.subgrid label { font-size: var(--small); color: var(--muted); gap: 6px; }
 .field .help { margin-block-start: 10px; }
 .preview { position: sticky; top: 24px; max-height: calc(100dvh - 48px); overflow: auto; }
 .preview > label { margin-block-start: 20px; }
