@@ -2,7 +2,6 @@ const $ = (id) => document.getElementById(id);
 const token = location.hash.slice(1) || sessionStorage.getItem("openrouter-token");
 if (token) sessionStorage.setItem("openrouter-token", token);
 history.replaceState(null, "", location.pathname + location.search);
-const sessionID = new URLSearchParams(location.search).get("sessionID") || undefined;
 let catalog;
 let dirty = false;
 let sequence = 0;
@@ -63,12 +62,6 @@ function updateModelSummary() {
   modelsDirty = disabledModels.size !== savedDisabled.size || [...disabledModels].some((id) => !savedDisabled.has(id));
   $("model-status").textContent = modelsDirty ? "Unsaved changes · global exclusions" : "Saved · global exclusions";
   $("save-models").disabled = !modelsDirty;
-  const current = catalog.session?.model;
-  const blocked = current?.providerID === "openrouter" && disabledModels.has(current.id);
-  $("model-warning").hidden = !blocked;
-  $("model-warning").textContent = blocked
-    ? `The current session’s model is disabled. ${savedDisabled.has(current.id) ? "New" : "After saving, new"} requests using it will fail until you enable it or switch models. Requests already in progress are not interrupted.`
-    : "";
 }
 
 function renderEmptyModels() {
@@ -102,20 +95,13 @@ function renderModels() {
     const id = document.createElement("code");
     id.textContent = model.id;
     info.append(name, id);
-    const current = catalog.session?.model;
-    const labels = [
-      ...(!model.available ? ["Disabled by OpenCode configuration or another plugin"] : []),
-      ...(current?.providerID === "openrouter" && current.id === model.id ? ["Current session"] : []),
-    ];
-    if (labels.length) {
+    if (!model.available) {
       const badges = document.createElement("div");
       badges.className = "model-badges";
-      for (const text of labels) {
-        const badge = document.createElement("span");
-        badge.className = "badge";
-        badge.textContent = text;
-        badges.append(badge);
-      }
+      const badge = document.createElement("span");
+      badge.className = "badge";
+      badge.textContent = "Disabled by OpenCode configuration or another plugin";
+      badges.append(badge);
       info.append(badges);
     }
     const toggle = document.createElement("label");
@@ -152,12 +138,20 @@ function renderModels() {
     routing.setAttribute("aria-label", `Routing settings for ${model.name} (${model.id})`);
     routing.addEventListener("click", async () => {
       if (dirty && !confirm("Discard unsaved routing settings?")) return;
+      const previous = selection;
+      const previousPreview = $("preview-model").value;
       $("model").value = model.id;
       $("preview-model").value = model.id;
       selection = { scope: $("scope").value, modelID: model.id };
       variants();
       tab("routing");
-      await load();
+      if (!(await load())) {
+        selection = previous;
+        $("model").value = previous.modelID;
+        $("preview-model").value = previousPreview;
+        variants();
+        return;
+      }
       ($("fields").querySelector("select, input, textarea") ?? $("scope")).focus();
     });
     row.append(select, info, toggle, routing);
@@ -277,7 +271,7 @@ function syncCatalogOptions() {
 }
 
 function inputData(patch) {
-  return { ...selection, sessionID, previewModelID: $("preview-model").value, variant: $("variant").value, patch };
+  return { ...selection, previewModelID: $("preview-model").value, variant: $("variant").value, patch };
 }
 
 function collect() {
@@ -409,14 +403,16 @@ async function load() {
   $("status").textContent = "Loading…";
   try {
     const state = await api("settings", inputData());
-    if (request !== sequence) return;
+    if (request !== sequence) return false;
     dirty = false;
     renderFields(state.patch);
     renderPreview(state);
     $("status").textContent = "Saved settings";
     showError(null);
+    return true;
   } catch (error) {
     if (request === sequence) { showError(error); $("status").textContent = "Could not load settings"; }
+    return false;
   } finally {
     if (request === sequence) $("settings").inert = false;
   }
@@ -428,9 +424,17 @@ for (const id of ["scope", "model"]) $(id).addEventListener("change", async () =
     $("model").value = selection.modelID;
     return;
   }
+  const previous = selection;
+  const previousPreview = $("preview-model").value;
   selection = { scope: $("scope").value, modelID: $("model").value };
   if (selection.modelID) { $("preview-model").value = selection.modelID; variants(); }
-  await load();
+  if (!(await load())) {
+    selection = previous;
+    $("scope").value = previous.scope;
+    $("model").value = previous.modelID;
+    $("preview-model").value = previousPreview;
+    variants();
+  }
 });
 $("preview-model").addEventListener("change", () => { variants(); void preview(); });
 $("variant").addEventListener("change", () => void preview());
@@ -471,7 +475,7 @@ $("copy").addEventListener("click", async () => {
 addEventListener("beforeunload", (event) => { if (dirty || modelsDirty) { event.preventDefault(); event.returnValue = ""; } });
 
 try {
-  catalog = await api(`context${sessionID ? `?sessionID=${encodeURIComponent(sessionID)}` : ""}`);
+  catalog = await api("context");
   savedDisabled = new Set(catalog.disabled);
   disabledModels = new Set(catalog.disabled);
   syncCatalogOptions();
@@ -480,14 +484,7 @@ try {
   $("models-panel").inert = false;
   $("routing-panel").inert = false;
   $("location").textContent = catalog.directory;
-  $("session").textContent = catalog.session ? `Session: ${catalog.session.title ?? catalog.session.id}` : "Open /openrouter from a session to configure session overrides.";
-  $("scope").querySelector('[value="session"]').disabled = !catalog.session;
-  const current = catalog.session?.model;
-  if (current?.providerID === "openrouter" && catalog.models.some((model) => model.id === current.id)) {
-    $("preview-model").value = current.id;
-  }
   variants();
-  if (current?.providerID === "openrouter" && current.variant) $("variant").value = current.variant;
   await load();
 } catch (error) {
   showError(error);

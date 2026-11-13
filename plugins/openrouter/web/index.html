@@ -37,7 +37,6 @@
           <button type="button" id="enable-models" class="quiet" disabled>Enable selected</button>
           <button type="button" id="disable-models" class="quiet" disabled>Disable selected</button>
         </div>
-        <div role="status"><p id="model-warning" class="warning" hidden></p></div>
         <ul id="model-list" class="card model-list" aria-label="OpenRouter models" aria-busy="true"></ul>
         <p id="model-count" class="help">Loading models…</p>
         <div class="save-bar"><span id="model-status" role="status" tabindex="-1">Loading…</span><button type="button" id="save-models" disabled>Save changes</button></div>
@@ -45,7 +44,7 @@
       <section id="routing-panel" role="tabpanel" aria-labelledby="routing-tab" hidden inert>
         <section class="context card" aria-label="Configuration scope">
           <div class="selectors">
-            <label>Scope<select id="scope"><option value="global">Global</option><option value="folder">This folder</option><option value="session">This session</option></select></label>
+            <label>Scope<select id="scope"><option value="global">Global</option><option value="folder">This folder</option></select></label>
             <div class="selector">
               <label for="model">Model override</label>
               <select id="model" aria-describedby="model-help"><option value="">All models (defaults)</option></select>
@@ -53,7 +52,6 @@
             </div>
           </div>
           <p id="location" class="location"></p>
-          <p id="session" class="help"></p>
         </section>
         <div class="layout">
           <form id="settings">
@@ -67,7 +65,7 @@
             <h2 id="preview-title">Effective settings</h2>
             <label>Preview model<select id="preview-model"></select></label>
             <label>OpenCode variant<select id="variant"><option value="">Default</option></select></label>
-            <p class="help">OpenCode defaults → global → folder → parent sessions → session. Within each scope, model overrides follow defaults.</p>
+            <p class="help">OpenCode defaults → global → folder. Within each scope, model overrides follow defaults.</p>
             <p id="preview-note" class="help"></p>
             <dl id="sources"></dl>
             <div class="json-heading"><h3>Request provider object</h3><button type="button" id="copy" class="quiet">Copy</button><span id="copy-status" class="sr-only" role="status"></span></div>

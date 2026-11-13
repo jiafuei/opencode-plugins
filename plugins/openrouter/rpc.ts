@@ -5,7 +5,7 @@ export const OpenRouterRpc = Rpc.define({
   id: "openrouter-settings",
   methods: {
     open: {
-      input: z.object({ sessionID: z.string().optional() }),
+      input: z.object({}),
       output: z.object({ url: z.string() }),
     },
   },

@@ -5,7 +5,7 @@ import OpenRouter from "./server.ts";
 
 async function instance(storage: Map<string, unknown>, directory = "/work/app", plugin = OpenRouter) {
   const hooks = new Map<string, (event: any) => Promise<void>>();
-  let open: (input: { sessionID?: string }) => Promise<{ url: string }>;
+  let open: (input: Record<string, never>) => Promise<{ url: string }>;
   let transform: (editor: ModelEditor) => void;
   const source = [{
     ...Model.Info.default(Provider.ID.make("openrouter"), Model.ID.make("vendor/model")),
@@ -30,8 +30,7 @@ async function instance(storage: Map<string, unknown>, directory = "/work/app", 
     } as ModelEditor);
   };
   const sessions: Record<string, unknown> = {
-    parent: { id: "parent", title: "Parent", location: { directory: "/work/app" } },
-    child: { id: "child", parentID: "parent", title: "Child", location: { directory: "/work/app" } },
+    main: { id: "main", location: { directory: "/work/app" } },
     other: { id: "other", location: { directory: "/work/app/worktree" } },
   };
   const dispose = await plugin.setup({
@@ -88,7 +87,7 @@ async function instance(storage: Map<string, unknown>, directory = "/work/app", 
   };
 }
 
-test("saved routing applies across request kinds, scopes, models, child sessions, and plugin restarts", async () => {
+test("saved routing applies across request kinds, scopes, models, and plugin restarts", async () => {
   const storage = new Map<string, unknown>();
   let app = await instance(storage);
   try {
@@ -96,21 +95,19 @@ test("saved routing applies across request kinds, scopes, models, child sessions
       { patch: { zdr: { mode: "set", value: true }, order: { mode: "set", value: ["a"] }, only: { mode: "remove" } } },
       { modelID: "vendor/model", patch: { data_collection: { mode: "set", value: "deny" } } },
       { scope: "folder", patch: { order: { mode: "append", value: ["a", "b"] }, allow_fallbacks: { mode: "set", value: false } } },
-      { scope: "session", sessionID: "parent", patch: { order: { mode: "append", value: ["c"] } } },
-      { scope: "session", sessionID: "child", modelID: "vendor/model", patch: { order: { mode: "append", value: ["b", "d"] }, zdr: { mode: "set", value: false } } },
+      { scope: "folder", modelID: "vendor/model", patch: { order: { mode: "append", value: ["c"] }, zdr: { mode: "set", value: false } } },
     ];
     for (const edit of edits) expect((await app.api("settings", edit)).status).toBe(200);
     await app.dispose();
     app = await instance(storage, "/different/plugin/location");
     for (const kind of ["primary", "title", "compaction", "generate"]) {
-      expect(await app.send("child", kind)).toEqual({ order: ["a", "b", "c", "d"], allow_fallbacks: false, zdr: false, data_collection: "deny" });
+      expect(await app.send("main", kind)).toEqual({ order: ["a", "b", "c"], allow_fallbacks: false, zdr: false, data_collection: "deny" });
     }
-    expect(await app.send("parent")).toEqual({ order: ["a", "b", "c"], allow_fallbacks: false, zdr: true, data_collection: "deny" });
     expect(await app.send("other")).toEqual({ order: ["a"], allow_fallbacks: true, zdr: true, data_collection: "deny" });
-    expect(await app.send("child", "primary", "another/model")).toEqual({ order: ["a", "b", "c"], allow_fallbacks: false, zdr: true });
+    expect(await app.send("main", "primary", "another/model")).toEqual({ order: ["a", "b"], allow_fallbacks: false, zdr: true });
     // Clearing an override restores inheritance on the very next call.
-    expect((await app.api("settings", { scope: "session", sessionID: "child", modelID: "vendor/model", patch: {} })).status).toBe(200);
-    expect((await app.send("child")).zdr).toBe(true);
+    expect((await app.api("settings", { scope: "folder", modelID: "vendor/model", patch: {} })).status).toBe(200);
+    expect((await app.send("main")).zdr).toBe(true);
   } finally { await app.dispose(); }
 });
 
@@ -121,13 +118,12 @@ test("local UI API previews unsaved settings without persisting them, validates 
     const page = await fetch(app.url);
     expect(page.status).toBe(200);
     expect(await page.text()).toContain("Effective settings");
-    const context = await fetch(new URL("/api/context?sessionID=child", app.url), {
+    const context = await fetch(new URL("/api/context", app.url), {
       headers: { authorization: `Bearer ${new URL(app.url).hash.slice(1)}` },
     });
     expect(context.status).toBe(200);
     expect(await context.json()).toMatchObject({
       directory: "/work/app",
-      session: { id: "child" },
       models: [
         { id: "vendor/locked", name: "Config-disabled model", available: false },
         { id: "vendor/model", name: "Model", variants: ["fast"], available: true },
@@ -148,7 +144,7 @@ test("local UI API previews unsaved settings without persisting them, validates 
     expect(baseline.provider.max_price).toEqual({ prompt: 3, completion: 2 });
     expect((await app.api("settings", { patch: { zdr: { mode: "set", value: "yes" } } })).status).toBe(400);
     expect(storage.size).toBe(0);
-    const sent = await app.send("parent");
+    const sent = await app.send("main");
     expect(sent).toEqual({ order: ["original"], only: ["original"], allow_fallbacks: true });
   } finally { await app.dispose(); }
 });
@@ -173,18 +169,18 @@ test("global model exclusions keep catalog entries visible, block session reques
         { id: "vendor/model", name: "Model (disabled - DO NOT USE)" },
       ]);
       for (const kind of ["primary", "title", "compaction", "generate"]) {
-        await expect(location.send("child", kind)).rejects.toThrow("Model is explicitly disabled");
+        await expect(location.send("main", kind)).rejects.toThrow("Model is explicitly disabled");
       }
     }
     // Reopening keeps one suffix, and exclusions outlive the plugin instance.
     await other.dispose();
     other = await instance(storage, "/work/other", separateModule);
     expect(other.models()[0]!.name).toBe("Model (disabled - DO NOT USE)");
-    await expect(other.send("parent")).rejects.toThrow("Model is explicitly disabled");
+    await expect(other.send("main")).rejects.toThrow("Model is explicitly disabled");
     expect((await other.api("models", { disabled: [] })).status).toBe(200);
     expect(app.models().map((model) => model.name)).toEqual(["Model"]);
     expect(other.models().map((model) => model.name)).toEqual(["Model"]);
-    expect(await app.send("child")).toEqual({ order: ["original"], only: ["original"], allow_fallbacks: true });
+    expect(await app.send("main")).toEqual({ order: ["original"], only: ["original"], allow_fallbacks: true });
     expect((await app.api("models", { disabled: [false] })).status).toBe(400);
   } finally {
     await app.dispose();

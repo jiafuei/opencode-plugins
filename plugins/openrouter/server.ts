@@ -4,8 +4,7 @@ import { OpenRouterRpc } from "./rpc.ts";
 import { fields, patchSchema, resolveSettings, settingsKey, type Layer, type Patch } from "./settings.ts";
 
 const selectionSchema = z.object({
-  sessionID: z.string().optional(),
-  scope: z.enum(["global", "folder", "session"]),
+  scope: z.enum(["global", "folder"]),
   modelID: z.string(),
   previewModelID: z.string(),
   variant: z.string().optional(),
@@ -59,22 +58,10 @@ export default Plugin.define({
       server = undefined;
     }
 
-    async function context(sessionID?: string) {
-      const sessions = [];
-      while (sessionID) {
-        const session = await ctx.session.get({ sessionID });
-        sessions.unshift(session);
-        sessionID = session.parentID;
-      }
-      const session = sessions.at(-1);
-      return { sessions, session, directory: session?.location.directory ?? ctx.location.directory };
-    }
-
-    async function layers(info: Awaited<ReturnType<typeof context>>, modelID: string) {
+    async function layers(directory: string, modelID: string) {
       const scopes = [
         { id: "global", name: "Global" },
-        { id: `folder/${encodeURIComponent(info.directory)}`, name: "Folder" },
-        ...info.sessions.map((session) => ({ id: `session/${session.id}`, name: `Session: ${session.title ?? session.id}` })),
+        { id: `folder/${encodeURIComponent(directory)}`, name: "Folder" },
       ];
       const entries = scopes.flatMap((scope) => [
         { key: settingsKey(scope.id, ""), name: `${scope.name} defaults` },
@@ -86,8 +73,8 @@ export default Plugin.define({
     }
 
     await ctx.session.hook("http.request", async (event) => {
-      const info = await context(event.sessionID);
-      const applied = await layers(info, event.model.id);
+      const session = event.sessionID ? await ctx.session.get({ sessionID: event.sessionID }) : undefined;
+      const applied = await layers(session?.location.directory ?? ctx.location.directory, event.model.id);
       if (!applied.some((layer) => Object.keys(layer.patch).length)) return;
       const body = await event.request.json() as { provider?: Record<string, unknown> };
       const { provider } = resolveSettings(body.provider ?? {}, applied);
@@ -100,7 +87,7 @@ export default Plugin.define({
 
     // Start the local UI only when it is opened from the TUI.
     await ctx.rpc.register(OpenRouterRpc, {
-      open: async ({ sessionID }) => {
+      open: async () => {
         if (!server) {
           server = Bun.serve({
             hostname: "127.0.0.1",
@@ -119,12 +106,10 @@ export default Plugin.define({
                 return Response.json({ ok: true });
               }
               if (url.pathname === "/api/context" && request.method === "GET") {
-                const info = await context(url.searchParams.get("sessionID") ?? undefined);
                 await reloadModels();
                 await ctx.model.list();
                 return Response.json({
-                  directory: info.directory,
-                  session: info.session ? { id: info.session.id, title: info.session.title, model: info.session.model } : null,
+                  directory: ctx.location.directory,
                   models,
                   disabled: [...disabledModels],
                   fields,
@@ -140,16 +125,11 @@ export default Plugin.define({
               }
               if ((url.pathname === "/api/settings" || url.pathname === "/api/preview") && request.method === "POST") {
                 const input = selectionSchema.parse(await request.json());
-                const info = await context(input.sessionID);
-                if (input.scope === "session" && !info.session) {
-                  return Response.json({ error: "Session not found" }, { status: 400 });
-                }
-                const scope = input.scope === "folder" ? `folder/${encodeURIComponent(info.directory)}`
-                  : input.scope === "session" ? `session/${info.session!.id}` : "global";
+                const scope = input.scope === "folder" ? `folder/${encodeURIComponent(ctx.location.directory)}` : "global";
                 const key = settingsKey(scope, input.modelID);
                 if (url.pathname === "/api/settings" && input.patch) await ctx.storage.set(key, input.patch);
                 const patch = input.patch ?? (await ctx.storage.get(key) as Patch | undefined) ?? {};
-                const applied = await layers(info, input.previewModelID);
+                const applied = await layers(ctx.location.directory, input.previewModelID);
                 if (input.patch) {
                   const edited = applied.find((layer) => layer.key === key);
                   if (edited) edited.patch = input.patch;
@@ -184,7 +164,6 @@ export default Plugin.define({
         idleTimer = setTimeout(stop, 5 * 60_000);
         idleTimer.unref();
         const url = new URL(`http://127.0.0.1:${server.port}/`);
-        if (sessionID) url.searchParams.set("sessionID", sessionID);
         url.hash = token;
         return { url: url.href };
       },

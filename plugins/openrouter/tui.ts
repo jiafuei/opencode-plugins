@@ -20,9 +20,7 @@ export default Plugin.define({
                 const route = ctx.ui.router.current();
                 const session = route.type === "session" ? ctx.data.session.get(route.sessionID) : undefined;
                 const location = session?.location ?? ctx.location ?? ctx.data.location.default();
-                const { url } = await ctx.client.rpc(OpenRouterRpc).open({
-                  sessionID: route.type === "session" ? route.sessionID : undefined,
-                }, { location });
+                const { url } = await ctx.client.rpc(OpenRouterRpc).open({}, { location });
                 const command = process.platform === "darwin" ? ["open", url]
                   : process.platform === "win32" ? ["rundll32.exe", "url.dll,FileProtocolHandler", url] : ["xdg-open", url];
                 const child = Bun.spawn(command, { stdout: "ignore", stderr: "ignore" });

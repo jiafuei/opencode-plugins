@@ -1,6 +1,6 @@
 # OpenRouter settings
 
-Manage OpenRouter model exclusions, provider routing, and privacy from OpenCode. The local browser UI has a global model list and a routing editor with an effective-settings preview. Routing settings can be global, per folder, per session, or per model.
+Manage OpenRouter model exclusions, provider routing, and privacy from OpenCode. The local browser UI has a global model list and a routing editor with an effective-settings preview. Routing settings can be global, per folder, or per model.
 
 ## Install
 
@@ -30,17 +30,15 @@ Direct generation outside a session, such as `ctx.experimental.generate.text`, d
 
 ## Routing configuration
 
-Open **Routing & Privacy** and choose **Global**, **This folder**, or **This session**. Leave **Model override** empty to edit the scope's defaults, or enter an exact OpenCode OpenRouter model ID (for example `anthropic/claude-sonnet-4.5`). Use a model row's **Routing** button to open its override. The preview model and variant select which settings to resolve.
+Open **Routing & Privacy** and choose **Global** or **This folder**. Leave **Model override** on **All models (defaults)** to edit the scope's defaults, or select a specific OpenRouter model. Use a model row's **Routing** button to open its override. The preview model and variant select which settings to resolve.
 
 Precedence, lowest to highest:
 
 1. Existing outgoing request's `provider` fields.
 2. Global defaults, then global model overrides.
 3. Exact-folder defaults, then folder model overrides.
-4. Ancestor-session defaults and model overrides, oldest parent first.
-5. Current-session defaults, then current-session model overrides.
 
-Folders do not inherit from ancestor folders. Worktrees have separate folder settings. Child sessions inherit parent session overrides live. Each session uses its own current directory for folder settings. Settings persist in OpenCode plugin storage, shared by plugin ID, with separate keys for each scope and model.
+Folders do not inherit from ancestor folders. Worktrees have separate folder settings. Each session uses its own current directory for folder settings. Settings persist in OpenCode plugin storage, shared by plugin ID, with separate keys for each scope and model.
 
 Each field supports:
 
